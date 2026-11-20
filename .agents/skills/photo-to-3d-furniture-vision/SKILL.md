@@ -3,55 +3,40 @@ name: photo-to-3d-furniture-vision
 description: >-
   Use this skill when designing, implementing, or improving the photo-to-3D
   furniture recognition pipeline (src/core/vision/ and VectorCanvas in Bloque 4).
-  Covers homography rectification, focal-prior aspect ratio, the carcass-seeded
-  matched-band shelf/divider detector with confidence, exterior->interior
-  coordinate conversion, known real-photo failure modes, and the photo protocol.
+  Covers homography rectification, fixed-focal aspect ratio, the chroma+luminance
+  parallax-aware carcass-seeded detector with 1-click eyedropper and confidence,
+  exterior->interior conversion, real-photo failure modes, and the photo protocol.
 ---
 
-# Offline Photo-to-3D Furniture Vision (evidence-based, red-team audited)
+# Offline Photo-to-3D Furniture Vision (v2.1 Rev. 2)
 
 ## Ground truth about the problem
-- The user TYPES `V_f` in mm. From the photo we need **topology** (u, v of dividers/shelves).
-- A 4-corner homography to the unit square gives exact normalized u, v **regardless of aspect ratio**.
-  Aspect ratio / A4 scale only prefill `V_0` -> low stakes. Spend effort on detection + correction UX.
-- Auto-detection is an **assistant**. The manual path (4× loupe, snap, add/drag/delete lines) is the
-  guaranteed path and must always work.
+- The user sets or refines `V_f` in mm. From the photo we primarily need **accurate topology** (`u, v` of dividers/shelves) so the 3D model updates immediately.
+- A 4-corner homography to the unit square gives exact normalized `u, v` **regardless of aspect ratio**. Fixed-focal aspect ratio and perspective-invariant A4 calibration prefill `V_0` / `V_f`.
+- Auto-detection is a **high-accuracy assistant**, while fast manual editing (4× loupe, live rectified preview, 1-click color eyedropper, add/drag/delete with snap) is the **100% guaranteed path**.
 
-## Pipeline
-1. **Corners** `[TL, TR, BR, BL]` with 4× loupe (edge snap optional; fails on white-on-white walls).
-2. **Aspect ratio:** Zhang vector formula with a **FIXED focal prior**, NOT estimated f.
-   `f_px = f35 / 43.27 * hypot(imgW, imgH)`, f35 from EXIF `FocalLengthIn35mmFilm` else **26**.
-   Monte Carlo evidence (σ=2.5 px clicks): typical tilted closet photo -> estimated-f Zhang invalid 43 %,
-   p95 error 21 %; focal-prior p95 2.0 % (2.9 % even with a 15 % wrong prior). Never crop (principal point).
-3. **Rectify** with bilinear sampling through `toCanvas`. Width adaptive so the 18 mm board is ≥ 6 px:
-   `W = max(360, ceil(6 * x_f / e))`, `H = round(W * y_f / x_f)`. Row 0 = top (v = 1).
-4. **Detect** with the carcass-seeded matched-band detector — reference implementation (86 lines, tested):
-   [bandDetector.ts](../../../docs/evidencia/bandDetector.ts) (stress test: [band_test.ts](../../../docs/evidencia/band_test.ts)).
-   Requires approximate `V_0` for `tRatio = e / dim`. Full rationale: [ANALISIS_TECNICO_v2.1.md](../../../docs/ANALISIS_TECNICO_v2.1.md).
-   - Flat-field normalize `L / boxBlur(L, W/8)` (integral image).
-   - Learn board appearance from the carcass side bands (median + MAD).
-   - Per-pixel binary "board-like"; projection profiles = **coverage fractions** (not gradient sums).
-   - 1D matched filter of known thickness, both flanks must be off; NMS at 3·t.
-   - Dividers first, kept only if continuous and touching BOTH top and base (rejects books).
-   - Shelves bay-by-bay; collinear shelves across bays merged (mathEngine re-splits at dividers).
-   - `interiorMatch > 0.5` => model cannot discriminate (white-on-white) => tell user to trace manually.
-5. **Convert exterior -> interior** before emitting `NormalizedSegment` (contracts use INTERIOR space):
-   `p_int = (p_ext - e/dim) / (1 - 2e/dim)`. Skipping this = ~9 mm error at u = 0.25 on 800 mm.
-6. **Depth Z:** typology preset (320 / 400 / 500 / 550 mm) or manual input. 2-view ZY is optional scope.
+## Pipeline (`src/core/vision/` + `VectorCanvas.tsx`)
+1. **Corners `[TL, TR, BR, BL]`:** Place with **4× loupe** + live **rectified preview thumbnail** so users confirm straight framing before running detection.
+2. **Aspect ratio:** Zhang vector formula with a **fixed focal prior** (`f_px = f35 / 43.27 * hypot(imgW, imgH)`, default `f35 = 26` or UI selector `1× = 26 mm` / `2× = 52 mm`). Never estimate `f` (fails on 43% of tilted closet photos) and do NOT build an offline EXIF parser. Evidence: [zhang_sim.ts](../../../docs/evidencia/zhang_sim.ts).
+3. **Rectify RGBA:** Bilinear sampling via `toCanvas` into `Uint8ClampedArray`. Adaptive width so an 18 mm board spans `>= 6 px`: `W = max(360, ceil(6 * x_f / e))`, `H = round(W * y_f / x_f)`. Row `0` = top (`v = 1`).
+4. **Detect (`detectStructureRGBA`):** Reference verified implementation in [bandDetector.ts](../../../docs/evidencia/bandDetector.ts) (`8/8` passing in [band_test.ts](../../../docs/evidencia/band_test.ts)):
+   - **Channels:** Flat-field luminance `L / boxBlur(L, W/8)` (integral image, kills window gradients/vignetting) + illumination-invariant chromaticity `(R-G)/(R+G+B+15)` and `(B-0.5*(R+G))/(R+G+B+15)` (separates wood/roble from equal-luminance gray shadows).
+   - **Robust Seeding:** Sample all **4 outer carcass borders** (left, right, top, bottom) with median + MAD (50% breakdown point -> tolerates single-edge corner click jitter), plus optional `seedPoint?: { u; v }` for a **1-click eyedropper** in the UI.
+   - **Parallax-Aware Front-Edge Anchoring:** Below horizon (`v < horizonV`), shelves expose their top surface above the front edge -> anchor on zero-gap bottom drop (`mean(i, i+t) - mean(i+t, i+t+fw)`). Above horizon (`v > horizonV`), anchor on zero-gap top rise. Same geometry horizontally for left/right dividers. Rejects giant solid regions (`> 0.24 * dim`) and suppresses underside double-triggers via NMS `max(4*t, 0.055*n)`.
+   - **Structural Priors:** Dividers must be continuous top-to-base (rejects books); shelves are searched bay-by-bay and collinear segments are merged across bays (`mathEngine` re-splits at dividers).
+   - **Confidence (`0..1`):** `interiorMatch > 0.5` => `confidence < 0.5` (white-on-white) => UI explicitly alerts and switches focus to manual tracing.
+5. **Convert exterior -> interior:** Emit `NormalizedSegment` via `exteriorToInterior(p, e, dim)` from `mathEngine` (prevents ~9 mm shift error).
+6. **Depth Z:** Fast typology presets (`320 / 400 / 500 / 550 mm`), manual input, AND optional **Vista Lateral (ZY)** tab in Paso 1 for full `pauta.md` compliance.
 
-## Known failure modes (handle or communicate)
-- 🔴 **Parallax (untested):** shelves below eye level show their top face (band 2–8× thicker than 18 mm);
-  above eye level the underside. Fix direction: one-sided flank test, pick the lower edge below the
-  horizon and the upper edge above it. Must be tuned on REAL photos.
-- 🔴 White carcass + white back panel: undetectable by pixels -> rely on confidence + manual.
-- 🟠 Ultrawide 0.5× barrel distortion; doors/drawers out of scope; WhatsApp strips EXIF (send as Document).
+## Known failure modes & real-photo status
+- 🟡 **Parallax:** Solved in synthetic stress tests (`Clóset 550 mm @ 3 m`, `~100 mm` visible faces -> `0.0–0.5 mm` error), **must be calibrated on 8–12 real phone photos** (23–24 nov).
+- 🔴 **White carcass + white back panel:** Undetectable by appearance alone -> cleanly flagged via `confidence < 0.5` -> quick manual tracing.
+- 🟠 **Ultrawide `0.5×` barrel distortion / closed doors / cropped photos:** Explicitly guarded by the in-app **Photo Protocol** card.
 
-## Photo protocol (show in UI)
-Mueble abierto, sin puertas · cámara centrada a media altura · alejarse ≥ 3 m y usar zoom 1×–2× (nunca 0.5×) ·
-sin recortar · enviar por WhatsApp como **Documento** o por USB/Drive.
+## Photo protocol (display in Paso 1 UI)
+Mueble abierto, sin puertas · cámara centrada a media altura · alejarse `≥ 3 m` y usar zoom `1×–2×` (nunca `0.5×`) · sin recortar · enviar por WhatsApp como **Documento** o por USB/Drive.
 
-## Verification
-- [ ] Vitest port of the synthetic stress test (books, shadows, 2× light gradient, noise): Estantería,
-      Rack TV, Clóset, Grafito pass with ≤ 8 mm error; white-on-white returns `interiorMatch > 0.5`.
-- [ ] Real-photo eval set (10–15 annotated photos) tracked as a regression table before the video.
-- [ ] Zero network requests, zero WASM, < 100 ms per detection on phone hardware.
+## Verification Checklist
+- [ ] Vitest port of all **8 scenarios** from [band_test.ts](../../../docs/evidencia/band_test.ts) passes (`<= 8 mm` error; white-on-white returns `confidence < 0.5`).
+- [ ] Real-photo regression table (8–12 annotated team photos) tracked before Bloque 4 / video.
+- [ ] Zero network requests, zero WASM, `< 120 ms` per detection on phone hardware.

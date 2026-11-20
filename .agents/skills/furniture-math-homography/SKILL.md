@@ -7,7 +7,7 @@ description: >-
   matrix scaling, arithmetic shelf progressions, and structural sag alerts.
 ---
 
-# Furniture Math Engine & 3x3 Projective Homography
+# Furniture Math Engine & 3x3 Projective Homography (v2.1 Rev. 2)
 
 ## 1. Pure 3x3 Homography (`src/core/mathEngine/homography.ts`)
 Zero external linear algebra libraries.
@@ -16,16 +16,14 @@ Zero external linear algebra libraries.
 - **Exact Inverse (`invertMatrix3x3`):** Compute adjugate/cofactor inverse; return `null` if `|det(H)| < 1e-10`.
 - **Projection (`applyHomography`):** Compute `[x', y', w'] = H · [x, y, 1]^T`. Guard against `|w'| < 1e-10` before dividing by `w'`.
 
-## 1b. v2.1 Additions
-- `exteriorToInterior(p, e, dim)` / `interiorToExterior` helpers live in `mathEngine/index.ts` (pure, tested).
-  The homography output (unit square of the OUTER quad) is exterior space; contracts use interior space.
-- `aspectRatioXY` from a photo uses Zhang's vector formula with a **fixed focal prior**
-  (`f_px = f35 / 43.27 * diag_px`, f35 from EXIF or 26) — never the estimated f (degenerate for typical
-  tilted closet photos). Evidence: [zhang_sim.ts](../../../docs/evidencia/zhang_sim.ts).
-- Aspect ratio and A4 scale only PREFILL `V_0`; the user types `V_f`. Keep them simple.
+## 1b. v2.1 Rev. 2 Additions
+- `exteriorToInterior(p, e, dim)` / `interiorToExterior(p, e, dim)` live in `src/core/mathEngine/index.ts` (pure, tested).
+  Homography output (unit square of the OUTER quad) is exterior space; `contracts.ts` uses interior space.
+- `aspectRatioXY` from a photo uses Zhang's vector formula with a **fixed focal prior** (`f_px = f35 / 43.27 * hypot(imgW, imgH)`, default `f35 = 26` or UI selector `1× = 26 mm` / `2× = 52 mm`) — NEVER estimated `f` (degenerate on 43% of typical tilted closet photos). Do NOT write an offline EXIF parser; 26 mm prior already yields p95 `<= 2.9%` even with 15% prior error. Evidence: [zhang_sim.ts](../../../docs/evidencia/zhang_sim.ts).
+- Aspect ratio and A4 scale prefill `V_0`/`V_f`; user can always edit `V_f` directly.
 
 ## 2. Perspective-Invariant A4 Metric Calibration (Bloque 4)
-**Avoid the raw-pixel perspective error trap:** Never compute `mmPerPixel` solely in distorted raw image pixels when the photo has perspective tilt.
+**Avoid the raw-pixel perspective error trap:** Never compute `mmPerPixel` solely in distorted raw pixels when the photo has perspective tilt.
 - When `toUnit` is valid and the A4 reference segment `[p1, p2]` lies coplanar with the furniture front face:
   1. Project `u1 = applyHomography(toUnit, p1)` and `u2 = applyHomography(toUnit, p2)`.
   2. Compute normalized deltas `du = u2.x - u1.x`, `dv = u2.y - u1.y`.
@@ -47,20 +45,26 @@ Zero external linear algebra libraries.
      - `a1 = e + clearSpanMm` (bottom face of 1st shelf from floor)
      - `d = clearSpanMm + e`
      - `terms[n-1] = a1 + (n - 1) * d` for `n = 1..N`
-   - **3D Center Placement Rule:** The 3D center `cy` of shelf `n` is **`terms[n-1] + e / 2`**, NOT `terms[n-1]`!
+   - **3D Center Placement Rule:**
+     - `'equidistant'`: `cy = terms[n-1] + e / 2` (NOT `terms[n-1]`).
+     - `'custom'`: `cy = e + shelf.position * hInteriorMm` (shelf vertical center; guard/clamp inside `[e + e/2, y_f - e - e/2]`).
 3. **Corner Joint Deductions:**
    - `topOverSides`: top/base = `x_f × z_f`; sides = `(y_f - 2e) × z_f`.
    - `topBetweenSides`: sides = `y_f × z_f`; top/base = `(x_f - 2e) × z_f`.
-4. **Back Panel Split Guard:**
-   - If `hasBackPanel === true`: split vertically along interior `vDividers` (or equal vertical strips) whenever `(x_f > minSheet && y_f > minSheet)` **OR** `x_f > maxSheet` **OR** `y_f > maxSheet`, so oversized back panels fit standard sheets cleanly.
-5. **Structural Sag / Pandeo Rule:**
+4. **Mixed-Bay Deductions & Exact Presets:**
+   - Deduct `e / 2` at both interior crossings AND divider boundary contacts (`<= 1e-3`).
+   - Use exact `1 / 3` and `2 / 3` in Preset 2 (`rack_tv`) -> center shelf `503.33 mm`.
+5. **Back Panel Split Guard:**
+   - If `hasBackPanel === true`: using `sheet = backPanelSheetDimensions ?? sheetDimensions`, split vertically along interior `vDividers` (or equal vertical strips) whenever `(x_f > minS && y_f > minS)` **OR** `x_f > maxS` **OR** `y_f > maxS`.
+6. **Structural Sag / Pandeo Rule:**
    - Emit `'pandeo'` (`severidad: 'warning'`) for every horizontal 18 mm shelf with net span (`ancho`) `> 850 mm`.
-   - Engineering context (for tooltips/defense): Based on Euler-Bernoulli deflection `δ = 5 W L³ / (384 E I)` for MDP particleboard (`E ≈ 2.0 GPa`), spans `> 700 mm` risk creep under heavy books and `> 850 mm` is the critical structural limit.
+   - Engineering context: Euler-Bernoulli deflection `δ = 5 W L³ / (384 E I)` for MDP particleboard (`E ≈ 2.0 GPa`).
 
 ## Verification Checklist
-Run `npx vitest run` and confirm:
+Run Vitest and confirm:
 - [ ] Etapa 2 exact numbers (`0.8800 -> 1.2672 m²`, `6.80 -> 8.16 m`, `e = 18 mm`).
-- [ ] Zero 3D AABB overlap across all 3 presets (`estanteria`, `rack_tv`, `closet`).
+- [ ] `exteriorToInterior(0.25, 18, 800) ≈ 0.2382` and round-trip with `interiorToExterior`.
+- [ ] Zero 3D AABB overlap across all 3 presets (`estanteria`, `rack_tv` with `503.33 mm`, `closet` with `723 mm`).
 - [ ] Symmetric shelf clearances (`N = 3, 4, 5`) including top clearance `=== s_libre`.
 - [ ] Pandeo alert triggers at `x_f = 1000 mm` and disappears when adding a `vDivider` at `u = 0.5`.
 - [ ] Homography round-trip error `< 1e-6` and degenerate quad returns `null`.

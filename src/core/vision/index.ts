@@ -46,4 +46,4 @@ export {
   snapPointToStrongEdge,
   vectorizeUserStroke,
 } from './userVectorTrace';
-export type { PartitionRectCell, TracedStrokeResult } from './userVectorTrace';
+export type { PartitionRectCell, TracedStrokeResult, UserStrokeMode } from './userVectorTrace';

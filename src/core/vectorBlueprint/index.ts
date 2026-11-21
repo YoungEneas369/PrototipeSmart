@@ -322,6 +322,18 @@ export function renderFurnitureVectorBlueprintSvg(
     );
   }
 
+  // Divisores diagonales / oblicuos
+  for (const diag of topology.diagonalDividers ?? []) {
+    const x1 = mapU(diag.u1);
+    const y1 = mapV(diag.v1);
+    const x2 = mapU(diag.u2);
+    const y2 = mapV(diag.v2);
+    lines.push(
+      `<line x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" stroke="#0f172a" stroke-width="${(ep + 1.4).toFixed(2)}" stroke-linecap="butt" />`,
+      `<line x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" stroke="#c084fc" stroke-width="${Math.max(1.5, ep - 0.6).toFixed(2)}" stroke-linecap="butt" />`,
+    );
+  }
+
   // Repisas estructurales (equidistantes o personalizadas)
   const shelfLines: Array<{ yPx: number; x0Px: number; x1Px: number }> = [];
   if (topology.shelfMode === 'equidistant') {

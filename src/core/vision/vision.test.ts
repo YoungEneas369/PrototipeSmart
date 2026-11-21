@@ -1094,6 +1094,7 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     );
     expect(hStroke).not.toBeNull();
     expect(hStroke!.kind).toBe('hShelf');
+    if (hStroke!.kind !== 'hShelf') throw new Error('Se esperaba hShelf');
     expect(hStroke!.segment.start).toBe(0);
     expect(hStroke!.segment.end).toBe(1);
     expect(Math.abs(hStroke!.segment.position - 0.5)).toBeLessThan(0.03);
@@ -1110,8 +1111,68 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     );
     expect(vStroke).not.toBeNull();
     expect(vStroke!.kind).toBe('vDivider');
+    if (vStroke!.kind !== 'vDivider') throw new Error('Se esperaba vDivider');
     expect(Math.abs(vStroke!.segment.start - hStroke!.segment.position)).toBeLessThan(0.03);
     expect(vStroke!.segment.end).toBe(1);
+  });
+
+  it('Escenario 23 (Líneas Diagonales Reales en 2D y 3D v6.1): trazos inclinados generan DiagonalSegment, pieza diagonal y rotación Z en 3D', () => {
+    const hom = computeQuadToUnitHomography([
+      { x: 60, y: 40 },
+      { x: 340, y: 40 },
+      { x: 340, y: 260 },
+      { x: 60, y: 260 },
+    ])!;
+
+    // Trazo diagonal de ~45° en modo 'auto' -> debe conservarse como diagonal (NO forzar a recta H/V)
+    const diagAuto = vectorizeUserStroke(
+      { x: 70, y: 250 },
+      { x: 330, y: 50 },
+      hom.toUnit,
+      [],
+      [],
+      18,
+      { x: 1000, y: 1000 },
+      true,
+      'auto',
+    );
+    expect(diagAuto).not.toBeNull();
+    expect(diagAuto!.kind).toBe('diagonal');
+    if (diagAuto!.kind !== 'diagonal') throw new Error('Se esperaba diagonal');
+    expect(Math.abs(diagAuto!.angleDeg)).toBeGreaterThan(25);
+    expect(Math.abs(diagAuto!.angleDeg)).toBeLessThan(65);
+    expect(diagAuto!.spanMm).toBeGreaterThan(1000);
+
+    // Verificar que calculateDespiece genera pieza física real con rotacion3D[2] != 0
+    const topoDiag: FurnitureTopology = {
+      viewsMode: 1,
+      aspectRatioXY: 1,
+      vDividers: [],
+      hShelves: [],
+      diagonalDividers: [diagAuto!.segment],
+      shelfMode: 'custom',
+      equalShelfCount: 0,
+      hasBackPanel: true,
+    };
+    const paramsDiag: ScaleAndBoardParams = {
+      targetDimensions: { x: 1000, y: 1000, z: 350 },
+      referenceDimensions: { x: 1000, y: 1000, z: 350 },
+      boardThickness: 18,
+      backPanelThickness: 3,
+      sheetDimensions: { width: 2440, height: 1220 },
+      trimMm: 0,
+      kerf: 4,
+      respectGrain: true,
+      packingStrategy: 'guillotine',
+      cornerJointType: 'topOverSides',
+      edgeBandingMode: 'visibleEdgesOnly',
+      material: 'roble',
+    };
+    const desp = calculateDespiece(topoDiag, paramsDiag);
+    const diagPiece = desp.matrizDespiece.find((p) => p.tipo === 'division_diagonal');
+    expect(diagPiece).toBeDefined();
+    expect(Math.abs(diagPiece!.rotacion3D[2])).toBeGreaterThan(0.4);
+    expect(diagPiece!.ancho).toBeGreaterThan(1000);
   });
 
   it('Escenario 22 (Partición Planar Rectangular Exacta de Vectores Recalcados v6.0): escritorio asimétrico en L y armario 3-cubículos/2-puertas producen celdas disjuntas con suma de área 1.0', () => {

@@ -240,9 +240,9 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <div className="brand-title">SmartFurniture v6.0 — Recalca Márgenes → Vectores → 3D</div>
+          <div className="brand-title">SmartFurniture v6.1 — Contorno 4 Puntos + Rectas y Diagonales → 3D</div>
           <div className="brand-sub">
-            100% Local Offline · Contorno y líneas recalcadas con imán de bordes → 3D exacto y Corte 244×122
+            100% Local Offline · Marca 4 esquinas en perspectiva + divisiones rectas o diagonales → 3D exacto y Corte 244×122
           </div>
         </div>
         <div className="preset-bar">

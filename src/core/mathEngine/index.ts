@@ -882,6 +882,38 @@ export function calculateDespiece(
     }
   }
 
+  // 4A. DIVISIONES DIAGONALES / OBLICUAS (longitud física real L y rotación Z exacta)
+  const diagonalDividers = topology.diagonalDividers ?? [];
+  for (let dIdx = 0; dIdx < diagonalDividers.length; dIdx++) {
+    const seg = diagonalDividers[dIdx];
+    const x1 = e + clamp01(seg.u1) * xInt;
+    const y1 = e + clamp01(seg.v1) * yInt;
+    const x2 = e + clamp01(seg.u2) * xInt;
+    const y2 = e + clamp01(seg.v2) * yInt;
+    const dxDiag = x2 - x1;
+    const dyDiag = y2 - y1;
+    const lenDiag = Math.hypot(dxDiag, dyDiag);
+    if (lenDiag < e * 1.5) continue;
+
+    const theta = Math.atan2(dyDiag, dxDiag);
+    const deg = Math.round(Math.abs((theta * 180) / Math.PI));
+    pieces.push({
+      id: seg.id || `diag_${dIdx + 1}`,
+      nombre: `Divisor Diagonal ${dIdx + 1} (${deg}°)`,
+      tipo: 'division_diagonal',
+      ancho: lenDiag,
+      alto: zf,
+      espesor: e,
+      cantidad: 1,
+      respectGrain: true,
+      edges: resolveEdgeBanding('division_diagonal', joint, edgeMode),
+      posicion3D: [(x1 + x2) / 2, (y1 + y2) / 2, zf / 2],
+      dimensiones3D: [lenDiag, e, zf],
+      rotacion3D: [0, 0, theta],
+      material: mat,
+    });
+  }
+
   // 4. FONDO DUROLAC / MDF 3 mm (clavado atrás en z ∈ [-backE, 0])
   if (topology.hasBackPanel && backE > 0) {
     const backSheet = params.backPanelSheetDimensions ?? params.sheetDimensions;
@@ -1215,6 +1247,7 @@ export function calculateDespiece(
     if (tipo === 'lateral') return 'Laterales';
     if (tipo === 'repisa') return 'Repisas';
     if (tipo === 'division_vertical') return 'Divisores Verticales';
+    if (tipo === 'division_diagonal') return 'Divisores Diagonales';
     if (tipo === 'fondo') return 'Fondo Durolac 3 mm';
     if (tipo === 'fondo_cajon') return 'Fondos Cajón 3 mm';
     if (tipo === 'puerta') return 'Puertas';

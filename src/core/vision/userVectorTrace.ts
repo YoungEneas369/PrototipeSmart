@@ -14,6 +14,7 @@
  *      acabado bicolor únicamente dentro de los márgenes exactos trazados por el usuario.
  */
 import type {
+  DiagonalSegment,
   FrontModuleKind,
   FrontZone,
   MelamineMaterial,
@@ -22,13 +23,33 @@ import type {
 } from '../../types/contracts';
 import { applyHomography, exteriorToInterior } from '../mathEngine';
 
-export interface TracedStrokeResult {
-  kind: 'vDivider' | 'hShelf';
-  segment: NormalizedSegment;
-  unitVec: [number, number];
-  positionMm: number;
-  spanMm: number;
-}
+export type UserStrokeMode = 'auto' | 'ortho' | 'diagonal';
+
+export type TracedStrokeResult =
+  | {
+      kind: 'vDivider';
+      segment: NormalizedSegment;
+      unitVec: [number, number];
+      positionMm: number;
+      spanMm: number;
+      angleDeg: number;
+    }
+  | {
+      kind: 'hShelf';
+      segment: NormalizedSegment;
+      unitVec: [number, number];
+      positionMm: number;
+      spanMm: number;
+      angleDeg: number;
+    }
+  | {
+      kind: 'diagonal';
+      segment: DiagonalSegment;
+      unitVec: [number, number];
+      positionMm: number;
+      spanMm: number;
+      angleDeg: number;
+    };
 
 export interface PartitionRectCell {
   id: string;
@@ -134,11 +155,12 @@ export function snapPointToStrongEdge(
 
 /**
  * Convierte un trazo libre `p1 -> p2` del usuario sobre la foto en un vector estructural
- * exacto (`vDivider` o `hShelf`) en el espacio interior normalizado `[0, 1]^2`:
- *  - Detecta automáticamente orientación (horizontal vs vertical).
- *  - Hace snap magnético de extremos a muros exteriores (`0`, `1`) y segmentos existentes (T-junctions).
- *  - Si el usuario hace un gesto corto dentro de un vano (`autoExtend = true`), extiende la línea
- *    limpiamente hasta las paredes/divisores que encierran ese vano.
+ * exacto (`vDivider`, `hShelf` o `diagonal`) en el espacio interior normalizado `[0, 1]^2`:
+ *  - Modo `'auto'` (default): si el ángulo está dentro de ±18° de H/V endereza a repisa/divisor
+ *    (siguiendo la perspectiva del contorno 4 pts); si está entre 18° y 72° conserva una
+ *    **división diagonal real** con su ángulo y longitud física exacta en mm.
+ *  - Modo `'diagonal'`: conserva SIEMPRE la línea libre/diagonal exacta sin forzar a recta.
+ *  - Modo `'ortho'`: endereza siempre a horizontal o vertical con snap a muros y T-junctions.
  */
 export function vectorizeUserStroke(
   p1: Point2D,
@@ -149,6 +171,7 @@ export function vectorizeUserStroke(
   boardThicknessMm: number,
   dimsMm: { x: number; y: number },
   autoExtend = true,
+  strokeMode: UserStrokeMode = 'auto',
 ): TracedStrokeResult | null {
   const uA = applyHomography(toUnitHomography, p1);
   const uB = applyHomography(toUnitHomography, p2);
@@ -164,13 +187,51 @@ export function vectorizeUserStroke(
   const distNorm = Math.hypot(du, dv);
   if (distNorm < 0.03) return null;
 
-  // Comparar en escala física real (mm) para no sesgar orientación en muebles muy anchos o altos
-  const dxMm = Math.abs(du) * Math.max(100, dimsMm.x - 2 * boardThicknessMm);
-  const dyMm = Math.abs(dv) * Math.max(100, dimsMm.y - 2 * boardThicknessMm);
-  const isHorizontal = dxMm >= dyMm;
-
   const xInt = Math.max(1, dimsMm.x - 2 * boardThicknessMm);
   const yInt = Math.max(1, dimsMm.y - 2 * boardThicknessMm);
+
+  // Comparar en escala física real (mm) para ángulo verdadero del mueble
+  const dxMmSigned = du * xInt;
+  const dyMmSigned = dv * yInt;
+  const dxMm = Math.abs(dxMmSigned);
+  const dyMm = Math.abs(dyMmSigned);
+  const absAngleFromHorizDeg = (Math.atan2(dyMm, dxMm) * 180) / Math.PI; // 0° = horiz, 90° = vert
+
+  const shouldBeDiagonal =
+    strokeMode === 'diagonal' ||
+    (strokeMode === 'auto' && absAngleFromHorizDeg > 18 && absAngleFromHorizDeg < 72);
+
+  if (shouldBeDiagonal) {
+    const allUAnchors = [0, ...existingVDividers.map((d) => d.position), 1];
+    const allVAnchors = [0, ...existingHShelves.map((s) => s.position), 1];
+    const su1 = clamp(snapToAnchors(clamp(x1, 0, 1), allUAnchors, 0.045), 0, 1);
+    const sv1 = clamp(snapToAnchors(clamp(y1, 0, 1), allVAnchors, 0.045), 0, 1);
+    const su2 = clamp(snapToAnchors(clamp(x2, 0, 1), allUAnchors, 0.045), 0, 1);
+    const sv2 = clamp(snapToAnchors(clamp(y2, 0, 1), allVAnchors, 0.045), 0, 1);
+
+    const fdx = (su2 - su1) * xInt;
+    const fdy = (sv2 - sv1) * yInt;
+    const lenMm = Math.hypot(fdx, fdy);
+    if (lenMm < Math.max(30, boardThicknessMm * 1.5)) return null;
+
+    const angleDeg = Math.round((Math.atan2(fdy, fdx) * 180) / Math.PI);
+    return {
+      kind: 'diagonal',
+      segment: {
+        id: `usr_diag_${Date.now()}_${Math.round(lenMm)}`,
+        u1: Number(su1.toFixed(4)),
+        v1: Number(sv1.toFixed(4)),
+        u2: Number(su2.toFixed(4)),
+        v2: Number(sv2.toFixed(4)),
+      },
+      unitVec: [Number((fdx / lenMm).toFixed(4)), Number((fdy / lenMm).toFixed(4))],
+      positionMm: Math.round(boardThicknessMm + ((su1 + su2) / 2) * xInt),
+      spanMm: Math.round(lenMm),
+      angleDeg,
+    };
+  }
+
+  const isHorizontal = dxMm >= dyMm;
 
   if (isHorizontal) {
     const vPos = clamp((y1 + y2) / 2, 0.04, 0.96);
@@ -210,6 +271,7 @@ export function vectorizeUserStroke(
       unitVec: [1, 0],
       positionMm: Math.round(boardThicknessMm + vPos * yInt),
       spanMm: Math.round((uEnd - uStart) * xInt),
+      angleDeg: 0,
     };
   }
 
@@ -249,6 +311,7 @@ export function vectorizeUserStroke(
     unitVec: [0, 1],
     positionMm: Math.round(boardThicknessMm + uPos * xInt),
     spanMm: Math.round((vEnd - vStart) * yInt),
+    angleDeg: 90,
   };
 }
 

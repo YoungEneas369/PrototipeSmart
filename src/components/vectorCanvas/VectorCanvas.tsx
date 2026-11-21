@@ -30,6 +30,7 @@ import {
 } from 'lucide-react';
 import type {
   DespieceResult,
+  DiagonalSegment,
   FrontModuleKind,
   FrontZone,
   FurnitureTopology,
@@ -60,6 +61,7 @@ import {
   snapPointToStrongEdge,
   vectorizeUserStroke,
   type MarginEvaluationResult,
+  type UserStrokeMode,
   type VectorLine2D,
   type VectorLineRole,
   type Visual3DSimilarityResult,
@@ -98,11 +100,27 @@ type DragTarget =
 interface LineSnapshot {
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
+  diagonalDividers?: DiagonalSegment[];
   frontZones?: FrontZone[];
 }
 
-const CORNER_LABELS = ['TL', 'TR', 'BR', 'BL'] as const;
+const CORNER_LABELS = ['1', '2', '3', '4'] as const;
+const CORNER_STEP_NAMES = [
+  'Esquina 1 de 4: Arriba-Izquierda',
+  'Esquina 2 de 4: Arriba-Derecha',
+  'Esquina 3 de 4: Abajo-Derecha',
+  'Esquina 4 de 4: Abajo-Izquierda',
+] as const;
 const MAX_WORK_DIM = 1400;
+
+function pointToSegmentDist(p: Point2D, a: Point2D, b: Point2D): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-8) return Math.hypot(p.x - a.x, p.y - a.y);
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
 
 const ZONE_CYCLE: readonly FrontModuleKind[] = [
   'open',
@@ -360,7 +378,10 @@ export function VectorCanvas({
 }: VectorCanvasProps) {
   const [viewTab, setViewTab] = useState<'frontal' | 'lateral'>('frontal');
   const [traceStep, setTraceStep] = useState<TraceStep>('frame');
-  const [frameMode, setFrameMode] = useState<FrameMode>('box');
+  // Por defecto 4 esquinas libres (Perspectiva H 3×3) para seguir líneas diagonales de fotos reales 3/4
+  const [frameMode, setFrameMode] = useState<FrameMode>('quad');
+  const [pickingCorners, setPickingCorners] = useState<Point2D[] | null>(null);
+  const [strokeMode, setStrokeMode] = useState<UserStrokeMode>('auto');
   const [extraTool, setExtraTool] = useState<ExtraTool>('none');
   const [magneticSnap, setMagneticSnap] = useState<boolean>(true);
   const [showPrecisionTools, setShowPrecisionTools] = useState(false);
@@ -418,6 +439,7 @@ export function VectorCanvas({
       {
         vDividers: topology.vDividers.map((d) => ({ ...d })),
         hShelves: topology.hShelves.map((s) => ({ ...s })),
+        diagonalDividers: (topology.diagonalDividers ?? []).map((dg) => ({ ...dg })),
         frontZones: (topology.frontZones ?? []).map((z) => ({ ...z })),
       },
     ]);
@@ -432,6 +454,7 @@ export function VectorCanvas({
         shelfMode: 'custom',
         vDividers: last.vDividers,
         hShelves: last.hShelves,
+        diagonalDividers: last.diagonalDividers ?? [],
         frontZones: last.frontZones,
       });
       setStatusMsg('Último trazo deshecho.');
@@ -440,13 +463,20 @@ export function VectorCanvas({
   };
 
   const handleClearLines = () => {
-    if (topology.vDividers.length === 0 && topology.hShelves.length === 0) return;
+    if (
+      topology.vDividers.length === 0 &&
+      topology.hShelves.length === 0 &&
+      (topology.diagonalDividers?.length ?? 0) === 0
+    ) {
+      return;
+    }
     pushUndo();
     onUpdateTopology({
       ...topology,
       shelfMode: 'custom',
       vDividers: [],
       hShelves: [],
+      diagonalDividers: [],
       frontZones: [
         { id: 'traced_zone_1', uStart: 0, uEnd: 1, vStart: 0, vEnd: 1, kind: 'open', label: 'Vano 1' },
       ],
@@ -454,7 +484,7 @@ export function VectorCanvas({
     });
     setTraceStep('lines');
     setExtraTool('none');
-    setStatusMsg('Líneas internas limpiadas. Recalca tus nuevas divisiones sobre la foto.');
+    setStatusMsg('Líneas internas limpiadas. Traza tus nuevas divisiones rectas o diagonales sobre la foto.');
   };
 
   useEffect(() => {
@@ -514,10 +544,11 @@ export function VectorCanvas({
       setQuad(bestBox);
       setPhotoVectorLines(extBest.lines);
       setMarginEval(mEval);
-      setFrameMode('box');
+      setFrameMode('quad');
+      setPickingCorners(null);
       setTraceStep('lines');
       setStatusMsg(
-        `Foto real cargada (${externalPhotoLabel ?? 'Catálogo QA'}): Márgenes ${mEval.overallScore}%. Puedes recalcar líneas en Paso 2, ajustar el contorno en Paso 1 o cambiar zonas en Paso 3.`,
+        `Foto real cargada (${externalPhotoLabel ?? 'Catálogo QA'}): Márgenes ${mEval.overallScore}%. Puedes trazar líneas rectas o diagonales en Paso 2, o remarcar las 4 esquinas en Paso 1.`,
       );
     };
     img.src = externalPhotoUrl;
@@ -623,6 +654,7 @@ export function VectorCanvas({
 
     const nextVDivs = opts.resetInternalLines ? [] : topology.vDividers;
     const nextHShelves = opts.resetInternalLines ? [] : topology.hShelves;
+    const nextDiags = opts.resetInternalLines ? [] : (topology.diagonalDividers ?? []);
     const cells = partitionCellsFromVectors(nextVDivs, nextHShelves);
     const zones = classifyPartitionedZonesFromPhoto(
       cells,
@@ -644,6 +676,7 @@ export function VectorCanvas({
       shelfMode: 'custom',
       vDividers: nextVDivs,
       hShelves: nextHShelves,
+      diagonalDividers: nextDiags,
       frontZones: zones,
       hasBackPanel: hasLegVoid ? false : topology.hasBackPanel,
       detectionSource: 'manual',
@@ -651,14 +684,15 @@ export function VectorCanvas({
     });
 
     if (opts.advanceToLines) {
+      setPickingCorners(null);
       setTraceStep('lines');
       setExtraTool('none');
       setStatusMsg(
-        `Paso 1 listo (Márgenes ${mEval.overallScore}%). Ahora en Paso 2 recalca con tu dedo/mouse cada línea interior (divisor, repisa, puerta o cajón) para construir tu 3D exacto.`,
+        `Paso 1 listo (Márgenes ${mEval.overallScore}%). Ahora en Paso 2 arrastra sobre la foto para trazar divisiones rectas o diagonales.`,
       );
     } else {
       setStatusMsg(
-        `Contorno actualizado (Márgenes ${mEval.overallScore}%). Puedes seguir recalcando líneas o ajustar zonas.`,
+        `Contorno actualizado (Márgenes ${mEval.overallScore}%). Puedes seguir trazando líneas rectas o diagonales.`,
       );
     }
   };
@@ -670,6 +704,7 @@ export function VectorCanvas({
     nextVDivs: NormalizedSegment[],
     nextHShelves: NormalizedSegment[],
     preservePreviousZones = true,
+    nextDiags?: DiagonalSegment[],
   ) => {
     const cells = partitionCellsFromVectors(nextVDivs, nextHShelves);
     const zones = classifyPartitionedZonesFromPhoto(
@@ -691,6 +726,7 @@ export function VectorCanvas({
       shelfMode: 'custom',
       vDividers: nextVDivs,
       hShelves: nextHShelves,
+      diagonalDividers: nextDiags ?? topology.diagonalDividers ?? [],
       frontZones: zones,
       hasBackPanel: hasLegVoid ? false : topology.hasBackPanel,
       detectionSource: 'manual',
@@ -750,12 +786,12 @@ export function VectorCanvas({
       setFrontBitmap(bmp);
       setImgSize({ w: bmp.w, h: bmp.h });
       setViewTab('frontal');
-      setFrameMode('box');
+      setFrameMode('quad');
       setCalibPts([]);
       setExtraTool('none');
 
-      // Al subir foto: proponer marco inicial limpio y poner al usuario DIRECTO en Paso 1 (recalcar contorno)
-      // sin llenar su foto de líneas falsas antes de que confirme sus márgenes!
+      // Al subir foto: iniciar en Paso 1 con modo guiado "Toca las 4 esquinas (1→2→3→4)"
+      // para que sea imposible confundirse, con 1 clic para aceptar el contorno sugerido si ya calza bien.
       const autoQ = autoDetectFurnitureQuad(bmp.rgba, bmp.w, bmp.h);
       const extRaw = extractStructuralVectorLines(bmp.rgba, bmp.w, bmp.h, autoQ.quadCorners);
       const initQuad = isSample
@@ -795,6 +831,7 @@ export function VectorCanvas({
         shelfMode: 'custom',
         vDividers: [],
         hShelves: [],
+        diagonalDividers: [],
         frontZones: [
           { id: 'traced_zone_1', uStart: 0, uEnd: 1, vStart: 0, vEnd: 1, kind: 'open', label: 'Cuerpo' },
         ],
@@ -803,10 +840,11 @@ export function VectorCanvas({
       });
 
       setTraceStep(isSample ? 'lines' : 'frame');
+      setPickingCorners(isSample ? null : []);
       setStatusMsg(
         isSample
-          ? 'Muestra cargada con contorno exacto. Recalca con tu dedo/mouse 2 o 3 líneas internas (cajonera y repisas) para ver el 3D exacto.'
-          : `Foto cargada (marco sugerido ${mEval.overallScore}%). Paso 1: arrastra sobre la cara frontal para recalcar el contorno exacto (o pulsa "Paso 2: Recalcar líneas" si el marco ya calza bien).`,
+          ? 'Muestra cargada con contorno exacto. Arrastra sobre la foto para trazar líneas rectas o diagonales.'
+          : 'PASO 1: Toca sobre la foto las 4 esquinas del frente del mueble (1 Arriba-Izq → 2 Arriba-Der → 3 Abajo-Der → 4 Abajo-Izq), o pulsa "Usar contorno sugerido".',
       );
     };
     img.src = url;
@@ -1105,7 +1143,51 @@ export function VectorCanvas({
         }
       }
 
-      // Vista previa EN VIVO del vector que está recalcando el usuario (ya enderezado y magnetizado!)
+      // Vectores diagonales / oblicuos reales trazados por el usuario (magenta)
+      for (const diag of topology.diagonalDividers ?? []) {
+        const p0 = applyHomography(toCanvas, {
+          x: interiorToExterior(diag.u1, e, xf),
+          y: interiorToExterior(diag.v1, e, yf),
+        });
+        const p1 = applyHomography(toCanvas, {
+          x: interiorToExterior(diag.u2, e, xf),
+          y: interiorToExterior(diag.v2, e, yf),
+        });
+        if (p0 && p1) {
+          ctx.strokeStyle = '#d946ef';
+          ctx.lineWidth = Math.max(3.4, cw / 260);
+          ctx.beginPath();
+          ctx.moveTo(p0.x, p0.y);
+          ctx.lineTo(p1.x, p1.y);
+          ctx.stroke();
+
+          ctx.fillStyle = '#ffffff';
+          ctx.beginPath();
+          ctx.arc(p0.x, p0.y, endR, 0, Math.PI * 2);
+          ctx.arc(p1.x, p1.y, endR, 0, Math.PI * 2);
+          ctx.fill();
+
+          if (traceStep === 'lines') {
+            const dxD = (diag.u2 - diag.u1) * xInt;
+            const dyD = (diag.v2 - diag.v1) * yInt;
+            const lenMm = Math.round(Math.hypot(dxD, dyD));
+            const deg = Math.round(Math.abs((Math.atan2(dyD, dxD) * 180) / Math.PI));
+            const mx = (p0.x + p1.x) / 2;
+            const my = (p0.y + p1.y) / 2;
+            ctx.font = `bold ${Math.max(10, Math.round(cw / 78))}px Consolas, monospace`;
+            const lbl = `${deg}° · ${lenMm}mm`;
+            const lw = ctx.measureText(lbl).width;
+            ctx.fillStyle = 'rgba(134, 25, 143, 0.92)';
+            ctx.fillRect(mx - lw / 2 - 4, my - 8, lw + 8, 16);
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(lbl, mx, my);
+          }
+        }
+      }
+
+      // Vista previa EN VIVO del vector que está recalcando el usuario (Recto en perspectiva o Diagonal real)
       if (dragTarget?.kind === 'drawVector' && cursorImgPt) {
         const previewVec = vectorizeUserStroke(
           dragTarget.start,
@@ -1116,30 +1198,56 @@ export function VectorCanvas({
           e,
           params.targetDimensions,
           true,
+          strokeMode,
         );
         ctx.save();
         if (previewVec) {
-          const isH = previewVec.kind === 'hShelf';
-          const pA = isH
-            ? applyHomography(toCanvas, {
-                x: interiorToExterior(previewVec.segment.start, e, xf),
-                y: interiorToExterior(previewVec.segment.position, e, yf),
-              })
-            : applyHomography(toCanvas, {
-                x: interiorToExterior(previewVec.segment.position, e, xf),
-                y: interiorToExterior(previewVec.segment.start, e, yf),
-              });
-          const pB = isH
-            ? applyHomography(toCanvas, {
-                x: interiorToExterior(previewVec.segment.end, e, xf),
-                y: interiorToExterior(previewVec.segment.position, e, yf),
-              })
-            : applyHomography(toCanvas, {
-                x: interiorToExterior(previewVec.segment.position, e, xf),
-                y: interiorToExterior(previewVec.segment.end, e, yf),
-              });
+          let pA: Point2D | null = null;
+          let pB: Point2D | null = null;
+          let strokeCol = '#4ade80';
+          let textCol = '#86efac';
+          let lbl = '';
+
+          if (previewVec.kind === 'diagonal') {
+            pA = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.u1, e, xf),
+              y: interiorToExterior(previewVec.segment.v1, e, yf),
+            });
+            pB = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.u2, e, xf),
+              y: interiorToExterior(previewVec.segment.v2, e, yf),
+            });
+            strokeCol = '#e879f9';
+            textCol = '#f5d0fe';
+            lbl = `⟋ Diagonal (${Math.abs(previewVec.angleDeg)}° · ${previewVec.spanMm} mm)`;
+          } else if (previewVec.kind === 'hShelf') {
+            pA = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.start, e, xf),
+              y: interiorToExterior(previewVec.segment.position, e, yf),
+            });
+            pB = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.end, e, xf),
+              y: interiorToExterior(previewVec.segment.position, e, yf),
+            });
+            strokeCol = '#fbbf24';
+            textCol = '#fde68a';
+            lbl = `→ Repisa (${previewVec.positionMm} mm)`;
+          } else {
+            pA = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.position, e, xf),
+              y: interiorToExterior(previewVec.segment.start, e, yf),
+            });
+            pB = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.position, e, xf),
+              y: interiorToExterior(previewVec.segment.end, e, yf),
+            });
+            strokeCol = '#4ade80';
+            textCol = '#86efac';
+            lbl = `↓ Divisor (${previewVec.positionMm} mm)`;
+          }
+
           if (pA && pB) {
-            ctx.strokeStyle = isH ? '#fbbf24' : '#4ade80';
+            ctx.strokeStyle = strokeCol;
             ctx.lineWidth = Math.max(4, cw / 220);
             ctx.setLineDash([10, 6]);
             ctx.beginPath();
@@ -1149,15 +1257,12 @@ export function VectorCanvas({
 
             const mx = (pA.x + pB.x) / 2;
             const my = (pA.y + pB.y) / 2;
-            const lbl = isH
-              ? `→ Repisa (${previewVec.positionMm} mm)`
-              : `↓ Divisor (${previewVec.positionMm} mm)`;
             ctx.setLineDash([]);
             ctx.font = `bold ${Math.max(12, Math.round(cw / 62))}px system-ui, sans-serif`;
             const lw = ctx.measureText(lbl).width;
-            ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
             ctx.fillRect(mx - lw / 2 - 6, my - 12, lw + 12, 22);
-            ctx.fillStyle = isH ? '#fde68a' : '#86efac';
+            ctx.fillStyle = textCol;
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText(lbl, mx, my);
@@ -1194,32 +1299,79 @@ export function VectorCanvas({
       }
     }
 
-    // Manijas del marco exterior (grandes en Paso 1, discretas en Paso 2 y 3)
-    const nodeR = Math.max(traceStep === 'frame' ? 11 : 7, cw / (traceStep === 'frame' ? 82 : 120));
-    activeQuad.forEach((p, idx) => {
-      const isDraggingCorner = dragTarget?.kind === 'corner' && dragTarget.idx === idx;
-      if (frameMode === 'box' && viewTab === 'frontal') {
-        const hs = nodeR * 1.35;
-        ctx.fillStyle = isDraggingCorner ? '#f59e0b' : '#0284c7';
-        ctx.fillRect(p.x - hs / 2, p.y - hs / 2, hs, hs);
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(p.x - hs / 2, p.y - hs / 2, hs, hs);
-      } else {
-        ctx.fillStyle = isDraggingCorner ? '#f59e0b' : '#0284c7';
+    // Modo guiado "Toca las 4 esquinas (1→2→3→4)" sobre la foto
+    if (viewTab === 'frontal' && pickingCorners !== null) {
+      const pickR = Math.max(13, cw / 68);
+      ctx.save();
+      if (pickingCorners.length >= 1) {
+        ctx.strokeStyle = '#facc15';
+        ctx.lineWidth = Math.max(3.5, cw / 240);
         ctx.beginPath();
-        ctx.arc(p.x, p.y, nodeR, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 2;
+        pickingCorners.forEach((pt, idx) =>
+          idx === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y),
+        );
         ctx.stroke();
-        ctx.fillStyle = '#ffffff';
-        ctx.font = `bold ${Math.round(nodeR * 0.98)}px system-ui, sans-serif`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(CORNER_LABELS[idx], p.x, p.y);
+
+        pickingCorners.forEach((pt, idx) => {
+          ctx.fillStyle = '#f59e0b';
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, pickR, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2.5;
+          ctx.stroke();
+          ctx.fillStyle = '#0f172a';
+          ctx.font = `bold ${Math.round(pickR * 1.1)}px system-ui, sans-serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(String(idx + 1), pt.x, pt.y);
+        });
       }
-    });
+      // Cartel flotante sobre la parte superior del lienzo indicando la esquina actual
+      const nextStepIdx = Math.min(3, pickingCorners.length);
+      const hintTxt = `TOCA ${CORNER_STEP_NAMES[nextStepIdx].toUpperCase()}`;
+      const fSize = Math.max(13, Math.min(20, Math.round(cw / 42)));
+      ctx.font = `bold ${fSize}px system-ui, sans-serif`;
+      const tw = ctx.measureText(hintTxt).width;
+      const bx = Math.max(10, (cw - tw) / 2 - 14);
+      ctx.fillStyle = 'rgba(2, 132, 199, 0.94)';
+      ctx.fillRect(bx, 12, tw + 28, fSize + 16);
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bx, 12, tw + 28, fSize + 16);
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(hintTxt, cw / 2, 12 + (fSize + 16) / 2);
+      ctx.restore();
+    } else {
+      // Manijas numeradas del marco exterior (grandes en Paso 1, discretas en Paso 2 y 3)
+      const nodeR = Math.max(traceStep === 'frame' ? 14 : 8, cw / (traceStep === 'frame' ? 66 : 110));
+      activeQuad.forEach((p, idx) => {
+        const isDraggingCorner = dragTarget?.kind === 'corner' && dragTarget.idx === idx;
+        if (frameMode === 'box' && viewTab === 'frontal') {
+          const hs = nodeR * 1.35;
+          ctx.fillStyle = isDraggingCorner ? '#f59e0b' : '#0284c7';
+          ctx.fillRect(p.x - hs / 2, p.y - hs / 2, hs, hs);
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2.2;
+          ctx.strokeRect(p.x - hs / 2, p.y - hs / 2, hs, hs);
+        } else {
+          ctx.fillStyle = isDraggingCorner ? '#f59e0b' : '#0284c7';
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, nodeR, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2.4;
+          ctx.stroke();
+          ctx.fillStyle = '#ffffff';
+          ctx.font = `bold ${Math.round(nodeR * 1.05)}px system-ui, sans-serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(CORNER_LABELS[idx], p.x, p.y);
+        }
+      });
+    }
 
     // Lupa 4× al arrastrar esquina o trazar vector
     if ((dragTarget?.kind === 'corner' || dragTarget?.kind === 'drawVector') && cursorImgPt) {
@@ -1260,6 +1412,8 @@ export function VectorCanvas({
     viewTab,
     traceStep,
     frameMode,
+    pickingCorners,
+    strokeMode,
     frontBitmap,
     sideBitmap,
     quad,
@@ -1268,6 +1422,7 @@ export function VectorCanvas({
     homography,
     topology.vDividers,
     topology.hShelves,
+    topology.diagonalDividers,
     topology.frontZones,
     params.boardThickness,
     params.targetDimensions,
@@ -1332,8 +1487,8 @@ export function VectorCanvas({
       if (extraTool === 'erase') {
         const uClick = exteriorToInterior(unitPt.x, eMm, xf);
         const vClick = exteriorToInterior(unitPt.y, eMm, yf);
-        let bestDist = 0.05;
-        let targetKind: 'div' | 'shelf' | null = null;
+        let bestDist = 0.055;
+        let targetKind: 'div' | 'shelf' | 'diag' | null = null;
         let targetId = '';
 
         for (const d of topology.vDividers) {
@@ -1356,6 +1511,18 @@ export function VectorCanvas({
             }
           }
         }
+        for (const dg of topology.diagonalDividers ?? []) {
+          const dist = pointToSegmentDist(
+            { x: uClick, y: vClick },
+            { x: dg.u1, y: dg.v1 },
+            { x: dg.u2, y: dg.v2 },
+          );
+          if (dist < bestDist) {
+            bestDist = dist;
+            targetKind = 'diag';
+            targetId = dg.id;
+          }
+        }
 
         if (targetKind === 'div') {
           pushUndo();
@@ -1371,13 +1538,52 @@ export function VectorCanvas({
             topology.hShelves.filter((s) => s.id !== targetId),
           );
           setStatusMsg('Vector repisa borrado (Ctrl+Z para deshacer).');
+        } else if (targetKind === 'diag') {
+          pushUndo();
+          syncTracedVectorsTo3D(
+            topology.vDividers,
+            topology.hShelves,
+            true,
+            (topology.diagonalDividers ?? []).filter((dg) => dg.id !== targetId),
+          );
+          setStatusMsg('Vector diagonal borrado (Ctrl+Z para deshacer).');
         }
         return;
       }
     }
 
-    // 2. Agarrar esquina del marco exterior (siempre disponible en Vista Lateral o si tocas la manija)
-    const hitTol = Math.max(24, (canvasRef.current?.width ?? 900) * 0.036);
+    // 1B. MODO GUIADO DE 4 TOQUES PARA CONTORNO EXTERIOR (1 Arriba-Izq → 2 Arriba-Der → 3 Abajo-Der → 4 Abajo-Izq)
+    if (viewTab === 'frontal' && pickingCorners !== null) {
+      const snapped = applyMagneticEdge(rawPt);
+      const nextPicked = [...pickingCorners, snapped];
+      if (nextPicked.length < 4) {
+        setPickingCorners(nextPicked);
+        setStatusMsg(
+          `Esquina ${nextPicked.length}/4 marcada. Ahora toca: ${CORNER_STEP_NAMES[nextPicked.length]}.`,
+        );
+      } else {
+        const nextQuad: [Point2D, Point2D, Point2D, Point2D] = [
+          nextPicked[0],
+          nextPicked[1],
+          nextPicked[2],
+          nextPicked[3],
+        ];
+        setFrameMode('quad');
+        setQuad(nextQuad);
+        setPickingCorners(null);
+        if (frontBitmap) {
+          commitOuterFrame(frontBitmap, nextQuad, {
+            resetInternalLines: true,
+            applyDims: true,
+            advanceToLines: true,
+          });
+        }
+      }
+      return;
+    }
+
+    // 2. Agarrar esquina numerada del marco exterior (libre en 4 pts o recto en box)
+    const hitTol = Math.max(28, (canvasRef.current?.width ?? 900) * 0.044);
     const hitIdx = activeQuad.findIndex((p) => Math.hypot(p.x - rawPt.x, p.y - rawPt.y) <= hitTol);
     if (hitIdx !== -1 || viewTab === 'lateral') {
       if (hitIdx !== -1) {
@@ -1388,14 +1594,30 @@ export function VectorCanvas({
       return;
     }
 
-    // 3. PASO 1 (CONTORNO EXTERIOR): arrastrar un rectángulo nuevo sobre la cara frontal en 1 gesto
+    // 3. PASO 1 (CONTORNO EXTERIOR):
+    //    - Si está en modo 4 esquinas libres (quad), arrastrar la esquina más cercana sin destruir la perspectiva!
+    //    - Si está en modo Recto (box), arrastrar rectángulo nuevo en 1 gesto.
     if (traceStep === 'frame') {
       const startPt = applyMagneticEdge(rawPt);
-      setFrameMode('box');
-      setDragTarget({ kind: 'drawBox', start: startPt });
-      setCursorImgPt(startPt);
-      setQuad(makeAxisAlignedQuad(startPt.x, startPt.y, startPt.x + 12, startPt.y + 12));
-      (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+      if (frameMode === 'quad') {
+        let nearestIdx = 0;
+        let nearestD = Infinity;
+        activeQuad.forEach((p, i) => {
+          const d = Math.hypot(p.x - rawPt.x, p.y - rawPt.y);
+          if (d < nearestD) {
+            nearestD = d;
+            nearestIdx = i;
+          }
+        });
+        setDragTarget({ kind: 'corner', idx: nearestIdx });
+        setCursorImgPt(startPt);
+        (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+      } else {
+        setDragTarget({ kind: 'drawBox', start: startPt });
+        setCursorImgPt(startPt);
+        setQuad(makeAxisAlignedQuad(startPt.x, startPt.y, startPt.x + 12, startPt.y + 12));
+        (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+      }
       return;
     }
 
@@ -1583,9 +1805,10 @@ export function VectorCanvas({
         params.boardThickness,
         params.targetDimensions,
         true,
+        strokeMode,
       );
       if (!stroke) {
-        setStatusMsg('Trazo demasiado corto. Arrastra una línea a lo largo de una división o repisa.');
+        setStatusMsg('Trazo demasiado corto. Arrastra una línea recta o diagonal sobre la foto.');
         return;
       }
 
@@ -1596,11 +1819,17 @@ export function VectorCanvas({
         setStatusMsg(
           `Vector divisor trazado en X = ${stroke.positionMm} mm (largo ${stroke.spanMm} mm) → 3D actualizado.`,
         );
-      } else {
+      } else if (stroke.kind === 'hShelf') {
         const nextH = [...topology.hShelves, stroke.segment];
         syncTracedVectorsTo3D(topology.vDividers, nextH, true);
         setStatusMsg(
           `Vector repisa trazado en Y = ${stroke.positionMm} mm (luz ${stroke.spanMm} mm) → 3D actualizado.`,
+        );
+      } else {
+        const nextDiags = [...(topology.diagonalDividers ?? []), stroke.segment];
+        syncTracedVectorsTo3D(topology.vDividers, topology.hShelves, true, nextDiags);
+        setStatusMsg(
+          `Vector DIAGONAL trazado (${Math.abs(stroke.angleDeg)}° · largo ${stroke.spanMm} mm) → tablero inclinado creado en 3D.`,
         );
       }
       return;
@@ -1657,13 +1886,15 @@ export function VectorCanvas({
   const activeBmp = viewTab === 'frontal' ? frontBitmap : sideBitmap;
   const hasPhoto = Boolean(frontBitmap);
   const zones = topology.frontZones ?? [];
-  const totalUserVectors = 4 + topology.vDividers.length + topology.hShelves.length;
+  const diagCount = topology.diagonalDividers?.length ?? 0;
+  const internalLineCount = topology.vDividers.length + topology.hShelves.length + diagCount;
+  const totalUserVectors = 4 + internalLineCount;
   const canvasCursor =
     dragTarget !== null
       ? 'grabbing'
       : extraTool === 'erase'
         ? 'pointer'
-        : extraTool !== 'none' || traceStep === 'frame' || traceStep === 'lines'
+        : pickingCorners !== null || extraTool !== 'none' || traceStep === 'frame' || traceStep === 'lines'
           ? 'crosshair'
           : 'pointer';
 
@@ -1671,9 +1902,9 @@ export function VectorCanvas({
     <div className="vector-card">
       <div className="card-header-row">
         <div>
-          <h3>Recalcar Márgenes → Vectores 2D → 3D Exacto</h3>
+          <h3>Recalcar Contorno (4 pts) y Divisiones (Rectas + Diagonales) → 3D</h3>
           <p className="muted small-note">
-            Marca tú mismo el contorno y las líneas sobre la foto: cada línea se vectoriza con imán de bordes y pasa directo a 3D exacto.
+            Toca las 4 esquinas del mueble (sigue perspectiva 3/4) y traza divisiones rectas o diagonales directo al 3D.
           </p>
         </div>
         <div className="chip-row">
@@ -1715,7 +1946,7 @@ export function VectorCanvas({
               setTraceStep('frame');
               setExtraTool('none');
               setStatusMsg(
-                'Paso 1 (Contorno): arrastra un rectángulo sobre la cara frontal del mueble (o mueve las esquinas).',
+                'Paso 1 (Contorno): pulsa "Marcar 4 esquinas" para tocar 1→2→3→4 sobre la foto, o arrastra los círculos numerados.',
               );
             }}
           >
@@ -1729,14 +1960,15 @@ export function VectorCanvas({
                 : 'trace-step-btn'
             }
             onClick={() => {
+              setPickingCorners(null);
               setTraceStep('lines');
               setExtraTool('none');
               setStatusMsg(
-                'Paso 2 (Recalcar líneas): arrastra el dedo o mouse sobre cada división, repisa, puerta o cajón. Se endereza y vectoriza solo.',
+                'Paso 2 (Divisiones): arrastra sobre la foto para trazar líneas rectas (siguen perspectiva) o diagonales reales.',
               );
             }}
           >
-            <PenTool size={14} /> <strong>2. Recalcar líneas ({topology.vDividers.length + topology.hShelves.length})</strong>
+            <PenTool size={14} /> <strong>2. Divisiones ({internalLineCount})</strong>
           </button>
           <button
             type="button"
@@ -1746,6 +1978,7 @@ export function VectorCanvas({
                 : 'trace-step-btn'
             }
             onClick={() => {
+              setPickingCorners(null);
               setTraceStep('zones');
               setExtraTool('none');
               setStatusMsg(
@@ -1755,6 +1988,119 @@ export function VectorCanvas({
           >
             <LayoutGrid size={14} /> <strong>3. Definir zonas ({zones.length})</strong>
           </button>
+        </div>
+      )}
+
+      {/* BANNER VISUAL IMPOSIBLE DE PERDER JUSTO ENCIMA DE LA FOTO */}
+      {hasPhoto && viewTab === 'frontal' && (
+        <div
+          className={`canvas-guide-banner ${
+            traceStep === 'lines' ? 'step-lines' : traceStep === 'zones' ? 'step-zones' : ''
+          }`}
+        >
+          {traceStep === 'frame' ? (
+            <>
+              <span className="guide-banner-text">
+                <span className="guide-step-pill">
+                  {pickingCorners !== null ? `TOQUE ${pickingCorners.length + 1}/4` : 'PASO 1'}
+                </span>
+                {pickingCorners !== null
+                  ? `Toca sobre la foto → ${CORNER_STEP_NAMES[Math.min(3, pickingCorners.length)]}`
+                  : 'Arrastra las esquinas ① ② ③ ④ sobre los bordes del mueble (o márcalas en 4 toques)'}
+              </span>
+              <div className="guide-banner-actions">
+                <button
+                  type="button"
+                  className={pickingCorners !== null ? 'guide-btn active' : 'guide-btn'}
+                  onClick={() => {
+                    setFrameMode('quad');
+                    setPickingCorners([]);
+                    setExtraTool('none');
+                    setStatusMsg(
+                      'Toca las 4 esquinas del frente del mueble: 1 Arriba-Izq → 2 Arriba-Der → 3 Abajo-Der → 4 Abajo-Izq.',
+                    );
+                  }}
+                >
+                  📍 Marcar 4 esquinas (1→2→3→4)
+                </button>
+                {pickingCorners !== null ? (
+                  <button
+                    type="button"
+                    className="guide-btn"
+                    onClick={() => {
+                      setPickingCorners(null);
+                      setTraceStep('lines');
+                      setStatusMsg(
+                        'Contorno sugerido aceptado. Ahora en Paso 2 traza líneas rectas o diagonales sobre la foto.',
+                      );
+                    }}
+                  >
+                    ✓ Usar contorno sugerido
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="guide-btn"
+                    onClick={() => {
+                      setTraceStep('lines');
+                      setExtraTool('none');
+                    }}
+                  >
+                    Listo → Ir a Paso 2
+                  </button>
+                )}
+              </div>
+            </>
+          ) : traceStep === 'lines' ? (
+            <>
+              <span className="guide-banner-text">
+                <span className="guide-step-pill">PASO 2</span>
+                Arrastra sobre la foto para trazar divisiones (rectas siguen perspectiva · inclinadas = diagonal 3D)
+              </span>
+              <div className="guide-banner-actions">
+                <button
+                  type="button"
+                  className={strokeMode === 'auto' ? 'guide-btn active' : 'guide-btn'}
+                  onClick={() => setStrokeMode('auto')}
+                  title="Trazos casi H/V se enderezan en perspectiva; trazos entre 18° y 72° quedan como diagonales reales"
+                >
+                  Auto (Recta + Diag)
+                </button>
+                <button
+                  type="button"
+                  className={strokeMode === 'diagonal' ? 'guide-btn active' : 'guide-btn'}
+                  onClick={() => setStrokeMode('diagonal')}
+                  title="Conserva cualquier ángulo diagonal libre sin forzar nunca a línea recta"
+                >
+                  ⟋ Diagonal / Libre
+                </button>
+                <button
+                  type="button"
+                  className={strokeMode === 'ortho' ? 'guide-btn active' : 'guide-btn'}
+                  onClick={() => setStrokeMode('ortho')}
+                  title="Endereza siempre a horizontal o vertical siguiendo la perspectiva del contorno"
+                >
+                  ┼ Solo Rectas
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <span className="guide-banner-text">
+                <span className="guide-step-pill">PASO 3</span>
+                Toca cualquier recuadro sobre la foto (o las etiquetas de abajo) para elegir Puerta, Cajón, Vidrio o Abierto
+              </span>
+              <div className="guide-banner-actions">
+                <button
+                  type="button"
+                  className="guide-btn"
+                  onClick={() => setTraceStep('lines')}
+                >
+                  + Trazar más líneas
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
 
@@ -1773,7 +2119,7 @@ export function VectorCanvas({
             type="button"
             className={extraTool === 'erase' ? 'chip-btn active' : 'chip-btn'}
             onClick={() => setExtraTool((t) => (t === 'erase' ? 'none' : 'erase'))}
-            disabled={topology.vDividers.length === 0 && topology.hShelves.length === 0}
+            disabled={internalLineCount === 0}
           >
             <Eraser size={12} /> Borrar línea
           </button>
@@ -1789,7 +2135,7 @@ export function VectorCanvas({
             type="button"
             className="chip-btn"
             onClick={handleClearLines}
-            disabled={topology.vDividers.length === 0 && topology.hShelves.length === 0}
+            disabled={internalLineCount === 0}
           >
             <Trash2 size={12} /> Limpiar
           </button>
@@ -1806,9 +2152,9 @@ export function VectorCanvas({
             type="button"
             className={frameMode === 'quad' ? 'chip-btn active' : 'chip-btn'}
             onClick={() => handleToggleFrameMode(frameMode === 'box' ? 'quad' : 'box')}
-            title="Activar 4 esquinas libres si la foto está muy en ángulo 3/4"
+            title="4 esquinas libres (perspectiva) vs recuadro recto"
           >
-            {frameMode === 'quad' ? '4 pts (3/4)' : 'Recto'}
+            {frameMode === 'quad' ? '4 pts libres (3/4)' : 'Marco recto'}
           </button>
           <button
             type="button"
@@ -2020,7 +2366,7 @@ export function VectorCanvas({
               </div>
               <div className="eval-sub">
                 Vectores activos: <strong>{totalUserVectors}</strong> ({topology.vDividers.length} V ·{' '}
-                {topology.hShelves.length} H)
+                {topology.hShelves.length} H{diagCount > 0 ? ` · ${diagCount} Diag` : ''})
               </div>
             </div>
           )}
@@ -2058,6 +2404,7 @@ export function VectorCanvas({
               <span><i style={{ background: '#00e5ff' }} />Contorno</span>
               <span><i style={{ background: '#22c55e' }} />Divisor (V)</span>
               <span><i style={{ background: '#f59e0b' }} />Repisa (H)</span>
+              <span><i style={{ background: '#d946ef' }} />Diagonal</span>
             </div>
           )}
         </div>

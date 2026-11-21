@@ -325,6 +325,7 @@ function FurnitureMeshGroup({
             <mesh
               key={piece.id}
               position={pos}
+              rotation={piece.rotacion3D}
               castShadow={!isGlassDoor}
               receiveShadow
               onClick={(e) => {

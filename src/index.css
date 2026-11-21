@@ -1425,3 +1425,80 @@ button:disabled {
   border-color: #0284c7;
   box-shadow: 0 2px 6px rgba(2, 132, 199, 0.25);
 }
+
+/* v6.1 Guía visual imposible de perder justo encima de la foto */
+.canvas-guide-banner {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: 9px;
+  background: linear-gradient(135deg, #0369a1 0%, #0f2b4c 100%);
+  color: #ffffff;
+  font-size: 12.5px;
+  font-weight: 600;
+  border: 1.5px solid #38bdf8;
+  box-shadow: 0 2px 8px rgba(2, 132, 199, 0.22);
+}
+
+.canvas-guide-banner.step-lines {
+  background: linear-gradient(135deg, #0f2b4c 0%, #1e3a8a 100%);
+  border-color: #60a5fa;
+}
+
+.canvas-guide-banner.step-zones {
+  background: linear-gradient(135deg, #065f46 0%, #0f2b4c 100%);
+  border-color: #34d399;
+}
+
+.guide-banner-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.guide-step-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #38bdf8;
+  color: #0f172a;
+  font-weight: 800;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.guide-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.guide-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.guide-btn:hover {
+  background: rgba(255, 255, 255, 0.26);
+}
+
+.guide-btn.active {
+  background: #facc15;
+  color: #0f172a;
+  border-color: #fde047;
+}

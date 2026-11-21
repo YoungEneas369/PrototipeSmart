@@ -51,6 +51,7 @@ export type PieceType =
   | 'base'
   | 'lateral'
   | 'division_vertical'
+  | 'division_diagonal'
   | 'repisa'
   | 'fondo'
   | 'puerta'
@@ -124,6 +125,18 @@ export interface NormalizedSegment {
   end: number;
 }
 
+/**
+ * Segmento estructural diagonal / oblicuo normalizado en espacio INTERIOR [0, 1]^2.
+ * Se modela en 3D con longitud física real L = sqrt(dx² + dy²) y rotación Z exacta.
+ */
+export interface DiagonalSegment {
+  id: string;
+  u1: number;
+  v1: number;
+  u2: number;
+  v2: number;
+}
+
 export interface FurnitureTopology {
   viewsMode: 1 | 2;
   aspectRatioXY: number;
@@ -133,6 +146,8 @@ export interface FurnitureTopology {
   homographyMatrix?: number[][];
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
+  /** Divisiones o refuerzos diagonales opcionales trazados por el usuario. */
+  diagonalDividers?: DiagonalSegment[];
   shelfMode: 'equidistant' | 'custom';
   equalShelfCount: number;
   hasBackPanel: boolean;

@@ -995,13 +995,14 @@ export function evaluate3DvsPhotoSimilarity(
       .map((z) => `puerta_${z.id}`),
   );
 
-  // Pintar las zonas explícitas `leg_void` como fondo exterior (sin tablero)
+  // Pintar las zonas explícitas `leg_void` y `void_outside` (recorte escalonado) como fondo exterior (sin tablero)
   for (const z of topology.frontZones ?? []) {
-    if (z.kind !== 'leg_void') continue;
-    const x0 = clamp(Math.floor(z.uStart * gW), 0, gW - 1);
-    const x1 = clamp(Math.ceil(z.uEnd * gW), 0, gW - 1);
-    const y0 = clamp(Math.floor((1 - z.vEnd) * gH), 0, gH - 1);
-    const y1 = clamp(Math.ceil((1 - z.vStart) * gH), 0, gH - 1);
+    if (z.kind !== 'leg_void' && z.kind !== 'void_outside') continue;
+    const isOut = z.kind === 'void_outside';
+    const x0 = isOut && z.uStart <= 0.02 ? 0 : clamp(Math.floor(z.uStart * gW), 0, gW - 1);
+    const x1 = isOut && z.uEnd >= 0.98 ? gW - 1 : clamp(Math.ceil(z.uEnd * gW), 0, gW - 1);
+    const y0 = isOut && z.vEnd >= 0.98 ? 0 : clamp(Math.floor((1 - z.vEnd) * gH), 0, gH - 1);
+    const y1 = isOut && z.vStart <= 0.02 ? gH - 1 : clamp(Math.ceil((1 - z.vStart) * gH), 0, gH - 1);
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
         const idx = y * gW + x;

@@ -509,7 +509,9 @@ export function MathPanel({
                       </strong>
                       <p className="muted small-note">{hw.notaCompra}</p>
                     </div>
-                    {hw.id !== 'hw_patas_externas' && (
+                    {hw.id !== 'hw_patas_externas' &&
+                      hw.id !== 'hw_ruedas_externas' &&
+                      !hw.id.endsWith('_calc') && (
                       <button
                         type="button"
                         className="btn-danger-sm"

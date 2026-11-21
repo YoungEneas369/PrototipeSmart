@@ -511,14 +511,16 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
       hasBackPanel: true,
       detectionSource: 'auto',
       detectionConfidence: 0.86,
+      baseSupportType: 'wheels',
       hasExternalLegs: true,
       externalLegHeightMm: 65,
       externalLegCount: 4,
       frontZones: [
         { id: 'c_sup', uStart: 0, uEnd: 0.68, vStart: 0.78, vEnd: 1, kind: 'drawers', drawerCount: 1, label: 'Cajón Sup', materialOverride: 'blanco' },
-        { id: 'canastos', uStart: 0, uEnd: 0.34, vStart: 0, vEnd: 0.78, kind: 'open', label: '3 Canastos' },
+        { id: 'canastos', uStart: 0, uEnd: 0.34, vStart: 0, vEnd: 0.78, kind: 'baskets', basketCount: 3, label: '3 Canastos' },
         { id: 'p_cen', uStart: 0.34, uEnd: 0.68, vStart: 0, vEnd: 0.78, kind: 'door_left', label: 'Puerta 1', materialOverride: 'blanco' },
         { id: 'p_der', uStart: 0.68, uEnd: 1, vStart: 0, vEnd: 0.72, kind: 'door_right', label: 'Puerta Baja', materialOverride: 'blanco' },
+        { id: 'void_step', uStart: 0.68, uEnd: 1, vStart: 0.72, vEnd: 1, kind: 'void_outside', label: 'Sin mueble (Escalón)' },
       ],
       hardwareItems: [
         {

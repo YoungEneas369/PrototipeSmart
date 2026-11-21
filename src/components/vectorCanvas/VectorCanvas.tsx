@@ -14,6 +14,7 @@ import {
   Contrast,
   Crop,
   Eraser,
+  Eye,
   GitBranch,
   LayoutGrid,
   Magnet,
@@ -27,6 +28,8 @@ import {
   Undo2,
   Upload,
   Wand2,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import type {
   DespieceResult,
@@ -122,23 +125,16 @@ function pointToSegmentDist(p: Point2D, a: Point2D, b: Point2D): number {
   return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
 }
 
-const ZONE_CYCLE: readonly FrontModuleKind[] = [
-  'open',
-  'door_left',
-  'door_double',
-  'drawers',
-  'door_glass',
-  'leg_void',
-];
-
 const ZONE_LABELS: Record<FrontModuleKind, string> = {
   open: 'Abierto',
   door_left: 'Puerta Izq',
   door_right: 'Puerta Der',
   door_double: '2 Puertas',
   door_glass: 'Vidrio',
-  drawers: 'Cajones',
+  drawers: 'Cajón',
+  baskets: 'Canastos',
   leg_void: 'Hueco Piernas',
+  void_outside: 'Sin mueble',
 };
 
 const ZONE_COLORS: Record<FrontModuleKind, { fill: string; stroke: string; dot: string }> = {
@@ -148,7 +144,9 @@ const ZONE_COLORS: Record<FrontModuleKind, { fill: string; stroke: string; dot: 
   door_double: { fill: 'rgba(245, 158, 11, 0.22)', stroke: '#f59e0b', dot: '#d97706' },
   door_glass: { fill: 'rgba(125, 211, 252, 0.26)', stroke: '#7dd3fc', dot: '#0ea5e9' },
   drawers: { fill: 'rgba(249, 115, 22, 0.24)', stroke: '#fb923c', dot: '#ea580c' },
+  baskets: { fill: 'rgba(16, 185, 129, 0.22)', stroke: '#34d399', dot: '#059669' },
   leg_void: { fill: 'rgba(168, 85, 247, 0.22)', stroke: '#c084fc', dot: '#9333ea' },
+  void_outside: { fill: 'rgba(239, 68, 68, 0.22)', stroke: '#f87171', dot: '#dc2626' },
 };
 
 const VECTOR_ROLE_COLORS: Record<VectorLineRole, string> = {
@@ -385,6 +383,9 @@ export function VectorCanvas({
   const [extraTool, setExtraTool] = useState<ExtraTool>('none');
   const [magneticSnap, setMagneticSnap] = useState<boolean>(true);
   const [showPrecisionTools, setShowPrecisionTools] = useState(false);
+  const [showRectPreview, setShowRectPreview] = useState(false);
+  const [canvasZoom, setCanvasZoom] = useState<1 | 2>(1);
+  const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
   const [visualLayer, setVisualLayer] = useState<VisualLayerMode>('traced_zones');
   const [isDragOver, setIsDragOver] = useState(false);
 
@@ -905,27 +906,82 @@ export function VectorCanvas({
     }
   };
 
-  const handleZoneKindSelect = (zoneId: string, nextKind: FrontModuleKind) => {
+  const handleZoneKindSelect = (
+    zoneId: string,
+    nextKind: FrontModuleKind,
+    explicitCount?: number,
+  ) => {
     pushUndo();
     const zones = topology.frontZones ?? [];
-    const updated = zones.map((z) =>
-      z.id === zoneId
-        ? {
-            ...z,
-            kind: nextKind,
-            drawerCount: nextKind === 'drawers' ? (z.drawerCount ?? 2) : undefined,
-            label: ZONE_LABELS[nextKind],
-          }
-        : z,
-    );
+    const updated = zones.map((z) => {
+      if (z.id !== zoneId) return z;
+      const clearOverride =
+        nextKind === 'open' ||
+        nextKind === 'baskets' ||
+        nextKind === 'leg_void' ||
+        nextKind === 'void_outside';
+      return {
+        ...z,
+        kind: nextKind,
+        drawerCount:
+          nextKind === 'drawers' ? (explicitCount ?? z.drawerCount ?? 1) : undefined,
+        basketCount:
+          nextKind === 'baskets' ? (explicitCount ?? z.basketCount ?? 3) : undefined,
+        internalShelves:
+          nextKind === 'drawers' ||
+          nextKind === 'baskets' ||
+          nextKind === 'leg_void' ||
+          nextKind === 'void_outside'
+            ? undefined
+            : z.internalShelves,
+        materialOverride: clearOverride ? undefined : z.materialOverride,
+        label: ZONE_LABELS[nextKind],
+      };
+    });
     onUpdateFrontZones(updated);
-    setStatusMsg(`Zona cambiada a "${ZONE_LABELS[nextKind]}" — 3D actualizado al instante.`);
+    setSelectedZoneId(zoneId);
+    setStatusMsg(
+      nextKind === 'void_outside'
+        ? 'Zona marcada como "Sin mueble (Vacío exterior)" — carcasa, cubierta, lateral y fondo recortados en 3D.'
+        : `Zona cambiada a "${ZONE_LABELS[nextKind]}" — 3D actualizado al instante.`,
+    );
   };
 
   const handleZoneDrawerCount = (zoneId: string, count: number) => {
     const zones = topology.frontZones ?? [];
     const updated = zones.map((z) =>
       z.id === zoneId ? { ...z, drawerCount: Math.max(1, Math.min(6, count)) } : z,
+    );
+    onUpdateFrontZones(updated);
+  };
+
+  const handleZoneBasketCount = (zoneId: string, count: number) => {
+    const zones = topology.frontZones ?? [];
+    const updated = zones.map((z) =>
+      z.id === zoneId ? { ...z, basketCount: Math.max(1, Math.min(6, count)) } : z,
+    );
+    onUpdateFrontZones(updated);
+  };
+
+  const handleZoneInternalShelves = (zoneId: string, count: number) => {
+    const zones = topology.frontZones ?? [];
+    const updated = zones.map((z) =>
+      z.id === zoneId
+        ? { ...z, internalShelves: count <= 0 ? undefined : Math.min(5, count) }
+        : z,
+    );
+    onUpdateFrontZones(updated);
+  };
+
+  const handleZoneMaterialOverride = (
+    zoneId: string,
+    mat: MelamineMaterial | 'same',
+  ) => {
+    const zones = topology.frontZones ?? [];
+    const updated = zones.map((z) =>
+      z.id === zoneId
+        ? { ...z, materialOverride: mat === 'same' ? undefined : mat }
+        : z,
     );
     onUpdateFrontZones(updated);
   };
@@ -1033,6 +1089,7 @@ export function VectorCanvas({
           const pBL = applyHomography(toCanvas, { x: u0, y: v0 });
           if (pTL && pTR && pBR && pBL) {
             const palette = ZONE_COLORS[z.kind];
+            const isSelZone = selectedZoneId === z.id;
             ctx.beginPath();
             ctx.moveTo(pTL.x, pTL.y);
             ctx.lineTo(pTR.x, pTR.y);
@@ -1041,20 +1098,48 @@ export function VectorCanvas({
             ctx.closePath();
             ctx.fillStyle = palette.fill;
             ctx.fill();
-            ctx.strokeStyle = palette.stroke;
-            ctx.lineWidth = Math.max(1.2, cw / 560);
+            ctx.save();
+            if (z.kind === 'void_outside') {
+              ctx.setLineDash([7, 5]);
+              ctx.beginPath();
+              ctx.moveTo(pTL.x, pTL.y);
+              ctx.lineTo(pBR.x, pBR.y);
+              ctx.moveTo(pTR.x, pTR.y);
+              ctx.lineTo(pBL.x, pBL.y);
+              ctx.strokeStyle = 'rgba(248, 113, 113, 0.7)';
+              ctx.lineWidth = Math.max(1.5, cw / 500);
+              ctx.stroke();
+            }
+            ctx.strokeStyle = isSelZone ? '#ffffff' : palette.stroke;
+            ctx.lineWidth = Math.max(isSelZone ? 3 : 1.3, cw / (isSelZone ? 280 : 540));
+            ctx.beginPath();
+            ctx.moveTo(pTL.x, pTL.y);
+            ctx.lineTo(pTR.x, pTR.y);
+            ctx.lineTo(pBR.x, pBR.y);
+            ctx.lineTo(pBL.x, pBL.y);
+            ctx.closePath();
             ctx.stroke();
+            ctx.restore();
 
             const center = applyHomography(toCanvas, { x: (u0 + u1) / 2, y: (v0 + v1) / 2 });
             if (center) {
               const tagText =
                 z.kind === 'drawers'
-                  ? `Z${zIdx + 1}: ${z.drawerCount ?? 2} Caj.`
-                  : `Z${zIdx + 1}: ${ZONE_LABELS[z.kind]}`;
+                  ? `Z${zIdx + 1}: ${z.drawerCount ?? 1} Caj.`
+                  : z.kind === 'baskets'
+                    ? `Z${zIdx + 1}: ${z.basketCount ?? 3} Can.`
+                    : z.kind === 'void_outside'
+                      ? `Z${zIdx + 1}: ✕ Vacío`
+                      : `Z${zIdx + 1}: ${ZONE_LABELS[z.kind]}`;
               const fontPx = Math.max(11, Math.min(16, Math.round(cw / 66)));
               ctx.font = `bold ${fontPx}px system-ui, sans-serif`;
               const tw = ctx.measureText(tagText).width;
-              ctx.fillStyle = 'rgba(15, 23, 42, 0.82)';
+              ctx.fillStyle =
+                z.kind === 'void_outside'
+                  ? 'rgba(185, 28, 28, 0.88)'
+                  : isSelZone
+                    ? 'rgba(2, 132, 199, 0.94)'
+                    : 'rgba(15, 23, 42, 0.82)';
               ctx.fillRect(center.x - tw / 2 - 5, center.y - fontPx * 0.7, tw + 10, fontPx * 1.4);
               ctx.fillStyle = '#ffffff';
               ctx.textAlign = 'center';
@@ -1299,18 +1384,47 @@ export function VectorCanvas({
       }
     }
 
-    // Modo guiado "Toca las 4 esquinas (1→2→3→4)" sobre la foto
+    // Modo guiado "Toca las 4 esquinas (1→2→3→4)" sobre la foto con líneas de proyección de perspectiva
     if (viewTab === 'frontal' && pickingCorners !== null) {
-      const pickR = Math.max(13, cw / 68);
+      const pickR = Math.max(12, cw / 72);
       ctx.save();
       if (pickingCorners.length >= 1) {
         ctx.strokeStyle = '#facc15';
-        ctx.lineWidth = Math.max(3.5, cw / 240);
+        ctx.lineWidth = Math.max(3, cw / 260);
         ctx.beginPath();
         pickingCorners.forEach((pt, idx) =>
           idx === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y),
         );
         ctx.stroke();
+
+        // Línea guía punteada hacia el puntero actual
+        if (cursorImgPt) {
+          const lastPt = pickingCorners[pickingCorners.length - 1];
+          ctx.setLineDash([7, 5]);
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = Math.max(2, cw / 360);
+          ctx.beginPath();
+          ctx.moveTo(lastPt.x, lastPt.y);
+          ctx.lineTo(cursorImgPt.x, cursorImgPt.y);
+          if (pickingCorners.length === 3) {
+            ctx.lineTo(pickingCorners[0].x, pickingCorners[0].y);
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
+        // Al tener 3 esquinas, proyectar paralelogramo fantasma para la 4ª esquina
+        if (pickingCorners.length === 3) {
+          const proj4 = {
+            x: pickingCorners[0].x + (pickingCorners[2].x - pickingCorners[1].x),
+            y: pickingCorners[0].y + (pickingCorners[2].y - pickingCorners[1].y),
+          };
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.85)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(proj4.x, proj4.y, pickR * 0.8, 0, Math.PI * 2);
+          ctx.stroke();
+        }
 
         pickingCorners.forEach((pt, idx) => {
           ctx.fillStyle = '#f59e0b';
@@ -1327,24 +1441,35 @@ export function VectorCanvas({
           ctx.fillText(String(idx + 1), pt.x, pt.y);
         });
       }
-      // Cartel flotante sobre la parte superior del lienzo indicando la esquina actual
-      const nextStepIdx = Math.min(3, pickingCorners.length);
-      const hintTxt = `TOCA ${CORNER_STEP_NAMES[nextStepIdx].toUpperCase()}`;
-      const fSize = Math.max(13, Math.min(20, Math.round(cw / 42)));
-      ctx.font = `bold ${fSize}px system-ui, sans-serif`;
-      const tw = ctx.measureText(hintTxt).width;
-      const bx = Math.max(10, (cw - tw) / 2 - 14);
-      ctx.fillStyle = 'rgba(2, 132, 199, 0.94)';
-      ctx.fillRect(bx, 12, tw + 28, fSize + 16);
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(bx, 12, tw + 28, fSize + 16);
-      ctx.fillStyle = '#ffffff';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(hintTxt, cw / 2, 12 + (fSize + 16) / 2);
       ctx.restore();
     } else {
+      // Guías sutiles de fuga al ajustar una esquina en perspectiva (ayuda a alinear esquinas en el aire!)
+      if (viewTab === 'frontal' && dragTarget?.kind === 'corner' && homography) {
+        ctx.save();
+        ctx.setLineDash([5, 5]);
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.55)';
+        ctx.lineWidth = 1.5;
+        for (const t of [0.33, 0.5, 0.67]) {
+          const h0 = applyHomography(homography.toCanvas, { x: 0, y: t });
+          const h1 = applyHomography(homography.toCanvas, { x: 1, y: t });
+          if (h0 && h1) {
+            ctx.beginPath();
+            ctx.moveTo(h0.x, h0.y);
+            ctx.lineTo(h1.x, h1.y);
+            ctx.stroke();
+          }
+          const v0 = applyHomography(homography.toCanvas, { x: t, y: 0 });
+          const v1 = applyHomography(homography.toCanvas, { x: t, y: 1 });
+          if (v0 && v1) {
+            ctx.beginPath();
+            ctx.moveTo(v0.x, v0.y);
+            ctx.lineTo(v1.x, v1.y);
+            ctx.stroke();
+          }
+        }
+        ctx.restore();
+      }
+
       // Manijas numeradas del marco exterior (grandes en Paso 1, discretas en Paso 2 y 3)
       const nodeR = Math.max(traceStep === 'frame' ? 14 : 8, cw / (traceStep === 'frame' ? 66 : 110));
       activeQuad.forEach((p, idx) => {
@@ -1373,13 +1498,18 @@ export function VectorCanvas({
       });
     }
 
-    // Lupa 4× al arrastrar esquina o trazar vector
-    if ((dragTarget?.kind === 'corner' || dragTarget?.kind === 'drawVector') && cursorImgPt) {
+    // Lupa 4× al marcar esquinas (hover), arrastrar esquina o trazar vector
+    const showLoupe =
+      cursorImgPt !== null &&
+      (pickingCorners !== null ||
+        dragTarget?.kind === 'corner' ||
+        dragTarget?.kind === 'drawVector');
+    if (showLoupe && cursorImgPt) {
       const magSize = Math.min(165, Math.round(cw * 0.22));
       const zoom = 4;
       const srcSpan = magSize / zoom;
       const mx = cursorImgPt.x < cw / 2 ? cw - magSize - 14 : 14;
-      const my = 14;
+      const my = cursorImgPt.y < ch / 2 ? ch - magSize - 14 : 14;
 
       ctx.save();
       ctx.fillStyle = '#0f172a';
@@ -1414,6 +1544,7 @@ export function VectorCanvas({
     frameMode,
     pickingCorners,
     strokeMode,
+    selectedZoneId,
     frontBitmap,
     sideBitmap,
     quad,
@@ -1621,8 +1752,41 @@ export function VectorCanvas({
       return;
     }
 
-    // 4. PASO 2 (RECALCAR LÍNEAS -> VECTORES): herramienta universal de dibujo
+    // 4. PASO 2 (DIVISIONES -> VECTORES): permite arrastrar líneas existentes O trazar nuevas (rectas o diagonales)
     if (traceStep === 'lines' && homography) {
+      const unitPt = applyHomography(homography.toUnit, rawPt);
+      if (unitPt) {
+        const uClick = exteriorToInterior(unitPt.x, eMm, xf);
+        const vClick = exteriorToInterior(unitPt.y, eMm, yf);
+        let bestDist = 0.026;
+        let hitLine: DragTarget | null = null;
+        for (const d of topology.vDividers) {
+          if (vClick >= d.start - 0.02 && vClick <= d.end + 0.02) {
+            const dist = Math.abs(d.position - uClick);
+            if (dist < bestDist) {
+              bestDist = dist;
+              hitLine = { kind: 'vDivider', id: d.id };
+            }
+          }
+        }
+        for (const s of topology.hShelves) {
+          if (uClick >= s.start - 0.02 && uClick <= s.end + 0.02) {
+            const dist = Math.abs(s.position - vClick);
+            if (dist < bestDist) {
+              bestDist = dist;
+              hitLine = { kind: 'hShelf', id: s.id };
+            }
+          }
+        }
+        if (hitLine) {
+          pushUndo();
+          setDragTarget(hitLine);
+          setCursorImgPt(rawPt);
+          (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+          return;
+        }
+      }
+
       const startPt = applyMagneticEdge(rawPt);
       setDragTarget({ kind: 'drawVector', start: startPt });
       setCursorImgPt(startPt);
@@ -1630,14 +1794,14 @@ export function VectorCanvas({
       return;
     }
 
-    // 5. PASO 3 (ZONAS -> 3D): mover líneas existentes o tocar una celda para alternar Puerta/Cajón/Hueco
+    // 5. PASO 3 (ZONAS -> 3D): tocar una celda la selecciona en el Inspector Contextual (o arrastrar líneas)
     if (traceStep === 'zones' && homography) {
       const unitPt = applyHomography(homography.toUnit, rawPt);
       if (!unitPt) return;
       const uClick = exteriorToInterior(unitPt.x, eMm, xf);
       const vClick = exteriorToInterior(unitPt.y, eMm, yf);
 
-      let bestDist = 0.032;
+      let bestDist = 0.028;
       let found: DragTarget | null = null;
       for (const d of topology.vDividers) {
         if (vClick >= d.start - 0.02 && vClick <= d.end + 0.02) {
@@ -1675,16 +1839,23 @@ export function VectorCanvas({
           vClick <= z.vEnd,
       );
       if (hitZone) {
-        const curIdx = ZONE_CYCLE.indexOf(hitZone.kind);
-        const nextKind = ZONE_CYCLE[(curIdx + 1) % ZONE_CYCLE.length];
-        handleZoneKindSelect(hitZone.id, nextKind);
+        setSelectedZoneId(hitZone.id);
+        setStatusMsg(
+          `Zona seleccionada (${ZONE_LABELS[hitZone.kind]}). Elige abajo qué es (Abierto, Puerta, 1 Cajón, Canastos o ✕ Sin mueble) y su color.`,
+        );
       }
     }
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!dragTarget) return;
     const rawPt = toCanvasCoords(e);
+    if (!dragTarget) {
+      // Mostrar lupa 4× y guía en vivo al apuntar las 4 esquinas del contorno
+      if (viewTab === 'frontal' && pickingCorners !== null) {
+        setCursorImgPt(rawPt);
+      }
+      return;
+    }
 
     if (dragTarget.kind === 'drawVector') {
       setCursorImgPt(applyMagneticEdge(rawPt));
@@ -2005,8 +2176,8 @@ export function VectorCanvas({
                   {pickingCorners !== null ? `TOQUE ${pickingCorners.length + 1}/4` : 'PASO 1'}
                 </span>
                 {pickingCorners !== null
-                  ? `Toca sobre la foto → ${CORNER_STEP_NAMES[Math.min(3, pickingCorners.length)]}`
-                  : 'Arrastra las esquinas ① ② ③ ④ sobre los bordes del mueble (o márcalas en 4 toques)'}
+                  ? `Toca sobre la foto → ${CORNER_STEP_NAMES[Math.min(3, pickingCorners.length)]} (solo frente de melamina, sin patas/ruedas ni costado 3/4)`
+                  : 'Arrastra ① ② ③ ④ sobre el frente de melamina (si es escalonado, proyecta la esquina superior y marca ese bloque como "✕ Sin mueble")'}
               </span>
               <div className="guide-banner-actions">
                 <button
@@ -2282,10 +2453,12 @@ export function VectorCanvas({
         </div>
       )}
 
-      {/* Lienzo + Panel lateral de Evaluación Visual */}
-      <div className="canvas-layout">
+      {/* Lienzo a ANCHO COMPLETO (+35% más grande para calcar con precisión) + Franja compacta de métricas */}
+      <div className="canvas-full-layout">
         <div
-          className={isDragOver ? 'photo-canvas-wrap drag-over' : 'photo-canvas-wrap'}
+          className={`${isDragOver ? 'photo-canvas-wrap drag-over' : 'photo-canvas-wrap'}${
+            canvasZoom === 2 ? ' zoomed' : ''
+          }`}
           onDragOver={(e) => {
             e.preventDefault();
             setIsDragOver(true);
@@ -2296,18 +2469,21 @@ export function VectorCanvas({
           {activeBmp ? (
             <canvas
               ref={canvasRef}
-              className="photo-canvas"
+              className={canvasZoom === 2 ? 'photo-canvas zoom-2x' : 'photo-canvas'}
               style={{ cursor: canvasCursor }}
               onPointerDown={handlePointerDown}
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerUp}
+              onPointerLeave={() => {
+                if (!dragTarget) setCursorImgPt(null);
+              }}
             />
           ) : (
             <div className="photo-dropzone">
               <Upload size={34} />
               <strong>Sube la foto de tu mueble y recalca sus márgenes para un 3D exacto</strong>
               <p className="small-note muted">
-                1) Encuadra el contorno · 2) Recalca las divisiones con 1 sola herramienta (imán de bordes) · 3) Tu 3D y plano de corte 244×122 salen al milímetro.
+                1) Toca las 4 esquinas del cuerpo frontal (sin patas ni ruedas) · 2) Traza divisiones rectas o diagonales · 3) Marca zonas (puertas, cajones, canastos o vacío exterior escalonado).
               </p>
               <div className="chip-row">
                 <button
@@ -2335,122 +2511,322 @@ export function VectorCanvas({
           )}
         </div>
 
-        <div className="rect-preview-panel">
-          <div className="card-header-row">
-            <strong>Frente Vectorizado</strong>
-            <select
-              className="select-mini"
-              value={focal35mm}
-              onChange={(e) => setFocal35mm(Number(e.target.value) as 26 | 52)}
-              aria-label="Lente"
-            >
-              <option value={26}>1× (26mm)</option>
-              <option value={52}>2× (52mm)</option>
-            </select>
-          </div>
-          <canvas ref={rectPreviewRef} className="rect-preview-canvas" />
-
-          {marginEval && (
-            <div className="eval-meter">
-              <div className="eval-meter-head">
-                <span>Contorno vs Foto</span>
-                <strong className={scoreToneClass(marginEval.overallScore)}>
-                  {marginEval.overallScore}%
-                </strong>
-              </div>
-              <div className="eval-bar-track">
-                <div
-                  className={`eval-bar-fill ${scoreToneClass(marginEval.overallScore)}`}
-                  style={{ width: `${marginEval.overallScore}%` }}
-                />
-              </div>
-              <div className="eval-sub">
-                Vectores activos: <strong>{totalUserVectors}</strong> ({topology.vDividers.length} V ·{' '}
-                {topology.hShelves.length} H{diagCount > 0 ? ` · ${diagCount} Diag` : ''})
-              </div>
-            </div>
-          )}
-
-          {live3DSimilarity && (
-            <div className="eval-meter">
-              <div className="eval-meter-head">
-                <span>Parecido 3D vs Foto</span>
-                <strong className={scoreToneClass(live3DSimilarity.overallScore)}>
-                  {live3DSimilarity.overallScore}%
-                </strong>
-              </div>
-              <div className="eval-bar-track">
-                <div
-                  className={`eval-bar-fill ${scoreToneClass(live3DSimilarity.overallScore)}`}
-                  style={{ width: `${live3DSimilarity.overallScore}%` }}
-                />
-              </div>
-              <div className="eval-sub">
-                Silueta {Math.round(live3DSimilarity.silhouetteMatch * 100)}% · Bordes{' '}
-                {Math.round(live3DSimilarity.edgeStructureMatch * 100)}% · Color{' '}
-                {Math.round(live3DSimilarity.colorPaletteMatch * 100)}%
+        {/* Franja horizontal compacta de Zoom + Métricas en vivo + Vista Rectificada opcional */}
+        {hasPhoto && (
+          <div className="eval-strip-bar">
+            <div className="eval-strip-meters">
+              {marginEval && (
+                <span className="eval-inline-pill">
+                  <span>Contorno</span>
+                  <span className="eval-mini-bar">
+                    <i
+                      className={`eval-bar-fill ${scoreToneClass(marginEval.overallScore)}`}
+                      style={{ width: `${marginEval.overallScore}%` }}
+                    />
+                  </span>
+                  <strong className={scoreToneClass(marginEval.overallScore)}>
+                    {marginEval.overallScore}%
+                  </strong>
+                </span>
+              )}
+              {live3DSimilarity && (
+                <span className="eval-inline-pill">
+                  <span>3D vs Foto</span>
+                  <span className="eval-mini-bar">
+                    <i
+                      className={`eval-bar-fill ${scoreToneClass(live3DSimilarity.overallScore)}`}
+                      style={{ width: `${live3DSimilarity.overallScore}%` }}
+                    />
+                  </span>
+                  <strong className={scoreToneClass(live3DSimilarity.overallScore)}>
+                    {live3DSimilarity.overallScore}%
+                  </strong>
+                </span>
+              )}
+              <span className="eval-sub mono">
+                {totalUserVectors} vec ({topology.vDividers.length}V·{topology.hShelves.length}H
+                {diagCount > 0 ? `·${diagCount}D` : ''})
+                {cameraPose ? ` · ~${cameraPose.distanceMeters.toFixed(1)}m` : ''}
+              </span>
+              <div className="vector-legend-mini">
+                <span><i style={{ background: '#00e5ff' }} />Contorno</span>
+                <span><i style={{ background: '#22c55e' }} />V</span>
+                <span><i style={{ background: '#f59e0b' }} />H</span>
+                <span><i style={{ background: '#d946ef' }} />Diag</span>
               </div>
             </div>
-          )}
 
-          {cameraPose && (
-            <div className="eval-sub mono">
-              Cámara ~{cameraPose.distanceMeters.toFixed(1)} m · W/H {estimatedAspectXY.toFixed(2)}
-            </div>
-          )}
-
-          {hasPhoto && (
-            <div className="vector-legend-mini">
-              <span><i style={{ background: '#00e5ff' }} />Contorno</span>
-              <span><i style={{ background: '#22c55e' }} />Divisor (V)</span>
-              <span><i style={{ background: '#f59e0b' }} />Repisa (H)</span>
-              <span><i style={{ background: '#d946ef' }} />Diagonal</span>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Chips táctiles de Zonas resultantes de tus vectores */}
-      {hasPhoto && viewTab === 'frontal' && zones.length > 0 && (
-        <div className="quick-zones-strip">
-          <span className="small-note">
-            <strong>Zonas ({zones.length}):</strong>
-          </span>
-          {zones.map((z, idx) => (
-            <div key={z.id} className="quick-zone-pill">
-              <i style={{ background: ZONE_COLORS[z.kind].dot }} />
-              <span>Z{idx + 1}:</span>
-              <select
-                value={z.kind}
-                onChange={(e) => handleZoneKindSelect(z.id, e.target.value as FrontModuleKind)}
-                aria-label={`Tipo de módulo zona ${idx + 1}`}
+            <div className="chip-row">
+              <button
+                type="button"
+                className={canvasZoom === 2 ? 'chip-btn active' : 'chip-btn'}
+                onClick={() => setCanvasZoom((z) => (z === 1 ? 2 : 1))}
+                title="Acercar foto 2× para calcar bordes finos con precisión"
               >
-                <option value="open">Abierto</option>
-                <option value="door_left">Puerta Izq</option>
-                <option value="door_right">Puerta Der</option>
-                <option value="door_double">2 Puertas</option>
-                <option value="door_glass">Vidrio</option>
-                <option value="drawers">Cajones (5 pzas)</option>
-                <option value="leg_void">Hueco Piernas</option>
+                {canvasZoom === 2 ? <ZoomOut size={12} /> : <ZoomIn size={12} />}
+                {canvasZoom === 2 ? 'Zoom 2×' : 'Zoom 1×'}
+              </button>
+              <button
+                type="button"
+                className={showRectPreview ? 'chip-btn active' : 'chip-btn'}
+                onClick={() => setShowRectPreview((v) => !v)}
+              >
+                <Eye size={12} /> Rectificado
+              </button>
+              <select
+                className="select-mini"
+                value={focal35mm}
+                onChange={(e) => setFocal35mm(Number(e.target.value) as 26 | 52)}
+                aria-label="Lente"
+              >
+                <option value={26}>1× (26mm)</option>
+                <option value={52}>2× (52mm)</option>
               </select>
-              {z.kind === 'drawers' && (
-                <select
-                  value={z.drawerCount ?? 2}
-                  onChange={(e) => handleZoneDrawerCount(z.id, Number(e.target.value))}
-                  aria-label={`Cantidad de cajones zona ${idx + 1}`}
-                  title="Cantidad de cajones"
-                >
-                  {[1, 2, 3, 4, 5, 6].map((n) => (
-                    <option key={n} value={n}>
-                      ×{n}
-                    </option>
-                  ))}
-                </select>
+            </div>
+          </div>
+        )}
+
+        {hasPhoto && showRectPreview && (
+          <div className="rect-drawer-box">
+            <canvas ref={rectPreviewRef} className="rect-preview-canvas" />
+            <div className="eval-sub">
+              <strong>Frente rectificado por Homografía H 3×3</strong>
+              <br />
+              Relación ancho/alto W/H = {estimatedAspectXY.toFixed(2)}
+              {live3DSimilarity && (
+                <>
+                  <br />
+                  Silueta {Math.round(live3DSimilarity.silhouetteMatch * 100)}% · Bordes{' '}
+                  {Math.round(live3DSimilarity.edgeStructureMatch * 100)}% · Color{' '}
+                  {Math.round(live3DSimilarity.colorPaletteMatch * 100)}%
+                </>
               )}
             </div>
-          ))}
-        </div>
-      )}
+          </div>
+        )}
+      </div>
+
+      {/* INSPECTOR CONTEXTUAL DE ZONAS (1 clic para elegir qué es cada espacio, incluyendo ✕ Sin mueble, Canastos y Bicolor) */}
+      {hasPhoto && viewTab === 'frontal' && zones.length > 0 && (() => {
+        const activeZone =
+          zones.find((z) => z.id === selectedZoneId) ?? zones[0];
+        const activeIdx = zones.findIndex((z) => z.id === activeZone.id);
+        const zWcm = Math.round(((activeZone.uEnd - activeZone.uStart) * params.targetDimensions.x) / 10);
+        const zHcm = Math.round(((activeZone.vEnd - activeZone.vStart) * params.targetDimensions.y) / 10);
+        const isClosedFront =
+          activeZone.kind === 'door_left' ||
+          activeZone.kind === 'door_right' ||
+          activeZone.kind === 'door_double' ||
+          activeZone.kind === 'door_glass' ||
+          activeZone.kind === 'drawers';
+        const supportsInternalShelves =
+          activeZone.kind === 'open' ||
+          activeZone.kind === 'door_left' ||
+          activeZone.kind === 'door_right' ||
+          activeZone.kind === 'door_double' ||
+          activeZone.kind === 'door_glass';
+
+        return (
+          <div className="zone-inspector-card">
+            <div className="zone-inspector-head">
+              <div className="zone-tabs-row">
+                <strong>Zonas ({zones.length}):</strong>
+                {zones.map((z, idx) => (
+                  <button
+                    key={z.id}
+                    type="button"
+                    className={`zone-tab-chip${z.id === activeZone.id ? ' active' : ''}${
+                      z.kind === 'void_outside' ? ' is-void' : ''
+                    }`}
+                    onClick={() => setSelectedZoneId(z.id)}
+                  >
+                    <i style={{ background: ZONE_COLORS[z.kind].dot }} />
+                    Z{idx + 1}:{' '}
+                    {z.kind === 'drawers'
+                      ? `${z.drawerCount ?? 1} Caj.`
+                      : z.kind === 'baskets'
+                        ? `${z.basketCount ?? 3} Can.`
+                        : ZONE_LABELS[z.kind]}
+                  </button>
+                ))}
+              </div>
+              <span className="mono small-note muted">
+                Z{activeIdx + 1} ≈ {zWcm} × {zHcm} cm
+              </span>
+            </div>
+
+            <div className="zone-kind-grid">
+              <button
+                type="button"
+                className={activeZone.kind === 'open' ? 'zone-kind-btn active' : 'zone-kind-btn'}
+                onClick={() => handleZoneKindSelect(activeZone.id, 'open')}
+              >
+                Abierto
+              </button>
+              <button
+                type="button"
+                className={activeZone.kind === 'baskets' ? 'zone-kind-btn active' : 'zone-kind-btn'}
+                onClick={() => handleZoneKindSelect(activeZone.id, 'baskets', activeZone.basketCount ?? 3)}
+              >
+                Canastos
+              </button>
+              <button
+                type="button"
+                className={activeZone.kind === 'door_left' ? 'zone-kind-btn active' : 'zone-kind-btn'}
+                onClick={() => handleZoneKindSelect(activeZone.id, 'door_left')}
+              >
+                Puerta Izq
+              </button>
+              <button
+                type="button"
+                className={activeZone.kind === 'door_right' ? 'zone-kind-btn active' : 'zone-kind-btn'}
+                onClick={() => handleZoneKindSelect(activeZone.id, 'door_right')}
+              >
+                Puerta Der
+              </button>
+              <button
+                type="button"
+                className={activeZone.kind === 'door_double' ? 'zone-kind-btn active' : 'zone-kind-btn'}
+                onClick={() => handleZoneKindSelect(activeZone.id, 'door_double')}
+              >
+                2 Puertas
+              </button>
+              <button
+                type="button"
+                className={activeZone.kind === 'door_glass' ? 'zone-kind-btn active' : 'zone-kind-btn'}
+                onClick={() => handleZoneKindSelect(activeZone.id, 'door_glass')}
+              >
+                Vidrio
+              </button>
+              <button
+                type="button"
+                className={
+                  activeZone.kind === 'drawers' && (activeZone.drawerCount ?? 1) === 1
+                    ? 'zone-kind-btn active'
+                    : 'zone-kind-btn'
+                }
+                onClick={() => handleZoneKindSelect(activeZone.id, 'drawers', 1)}
+              >
+                1 Cajón
+              </button>
+              <button
+                type="button"
+                className={
+                  activeZone.kind === 'drawers' && (activeZone.drawerCount ?? 1) > 1
+                    ? 'zone-kind-btn active'
+                    : 'zone-kind-btn'
+                }
+                onClick={() =>
+                  handleZoneKindSelect(
+                    activeZone.id,
+                    'drawers',
+                    (activeZone.drawerCount ?? 1) > 1 ? activeZone.drawerCount : 3,
+                  )
+                }
+              >
+                Cajonera
+              </button>
+              <button
+                type="button"
+                className={activeZone.kind === 'leg_void' ? 'zone-kind-btn active' : 'zone-kind-btn'}
+                onClick={() => handleZoneKindSelect(activeZone.id, 'leg_void')}
+              >
+                Hueco Piernas
+              </button>
+              <button
+                type="button"
+                className={
+                  activeZone.kind === 'void_outside'
+                    ? 'zone-kind-btn void-btn active'
+                    : 'zone-kind-btn void-btn'
+                }
+                onClick={() => handleZoneKindSelect(activeZone.id, 'void_outside')}
+                title="Este espacio está fuera del mueble (recorta cubierta, lateral y fondo en muebles escalonados)"
+              >
+                ✕ Sin mueble (Vacío)
+              </button>
+            </div>
+
+            <div className="zone-sub-row">
+              {activeZone.kind === 'drawers' && (
+                <div className="chip-row">
+                  <span>Cantidad cajones:</span>
+                  {[1, 2, 3, 4, 5, 6].map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      className={(activeZone.drawerCount ?? 1) === n ? 'chip-btn active' : 'chip-btn'}
+                      onClick={() => handleZoneDrawerCount(activeZone.id, n)}
+                    >
+                      ×{n}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {activeZone.kind === 'baskets' && (
+                <div className="chip-row">
+                  <span>Canastos extraíbles:</span>
+                  {[1, 2, 3, 4].map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      className={(activeZone.basketCount ?? 3) === n ? 'chip-btn active' : 'chip-btn'}
+                      onClick={() => handleZoneBasketCount(activeZone.id, n)}
+                    >
+                      ×{n}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {supportsInternalShelves && (
+                <div className="chip-row">
+                  <span>Repisas internas:</span>
+                  {[0, 1, 2, 3, 4].map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      className={(activeZone.internalShelves ?? 0) === n ? 'chip-btn active' : 'chip-btn'}
+                      onClick={() => handleZoneInternalShelves(activeZone.id, n)}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {isClosedFront && (
+                <div className="chip-row">
+                  <span>Color frente:</span>
+                  <button
+                    type="button"
+                    className={!activeZone.materialOverride ? 'chip-btn active' : 'chip-btn'}
+                    onClick={() => handleZoneMaterialOverride(activeZone.id, 'same')}
+                  >
+                    Carcasa
+                  </button>
+                  {(['blanco', 'roble', 'grafito'] as MelamineMaterial[]).map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      className={
+                        activeZone.materialOverride === m
+                          ? 'chip-btn swatch-btn active'
+                          : 'chip-btn swatch-btn'
+                      }
+                      onClick={() => handleZoneMaterialOverride(activeZone.id, m)}
+                    >
+                      <i className={`swatch-dot swatch-${m}`} />
+                      {m === 'blanco' ? 'Blanco' : m === 'roble' ? 'Roble' : 'Grafito'}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       <p className="status-line">{statusMsg}</p>
 

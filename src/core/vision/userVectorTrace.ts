@@ -199,7 +199,7 @@ export function vectorizeUserStroke(
 
   const shouldBeDiagonal =
     strokeMode === 'diagonal' ||
-    (strokeMode === 'auto' && absAngleFromHorizDeg > 18 && absAngleFromHorizDeg < 72);
+    (strokeMode === 'auto' && absAngleFromHorizDeg > 24 && absAngleFromHorizDeg < 66);
 
   if (shouldBeDiagonal) {
     const allUAnchors = [0, ...existingVDividers.map((d) => d.position), 1];

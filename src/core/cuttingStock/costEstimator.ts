@@ -102,7 +102,11 @@ export function estimateProjectBomAndCost(
   }
 
   const externalHardware: BomLineItem[] = despiece.hardwareSummary.map((hw) => {
-    const unitClp = HARDWARE_UNIT_CLP[hw.categoria];
+    const unitClp = /canasto/i.test(hw.descripcion)
+      ? 14990
+      : /rueda/i.test(hw.descripcion)
+        ? 4990
+        : HARDWARE_UNIT_CLP[hw.categoria];
     return {
       id: `cost_${hw.id}`,
       nombre: hw.descripcion,

@@ -6,6 +6,7 @@
 import { useMemo, useState } from 'react';
 import { Lock, Unlock } from 'lucide-react';
 import type {
+  BaseSupportType,
   FrontZone,
   FurnitureTopology,
   HardwareItem,
@@ -20,6 +21,7 @@ import {
   clonePreset,
   compareShapeAspect,
   computeUnitDirectionVector,
+  resolveBaseSupport,
   type PresetKey,
 } from './core/mathEngine';
 import { generateCuttingPlan } from './core/cuttingStock';
@@ -214,11 +216,86 @@ export default function App() {
   const handleToggleExternalLegs = (checked: boolean, heightMm?: number, count?: number) => {
     setTopology((prev) => ({
       ...prev,
+      baseSupportType: checked ? 'legs' : 'none',
       hasExternalLegs: checked,
       externalLegHeightMm: heightMm ?? prev.externalLegHeightMm ?? 150,
       externalLegCount: count ?? prev.externalLegCount ?? 4,
+      toeKickHeightMm: checked ? 0 : prev.toeKickHeightMm,
     }));
   };
+
+  const handleSetBaseSupport = (
+    type: BaseSupportType,
+    heightMm?: number,
+    count?: number,
+  ) => {
+    setTopology((prev) => {
+      if (type === 'none') {
+        return {
+          ...prev,
+          baseSupportType: 'none',
+          hasExternalLegs: false,
+          toeKickHeightMm: 0,
+        };
+      }
+      if (type === 'toe_kick') {
+        return {
+          ...prev,
+          baseSupportType: 'toe_kick',
+          hasExternalLegs: false,
+          toeKickHeightMm: heightMm ?? (prev.toeKickHeightMm && prev.toeKickHeightMm >= 40 ? prev.toeKickHeightMm : 80),
+        };
+      }
+      const isWheel = type === 'wheels';
+      const defaultH = isWheel ? 65 : 150;
+      return {
+        ...prev,
+        baseSupportType: type,
+        hasExternalLegs: true,
+        externalLegHeightMm: heightMm ?? defaultH,
+        externalLegCount: count ?? prev.externalLegCount ?? 4,
+        toeKickHeightMm: 0,
+      };
+    });
+  };
+
+  const handleSetAllFrontsMaterial = (choice: MelamineMaterial | 'same') => {
+    setTopology((prev) => {
+      const zones = prev.frontZones ?? [];
+      if (zones.length === 0) return prev;
+      return {
+        ...prev,
+        frontZones: zones.map((z) => {
+          if (
+            z.kind === 'open' ||
+            z.kind === 'leg_void' ||
+            z.kind === 'void_outside' ||
+            z.kind === 'baskets'
+          ) {
+            return z;
+          }
+          return {
+            ...z,
+            materialOverride: choice === 'same' ? undefined : choice,
+          };
+        }),
+      };
+    });
+  };
+
+  const activeSupport = resolveBaseSupport(topology);
+  const closedFrontZones = (topology.frontZones ?? []).filter(
+    (z) =>
+      z.kind !== 'open' &&
+      z.kind !== 'leg_void' &&
+      z.kind !== 'void_outside' &&
+      z.kind !== 'baskets',
+  );
+  const activeFrontOverride: MelamineMaterial | 'same' | 'mixed' = (() => {
+    if (closedFrontZones.length === 0) return 'same';
+    const first = closedFrontZones[0].materialOverride ?? 'same';
+    return closedFrontZones.every((z) => (z.materialOverride ?? 'same') === first) ? first : 'mixed';
+  })();
 
   const handleAddHardwareItem = (item: HardwareItem) => {
     setTopology((prev) => ({
@@ -240,9 +317,9 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <div className="brand-title">SmartFurniture v6.1 — Contorno 4 Puntos + Rectas y Diagonales → 3D</div>
+          <div className="brand-title">SmartFurniture v7.0 — Calcado Escalonado, Bicolor y 3D Exacto</div>
           <div className="brand-sub">
-            100% Local Offline · Marca 4 esquinas en perspectiva + divisiones rectas o diagonales → 3D exacto y Corte 244×122
+            100% Local Offline · Contorno 4 pts con lupa y fuga · Vacío exterior · Canastos · Ruedas · Bicolor y Corte 244×122
           </div>
         </div>
         <div className="preset-bar">
@@ -467,26 +544,56 @@ export default function App() {
               Fondo Durolac 3 mm (n×3 → n×5)
             </label>
 
-            <label className="toggle-label">
-              <input
-                type="checkbox"
-                checked={Boolean(topology.hasExternalLegs)}
-                onChange={(e) => handleToggleExternalLegs(e.target.checked)}
-              />
-              Patas externas independientes
-            </label>
-            {topology.hasExternalLegs && (
+            <div className="small-note muted" style={{ marginTop: 2 }}>
+              <strong>Apoyo inferior:</strong>
+            </div>
+            <div className="support-seg-grid">
+              {(
+                [
+                  ['none', 'Al piso'],
+                  ['toe_kick', 'Zócalo'],
+                  ['legs', 'Patas'],
+                  ['wheels', 'Ruedas'],
+                ] as const
+              ).map(([supKey, label]) => (
+                <button
+                  key={supKey}
+                  type="button"
+                  className={activeSupport.type === supKey ? 'chip-btn active' : 'chip-btn'}
+                  onClick={() => handleSetBaseSupport(supKey)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {activeSupport.type === 'toe_kick' && (
+              <div className="chip-row">
+                <label className="small-note inline-num">
+                  Alto zócalo (mm):
+                  <NumericInput
+                    min={40}
+                    max={200}
+                    step={10}
+                    value={activeSupport.heightMm}
+                    onCommit={(v) => handleSetBaseSupport('toe_kick', v)}
+                    style={{ width: 62 }}
+                    ariaLabel="Alto de zócalo en milímetros"
+                  />
+                </label>
+              </div>
+            )}
+            {(activeSupport.type === 'legs' || activeSupport.type === 'wheels') && (
               <div className="chip-row">
                 <label className="small-note inline-num">
                   Alto (mm):
                   <NumericInput
-                    min={40}
+                    min={30}
                     max={400}
-                    step={10}
-                    value={topology.externalLegHeightMm ?? 150}
-                    onCommit={(v) => handleToggleExternalLegs(true, v, topology.externalLegCount)}
+                    step={5}
+                    value={activeSupport.heightMm}
+                    onCommit={(v) => handleSetBaseSupport(activeSupport.type, v, activeSupport.count)}
                     style={{ width: 62 }}
-                    ariaLabel="Alto de patas en milímetros"
+                    ariaLabel="Alto de patas o ruedas en milímetros"
                   />
                 </label>
                 <label className="small-note inline-num">
@@ -494,11 +601,11 @@ export default function App() {
                   <NumericInput
                     min={2}
                     max={12}
-                    step={2}
-                    value={topology.externalLegCount ?? 4}
-                    onCommit={(v) => handleToggleExternalLegs(true, topology.externalLegHeightMm, v)}
+                    step={1}
+                    value={activeSupport.count}
+                    onCommit={(v) => handleSetBaseSupport(activeSupport.type, activeSupport.heightMm, v)}
                     style={{ width: 48 }}
-                    ariaLabel="Cantidad de patas"
+                    ariaLabel="Cantidad de patas o ruedas"
                   />
                 </label>
               </div>
@@ -506,7 +613,8 @@ export default function App() {
           </div>
 
           <div className="control-group">
-            <h3>Acabado 3D y Vista Explotada</h3>
+            <h3>Acabado 3D (Carcasa y Frentes)</h3>
+            <div className="small-note muted">Carcasa / estructura:</div>
             <div className="chip-row">
               {(['blanco', 'roble', 'grafito'] as MelamineMaterial[]).map((m) => (
                 <button
@@ -520,6 +628,31 @@ export default function App() {
                 </button>
               ))}
             </div>
+            {closedFrontZones.length > 0 && (
+              <>
+                <div className="small-note muted">Frentes (puertas / cajones — Bicolor):</div>
+                <div className="chip-row">
+                  <button
+                    type="button"
+                    className={activeFrontOverride === 'same' ? 'chip-btn active' : 'chip-btn'}
+                    onClick={() => handleSetAllFrontsMaterial('same')}
+                  >
+                    Igual
+                  </button>
+                  {(['blanco', 'roble', 'grafito'] as MelamineMaterial[]).map((m) => (
+                    <button
+                      key={`front_${m}`}
+                      type="button"
+                      className={activeFrontOverride === m ? 'chip-btn swatch-btn active' : 'chip-btn swatch-btn'}
+                      onClick={() => handleSetAllFrontsMaterial(m)}
+                    >
+                      <i className={`swatch-dot swatch-${m}`} />
+                      {m === 'blanco' ? 'Blanco' : m === 'roble' ? 'Roble' : 'Grafito'}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
             <div className="slider-row">
               <div className="slider-head">
                 <label>Separar piezas (Explotada)</label>

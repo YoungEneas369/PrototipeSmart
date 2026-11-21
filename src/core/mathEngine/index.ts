@@ -6,6 +6,7 @@
  */
 import type {
   BaseMatrixScaleResult,
+  BaseSupportType,
   BoardPiece,
   DespieceResult,
   EdgeBandingFlags,
@@ -402,23 +403,86 @@ interface VirtualShelf {
   uEnd: number;
 }
 
+export interface ResolvedBaseSupport {
+  type: BaseSupportType;
+  heightMm: number;
+  count: number;
+}
+
+/**
+ * Resuelve el tipo real de apoyo inferior (`none` | `legs` | `wheels` | `toe_kick`)
+ * manteniendo compatibilidad 100% hacia atrás con `hasExternalLegs` y `toeKickHeightMm`.
+ */
+export function resolveBaseSupport(topology: FurnitureTopology): ResolvedBaseSupport {
+  if (topology.baseSupportType) {
+    const t = topology.baseSupportType;
+    if (t === 'wheels') {
+      return {
+        type: 'wheels',
+        heightMm: Math.max(30, topology.externalLegHeightMm ?? 65),
+        count: Math.max(2, Math.round(topology.externalLegCount ?? 4)),
+      };
+    }
+    if (t === 'legs') {
+      return {
+        type: 'legs',
+        heightMm: Math.max(40, topology.externalLegHeightMm ?? 150),
+        count: Math.max(2, Math.round(topology.externalLegCount ?? 4)),
+      };
+    }
+    if (t === 'toe_kick') {
+      return {
+        type: 'toe_kick',
+        heightMm: Math.min(200, Math.max(40, topology.toeKickHeightMm ?? 80)),
+        count: 0,
+      };
+    }
+    return { type: 'none', heightMm: 0, count: 0 };
+  }
+
+  if (topology.hasExternalLegs) {
+    const hasWheelHw = (topology.hardwareItems ?? []).some((h) =>
+      /rueda|caster|garrucha/i.test(h.descripcion),
+    );
+    return {
+      type: hasWheelHw ? 'wheels' : 'legs',
+      heightMm: Math.max(30, topology.externalLegHeightMm ?? (hasWheelHw ? 65 : 150)),
+      count: Math.max(2, Math.round(topology.externalLegCount ?? 4)),
+    };
+  }
+
+  if ((topology.toeKickHeightMm ?? 0) > 0) {
+    return {
+      type: 'toe_kick',
+      heightMm: Math.min(200, Math.max(40, topology.toeKickHeightMm!)),
+      count: 0,
+    };
+  }
+
+  return { type: 'none', heightMm: 0, count: 0 };
+}
+
 function buildHardwareSummary(topology: FurnitureTopology): HardwareItem[] {
   const items: HardwareItem[] = (topology.hardwareItems ?? []).map((item) => ({
     ...item,
   }));
+  const support = resolveBaseSupport(topology);
 
-  if (topology.hasExternalLegs) {
+  if (support.type === 'legs' || support.type === 'wheels') {
     const alreadyHasLegs = items.some((i) => i.categoria === 'patas');
     if (!alreadyHasLegs) {
-      const count = Math.max(1, Math.round(topology.externalLegCount ?? 4));
-      const heightMm = topology.externalLegHeightMm ?? 150;
+      const isWheels = support.type === 'wheels';
       items.unshift({
-        id: 'hw_patas_externas',
+        id: isWheels ? 'hw_ruedas_externas' : 'hw_patas_externas',
         categoria: 'patas',
-        descripcion: `Patas independientes externas (${heightMm} mm)`,
-        cantidad: count,
-        medidaReferenciaMm: heightMm,
-        notaCompra: `Excluidas del cuerpo de melamina. Adquirir ${count} patas del mismo tipo (${heightMm} mm aprox.) aparte.`,
+        descripcion: isWheels
+          ? `Ruedas giratorias con freno (${support.heightMm} mm)`
+          : `Patas independientes externas (${support.heightMm} mm)`,
+        cantidad: support.count,
+        medidaReferenciaMm: support.heightMm,
+        notaCompra: isWheels
+          ? `Excluidas del cuerpo de melamina. Adquirir ${support.count} ruedas giratorias (${support.heightMm} mm) con freno.`
+          : `Excluidas del cuerpo de melamina. Adquirir ${support.count} patas del mismo tipo (${support.heightMm} mm aprox.) aparte.`,
         origen: topology.detectionSource === 'auto' ? 'detectado' : 'manual',
       });
     }
@@ -498,13 +562,83 @@ export function calculateDespiece(
   const joint = params.cornerJointType;
   const edgeMode = params.edgeBandingMode;
 
-  // 1. CARCASA EXTERIOR (Base / Bases parciales con faldón si hay hueco de piernas, Cubierta, Laterales)
+  // 1. CARCASA EXTERIOR (Base / Bases parciales con faldón, Cubierta recortada si hay escalón `void_outside`, Laterales)
+  const support = resolveBaseSupport(topology);
   const horizWidth = joint === 'topOverSides' ? xf : xInt;
-  const sideHeight = joint === 'topOverSides' ? yInt : yf;
   const frontZones = topology.frontZones ?? [];
   const legVoidsAtBottom = frontZones.filter(
     (z) => z.kind === 'leg_void' && z.vStart <= SEGMENT_TOUCH_TOL,
   );
+  const minCy = e + e / 2;
+  const maxCy = yf - e - e / 2;
+  const minMarginU = Math.min(0.49, (e / 2) / xInt);
+
+  // Detección exacta de recortes escalonados (`void_outside`) en esquina superior derecha y/o izquierda
+  interface StepCutout {
+    u: number;
+    v: number;
+    x: number;
+    cy: number;
+    yBot: number;
+    yTop: number;
+  }
+
+  const rawTopRight = frontZones.find(
+    (z) =>
+      z.kind === 'void_outside' &&
+      z.uEnd >= 0.98 &&
+      z.vEnd >= 0.98 &&
+      z.uStart > 0.05 &&
+      z.uStart < 0.95 &&
+      z.vStart > 0.05 &&
+      z.vStart < 0.95,
+  );
+  let stepR: StepCutout | null = null;
+  if (rawTopRight) {
+    const uR = clamp(rawTopRight.uStart, minMarginU, 1 - minMarginU);
+    const xR = e + uR * xInt;
+    const vR = clamp01(rawTopRight.vStart);
+    const cyR = clamp(e + vR * yInt, minCy, maxCy);
+    const yRBot = cyR - e / 2;
+    const yRTop = cyR + e / 2;
+    if (
+      yRBot > e + GEOM_EPS &&
+      yRTop < yf - e - GEOM_EPS &&
+      xR + e / 2 < xf - e - GEOM_EPS &&
+      xR - e / 2 > e + GEOM_EPS
+    ) {
+      stepR = { u: uR, v: vR, x: xR, cy: cyR, yBot: yRBot, yTop: yRTop };
+    }
+  }
+
+  const rawTopLeft = frontZones.find(
+    (z) =>
+      z.kind === 'void_outside' &&
+      z.uStart <= 0.02 &&
+      z.vEnd >= 0.98 &&
+      z.uEnd > 0.05 &&
+      z.uEnd < 0.95 &&
+      z.vStart > 0.05 &&
+      z.vStart < 0.95,
+  );
+  let stepL: StepCutout | null = null;
+  if (rawTopLeft) {
+    const uL = clamp(rawTopLeft.uEnd, minMarginU, 1 - minMarginU);
+    const xL = e + uL * xInt;
+    const vL = clamp01(rawTopLeft.vStart);
+    const cyL = clamp(e + vL * yInt, minCy, maxCy);
+    const yLBot = cyL - e / 2;
+    const yLTop = cyL + e / 2;
+    if (
+      yLBot > e + GEOM_EPS &&
+      yLTop < yf - e - GEOM_EPS &&
+      xL - e / 2 > e + GEOM_EPS &&
+      xL + e / 2 < xf - e - GEOM_EPS &&
+      (!stepR || xL + e / 2 < stepR.x - e / 2 - GEOM_EPS)
+    ) {
+      stepL = { u: uL, v: vL, x: xL, cy: cyL, yBot: yLBot, yTop: yLTop };
+    }
+  }
 
   if (legVoidsAtBottom.length === 0) {
     pieces.push({
@@ -599,60 +733,84 @@ export function calculateDespiece(
     }
   }
 
-  // Cubierta
+  // Cubierta (recortada exactamente si existe `void_outside` superior derecho o izquierdo)
+  const xCub0 = stepL ? stepL.x - e / 2 : joint === 'topOverSides' ? 0 : e;
+  const xCub1 = stepR ? stepR.x + e / 2 : joint === 'topOverSides' ? xf : xf - e;
+  const cubWidth = xCub1 - xCub0;
+  const cubEdges = { ...resolveEdgeBanding('cubierta', joint, edgeMode) };
+  if (stepR) cubEdges.right = true;
+  if (stepL) cubEdges.left = true;
   pieces.push({
     id: 'cubierta',
     nombre: 'Cubierta',
     tipo: 'cubierta',
-    ancho: horizWidth,
+    ancho: cubWidth,
     alto: zf,
     espesor: e,
     cantidad: 1,
     respectGrain: true,
-    edges: resolveEdgeBanding('cubierta', joint, edgeMode),
-    posicion3D: [xf / 2, yf - e / 2, zf / 2],
-    dimensiones3D: [horizWidth, e, zf],
+    edges: cubEdges,
+    posicion3D: [(xCub0 + xCub1) / 2, yf - e / 2, zf / 2],
+    dimensiones3D: [cubWidth, e, zf],
     rotacion3D: [0, 0, 0],
     material: mat,
   });
 
-  // Laterales (ancho = sideHeight veta VERTICAL en eje Y, alto = zf profundidad)
+  // Laterales (ancho = altura veta VERTICAL en eje Y, alto = zf profundidad; recortados en escalón)
+  const yL0 = joint === 'topOverSides' ? e : 0;
+  const yL1 = stepL
+    ? joint === 'topOverSides'
+      ? stepL.yBot
+      : stepL.yTop
+    : joint === 'topOverSides'
+      ? yf - e
+      : yf;
+  const hLeft = yL1 - yL0;
+
   pieces.push({
     id: 'lateral_izq',
     nombre: 'Lateral Izquierdo',
     tipo: 'lateral',
-    ancho: sideHeight,
+    ancho: hLeft,
     alto: zf,
     espesor: e,
     cantidad: 1,
     respectGrain: true,
     edges: resolveEdgeBanding('lateral', joint, edgeMode),
-    posicion3D: [e / 2, yf / 2, zf / 2],
-    dimensiones3D: [e, sideHeight, zf],
+    posicion3D: [e / 2, (yL0 + yL1) / 2, zf / 2],
+    dimensiones3D: [e, hLeft, zf],
     rotacion3D: [0, 0, 0],
     material: mat,
   });
+
+  const yR0 = joint === 'topOverSides' ? e : 0;
+  const yR1 = stepR
+    ? joint === 'topOverSides'
+      ? stepR.yBot
+      : stepR.yTop
+    : joint === 'topOverSides'
+      ? yf - e
+      : yf;
+  const hRight = yR1 - yR0;
 
   pieces.push({
     id: 'lateral_der',
     nombre: 'Lateral Derecho',
     tipo: 'lateral',
-    ancho: sideHeight,
+    ancho: hRight,
     alto: zf,
     espesor: e,
     cantidad: 1,
     respectGrain: true,
     edges: resolveEdgeBanding('lateral', joint, edgeMode),
-    posicion3D: [xf - e / 2, yf / 2, zf / 2],
-    dimensiones3D: [e, sideHeight, zf],
+    posicion3D: [xf - e / 2, (yR0 + yR1) / 2, zf / 2],
+    dimensiones3D: [e, hRight, zf],
     rotacion3D: [0, 0, 0],
     material: mat,
   });
 
-  // 2. PREPARACIÓN DE REPISAS VIRTUALES (permite recorte simétrico ±e/2 en divisores parciales)
+  // 2. PREPARACIÓN DE REPISAS VIRTUALES (permite recorte simétrico ±e/2 en divisores parciales y repisas interiores)
   const virtualShelves: VirtualShelf[] = [];
-  const minCy = e + e / 2;
-  const maxCy = yf - e - e / 2;
 
   if (topology.shelfMode === 'equidistant') {
     shelfProgression.terms.forEach((an, idx) => {
@@ -693,8 +851,41 @@ export function calculateDespiece(
     });
   }
 
-  // 3. DIVISORES VERTICALES (continuos y parciales con recorte exacto contra repisas + anti-colisión)
-  const minMarginU = Math.min(0.49, (e / 2) / xInt);
+  // Repisas interiores opcionales definidas dentro de zonas (`zone.internalShelves > 0`)
+  for (const zone of frontZones) {
+    const nInt = Math.max(0, Math.min(6, Math.round(zone.internalShelves ?? 0)));
+    if (
+      nInt <= 0 ||
+      zone.kind === 'drawers' ||
+      zone.kind === 'baskets' ||
+      zone.kind === 'leg_void' ||
+      zone.kind === 'void_outside'
+    ) {
+      continue;
+    }
+    const zU0 = clamp01(Math.min(zone.uStart, zone.uEnd));
+    const zU1 = clamp01(Math.max(zone.uStart, zone.uEnd));
+    const zV0 = clamp01(Math.min(zone.vStart, zone.vEnd));
+    const zV1 = clamp01(Math.max(zone.vStart, zone.vEnd));
+    const y0Zone = e + zV0 * yInt;
+    const y1Zone = e + zV1 * yInt;
+    const hZone = y1Zone - y0Zone;
+    const netSpace = hZone - nInt * e;
+    if (zU1 - zU0 <= 0.04 || netSpace <= 20) continue;
+    const clearGap = netSpace / (nInt + 1);
+    for (let k = 1; k <= nInt; k++) {
+      const cy = clamp(y0Zone + k * clearGap + (k - 0.5) * e, minCy, maxCy);
+      virtualShelves.push({
+        id: `rep_int_${zone.id}_${k}`,
+        labelPrefix: `Repisa Interior ${zone.label ?? zone.id} #${k}`,
+        cy,
+        uStart: zU0,
+        uEnd: zU1,
+      });
+    }
+  }
+
+  // 3. DIVISORES VERTICALES (continuos y parciales con recorte exacto contra repisas, escalones y anti-colisión)
   const sortedDivs = [...topology.vDividers].sort((a, b) => a.position - b.position);
   const activeDividers: ActiveDividerSpan[] = [];
   const shelfTouchTolMm = Math.max(e * 0.65, yInt * 0.015);
@@ -719,6 +910,10 @@ export function calculateDespiece(
       );
       if (bottomShelf) {
         divY0 = bottomShelf.cy + e / 2;
+      } else if (stepR && u >= stepR.u - SEGMENT_TOUCH_TOL && Math.abs(stepR.cy - divY0) <= shelfTouchTolMm) {
+        divY0 = stepR.yTop;
+      } else if (stepL && u <= stepL.u + SEGMENT_TOUCH_TOL && Math.abs(stepL.cy - divY0) <= shelfTouchTolMm) {
+        divY0 = stepL.yTop;
       }
     }
     if (vEnd < 1 - SEGMENT_TOUCH_TOL) {
@@ -730,7 +925,21 @@ export function calculateDespiece(
       );
       if (topShelf) {
         divY1 = topShelf.cy - e / 2;
+      } else if (stepR && u >= stepR.u - SEGMENT_TOUCH_TOL && Math.abs(stepR.cy - divY1) <= shelfTouchTolMm) {
+        divY1 = stepR.yBot;
+      } else if (stepL && u <= stepL.u + SEGMENT_TOUCH_TOL && Math.abs(stepL.cy - divY1) <= shelfTouchTolMm) {
+        divY1 = stepL.yBot;
       }
+    }
+
+    // Recorte contra vacío exterior escalonado (solo divisores estrictamente dentro del área recortada)
+    if (stepR && u > stepR.u + SEGMENT_TOUCH_TOL) {
+      divY1 = Math.min(divY1, stepR.yBot);
+      if (divY1 - divY0 <= GEOM_EPS) continue;
+    }
+    if (stepL && u < stepL.u - SEGMENT_TOUCH_TOL) {
+      divY1 = Math.min(divY1, stepL.yBot);
+      if (divY1 - divY0 <= GEOM_EPS) continue;
     }
 
     const dy = divY1 - divY0;
@@ -783,12 +992,167 @@ export function calculateDespiece(
     });
   }
 
-  // 4. PIPELINE UNIFICADO DE REPISAS (`equidistant` y `custom` pasan por el MISMO recortador)
-
-  // Registro de repisas colocadas para validar colisiones verticales en el mismo vano
+  // 3B. AUTO-CIERRE VERTICAL DE TORRE EN ESCALÓN + CUBIERTAS DE ESCALÓN (0.000 mm overlap)
   const placedShelves: Array<{ x0: number; x1: number; cy: number }> = [];
 
-  for (const shelf of virtualShelves) {
+  if (stepR) {
+    const hasTowerWallR = activeDividers.some(
+      (d) =>
+        Math.abs(d.u - stepR.u) <= SEGMENT_TOUCH_TOL &&
+        d.y0 <= stepR.yTop + GEOM_EPS &&
+        d.y1 >= yf - e - GEOM_EPS,
+    );
+    if (!hasTowerWallR) {
+      const twH = yf - e - stepR.yTop;
+      if (twH > GEOM_EPS) {
+        activeDividers.push({
+          id: 'lateral_escalon_der',
+          u: stepR.u,
+          cx: stepR.x,
+          y0: stepR.yTop,
+          y1: yf - e,
+        });
+        pieces.push({
+          id: 'lateral_escalon_der',
+          nombre: 'Lateral Escalón Der',
+          tipo: 'lateral',
+          ancho: twH,
+          alto: zf,
+          espesor: e,
+          cantidad: 1,
+          respectGrain: true,
+          edges: resolveEdgeBanding('lateral', joint, edgeMode),
+          posicion3D: [stepR.x, (stepR.yTop + (yf - e)) / 2, zf / 2],
+          dimensiones3D: [e, twH, zf],
+          rotacion3D: [0, 0, 0],
+          material: mat,
+        });
+      }
+    }
+
+    const divCrossesR = activeDividers.some(
+      (d) =>
+        Math.abs(d.u - stepR.u) <= SEGMENT_TOUCH_TOL &&
+        d.y0 < stepR.yTop - GEOM_EPS &&
+        d.y1 > stepR.yBot + GEOM_EPS,
+    );
+    const leftShelfAtStepR = virtualShelves.some(
+      (s) =>
+        Math.abs(s.cy - stepR.cy) < e - GEOM_EPS &&
+        s.uStart < stepR.u - SEGMENT_TOUCH_TOL &&
+        s.uEnd >= stepR.u - SEGMENT_TOUCH_TOL,
+    );
+    const xStepR0 = divCrossesR ? stepR.x + e / 2 : leftShelfAtStepR ? stepR.x : stepR.x - e / 2;
+    const xStepR1 = joint === 'topOverSides' ? xf : xf - e;
+    const wStepR = xStepR1 - xStepR0;
+    if (wStepR > GEOM_EPS) {
+      placedShelves.push({ x0: xStepR0, x1: xStepR1, cy: stepR.cy });
+      pieces.push({
+        id: 'cubierta_escalon_der',
+        nombre: 'Cubierta Escalón Der',
+        tipo: 'cubierta',
+        ancho: wStepR,
+        alto: zf,
+        espesor: e,
+        cantidad: 1,
+        respectGrain: true,
+        edges:
+          edgeMode === 'fullPerimeter'
+            ? { top: true, bottom: true, left: true, right: true }
+            : { top: true, bottom: false, left: false, right: joint === 'topOverSides' },
+        posicion3D: [(xStepR0 + xStepR1) / 2, stepR.cy, zf / 2],
+        dimensiones3D: [wStepR, e, zf],
+        rotacion3D: [0, 0, 0],
+        material: mat,
+      });
+    }
+  }
+
+  if (stepL) {
+    const hasTowerWallL = activeDividers.some(
+      (d) =>
+        Math.abs(d.u - stepL.u) <= SEGMENT_TOUCH_TOL &&
+        d.y0 <= stepL.yTop + GEOM_EPS &&
+        d.y1 >= yf - e - GEOM_EPS,
+    );
+    if (!hasTowerWallL) {
+      const twH = yf - e - stepL.yTop;
+      if (twH > GEOM_EPS) {
+        activeDividers.push({
+          id: 'lateral_escalon_izq',
+          u: stepL.u,
+          cx: stepL.x,
+          y0: stepL.yTop,
+          y1: yf - e,
+        });
+        pieces.push({
+          id: 'lateral_escalon_izq',
+          nombre: 'Lateral Escalón Izq',
+          tipo: 'lateral',
+          ancho: twH,
+          alto: zf,
+          espesor: e,
+          cantidad: 1,
+          respectGrain: true,
+          edges: resolveEdgeBanding('lateral', joint, edgeMode),
+          posicion3D: [stepL.x, (stepL.yTop + (yf - e)) / 2, zf / 2],
+          dimensiones3D: [e, twH, zf],
+          rotacion3D: [0, 0, 0],
+          material: mat,
+        });
+      }
+    }
+
+    const divCrossesL = activeDividers.some(
+      (d) =>
+        Math.abs(d.u - stepL.u) <= SEGMENT_TOUCH_TOL &&
+        d.y0 < stepL.yTop - GEOM_EPS &&
+        d.y1 > stepL.yBot + GEOM_EPS,
+    );
+    const rightShelfAtStepL = virtualShelves.some(
+      (s) =>
+        Math.abs(s.cy - stepL.cy) < e - GEOM_EPS &&
+        s.uEnd > stepL.u + SEGMENT_TOUCH_TOL &&
+        s.uStart <= stepL.u + SEGMENT_TOUCH_TOL,
+    );
+    const xStepL0 = joint === 'topOverSides' ? 0 : e;
+    const xStepL1 = divCrossesL ? stepL.x - e / 2 : rightShelfAtStepL ? stepL.x : stepL.x + e / 2;
+    const wStepL = xStepL1 - xStepL0;
+    if (wStepL > GEOM_EPS) {
+      placedShelves.push({ x0: xStepL0, x1: xStepL1, cy: stepL.cy });
+      pieces.push({
+        id: 'cubierta_escalon_izq',
+        nombre: 'Cubierta Escalón Izq',
+        tipo: 'cubierta',
+        ancho: wStepL,
+        alto: zf,
+        espesor: e,
+        cantidad: 1,
+        respectGrain: true,
+        edges:
+          edgeMode === 'fullPerimeter'
+            ? { top: true, bottom: true, left: true, right: true }
+            : { top: true, bottom: false, left: joint === 'topOverSides', right: false },
+        posicion3D: [(xStepL0 + xStepL1) / 2, stepL.cy, zf / 2],
+        dimensiones3D: [wStepL, e, zf],
+        rotacion3D: [0, 0, 0],
+        material: mat,
+      });
+    }
+  }
+
+  // 4. PIPELINE UNIFICADO DE REPISAS (`equidistant`, `custom` e interiores pasan por el MISMO recortador)
+  for (const rawShelf of virtualShelves) {
+    let sUStart = rawShelf.uStart;
+    let sUEnd = rawShelf.uEnd;
+    if (stepR && rawShelf.cy + e / 2 > stepR.yBot + GEOM_EPS) {
+      sUEnd = Math.min(sUEnd, stepR.u);
+    }
+    if (stepL && rawShelf.cy + e / 2 > stepL.yBot + GEOM_EPS) {
+      sUStart = Math.max(sUStart, stepL.u);
+    }
+    if (sUEnd - sUStart <= GEOM_EPS) continue;
+    const shelf: VirtualShelf = { ...rawShelf, uStart: sUStart, uEnd: sUEnd };
     // Divisores verticales que se cruzan con la banda Y de esta repisa
     const crossingDivs = activeDividers.filter(
       (div) => div.y0 < shelf.cy + e / 2 - GEOM_EPS && div.y1 > shelf.cy - e / 2 + GEOM_EPS,
@@ -914,78 +1278,109 @@ export function calculateDespiece(
     });
   }
 
-  // 4. FONDO DUROLAC / MDF 3 mm (clavado atrás en z ∈ [-backE, 0])
+  // 4. FONDO DUROLAC / MDF 3 mm (clavado atrás en z ∈ [-backE, 0]; segmentado por escalones `void_outside`)
   if (topology.hasBackPanel && backE > 0) {
     const backSheet = params.backPanelSheetDimensions ?? params.sheetDimensions;
     const minS = Math.min(backSheet.width, backSheet.height);
     const maxS = Math.max(backSheet.width, backSheet.height);
-    const needsSplit = (xf > minS && yf > minS) || xf > maxS || yf > maxS;
 
-    // Coordenadas X de división de paños de fondo
-    let xCuts: number[] = [0, xf];
+    const backStrips: Array<{ x0: number; x1: number; h: number; label: string }> = [];
+    if (stepL && stepR) {
+      backStrips.push({ x0: 0, x1: stepL.x - e / 2, h: stepL.yTop, label: 'Escalón Izq' });
+      backStrips.push({ x0: stepL.x - e / 2, x1: stepR.x + e / 2, h: yf, label: 'Cuerpo Alto' });
+      backStrips.push({ x0: stepR.x + e / 2, x1: xf, h: stepR.yTop, label: 'Escalón Der' });
+    } else if (stepR) {
+      backStrips.push({ x0: 0, x1: stepR.x + e / 2, h: yf, label: 'Cuerpo Alto' });
+      backStrips.push({ x0: stepR.x + e / 2, x1: xf, h: stepR.yTop, label: 'Escalón Der' });
+    } else if (stepL) {
+      backStrips.push({ x0: 0, x1: stepL.x - e / 2, h: stepL.yTop, label: 'Escalón Izq' });
+      backStrips.push({ x0: stepL.x - e / 2, x1: xf, h: yf, label: 'Cuerpo Alto' });
+    } else {
+      backStrips.push({ x0: 0, x1: xf, h: yf, label: '' });
+    }
 
-    if (needsSplit) {
-      const fullHeightDivs = activeDividers.filter(
-        (d) => d.y0 <= e + 1 && d.y1 >= yf - e - 1,
-      );
+    const backSubPanels: Array<{ x0: number; x1: number; h: number; label: string }> = [];
+    for (const strip of backStrips) {
+      const swStrip = strip.x1 - strip.x0;
+      const shStrip = strip.h;
+      if (swStrip <= GEOM_EPS || shStrip <= GEOM_EPS) continue;
+      const needsSplit = (swStrip > minS && shStrip > minS) || swStrip > maxS || shStrip > maxS;
+      let xCuts: number[] = [strip.x0, strip.x1];
 
-      if (fullHeightDivs.length > 0) {
-        const candidateCuts = [0, ...fullHeightDivs.map((d) => d.cx), xf];
-        const allPanelsFit = candidateCuts.every((cut, idx) => {
-          if (idx === candidateCuts.length - 1) return true;
-          const pw = candidateCuts[idx + 1] - cut;
-          return (pw <= maxS && yf <= minS) || (pw <= minS && yf <= maxS);
-        });
-        if (allPanelsFit) {
-          xCuts = candidateCuts;
+      if (needsSplit) {
+        const innerDivs = activeDividers.filter(
+          (d) =>
+            d.cx > strip.x0 + e &&
+            d.cx < strip.x1 - e &&
+            d.y0 <= e + 1 &&
+            d.y1 >= shStrip - e - 1,
+        );
+        if (innerDivs.length > 0) {
+          const candidateCuts = [strip.x0, ...innerDivs.map((d) => d.cx), strip.x1];
+          const allPanelsFit = candidateCuts.every((cut, idx) => {
+            if (idx === candidateCuts.length - 1) return true;
+            const pw = candidateCuts[idx + 1] - cut;
+            return (pw <= maxS && shStrip <= minS) || (pw <= minS && shStrip <= maxS);
+          });
+          if (allPanelsFit) {
+            xCuts = candidateCuts;
+          } else {
+            const maxAllowedW = shStrip <= maxS ? minS : maxS;
+            const panels = Math.max(2, Math.ceil(swStrip / Math.max(1, maxAllowedW)));
+            xCuts = Array.from({ length: panels + 1 }, (_, k) => strip.x0 + (swStrip * k) / panels);
+          }
         } else {
-          const maxAllowedW = yf <= maxS ? minS : maxS;
-          const panels = Math.max(2, Math.ceil(xf / Math.max(1, maxAllowedW)));
-          xCuts = Array.from({ length: panels + 1 }, (_, k) => (xf * k) / panels);
+          const maxAllowedW = shStrip <= maxS ? minS : maxS;
+          const panels = Math.max(2, Math.ceil(swStrip / Math.max(1, maxAllowedW)));
+          xCuts = Array.from({ length: panels + 1 }, (_, k) => strip.x0 + (swStrip * k) / panels);
         }
-      } else {
-        const maxAllowedW = yf <= maxS ? minS : maxS;
-        const panels = Math.max(2, Math.ceil(xf / Math.max(1, maxAllowedW)));
-        xCuts = Array.from({ length: panels + 1 }, (_, k) => (xf * k) / panels);
+      }
+
+      for (let k = 0; k < xCuts.length - 1; k++) {
+        backSubPanels.push({ x0: xCuts[k], x1: xCuts[k + 1], h: shStrip, label: strip.label });
       }
     }
 
-    const panelCount = xCuts.length - 1;
-    for (let pIdx = 0; pIdx < panelCount; pIdx++) {
-      const px0 = xCuts[pIdx];
-      const px1 = xCuts[pIdx + 1];
-      const pw = px1 - px0;
-      const pId = panelCount > 1 ? `fondo_${pIdx + 1}` : 'fondo';
+    const totalPanels = backSubPanels.length;
+    backSubPanels.forEach((bp, pIdx) => {
+      const pw = bp.x1 - bp.x0;
+      const pId = totalPanels > 1 ? `fondo_${pIdx + 1}` : 'fondo';
       const pName =
-        panelCount > 1 ? `Fondo 3mm (Paño ${pIdx + 1}/${panelCount})` : 'Fondo 3mm';
+        totalPanels > 1
+          ? bp.label
+            ? `Fondo 3mm (${bp.label})`
+            : `Fondo 3mm (Paño ${pIdx + 1}/${totalPanels})`
+          : 'Fondo 3mm';
 
       pieces.push({
         id: pId,
         nombre: pName,
         tipo: 'fondo',
         ancho: pw,
-        alto: yf,
+        alto: bp.h,
         espesor: backE,
         cantidad: 1,
         respectGrain: false,
         edges: resolveEdgeBanding('fondo', joint, edgeMode),
-        posicion3D: [(px0 + px1) / 2, yf / 2, -backE / 2],
-        dimensiones3D: [pw, yf, backE],
+        posicion3D: [(bp.x0 + bp.x1) / 2, bp.h / 2, -backE / 2],
+        dimensiones3D: [pw, bp.h, backE],
         rotacion3D: [0, 0, 0],
         material: 'durolac_3mm',
       });
-    }
+    });
   }
 
-  // 4B. ZONAS FRONTALES FUNCIONALES: PUERTAS, CAJONES COMPLETOS (5 PIEZAS) Y ZÓCALO
+  // 4B. ZONAS FRONTALES FUNCIONALES: PUERTAS, CAJONES (5 PIEZAS), CANASTOS (HERRAJE) Y ZÓCALO
   let autoHinges = 0;
   let autoSlidesPairs = 0;
   let autoGlassPanels = 0;
   let autoFrontHandles = 0;
+  let autoBaskets = 0;
+  let basketRefWidthMm = 300;
   let slideNominalLenMm = 350;
 
   for (const zone of frontZones) {
-    if (zone.kind === 'open' || zone.kind === 'leg_void') continue;
+    if (zone.kind === 'open' || zone.kind === 'leg_void' || zone.kind === 'void_outside') continue;
 
     const zU0 = clamp01(Math.min(zone.uStart, zone.uEnd));
     const zU1 = clamp01(Math.max(zone.uStart, zone.uEnd));
@@ -1003,10 +1398,32 @@ export function calculateDespiece(
     const xInner1 = zoneX1 - (touchesR ? e / 2 : 0);
     const innerW = xInner1 - xInner0;
 
+    if (zone.kind === 'baskets') {
+      autoBaskets += Math.max(1, Math.min(6, Math.round(zone.basketCount ?? 3)));
+      basketRefWidthMm = Math.max(120, Math.round(innerW));
+      continue;
+    }
+
+    const underStepR =
+      stepR !== null &&
+      zU0 >= stepR.u - SEGMENT_TOUCH_TOL &&
+      Math.abs(zV1 - stepR.v) <= 0.025;
+    const underStepL =
+      stepL !== null &&
+      zU1 <= stepL.u + SEGMENT_TOUCH_TOL &&
+      Math.abs(zV1 - stepL.v) <= 0.025;
+
     const frontX0 = zU0 <= SEGMENT_TOUCH_TOL ? 2 : zoneX0 + 1.5;
     const frontX1 = zU1 >= 1 - SEGMENT_TOUCH_TOL ? xf - 2 : zoneX1 - 1.5;
     const frontY0 = zV0 <= SEGMENT_TOUCH_TOL ? 2 : zoneY0 + 1.5;
-    const frontY1 = zV1 >= 1 - SEGMENT_TOUCH_TOL ? yf - 2 : zoneY1 - 1.5;
+    const frontY1 =
+      zV1 >= 1 - SEGMENT_TOUCH_TOL
+        ? yf - 2
+        : underStepR && stepR
+          ? stepR.yTop - 2
+          : underStepL && stepL
+            ? stepL.yTop - 2
+            : zoneY1 - 1.5;
     const frontW = frontX1 - frontX0;
     const frontH = frontY1 - frontY0;
     const frontMat: PieceMaterial = zone.materialOverride ?? mat;
@@ -1175,8 +1592,8 @@ export function calculateDespiece(
     }
   }
 
-  if (!topology.hasExternalLegs && (topology.toeKickHeightMm ?? 0) > 0 && legVoidsAtBottom.length === 0) {
-    const tkH = Math.min(200, Math.max(40, topology.toeKickHeightMm!));
+  if (support.type === 'toe_kick' && legVoidsAtBottom.length === 0) {
+    const tkH = support.heightMm;
     pieces.push({
       id: 'zocalo_frontal',
       nombre: 'Zócalo Frontal',
@@ -1191,6 +1608,18 @@ export function calculateDespiece(
       dimensiones3D: [xInt, tkH, e],
       rotacion3D: [0, 0, 0],
       material: mat,
+    });
+  }
+
+  if (autoBaskets > 0 && !hardwareSummary.some((h) => h.id === 'hw_canastos_calc' || /canasto/i.test(h.descripcion))) {
+    hardwareSummary.push({
+      id: 'hw_canastos_calc',
+      categoria: 'otro',
+      descripcion: 'Canastos metálicos cromados extraíbles',
+      cantidad: autoBaskets,
+      medidaReferenciaMm: basketRefWidthMm,
+      notaCompra: `Excluidos de melamina; incluye ${autoBaskets} canasto(s) con rieles laterales para vano de ${basketRefWidthMm} mm.`,
+      origen: 'detectado',
     });
   }
 

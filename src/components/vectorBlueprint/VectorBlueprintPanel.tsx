@@ -95,7 +95,12 @@ export function VectorBlueprintPanel({
         ? {
             ...z,
             kind,
-            drawerCount: kind === 'drawers' ? (z.drawerCount ?? 3) : undefined,
+            drawerCount: kind === 'drawers' ? (z.drawerCount ?? 2) : undefined,
+            basketCount: kind === 'baskets' ? (z.basketCount ?? 3) : undefined,
+            materialOverride:
+              kind === 'open' || kind === 'leg_void' || kind === 'void_outside' || kind === 'baskets'
+                ? undefined
+                : z.materialOverride,
           }
         : z,
     );
@@ -105,6 +110,13 @@ export function VectorBlueprintPanel({
   const handleChangeDrawerCount = (id: string, count: number) => {
     const updated = zones.map((z) =>
       z.id === id ? { ...z, drawerCount: Math.max(1, Math.min(6, count)) } : z,
+    );
+    onUpdateFrontZones(updated);
+  };
+
+  const handleChangeBasketCount = (id: string, count: number) => {
+    const updated = zones.map((z) =>
+      z.id === id ? { ...z, basketCount: Math.max(1, Math.min(6, count)) } : z,
     );
     onUpdateFrontZones(updated);
   };
@@ -225,21 +237,33 @@ export function VectorBlueprintPanel({
                   onChange={(e) => handleChangeZoneKind(z.id, e.target.value as FrontModuleKind)}
                 >
                   <option value="open">Abierto (Vano)</option>
+                  <option value="baskets">Canastos Metálicos</option>
                   <option value="door_left">Puerta (Abre Izq)</option>
                   <option value="door_right">Puerta (Abre Der)</option>
                   <option value="door_double">Puerta Doble</option>
                   <option value="door_glass">Puerta con Vidrio</option>
-                  <option value="drawers">Cajonera (5 pzas/cajón)</option>
+                  <option value="drawers">Cajón / Cajonera</option>
                   <option value="leg_void">Hueco Piernas</option>
+                  <option value="void_outside">Sin mueble (Vacío exterior)</option>
                 </select>
                 {z.kind === 'drawers' && (
                   <NumericInput
                     min={1}
                     max={6}
-                    value={z.drawerCount ?? 3}
+                    value={z.drawerCount ?? 2}
                     onCommit={(v) => handleChangeDrawerCount(z.id, v)}
                     style={{ width: 52 }}
                     ariaLabel="Cantidad de cajones"
+                  />
+                )}
+                {z.kind === 'baskets' && (
+                  <NumericInput
+                    min={1}
+                    max={6}
+                    value={z.basketCount ?? 3}
+                    onCommit={(v) => handleChangeBasketCount(z.id, v)}
+                    style={{ width: 52 }}
+                    ariaLabel="Cantidad de canastos metálicos"
                   />
                 )}
               </div>

@@ -330,4 +330,59 @@ describe('SmartFurniture Bloque 1 — Motor Matemático y Homografía (v3.0)', (
       expect(ps.ancho).toBeCloseTo((1400 - 36) * 0.35 - 9, 2);
     }
   });
+
+  it('13. Mueble escalonado con espacio vacío exterior (`void_outside`), canastos metálicos, repisas interiores y ruedas (Imagen 12 v7.0): 0.000 mm overlap en ambos encuentros', () => {
+    for (const joint of ['topOverSides', 'topBetweenSides'] as const) {
+      const { topology, params } = clonePreset('estanteria');
+      params.targetDimensions = { x: 950, y: 820, z: 420 };
+      params.referenceDimensions = { x: 950, y: 820, z: 420 };
+      params.cornerJointType = joint;
+      params.material = 'roble';
+      topology.shelfMode = 'custom';
+      topology.hasBackPanel = true;
+      topology.baseSupportType = 'wheels';
+      topology.hasExternalLegs = true;
+      topology.externalLegHeightMm = 65;
+      topology.externalLegCount = 4;
+      topology.vDividers = [
+        { id: 'd1', position: 0.34, start: 0, end: 0.78 },
+        { id: 'd2', position: 0.68, start: 0, end: 1 },
+      ];
+      topology.hShelves = [
+        { id: 'r_caj', position: 0.78, start: 0, end: 0.68 },
+        { id: 'r_step', position: 0.72, start: 0.68, end: 1 },
+      ];
+      topology.frontZones = [
+        { id: 'c_sup', uStart: 0, uEnd: 0.68, vStart: 0.78, vEnd: 1, kind: 'drawers', drawerCount: 1, materialOverride: 'blanco' },
+        { id: 'canastos', uStart: 0, uEnd: 0.34, vStart: 0, vEnd: 0.78, kind: 'baskets', basketCount: 3 },
+        { id: 'p_cen', uStart: 0.34, uEnd: 0.68, vStart: 0, vEnd: 0.78, kind: 'door_left', internalShelves: 1, materialOverride: 'blanco' },
+        { id: 'p_der', uStart: 0.68, uEnd: 1, vStart: 0, vEnd: 0.72, kind: 'door_right', materialOverride: 'blanco' },
+        { id: 'void_step', uStart: 0.68, uEnd: 1, vStart: 0.72, vEnd: 1, kind: 'void_outside' },
+      ];
+
+      const res = calculateDespiece(topology, params);
+      assertNo3DOverlap(res.matrizDespiece);
+
+      const cubierta = res.matrizDespiece.find((p) => p.id === 'cubierta')!;
+      const stepCap = res.matrizDespiece.find((p) => p.id === 'cubierta_escalon_der')!;
+      const latIzq = res.matrizDespiece.find((p) => p.id === 'lateral_izq')!;
+      const latDer = res.matrizDespiece.find((p) => p.id === 'lateral_der')!;
+      const fondos = res.matrizDespiece.filter((p) => p.tipo === 'fondo');
+
+      // Cubierta recortada a la torre alta (~648.5 mm en topOverSides, < 950 mm)
+      expect(cubierta.ancho).toBeLessThan(700);
+      expect(stepCap).toBeDefined();
+      expect(stepCap.ancho).toBeGreaterThan(250);
+      // Lateral derecho más bajo que el izquierdo por el escalón
+      expect(latDer.ancho).toBeLessThan(latIzq.ancho - 150);
+      // Fondo Durolac 3 mm segmentado en 2 paños (ninguno invade el espacio vacío arriba-derecha)
+      expect(fondos).toHaveLength(2);
+      expect(fondos.some((f) => f.alto < 620)).toBe(true);
+      // Repisa interior dentro de puerta central creada sin colisión
+      expect(res.matrizDespiece.some((p) => p.id.startsWith('rep_int_p_cen_'))).toBe(true);
+      // Herrajes no-melamina: ruedas y 3 canastos metálicos
+      expect(res.hardwareSummary.some((h) => /rueda/i.test(h.descripcion) && h.cantidad === 4)).toBe(true);
+      expect(res.hardwareSummary.some((h) => /canasto/i.test(h.descripcion) && h.cantidad === 3)).toBe(true);
+    }
+  });
 });

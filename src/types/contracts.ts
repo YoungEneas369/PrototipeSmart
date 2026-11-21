@@ -69,12 +69,16 @@ export type FrontModuleKind =
   | 'door_double'
   | 'door_glass'
   | 'drawers'
-  | 'leg_void';
+  | 'baskets'
+  | 'leg_void'
+  | 'void_outside';
+
+export type BaseSupportType = 'none' | 'legs' | 'wheels' | 'toe_kick';
 
 /**
  * Zona funcional frontal en espacio INTERIOR normalizado [0, 1]^2.
- * Permite modelar muebles abiertos, cerrados, mixtos (puertas + cajones + nichos)
- * y escritorios con hueco de piernas, generando despiece completo real.
+ * Permite modelar muebles abiertos, cerrados, mixtos (puertas + cajones + canastos + nichos),
+ * escritorios con hueco de piernas y recortes escalonados (`void_outside` = no pertenece al mueble).
  */
 export interface FrontZone {
   id: string;
@@ -85,6 +89,8 @@ export interface FrontZone {
   kind: FrontModuleKind;
   /** Cantidad de cajones cuando kind === 'drawers'. */
   drawerCount?: number;
+  /** Cantidad de canastos metálicos extraíbles cuando kind === 'baskets' (no melamina). */
+  basketCount?: number;
   /** Repisas interiores opcionales dentro de la zona abierta/puerta. */
   internalShelves?: number;
   label?: string;
@@ -154,7 +160,9 @@ export interface FurnitureTopology {
   detectionSource?: 'manual' | 'auto' | 'preset';
   /** Confianza 0..1. Si < 0.5, la UI advierte y guía trazado/ajuste manual. */
   detectionConfidence?: number;
-  /** Si true, el mueble usa patas independientes EXCLUIDAS de `targetDimensions.y` y del corte de melamina. */
+  /** Tipo explícito de apoyo inferior ('none' | 'legs' | 'wheels' | 'toe_kick'). */
+  baseSupportType?: BaseSupportType;
+  /** Si true, el mueble usa patas o ruedas independientes EXCLUIDAS de `targetDimensions.y` y del corte de melamina. */
   hasExternalLegs?: boolean;
   externalLegHeightMm?: number;
   externalLegCount?: number;

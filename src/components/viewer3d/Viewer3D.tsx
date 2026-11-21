@@ -18,7 +18,7 @@ import type {
   MelamineMaterial,
   ScaleAndBoardParams,
 } from '../../types/contracts';
-import { calculateShelfDeflectionDIN } from '../../core/mathEngine';
+import { calculateShelfDeflectionDIN, resolveBaseSupport } from '../../core/mathEngine';
 
 interface Viewer3DProps {
   despiece: DespieceResult;
@@ -150,14 +150,17 @@ function FurnitureMeshGroup({
     };
   }, []);
   const { x: xf, y: yf, z: zf } = params.targetDimensions;
+  const e = params.boardThickness;
+  const xInt = Math.max(1, xf - 2 * e);
+  const yInt = Math.max(1, yf - 2 * e);
+  const support = resolveBaseSupport(topology);
   const hasLegVoidAtBottom = (topology.frontZones ?? []).some(
     (z) => z.kind === 'leg_void' && z.vStart <= 1e-3,
   );
-  const legHeightMm = topology.hasExternalLegs ? Math.max(40, topology.externalLegHeightMm ?? 150) : 0;
+  const legHeightMm = support.type === 'legs' || support.type === 'wheels' ? support.heightMm : 0;
   const toeKickMm =
-    !topology.hasExternalLegs && !hasLegVoidAtBottom && (topology.toeKickHeightMm ?? 0) > 0
-      ? Math.min(200, Math.max(40, topology.toeKickHeightMm ?? 0))
-      : 0;
+    support.type === 'toe_kick' && !hasLegVoidAtBottom ? support.heightMm : 0;
+  const isWheels = support.type === 'wheels';
   const legOffsetY = legHeightMm / 1000;
   const bodyOffsetY = (legHeightMm + toeKickMm) / 1000;
 
@@ -252,7 +255,7 @@ function FurnitureMeshGroup({
   const legInset = Math.min(0.06, xm * 0.12, zm * 0.18);
 
   const legCoords = useMemo<[number, number][]>(() => {
-    const total = Math.max(2, Math.min(12, Math.round(topology.externalLegCount ?? 4)));
+    const total = Math.max(2, Math.min(12, Math.round(support.count || 4)));
     const frontCount = Math.ceil(total / 2);
     const backCount = Math.max(1, total - frontCount);
     const spanX = Math.max(0.02, xm - 2 * legInset);
@@ -264,22 +267,107 @@ function FurnitureMeshGroup({
     for (const lx of distributeX(backCount)) coords.push([lx, legInset]);
     for (const lx of distributeX(frontCount)) coords.push([lx, zm - legInset]);
     return coords;
-  }, [topology.externalLegCount, xm, zm, legInset]);
+  }, [support.count, xm, zm, legInset]);
+
+  // Geometría 3D procedural de canastos metálicos extraíbles (excluidos de melamina)
+  const basketVisuals = useMemo(() => {
+    const list: Array<{
+      key: string;
+      cx: number;
+      cy: number;
+      cz: number;
+      w: number;
+      h: number;
+      d: number;
+      xLeftRail: number;
+      xRightRail: number;
+    }> = [];
+    for (const z of topology.frontZones ?? []) {
+      if (z.kind !== 'baskets') continue;
+      const nb = Math.max(1, Math.min(6, Math.round(z.basketCount ?? 3)));
+      const u0 = Math.min(z.uStart, z.uEnd);
+      const u1 = Math.max(z.uStart, z.uEnd);
+      const v0 = Math.min(z.vStart, z.vEnd);
+      const v1 = Math.max(z.vStart, z.vEnd);
+      const x0 = e + u0 * xInt + (u0 > 0.01 ? e / 2 : 0);
+      const x1 = e + u1 * xInt - (u1 < 0.99 ? e / 2 : 0);
+      const y0 = e + v0 * yInt + (v0 > 0.01 ? e / 2 : 0);
+      const y1 = e + v1 * yInt - (v1 < 0.99 ? e / 2 : 0);
+      const wIn = x1 - x0;
+      const hIn = y1 - y0;
+      if (wIn < 80 || hIn < 90) continue;
+      const bw = Math.max(60, wIn - 24) / 1000;
+      const bd = Math.max(120, zf - 44) / 1000;
+      const slotH = hIn / nb;
+      const bh = Math.max(70, Math.min(175, slotH * 0.6)) / 1000;
+      for (let k = 0; k < nb; k++) {
+        const cyMm = y0 + (k + 0.44) * slotH;
+        list.push({
+          key: `basket_${z.id}_${k}`,
+          cx: (x0 + x1) / 2000,
+          cy: cyMm / 1000,
+          cz: (zf - 12 - (bd * 1000) / 2) / 1000 + explodeDist * 0.65,
+          w: bw,
+          h: bh,
+          d: bd,
+          xLeftRail: (x0 + 5) / 1000,
+          xRightRail: (x1 - 5) / 1000,
+        });
+      }
+    }
+    return list;
+  }, [topology.frontZones, e, xInt, yInt, zf, explodeDist]);
 
   const edgeLineColor = params.material === 'grafito' ? '#94a3b8' : '#334155';
   const renderDims = showDimensions && explodeFactor <= 0.1;
 
   return (
     <group position={[-xm / 2, 0, -zm / 2]}>
-      {/* Patas independientes externas (NO forman parte de la melamina) */}
-      {topology.hasExternalLegs && legHeightMm > 0 && (
+      {/* Patas independientes o Ruedas giratorias (NO forman parte de la melamina) */}
+      {(support.type === 'legs' || support.type === 'wheels') && legHeightMm > 0 && (
         <group>
-          {legCoords.map(([lx, lz], idx) => (
-            <mesh key={`ext_leg_${idx}`} position={[lx, legOffsetY / 2, lz]} castShadow>
-              <cylinderGeometry args={[0.016, 0.012, legOffsetY, 16]} />
-              <meshStandardMaterial color="#1e293b" metalness={0.65} roughness={0.35} />
-            </mesh>
-          ))}
+          {legCoords.map(([lx, lz], idx) => {
+            if (isWheels) {
+              const plateH = Math.min(0.005, legOffsetY * 0.08);
+              const wheelR = Math.max(0.014, (legOffsetY - plateH) * 0.44);
+              const wheelW = Math.min(0.022, wheelR * 0.8);
+              const swivelAngle = idx % 2 === 0 ? 0.25 : -0.2;
+              return (
+                <group key={`ext_wheel_${idx}`} position={[lx, 0, lz]} rotation={[0, swivelAngle, 0]}>
+                  {/* Platina superior de montaje */}
+                  <mesh position={[0, legOffsetY - plateH / 2, 0]}>
+                    <boxGeometry args={[wheelR * 1.7, plateH, wheelR * 1.7]} />
+                    <meshStandardMaterial color="#94a3b8" metalness={0.75} roughness={0.3} />
+                  </mesh>
+                  {/* Horquilla metálica */}
+                  <mesh position={[-(wheelW / 2 + 0.0025), legOffsetY - plateH - wheelR * 0.65, 0]}>
+                    <boxGeometry args={[0.004, wheelR * 1.3, wheelR * 0.85]} />
+                    <meshStandardMaterial color="#64748b" metalness={0.8} roughness={0.28} />
+                  </mesh>
+                  <mesh position={[wheelW / 2 + 0.0025, legOffsetY - plateH - wheelR * 0.65, 0]}>
+                    <boxGeometry args={[0.004, wheelR * 1.3, wheelR * 0.85]} />
+                    <meshStandardMaterial color="#64748b" metalness={0.8} roughness={0.28} />
+                  </mesh>
+                  {/* Rueda giratoria (apoya exactamente en y = 0.000) */}
+                  <mesh position={[0, wheelR, 0]} rotation={[0, 0, Math.PI / 2]} castShadow>
+                    <cylinderGeometry args={[wheelR, wheelR, wheelW, 20]} />
+                    <meshStandardMaterial color="#f1f5f9" roughness={0.4} metalness={0.1} />
+                  </mesh>
+                  {/* Banda de rodadura / eje */}
+                  <mesh position={[0, wheelR, 0]} rotation={[0, 0, Math.PI / 2]}>
+                    <cylinderGeometry args={[wheelR * 0.48, wheelR * 0.48, wheelW + 0.003, 14]} />
+                    <meshStandardMaterial color="#334155" metalness={0.5} roughness={0.4} />
+                  </mesh>
+                </group>
+              );
+            }
+            return (
+              <mesh key={`ext_leg_${idx}`} position={[lx, legOffsetY / 2, lz]} castShadow>
+                <cylinderGeometry args={[0.016, 0.012, legOffsetY, 16]} />
+                <meshStandardMaterial color="#1e293b" metalness={0.65} roughness={0.35} />
+              </mesh>
+            );
+          })}
         </group>
       )}
 
@@ -385,6 +473,69 @@ function FurnitureMeshGroup({
           );
         })}
 
+        {/* Canastos metálicos cromados extraíbles (herraje externo no-melamina) */}
+        {basketVisuals.map((bk) => {
+          const rodR = 0.003;
+          const wireOffsets = [-0.36, -0.18, 0, 0.18, 0.36];
+          return (
+            <group key={bk.key}>
+              {/* Rieles laterales */}
+              <mesh position={[bk.xLeftRail, bk.cy + bk.h * 0.35, bk.cz]}>
+                <boxGeometry args={[0.008, 0.012, bk.d]} />
+                <meshStandardMaterial color="#64748b" metalness={0.75} roughness={0.3} />
+              </mesh>
+              <mesh position={[bk.xRightRail, bk.cy + bk.h * 0.35, bk.cz]}>
+                <boxGeometry args={[0.008, 0.012, bk.d]} />
+                <meshStandardMaterial color="#64748b" metalness={0.75} roughness={0.3} />
+              </mesh>
+              <group position={[bk.cx, bk.cy, bk.cz]}>
+                {/* Borde superior frontal/trasero/laterales */}
+                <mesh position={[0, bk.h / 2, bk.d / 2]}>
+                  <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
+                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                </mesh>
+                <mesh position={[0, -bk.h / 2, bk.d / 2]}>
+                  <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
+                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                </mesh>
+                <mesh position={[0, bk.h / 2, -bk.d / 2]}>
+                  <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
+                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                </mesh>
+                <mesh position={[-bk.w / 2, bk.h / 2, 0]}>
+                  <boxGeometry args={[rodR * 2, rodR * 2, bk.d]} />
+                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                </mesh>
+                <mesh position={[bk.w / 2, bk.h / 2, 0]}>
+                  <boxGeometry args={[rodR * 2, rodR * 2, bk.d]} />
+                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                </mesh>
+                {/* Base metálica enrejada */}
+                <mesh position={[0, -bk.h / 2, 0]}>
+                  <boxGeometry args={[bk.w, rodR * 1.4, bk.d]} />
+                  <meshStandardMaterial color="#94a3b8" metalness={0.7} roughness={0.32} transparent opacity={0.72} />
+                </mesh>
+                {/* Varillas verticales frontales */}
+                {wireOffsets.map((frac, wi) => (
+                  <mesh key={wi} position={[bk.w * frac, 0, bk.d / 2]}>
+                    <boxGeometry args={[rodR * 1.6, bk.h, rodR * 1.6]} />
+                    <meshStandardMaterial color="#e2e8f0" metalness={0.85} roughness={0.2} />
+                  </mesh>
+                ))}
+                {/* 4 postes esquineros */}
+                {([-1, 1] as const).map((sx) =>
+                  ([-1, 1] as const).map((sz) => (
+                    <mesh key={`${sx}_${sz}`} position={[(sx * bk.w) / 2, 0, (sz * bk.d) / 2]}>
+                      <boxGeometry args={[rodR * 2, bk.h, rodR * 2]} />
+                      <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                    </mesh>
+                  )),
+                )}
+              </group>
+            </group>
+          );
+        })}
+
         {/* Cotas 3D dinámicas (ocultas automáticamente al explotar para no chocar con placas) */}
         {renderDims && (
           <>
@@ -410,7 +561,14 @@ function FurnitureMeshGroup({
             />
             <Html position={[xm + 0.14, ym / 2, zm]} center>
               <div className="dim-badge dim-y">
-                Y: {Math.round(yf)} mm{topology.hasExternalLegs ? ` (+${legHeightMm} patas)` : ''}
+                Y: {Math.round(yf)} mm
+                {support.type === 'wheels'
+                  ? ` (+${legHeightMm} ruedas)`
+                  : support.type === 'legs'
+                    ? ` (+${legHeightMm} patas)`
+                    : support.type === 'toe_kick'
+                      ? ` (+${toeKickMm} zócalo)`
+                      : ''}
               </div>
             </Html>
 
@@ -459,9 +617,8 @@ export function Viewer3D({
     );
   }, [selectedPiece]);
 
-  const legExtraMm = topology.hasExternalLegs
-    ? Math.max(40, topology.externalLegHeightMm ?? 150)
-    : (topology.toeKickHeightMm ?? 0);
+  const supportSummary = resolveBaseSupport(topology);
+  const legExtraMm = supportSummary.heightMm;
   const maxDim =
     Math.max(params.targetDimensions.x, params.targetDimensions.y + legExtraMm, params.targetDimensions.z) /
     1000;
@@ -484,9 +641,9 @@ export function Viewer3D({
             Visor 3D Offline · {despiece.matrizDespiece.length} placas
             {!selectedPiece ? ' · Clic en pieza' : ''}
           </span>
-          {topology.hasExternalLegs && (
+          {(supportSummary.type === 'legs' || supportSummary.type === 'wheels') && (
             <span className="badge-legs">
-              Patas ({topology.externalLegCount ?? 4} × {topology.externalLegHeightMm ?? 150} mm) aparte
+              {supportSummary.type === 'wheels' ? 'Ruedas' : 'Patas'} ({supportSummary.count} × {supportSummary.heightMm} mm) aparte
             </span>
           )}
         </div>

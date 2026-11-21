@@ -11,6 +11,7 @@ import type {
   ScaleAndBoardParams,
   NormalizedSegment,
 } from '../../types/contracts';
+import { resolveBaseSupport } from '../mathEngine';
 import type { DetectedHandlePoint } from '../vision';
 
 function escapeXml(str: string): string {
@@ -106,8 +107,10 @@ export function renderFurnitureVectorBlueprintSvg(
 ): string {
   const { x: xf, y: yf, z: zf } = params.targetDimensions;
   const e = params.boardThickness;
-  const legH = topology.hasExternalLegs ? Math.max(40, topology.externalLegHeightMm ?? 150) : 0;
-  const toeH = !topology.hasExternalLegs ? Math.max(0, topology.toeKickHeightMm ?? 0) : 0;
+  const support = resolveBaseSupport(topology);
+  const legH = support.type === 'legs' || support.type === 'wheels' ? support.heightMm : 0;
+  const toeH = support.type === 'toe_kick' ? support.heightMm : 0;
+  const isWheels = support.type === 'wheels';
   const baseLiftH = legH + toeH;
   const totalH = yf + baseLiftH;
 
@@ -169,35 +172,64 @@ export function renderFurnitureVectorBlueprintSvg(
     `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">ALZADO FRONTAL (PLANO XY)</text>`,
   );
 
-  // Fondo interior general
-  lines.push(
-    `<rect x="${frontX.toFixed(2)}" y="${frontY.toFixed(2)}" width="${fw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#0f172a" stroke-width="1.8" />`,
-  );
+  // Fondo interior general (trazado por paños reales de fondo o carcasa, respetando recortes `void_outside`)
+  const zones = topology.frontZones ?? [];
+  const hasStepVoid = zones.some((z) => z.kind === 'void_outside');
+  if (!hasStepVoid) {
+    lines.push(
+      `<rect x="${frontX.toFixed(2)}" y="${frontY.toFixed(2)}" width="${fw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#0f172a" stroke-width="1.8" />`,
+    );
+  } else {
+    for (const bp of despiece.matrizDespiece.filter((p) => p.tipo === 'fondo')) {
+      const bx0 = frontX + (bp.posicion3D[0] - bp.dimensiones3D[0] / 2) * sc;
+      const by0 = frontY + fh - (bp.posicion3D[1] + bp.dimensiones3D[1] / 2) * sc;
+      const bw = bp.dimensiones3D[0] * sc;
+      const bh = bp.dimensiones3D[1] * sc;
+      lines.push(
+        `<rect x="${bx0.toFixed(2)}" y="${by0.toFixed(2)}" width="${bw.toFixed(2)}" height="${bh.toFixed(2)}" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" />`,
+      );
+    }
+  }
 
-  // Patas externas (si existen) o Zócalo inferior
+  // Patas externas / Ruedas giratorias / Zócalo inferior
   if (legH > 0) {
     const legW = Math.max(5, Math.min(12, fw * 0.032));
-    const nLegs = Math.max(2, Math.min(6, topology.externalLegCount ?? 4));
+    const nLegs = Math.max(2, Math.min(6, support.count || 4));
     const legXs =
       nLegs >= 5
         ? [frontX + fw * 0.06, frontX + fw * 0.5 - legW / 2, frontX + fw * 0.94 - legW]
         : [frontX + fw * 0.06, frontX + fw * 0.94 - legW];
-    for (const lx of legXs) {
+    if (isWheels) {
+      const rW = Math.max(4, Math.min(11, liftPx * 0.4));
+      for (const lx of legXs) {
+        const cxW = lx + legW / 2;
+        const cyW = frontY + fh + liftPx - rW;
+        lines.push(
+          `<rect x="${(cxW - rW).toFixed(2)}" y="${(frontY + fh).toFixed(2)}" width="${(rW * 2).toFixed(2)}" height="${Math.max(2, liftPx * 0.25).toFixed(2)}" fill="#94a3b8" stroke="#334155" stroke-width="1" />`,
+          `<circle cx="${cxW.toFixed(2)}" cy="${cyW.toFixed(2)}" r="${rW.toFixed(2)}" fill="#334155" stroke="#0f172a" stroke-width="1.2" />`,
+          `<circle cx="${cxW.toFixed(2)}" cy="${cyW.toFixed(2)}" r="${(rW * 0.45).toFixed(2)}" fill="#e2e8f0" />`,
+        );
+      }
       lines.push(
-        `<rect x="${lx.toFixed(2)}" y="${(frontY + fh).toFixed(2)}" width="${legW.toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#475569" stroke-width="1.2" stroke-dasharray="3,2" />`,
+        `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY + fh + liftPx * 0.72).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="9" fill="#92400e">RUEDAS GIRATORIAS (${nLegs} × ${legH} mm · NO MELAMINA)</text>`,
+      );
+    } else {
+      for (const lx of legXs) {
+        lines.push(
+          `<rect x="${lx.toFixed(2)}" y="${(frontY + fh).toFixed(2)}" width="${legW.toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#475569" stroke-width="1.2" stroke-dasharray="3,2" />`,
+        );
+      }
+      lines.push(
+        `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY + fh + liftPx * 0.65).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="9" fill="#92400e">PATAS EXTERNAS (${legH} mm · NO MELAMINA)</text>`,
       );
     }
-    lines.push(
-      `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY + fh + liftPx * 0.65).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="9" fill="#92400e">PATAS EXTERNAS (${legH} mm · NO MELAMINA)</text>`,
-    );
   } else if (toeH > 0) {
     lines.push(
       `<rect x="${(frontX + ep).toFixed(2)}" y="${(frontY + fh).toFixed(2)}" width="${(fw - 2 * ep).toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#334155" stroke-width="1.2" />`,
     );
   }
 
-  // Zonas frontales (puertas, cajones, vidrios, nichos abiertos, hueco de piernas)
-  const zones = topology.frontZones ?? [];
+  // Zonas frontales (puertas, cajones, canastos metálicos, vidrios, nichos abiertos, hueco de piernas, vacío exterior)
   for (const z of zones) {
     const zx0 = mapU(z.uStart);
     const zx1 = mapU(z.uEnd);
@@ -205,6 +237,47 @@ export function renderFurnitureVectorBlueprintSvg(
     const zy1 = mapV(z.vStart);
     const zw = Math.max(1, zx1 - zx0);
     const zh = Math.max(1, zy1 - zy0);
+
+    if (z.kind === 'void_outside') {
+      lines.push(
+        `<rect x="${zx0.toFixed(2)}" y="${zy0.toFixed(2)}" width="${zw.toFixed(2)}" height="${zh.toFixed(2)}" fill="none" stroke="#94a3b8" stroke-width="0.9" stroke-dasharray="4,4" />`,
+      );
+      if (zw > 38 && zh > 22) {
+        lines.push(
+          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh / 2 + 3).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="8.5" fill="#94a3b8">SIN MUEBLE</text>`,
+        );
+      }
+      continue;
+    }
+
+    if (z.kind === 'baskets') {
+      const nb = Math.max(1, Math.min(6, Math.round(z.basketCount ?? 3)));
+      const slotH = zh / nb;
+      lines.push(
+        `<rect x="${zx0.toFixed(2)}" y="${zy0.toFixed(2)}" width="${zw.toFixed(2)}" height="${zh.toFixed(2)}" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="0.8" />`,
+      );
+      for (let k = 0; k < nb; k++) {
+        const by0 = zy0 + k * slotH + slotH * 0.24;
+        const bh = Math.max(6, slotH * 0.66);
+        lines.push(
+          `<rect x="${(zx0 + 4).toFixed(2)}" y="${by0.toFixed(2)}" width="${Math.max(4, zw - 8).toFixed(2)}" height="${bh.toFixed(2)}" fill="#e2e8f0" fill-opacity="0.55" stroke="#475569" stroke-width="1.2" rx="2" />`,
+          `<line x1="${(zx0 + 4).toFixed(1)}" y1="${(by0 + bh / 2).toFixed(1)}" x2="${(zx1 - 4).toFixed(1)}" y2="${(by0 + bh / 2).toFixed(1)}" stroke="#64748b" stroke-width="0.8" />`,
+        );
+        const wires = Math.max(3, Math.min(7, Math.floor((zw - 12) / 10)));
+        for (let wIdx = 1; wIdx < wires; wIdx++) {
+          const wx = zx0 + 4 + ((zw - 8) * wIdx) / wires;
+          lines.push(
+            `<line x1="${wx.toFixed(1)}" y1="${by0.toFixed(1)}" x2="${wx.toFixed(1)}" y2="${(by0 + bh).toFixed(1)}" stroke="#64748b" stroke-width="0.7" />`,
+          );
+        }
+        if (zw > 44 && bh > 16) {
+          lines.push(
+            `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(by0 + bh - 3).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="7.5" fill="#334155">Canasto ${k + 1}/${nb}</text>`,
+          );
+        }
+      }
+      continue;
+    }
 
     if (z.kind === 'leg_void') {
       lines.push(
@@ -304,21 +377,24 @@ export function renderFurnitureVectorBlueprintSvg(
     }
   }
 
-  // Tableros estructurales de carcasa (espesor real 18 mm resaltado)
-  lines.push(`<rect x="${frontX.toFixed(2)}" y="${frontY.toFixed(2)}" width="${fw.toFixed(2)}" height="${ep.toFixed(2)}" fill="#cbd5e1" stroke="#0f172a" stroke-width="1" />`); // Cubierta
-  if (!zones.some((z) => z.kind === 'leg_void' && z.vStart <= 1e-3)) {
-    lines.push(`<rect x="${frontX.toFixed(2)}" y="${(frontY + fh - ep).toFixed(2)}" width="${fw.toFixed(2)}" height="${ep.toFixed(2)}" fill="#cbd5e1" stroke="#0f172a" stroke-width="1" />`); // Base
-  }
-  lines.push(`<rect x="${frontX.toFixed(2)}" y="${frontY.toFixed(2)}" width="${ep.toFixed(2)}" height="${fh.toFixed(2)}" fill="#cbd5e1" stroke="#0f172a" stroke-width="1" />`); // Lateral Izq
-  lines.push(`<rect x="${(frontX + fw - ep).toFixed(2)}" y="${frontY.toFixed(2)}" width="${ep.toFixed(2)}" height="${fh.toFixed(2)}" fill="#cbd5e1" stroke="#0f172a" stroke-width="1" />`); // Lateral Der
-
-  // Divisores verticales estructurales
-  for (const d of topology.vDividers) {
-    const dx = mapU(d.position) - ep / 2;
-    const dy0 = mapV(d.end);
-    const dy1 = mapV(d.start);
+  // Tableros estructurales directamente desde `despiece.matrizDespiece` (paridad 100% con 3D, incluye escalones `void_outside` y repisas interiores)
+  for (const p of despiece.matrizDespiece) {
+    if (
+      p.tipo !== 'cubierta' &&
+      p.tipo !== 'base' &&
+      p.tipo !== 'lateral' &&
+      p.tipo !== 'division_vertical' &&
+      p.tipo !== 'repisa'
+    ) {
+      continue;
+    }
+    const px0 = frontX + (p.posicion3D[0] - p.dimensiones3D[0] / 2) * sc;
+    const py0 = frontY + fh - (p.posicion3D[1] + p.dimensiones3D[1] / 2) * sc;
+    const pw = Math.max(1.5, p.dimensiones3D[0] * sc);
+    const ph = Math.max(1.5, p.dimensiones3D[1] * sc);
+    const isOuter = p.tipo === 'cubierta' || p.tipo === 'base' || p.tipo === 'lateral';
     lines.push(
-      `<rect x="${dx.toFixed(2)}" y="${dy0.toFixed(2)}" width="${ep.toFixed(2)}" height="${Math.max(1, dy1 - dy0).toFixed(2)}" fill="#94a3b8" stroke="#0f172a" stroke-width="0.9" />`,
+      `<rect x="${px0.toFixed(2)}" y="${py0.toFixed(2)}" width="${pw.toFixed(2)}" height="${ph.toFixed(2)}" fill="${isOuter ? '#cbd5e1' : '#94a3b8'}" stroke="#0f172a" stroke-width="${isOuter ? '1.1' : '0.9'}" />`,
     );
   }
 
@@ -331,32 +407,6 @@ export function renderFurnitureVectorBlueprintSvg(
     lines.push(
       `<line x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" stroke="#0f172a" stroke-width="${(ep + 1.4).toFixed(2)}" stroke-linecap="butt" />`,
       `<line x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" stroke="#c084fc" stroke-width="${Math.max(1.5, ep - 0.6).toFixed(2)}" stroke-linecap="butt" />`,
-    );
-  }
-
-  // Repisas estructurales (equidistantes o personalizadas)
-  const shelfLines: Array<{ yPx: number; x0Px: number; x1Px: number }> = [];
-  if (topology.shelfMode === 'equidistant') {
-    for (const an of despiece.shelfProgression.terms) {
-      const cyMm = an + e / 2;
-      shelfLines.push({
-        yPx: frontY + fh - cyMm * sc - ep / 2,
-        x0Px: frontX + ep,
-        x1Px: frontX + fw - ep,
-      });
-    }
-  } else {
-    for (const s of topology.hShelves) {
-      shelfLines.push({
-        yPx: mapV(s.position) - ep / 2,
-        x0Px: mapU(s.start),
-        x1Px: mapU(s.end),
-      });
-    }
-  }
-  for (const sl of shelfLines) {
-    lines.push(
-      `<rect x="${sl.x0Px.toFixed(2)}" y="${sl.yPx.toFixed(2)}" width="${Math.max(1, sl.x1Px - sl.x0Px).toFixed(2)}" height="${ep.toFixed(2)}" fill="#94a3b8" stroke="#0f172a" stroke-width="0.9" />`,
     );
   }
 
@@ -386,16 +436,35 @@ export function renderFurnitureVectorBlueprintSvg(
     );
   }
   if (legH > 0) {
-    const legW = Math.max(5, Math.min(10, sw * 0.1));
-    lines.push(
-      `<rect x="${(sideX + sw * 0.12).toFixed(2)}" y="${(sideY + fh).toFixed(2)}" width="${legW.toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#475569" stroke-dasharray="3,2" />`,
-    );
-    lines.push(
-      `<rect x="${(sideX + sw * 0.88 - legW).toFixed(2)}" y="${(sideY + fh).toFixed(2)}" width="${legW.toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#475569" stroke-dasharray="3,2" />`,
-    );
+    if (isWheels) {
+      const rW = Math.max(4, Math.min(10, liftPx * 0.4));
+      for (const sxW of [sideX + sw * 0.16, sideX + sw * 0.84]) {
+        const cyW = sideY + fh + liftPx - rW;
+        lines.push(
+          `<circle cx="${sxW.toFixed(2)}" cy="${cyW.toFixed(2)}" r="${rW.toFixed(2)}" fill="#334155" stroke="#0f172a" stroke-width="1.2" />`,
+          `<circle cx="${sxW.toFixed(2)}" cy="${cyW.toFixed(2)}" r="${(rW * 0.45).toFixed(2)}" fill="#e2e8f0" />`,
+        );
+      }
+    } else {
+      const legW = Math.max(5, Math.min(10, sw * 0.1));
+      lines.push(
+        `<rect x="${(sideX + sw * 0.12).toFixed(2)}" y="${(sideY + fh).toFixed(2)}" width="${legW.toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#475569" stroke-dasharray="3,2" />`,
+      );
+      lines.push(
+        `<rect x="${(sideX + sw * 0.88 - legW).toFixed(2)}" y="${(sideY + fh).toFixed(2)}" width="${legW.toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#475569" stroke-dasharray="3,2" />`,
+      );
+    }
   }
   // Frente sobrepuesto si hay puertas o cajones
-  if (zones.some((z) => z.kind !== 'open' && z.kind !== 'leg_void')) {
+  if (
+    zones.some(
+      (z) =>
+        z.kind !== 'open' &&
+        z.kind !== 'leg_void' &&
+        z.kind !== 'void_outside' &&
+        z.kind !== 'baskets',
+    )
+  ) {
     lines.push(
       `<rect x="${(sideX + sw + 1).toFixed(2)}" y="${(sideY + 2).toFixed(2)}" width="${ep.toFixed(2)}" height="${(fh - 4).toFixed(2)}" fill="#fef9c3" stroke="#0284c7" stroke-width="1" />`,
     );

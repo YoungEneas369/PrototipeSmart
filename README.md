@@ -1,24 +1,42 @@
-# PrototipeSmart: SmartFurniture
+# PrototipeSmart: SmartFurniture v3.1
 
-Prototipo web **100 % offline** (React + TypeScript + Three.js) para diseñar, escalar, analizar desde fotografía y optimizar el corte de muebles de melamina. Proyecto de **Funciones y Matrices, Unidad 3 (INACAP)**. Entrega: **1 de diciembre de 2026**.
+Prototipo web **100 % offline** (React + TypeScript + Three.js) para analizar fotografías de muebles, escalarlos paramétricamente en 3D, demostrar la matemática de **Funciones y Matrices — Unidad 3 (INACAP)** y optimizar el corte de planchas de melamina (Guillotina 2 etapas / MaxRects) con exportación **Excel `.xls` (3 hojas)**, **CSV Chile (`;`)** y **SVG**.
 
-> **Estado (20 nov 2026 — v2.1 Rev. 2):** fase de especificación y validación técnica **cerrada y 100 % sincronizada** entre todos los documentos, prompts por bloque, skills de agente y scripts de evidencia reproducibles. Listo para iniciar el **Bloque 1** de implementación.
+> **Demo web en vivo (GitHub Pages):** https://youngeneas369.github.io/PrototipeSmart/  
+> *(Una vez cargada la página, toda la matemática, visión computacional, render 3D y exportación funcionan 100 % en el navegador sin peticiones externas ni backend).*
 
-## Documentación (empieza por aquí)
+## Stack fijado (verificado offline)
 
-| Documento | Para quién | Versión |
-|---|---|---|
-| [`docs/RESUMEN_PARA_EL_EQUIPO.md`](docs/RESUMEN_PARA_EL_EQUIPO.md) | **Equipo (lectura 5 min).** Plan simple, mejoras de foto → 3D, protocolo de fotos y calendario | v2.1 Rev. 2 |
-| [`docs/ANALISIS_TECNICO_v2.1.md`](docs/ANALISIS_TECNICO_v2.1.md) | **Revisión técnica (persona o IA).** Evidencia reproducible, enmiendas de contratos, visión con paralaje + croma y preguntas abiertas | v2.1 Rev. 2 |
-| [`pauta.md`](pauta.md) | **Especificación maestra INACAP.** Rúbrica Unidad 3, flujo de 4 pasos, 3 presets oficiales y arquitectura | v2.1 Rev. 2 |
-| [`Auditoria y Prompts.txt`](Auditoria%20y%20Prompts.txt) | **Auditoría consolidada + 5 prompts listos para ejecutar** (Bloques 1, 2, Visión, 3 y 4) sin contradicciones | v2.1 Rev. 2 |
-| [`docs/evidencia/`](docs/evidencia/) | Scripts reproducibles (`zhang_sim.ts`, `bandDetector.ts` + `band_test.ts`, `guillotine_sim.ts`, `toolchain-spike/`) | Verificados |
-| [`.agents/skills/`](.agents/skills/) | 6 skills operativas de Antigravity sincronizadas 1:1 con v2.1 Rev. 2 | v2.1 Rev. 2 |
+- React `18.3.1` · TypeScript `~5.8.3` · Vite `6.3.5` · Vitest `3.2.4`
+- Three.js `0.162.0` · `@react-three/fiber 8.18.0` · `@react-three/drei 9.122.0` · `lucide-react`
 
-## Reproducir la evidencia técnica (Node ≥ 22/24)
+## Ejecución y pruebas locales
 
 ```bash
-node --no-warnings docs/evidencia/zhang_sim.ts
-node --no-warnings docs/evidencia/band_test.ts
-node --no-warnings docs/evidencia/guillotine_sim.ts
+# Instalar dependencias (solo primera vez)
+npm ci
+
+# Ejecutar toda la suite de pruebas (Bloques 1 + 2 + Visión)
+npx vitest run
+# En Termux (Android):
+node node_modules/vitest/vitest.mjs run
+
+# Compilación estricta TypeScript + build de producción
+npx tsc -b && npx vite build
+# En Termux (Android):
+node node_modules/typescript/bin/tsc -b && node node_modules/vite/bin/vite.js build
+
+# Iniciar servidor local (o doble clic en INICIAR_SMARTFURNITURE.bat en Windows)
+npm run dev
 ```
+
+## Documentación y Evidencia
+
+| Documento | Contenido |
+|---|---|
+| [`pauta.md`](pauta.md) | Especificación maestra INACAP (Unidad 3, 4 pasos, 3 presets) |
+| [`docs/RESUMEN_PARA_EL_EQUIPO.md`](docs/RESUMEN_PARA_EL_EQUIPO.md) | Resumen ejecutivo, protocolo de fotos y guion del video |
+| [`docs/ANALISIS_TECNICO_v2.1.md`](docs/ANALISIS_TECNICO_v2.1.md) | Análisis técnico pre-implementación con evidencia reproducible |
+| [`docs/AUDITORIA_Y_PROMPTS_BLINDADOS_v3.0_EQUIPO.md`](docs/AUDITORIA_Y_PROMPTS_BLINDADOS_v3.0_EQUIPO.md) | Auditoría v3.0 y prompts blindados del equipo |
+| [`docs/evidencia/`](docs/evidencia/) | Scripts reproducibles (`zhang_sim.ts`, `bandDetector.ts`, `guillotine_sim.ts`, `toolchain-spike/`) |
+| [`.agents/skills/`](.agents/skills/) | 6 skills operativas de Antigravity |

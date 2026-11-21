@@ -12,6 +12,11 @@ import type {
   EdgeBandingFlags,
   ScaleAndBoardParams,
 } from '../../types/contracts';
+import {
+  analyzeShelvesDeflectionDIN,
+  computeUnitDirectionVector,
+} from '../mathEngine';
+import { estimateProjectBomAndCost, formatClp } from './costEstimator';
 
 function escapeXml(str: string): string {
   return str
@@ -184,6 +189,23 @@ export function generateExcelSpreadsheetML(
       ]),
     );
   }
+  const bomCost = estimateProjectBomAndCost(despiece, cuttingPlan, params);
+  const unitVec = computeUnitDirectionVector(params.targetDimensions);
+  const dinReports = analyzeShelvesDeflectionDIN(despiece.matrizDespiece);
+  const maxDinDeflection = dinReports.reduce((m, r) => Math.max(m, r.deflectionMm), 0);
+
+  for (const fItem of bomCost.fasteners) {
+    h2Rows.push(
+      xmlRow([
+        { type: 'String', value: 'fijacion_bom' },
+        { type: 'String', value: fItem.nombre },
+        { type: 'Number', value: fItem.cantidad },
+        { type: 'String', value: fItem.unidad },
+        { type: 'String', value: 'calculado' },
+        { type: 'String', value: `Est. ${formatClp(fItem.subtotalClp)} (${formatClp(fItem.costoUnitarioClp)} c/u)` },
+      ]),
+    );
+  }
   h2Rows.push(
     xmlRow([
       { type: 'String', value: 'tapacanto' },
@@ -191,7 +213,7 @@ export function generateExcelSpreadsheetML(
       { type: 'Number', value: Number(despiece.totalEdgeBandingMeters.toFixed(2)) },
       { type: 'String', value: 'metros lineales' },
       { type: 'String', value: 'calculado' },
-      { type: 'String', value: 'Agregar 10% holgura de corte en compra' },
+      { type: 'String', value: `Con +10% holgura: ${bomCost.edgeBandingMetersWithAllowance} m (${formatClp(bomCost.edgeBandingClp)})` },
     ]),
   );
 
@@ -211,6 +233,11 @@ export function generateExcelSpreadsheetML(
       { type: 'String', value: 'Vector Objetivo Vf (cuerpo melamina)' },
       { type: 'String', value: `(${params.targetDimensions.x}, ${params.targetDimensions.y}, ${params.targetDimensions.z})` },
       { type: 'String', value: 'mm' },
+    ]),
+    xmlRow([
+      { type: 'String', value: 'Vector Unitario de Forma û_V = Vf / ||Vf||' },
+      { type: 'String', value: `(${unitVec.unit3D.map((v) => v.toFixed(4)).join(', ')})` },
+      { type: 'String', value: `||Vf|| = ${unitVec.magnitudeMm.toFixed(1)} mm · r = W/H = ${unitVec.aspectRatioXY.toFixed(3)}` },
     ]),
     xmlRow([
       { type: 'String', value: 'Factores Escalamiento (kx, ky, kz)' },
@@ -239,6 +266,24 @@ export function generateExcelSpreadsheetML(
       { type: 'String', value: 'Aprovechamiento Global (Ponderado)' },
       { type: 'Number', value: cuttingPlan.usagePercentage },
       { type: 'String', value: `% (Desperdicio: ${cuttingPlan.wastePercentage}%)` },
+    ]),
+    xmlRow([
+      { type: 'String', value: 'Rigidez Máx. Repisas DIN 68874-1 (25 kg)' },
+      { type: 'Number', value: Number(maxDinDeflection.toFixed(2)) },
+      {
+        type: 'String',
+        value: dinReports.length > 0
+          ? `mm (repisas evaluadas: ${dinReports.length}, cumplen DIN: ${dinReports.filter((r) => r.passesDIN).length}/${dinReports.length})`
+          : 'Sin repisas horizontales',
+      },
+    ]),
+    xmlRow([
+      { type: 'String', value: 'Presupuesto Referencial Total (CLP)' },
+      { type: 'Number', value: bomCost.totalClp },
+      {
+        type: 'String',
+        value: `${formatClp(bomCost.totalClp)} (Planchas + Tapacanto + Fijaciones + Herrajes)`,
+      },
     ]),
     xmlRow([
       { type: 'String', value: 'Alertas Estructurales' },

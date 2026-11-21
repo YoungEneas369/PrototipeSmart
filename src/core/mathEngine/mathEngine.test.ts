@@ -2,11 +2,15 @@ import { describe, expect, it } from 'vitest';
 import type { BoardPiece, Point2D } from '../../types/contracts';
 import {
   ETAPA2_BASE_MATRIX_M0,
+  analyzeShelvesDeflectionDIN,
   applyHomography,
   calculateDespiece,
+  calculateShelfDeflectionDIN,
   calculateShelfProgression,
   clonePreset,
+  compareShapeAspect,
   computeQuadToUnitHomography,
+  computeUnitDirectionVector,
   exteriorToInterior,
   exteriorToInteriorRaw,
   interiorToExterior,
@@ -236,5 +240,62 @@ describe('SmartFurniture Bloque 1 — Motor Matemático y Homografía (v3.0)', (
       { x: 50, y: 100 },
     ];
     expect(computeQuadToUnitHomography(degenerate)).toBeNull();
+  });
+
+  it('Vector unitario de forma û_V = V/||V||: norma 1 e invariancia exacta bajo k·V (0.5, 1.2, 2.0) + compararForma', () => {
+    const base = { x: 800, y: 1800, z: 320 };
+    const u0 = computeUnitDirectionVector(base);
+    expect(Math.hypot(...u0.unit3D)).toBeCloseTo(1, 8);
+    expect(Math.hypot(...u0.unitXY)).toBeCloseTo(1, 8);
+    expect(u0.aspectRatioXY).toBeCloseTo(800 / 1800, 6);
+
+    for (const k of [0.5, 1.2, 2.0]) {
+      const uk = computeUnitDirectionVector({
+        x: base.x * k,
+        y: base.y * k,
+        z: base.z * k,
+      });
+      expect(uk.unit3D[0]).toBeCloseTo(u0.unit3D[0], 8);
+      expect(uk.unit3D[1]).toBeCloseTo(u0.unit3D[1], 8);
+      expect(uk.unit3D[2]).toBeCloseTo(u0.unit3D[2], 8);
+      expect(uk.unitXY[0]).toBeCloseTo(u0.unitXY[0], 8);
+      expect(uk.unitXY[1]).toBeCloseTo(u0.unitXY[1], 8);
+      expect(uk.magnitudeMm).toBeCloseTo(u0.magnitudeMm * k, 4);
+    }
+
+    // compararForma: sin deformación vs estirado horizontal/vertical
+    const ok = compareShapeAspect(0.5, 900, 1800)!;
+    expect(ok.warn).toBe(false);
+    expect(ok.direction).toBe('ok');
+
+    const wide = compareShapeAspect(0.5, 1500, 1800)!;
+    expect(wide.warn).toBe(true);
+    expect(wide.direction).toBe('estirado_horizontal');
+
+    const tall = compareShapeAspect(1.5, 800, 1800)!;
+    expect(tall.warn).toBe(true);
+    expect(tall.direction).toBe('estirado_vertical');
+  });
+
+  it('Euler-Bernoulli DIN 68874-1: 800 mm cumple, 1000 mm falla con pandeo severo y divisor central recupera rigidez', () => {
+    const d800 = calculateShelfDeflectionDIN(800, 320, 18, 25);
+    expect(d800.passesDIN).toBe(true);
+    expect(d800.allowableMm).toBeCloseTo(4.0, 2);
+    expect(d800.deflectionMm).toBeCloseTo(3.89, 1);
+
+    const d1000 = calculateShelfDeflectionDIN(1000, 320, 18, 25);
+    expect(d1000.passesDIN).toBe(false);
+    expect(d1000.status).toBe('Pandeo Severo');
+    expect(d1000.deflectionMm).toBeGreaterThan(d1000.allowableMm);
+    expect(d1000.maxLoadKg).toBeLessThan(20);
+
+    // Con divisor central en mueble de 1000 mm -> luz 473 mm -> excelente rigidez
+    const { topology, params } = clonePreset('estanteria');
+    params.targetDimensions.x = 1000;
+    topology.vDividers.push({ id: 'div_c', position: 0.5, start: 0, end: 1 });
+    const res = calculateDespiece(topology, params);
+    const reports = analyzeShelvesDeflectionDIN(res.matrizDespiece, 25);
+    expect(reports).toHaveLength(8);
+    expect(reports.every((r) => r.passesDIN && r.status === 'Excelente')).toBe(true);
   });
 });

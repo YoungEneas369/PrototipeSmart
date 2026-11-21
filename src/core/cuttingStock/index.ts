@@ -10,6 +10,8 @@ import { optimizeCuttingSheets } from './optimizer';
 import { renderCuttingPlanSvg } from './svgGenerator';
 
 export { generateDespieceCsv, generateExcelSpreadsheetML } from './exporters';
+export { estimateProjectBomAndCost, formatClp } from './costEstimator';
+export type { BomLineItem, ProjectCostEstimate } from './costEstimator';
 export { renderCuttingPlanSvg } from './svgGenerator';
 
 export function generateCuttingPlan(

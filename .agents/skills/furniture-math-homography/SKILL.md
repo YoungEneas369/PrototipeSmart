@@ -57,8 +57,11 @@ Zero external linear algebra libraries.
 5. **Back Panel Split Guard:**
    - If `hasBackPanel === true`: using `sheet = backPanelSheetDimensions ?? sheetDimensions`, split vertically along interior `vDividers` (or equal vertical strips) whenever `(x_f > minS && y_f > minS)` **OR** `x_f > maxS` **OR** `y_f > maxS`.
 6. **Structural Sag / Pandeo Rule:**
-   - Emit `'pandeo'` (`severidad: 'warning'`) for every horizontal 18 mm shelf with net span (`ancho`) `> 850 mm`.
-   - Engineering context: Euler-Bernoulli deflection `δ = 5 W L³ / (384 E I)` for MDP particleboard (`E ≈ 2.0 GPa`).
+   - Emit `'pandeo'` (`severidad: 'warning'` > 850 mm, `'critical'` > 1050 mm) for every horizontal 18 mm shelf with net span (`ancho`) `> 850 mm`.
+   - Engineering calculation (v3.2): `calculateShelfDeflectionDIN(spanMm, depthMm, thicknessMm = 18, loadKg = 25)` and `analyzeShelvesDeflectionDIN(pieces, loadKg = 25)` compute exact Euler-Bernoulli deflection `δ = 5 P L³ / (384 E I)` for MDP particleboard (`E = 2700 N/mm²`, DIN 68874-1 limit `L / 200`, max load kg).
+7. **Unit Direction Vector & Shape Distortion (v3.2):**
+   - `computeUnitDirectionVector(dims)` returns `û_V = V / ||V||` (`||û_V|| = 1`, strictly scale-invariant under `k·V`) and frontal `û_XY`, distinguishing homogeneous shape invariance from affine carpentry deductions (`W_int = k·W_0 - 2e`).
+   - `compareShapeAspect(photoRatioXY, targetX, targetY)` flags aspect distortion outside `[0.75, 1.33]`.
 
 ## Verification Checklist
 Run Vitest and confirm:

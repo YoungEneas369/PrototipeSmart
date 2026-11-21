@@ -85,6 +85,173 @@ export function interiorToExterior(p: number, e: number, dim: number): number {
   return p * (1 - (2 * e) / dim) + e / dim;
 }
 
+export interface UnitDirectionVectorResult {
+  /** Vector unitario 3D û_V = V / ||V|| ∈ ℝ³ (invariante bajo escalamiento uniforme k·V). */
+  unit3D: [number, number, number];
+  /** Vector unitario frontal 2D û_XY = (W, H) / ||(W, H)|| (invariante de silueta frontal). */
+  unitXY: [number, number];
+  /** Norma euclidiana ||V|| = √(W² + H² + D²) en mm. */
+  magnitudeMm: number;
+  /** Razón de aspecto frontal W / H = û_x / û_y. */
+  aspectRatioXY: number;
+}
+
+/**
+ * Calcula el vector unitario de forma û_V = V / ||V|| en ℝ³ y su proyección frontal û_XY.
+ * Demuestra invariancia de forma bajo escalamiento homogéneo V' = k·V (û_{kV} = û_V).
+ */
+export function computeUnitDirectionVector(dims: {
+  x: number;
+  y: number;
+  z: number;
+}): UnitDirectionVectorResult {
+  const x = Math.max(0, dims.x);
+  const y = Math.max(0, dims.y);
+  const z = Math.max(0, dims.z);
+  const magnitudeMm = Math.hypot(x, y, z);
+  const normXY = Math.hypot(x, y);
+
+  if (magnitudeMm < 1e-9) {
+    return {
+      unit3D: [0, 0, 0],
+      unitXY: [0, 0],
+      magnitudeMm: 0,
+      aspectRatioXY: 1,
+    };
+  }
+
+  return {
+    unit3D: [x / magnitudeMm, y / magnitudeMm, z / magnitudeMm],
+    unitXY: normXY > 1e-9 ? [x / normXY, y / normXY] : [0, 0],
+    magnitudeMm,
+    aspectRatioXY: y > 1e-9 ? x / y : 1,
+  };
+}
+
+export interface ShapeComparisonResult {
+  photoRatioXY: number;
+  realRatioXY: number;
+  deformationFactor: number;
+  warn: boolean;
+  direction: 'ok' | 'estirado_horizontal' | 'estirado_vertical';
+}
+
+/**
+ * Compara la proporción W/H real respecto a la proporción de referencia/foto (portado de SmartFurniture).
+ * Advierte cuando la deformación sale del rango saludable [0.75, 1.33].
+ */
+export function compareShapeAspect(
+  photoRatioXY: number,
+  targetX: number,
+  targetY: number,
+): ShapeComparisonResult | null {
+  if (!(photoRatioXY > 0) || !(targetX > 0) || !(targetY > 0)) {
+    return null;
+  }
+  const realRatioXY = targetX / targetY;
+  const deformationFactor = realRatioXY / photoRatioXY;
+  const direction: ShapeComparisonResult['direction'] =
+    deformationFactor > 1.33
+      ? 'estirado_horizontal'
+      : deformationFactor < 0.75
+        ? 'estirado_vertical'
+        : 'ok';
+
+  return {
+    photoRatioXY,
+    realRatioXY,
+    deformationFactor,
+    warn: direction !== 'ok',
+    direction,
+  };
+}
+
+export interface ShelfDeflectionDIN {
+  spanMm: number;
+  depthMm: number;
+  thicknessMm: number;
+  loadKg: number;
+  /** Flecha elástica Euler-Bernoulli δ = (5·P·L³) / (384·E·I) en mm. */
+  deflectionMm: number;
+  /** Límite admisible DIN 68874-1 (L / 200) en mm. */
+  allowableMm: number;
+  /** Carga máxima uniforme admisible antes de exceder L / 200 (kg). */
+  maxLoadKg: number;
+  passesDIN: boolean;
+  status: 'Excelente' | 'Buena' | 'Al Límite' | 'Pandeo Severo';
+}
+
+export interface PieceDeflectionReport extends ShelfDeflectionDIN {
+  id: string;
+  nombre: string;
+}
+
+const MELAMINE_MDP_MODULUS_E = 2700; // N/mm² (MDP estándar)
+const GRAVITY_MS2 = 9.80665;
+
+/**
+ * Calcula la flecha elástica máxima de una repisa simplemente apoyada bajo carga uniforme
+ * según Euler-Bernoulli y la norma DIN 68874-1 (límite L/200).
+ */
+export function calculateShelfDeflectionDIN(
+  spanMm: number,
+  depthMm: number,
+  thicknessMm = 18,
+  loadKg = 25,
+): ShelfDeflectionDIN {
+  const L = Math.max(50, spanMm);
+  const b = Math.max(80, depthMm);
+  const e = Math.max(8, thicknessMm);
+  const m = Math.max(1, loadKg);
+
+  const I = (b * Math.pow(e, 3)) / 12;
+  const P = m * GRAVITY_MS2;
+  const L3 = Math.pow(L, 3);
+
+  const deflectionMm = (5 * P * L3) / (384 * MELAMINE_MDP_MODULUS_E * I);
+  const allowableMm = L / 200;
+  const maxLoadN = (384 * MELAMINE_MDP_MODULUS_E * I * allowableMm) / (5 * L3);
+  const maxLoadKg = maxLoadN / GRAVITY_MS2;
+  const passesDIN = deflectionMm <= allowableMm;
+
+  let status: ShelfDeflectionDIN['status'] = 'Excelente';
+  if (deflectionMm > allowableMm * 1.33) {
+    status = 'Pandeo Severo';
+  } else if (!passesDIN) {
+    status = 'Al Límite';
+  } else if (deflectionMm > allowableMm * 0.5) {
+    status = 'Buena';
+  }
+
+  return {
+    spanMm: Number(L.toFixed(1)),
+    depthMm: Number(b.toFixed(1)),
+    thicknessMm: e,
+    loadKg: m,
+    deflectionMm: Number(deflectionMm.toFixed(2)),
+    allowableMm: Number(allowableMm.toFixed(2)),
+    maxLoadKg: Number(maxLoadKg.toFixed(1)),
+    passesDIN,
+    status,
+  };
+}
+
+/**
+ * Evalúa la rigidez estructural DIN 68874-1 de todas las repisas horizontales del despiece.
+ */
+export function analyzeShelvesDeflectionDIN(
+  pieces: readonly BoardPiece[],
+  loadKg = 25,
+): PieceDeflectionReport[] {
+  return pieces
+    .filter((p) => p.tipo === 'repisa')
+    .map((p) => ({
+      id: p.id,
+      nombre: p.nombre,
+      ...calculateShelfDeflectionDIN(p.ancho, p.alto, p.espesor, loadKg),
+    }));
+}
+
 /**
  * Operador algebraico puro de Etapa 2:
  * Aplica M = M0 · diag(kx, ky, 1) preservando invariante la 3ª columna (espesor e).
@@ -584,11 +751,12 @@ export function calculateDespiece(
       });
 
       if (dx > SPAN_WARNING_MM + GEOM_EPS) {
+        const din = calculateShelfDeflectionDIN(dx, zf, e, 25);
         alerts.push({
           id: `alert_pandeo_${pieceId}`,
-          severidad: dx > SPAN_CRITICAL_MM ? 'critical' : 'warning',
+          severidad: dx > SPAN_CRITICAL_MM || !din.passesDIN ? (dx > SPAN_CRITICAL_MM ? 'critical' : 'warning') : 'warning',
           tipo: 'pandeo',
-          mensaje: `${pieceName} supera los ${SPAN_WARNING_MM} mm de luz libre (${dx.toFixed(1)} mm). Riesgo de pandeo: agregue un divisor vertical.`,
+          mensaje: `${pieceName} supera los ${SPAN_WARNING_MM} mm de luz libre (${dx.toFixed(1)} mm). Flecha DIN 68874-1: ${din.deflectionMm.toFixed(2)} mm bajo 25 kg (límite L/200 = ${din.allowableMm.toFixed(2)} mm, máx. ${din.maxLoadKg.toFixed(1)} kg). Agregue un divisor vertical.`,
           piezaId: pieceId,
           luzLibreMm: dx,
         });

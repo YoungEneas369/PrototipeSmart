@@ -27,9 +27,14 @@ import type {
 } from '../../types/contracts';
 import {
   ETAPA2_BASE_MATRIX_M0,
+  analyzeShelvesDeflectionDIN,
+  compareShapeAspect,
+  computeUnitDirectionVector,
   scaleBaseMatrix,
 } from '../../core/mathEngine';
 import {
+  estimateProjectBomAndCost,
+  formatClp,
   generateDespieceCsv,
   generateExcelSpreadsheetML,
 } from '../../core/cuttingStock';
@@ -89,6 +94,14 @@ export function MathPanel({
   const etapa2Demo = scaleBaseMatrix(ETAPA2_BASE_MATRIX_M0, 1.2, 1.2);
   const { kx, ky, kz } = despiece.scaleFactors;
   const prog = despiece.shelfProgression;
+  const unitVec = computeUnitDirectionVector(params.targetDimensions);
+  const shapeComp = compareShapeAspect(
+    topology.aspectRatioXY,
+    params.targetDimensions.x,
+    params.targetDimensions.y,
+  );
+  const dinReports = analyzeShelvesDeflectionDIN(despiece.matrizDespiece, 25);
+  const bomCost = estimateProjectBomAndCost(despiece, cuttingPlan, params);
   const melamineAreaM2 = Math.max(0, despiece.totalNetAreaM2 - despiece.backPanelAreaM2);
   const activeMatrixView: 'nx3' | 'nx5' =
     matrixOverride === 'auto' ? (topology.hasBackPanel ? 'nx5' : 'nx3') : matrixOverride;
@@ -216,6 +229,25 @@ export function MathPanel({
                 k = (k<sub>x</sub> = {kx.toFixed(3)}, k<sub>y</sub> = {ky.toFixed(3)}, k
                 <sub>z</sub> = {kz.toFixed(3)}) · Espesor e = {params.boardThickness} mm constante
               </p>
+              <p className="math-eq">
+                û<sub>V</sub> = V<sub>f</sub> / ‖V<sub>f</sub>‖ = (
+                {unitVec.unit3D.map((v) => v.toFixed(4)).join(', ')}) · ‖V<sub>f</sub>‖ ={' '}
+                {unitVec.magnitudeMm.toFixed(1)} mm · ‖û<sub>V</sub>‖ = 1.000
+              </p>
+              <p className="muted small-note">
+                Invarianza de forma: escalar por k·V conserva û<sub>V</sub> y r = W/H ={' '}
+                {unitVec.aspectRatioXY.toFixed(3)}, mientras las piezas interiores usan
+                transformación afín (W<sub>int</sub> = k·W<sub>0</sub> − 2e) por e ={' '}
+                {params.boardThickness} mm constante.
+                {shapeComp?.warn && (
+                  <>
+                    {' '}
+                    <strong>
+                      Deformación vs foto: {(shapeComp.deformationFactor * 100).toFixed(0)}%.
+                    </strong>
+                  </>
+                )}
+              </p>
             </div>
 
             <div className="metric-card">
@@ -309,6 +341,55 @@ export function MathPanel({
                 )}
               </>
             )}
+
+            <div className="metric-card">
+              <h4>Rigidez Estructural de Repisas — Norma DIN 68874-1 (Euler-Bernoulli, 25 kg)</h4>
+              <p className="math-eq small-note">
+                δ = (5 · P · L³) / (384 · E · I) · E = 2700 N/mm² (MDP) · Límite admisible L / 200
+              </p>
+              {dinReports.length === 0 ? (
+                <p className="muted small-note">Este mueble no tiene repisas horizontales suspendidas.</p>
+              ) : (
+                <div className="table-scroll">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Repisa</th>
+                        <th>Luz L (mm)</th>
+                        <th>Flecha δ (mm)</th>
+                        <th>Límite L/200</th>
+                        <th>Carga Máx.</th>
+                        <th>Estado DIN</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {dinReports.map((r) => (
+                        <tr key={r.id}>
+                          <td>{r.nombre}</td>
+                          <td className="num">{r.spanMm.toFixed(1)}</td>
+                          <td className="num">{r.deflectionMm.toFixed(2)}</td>
+                          <td className="num">{r.allowableMm.toFixed(2)}</td>
+                          <td className="num">{r.maxLoadKg.toFixed(1)} kg</td>
+                          <td>
+                            <span
+                              className={
+                                r.status === 'Pandeo Severo'
+                                  ? 'din-pill bad'
+                                  : r.status === 'Al Límite'
+                                    ? 'din-pill warn'
+                                    : 'din-pill ok'
+                              }
+                            >
+                              {r.status}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -468,6 +549,58 @@ export function MathPanel({
               <button type="button" className="btn-small" onClick={handleAddHw} disabled={!hwDesc.trim()}>
                 + Agregar
               </button>
+            </div>
+
+            <div className="metric-card">
+              <div className="card-header-row">
+                <h4>Quincallería Automática (BOM) &amp; Presupuesto Referencial CLP</h4>
+                <span className="bom-total-pill">{formatClp(bomCost.totalClp)}</span>
+              </div>
+              <div className="kpi-grid">
+                <div>
+                  <span className="kpi-label">Melamina ({cuttingPlan.melamineSheetsCount} pl.)</span>
+                  <strong>{formatClp(bomCost.melamineSheetsClp)}</strong>
+                </div>
+                <div>
+                  <span className="kpi-label">Fondo 3 mm ({cuttingPlan.backPanelSheetsCount} pl.)</span>
+                  <strong>{formatClp(bomCost.backPanelSheetsClp)}</strong>
+                </div>
+                <div>
+                  <span className="kpi-label">Tapacanto ({bomCost.edgeBandingMetersWithAllowance} m)</span>
+                  <strong>{formatClp(bomCost.edgeBandingClp)}</strong>
+                </div>
+                <div>
+                  <span className="kpi-label">Fijaciones + Herrajes</span>
+                  <strong>{formatClp(bomCost.fastenersClp + bomCost.externalHardwareClp)}</strong>
+                </div>
+              </div>
+              <div className="table-scroll">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Insumo calculado (BOM)</th>
+                      <th>Cant.</th>
+                      <th>Precio Ref.</th>
+                      <th>Subtotal</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bomCost.fasteners.map((it) => (
+                      <tr key={it.id}>
+                        <td>{it.nombre}</td>
+                        <td className="num">
+                          {it.cantidad} {it.unidad}
+                        </td>
+                        <td className="num">{formatClp(it.costoUnitarioClp)}</td>
+                        <td className="num">{formatClp(it.subtotalClp)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="muted small-note">
+                Estimación 100 % offline basada en precios referenciales de mercado chileno (plancha, tapacanto +10 % holgura y fijaciones).
+              </p>
             </div>
           </div>
         )}

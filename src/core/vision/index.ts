@@ -12,8 +12,12 @@ export type {
   LowerGapHintResult,
 } from './bandDetector';
 export {
+  autoDetectFurnitureQuad,
   computeRectifiedSize,
+  computeSobelEdgeOverlayRGBA,
   estimateAspectRatioFixedFocal,
+  estimateCameraPoseMeters,
   extrapolateDimensionsFromSingleMeasure,
   rectifyImageRGBA,
 } from './rectify';
+export type { AutoQuadResult, CameraPoseEstimate } from './rectify';

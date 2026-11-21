@@ -9,10 +9,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Camera,
+  Contrast,
   Eraser,
   Move,
   Pipette,
   Ruler,
+  Scan,
   ScanSearch,
   Sparkles,
   Trash2,
@@ -35,9 +37,12 @@ import {
 } from '../../core/mathEngine';
 import {
   analyzeRectifiedFurniture,
+  autoDetectFurnitureQuad,
   computeRectifiedSize,
+  computeSobelEdgeOverlayRGBA,
   detectLowerGapHint,
   estimateAspectRatioFixedFocal,
+  estimateCameraPoseMeters,
   extrapolateDimensionsFromSingleMeasure,
   rectifyImageRGBA,
 } from '../../core/vision';
@@ -224,6 +229,7 @@ export function VectorCanvas({
   );
   const [tool, setTool] = useState<ToolMode>('corners');
   const [focal35mm, setFocal35mm] = useState<26 | 52>(26);
+  const [showSobelOverlay, setShowSobelOverlay] = useState<boolean>(false);
   const [dragTarget, setDragTarget] = useState<DragTarget | null>(null);
   const [cursorImgPt, setCursorImgPt] = useState<Point2D | null>(null);
   const [draftLineStart, setDraftLineStart] = useState<Point2D | null>(null);
@@ -324,6 +330,30 @@ export function VectorCanvas({
     return estimateAspectRatioFixedFocal(quad, imgSize.w, imgSize.h, focal35mm);
   }, [quad, imgSize.w, imgSize.h, focal35mm]);
 
+  const cameraPose = useMemo(() => {
+    if (!frontBitmap || !homography) return null;
+    return estimateCameraPoseMeters(
+      quad,
+      imgSize.w,
+      imgSize.h,
+      knownAxis,
+      knownMeasureMm,
+      focal35mm,
+    );
+  }, [frontBitmap, homography, quad, imgSize.w, imgSize.h, knownAxis, knownMeasureMm, focal35mm]);
+
+  const sobelCanvas = useMemo(() => {
+    if (!showSobelOverlay || !frontBitmap || frontBitmap.w === 0) return null;
+    const edgeRgba = computeSobelEdgeOverlayRGBA(frontBitmap.rgba, frontBitmap.w, frontBitmap.h);
+    const c = document.createElement('canvas');
+    c.width = frontBitmap.w;
+    c.height = frontBitmap.h;
+    const ctx = c.getContext('2d');
+    if (!ctx) return null;
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(edgeRgba), frontBitmap.w, frontBitmap.h), 0, 0);
+    return c;
+  }, [showSobelOverlay, frontBitmap]);
+
   const loadFrontalFromUrl = (url: string, isSample = false) => {
     const img = new Image();
     img.onload = () => {
@@ -332,32 +362,47 @@ export function VectorCanvas({
       setFrontBitmap(bmp);
       setImgSize({ w: bmp.w, h: bmp.h });
       setShowProtocol(false);
+      setShowSobelOverlay(false);
 
-      const defaultQuad: [Point2D, Point2D, Point2D, Point2D] = isSample
-        ? [
-            { x: 185, y: 85 },
-            { x: 675, y: 98 },
-            { x: 700, y: 515 },
-            { x: 165, y: 525 },
-          ]
-        : [
-            { x: Math.round(bmp.w * 0.16), y: Math.round(bmp.h * 0.14) },
-            { x: Math.round(bmp.w * 0.84), y: Math.round(bmp.h * 0.14) },
-            { x: Math.round(bmp.w * 0.84), y: Math.round(bmp.h * 0.84) },
-            { x: Math.round(bmp.w * 0.16), y: Math.round(bmp.h * 0.84) },
-          ];
-      setQuad(defaultQuad);
+      let initialQuad: [Point2D, Point2D, Point2D, Point2D];
+      let nextMsg: string;
+
+      if (isSample) {
+        initialQuad = [
+          { x: 185, y: 85 },
+          { x: 675, y: 98 },
+          { x: 700, y: 515 },
+          { x: 165, y: 525 },
+        ];
+        nextMsg = 'Croquis cargado. Pulsa "Detectar estructura" o arrastra los nodos TL/TR/BR/BL.';
+      } else {
+        const autoQ = autoDetectFurnitureQuad(bmp.rgba, bmp.w, bmp.h);
+        initialQuad = autoQ.quadCorners;
+        nextMsg = autoQ.usedFallback
+          ? `Foto lista (${bmp.w}×${bmp.h} px). Alinea las 4 esquinas al cuerpo de melamina (sin patas) y pulsa "Detectar".`
+          : `Foto lista (${bmp.w}×${bmp.h} px). Auto-esquinas Sobel aplicadas (${Math.round(autoQ.confidence * 100)}%). Afina con la lupa 4× y pulsa "Detectar".`;
+      }
+
+      setQuad(initialQuad);
       setCalibPts([]);
       setHardwareMarkers([]);
       setLegHintDetected(false);
       setTool('corners');
-      setStatusMsg(
-        isSample
-          ? 'Croquis cargado. Pulsa "Detectar estructura" o arrastra los nodos TL/TR/BR/BL.'
-          : `Foto lista (${bmp.w}×${bmp.h} px). Alinea las 4 esquinas al cuerpo de melamina (sin patas) y pulsa "Detectar".`,
-      );
+      setStatusMsg(nextMsg);
     };
     img.src = url;
+  };
+
+  const handleAutoQuad = () => {
+    if (!frontBitmap || frontBitmap.w === 0) return;
+    const autoQ = autoDetectFurnitureQuad(frontBitmap.rgba, frontBitmap.w, frontBitmap.h);
+    setQuad(autoQ.quadCorners);
+    setTool('corners');
+    setStatusMsg(
+      autoQ.usedFallback
+        ? 'Fondo complejo: se propuso marco base. Arrastra TL/TR/BR/BL manualmente.'
+        : `Auto-esquinas Sobel recalculadas (${Math.round(autoQ.confidence * 100)}% conf.). Ajusta si hay patas externas.`,
+    );
   };
 
   const loadSideFromFile = (file: File) => {
@@ -444,7 +489,11 @@ export function VectorCanvas({
     canvas.width = cw;
     canvas.height = ch;
 
-    ctx.drawImage(activeBmp.canvas, 0, 0, cw, ch);
+    if (viewTab === 'frontal' && showSobelOverlay && sobelCanvas) {
+      ctx.drawImage(sobelCanvas, 0, 0, cw, ch);
+    } else {
+      ctx.drawImage(activeBmp.canvas, 0, 0, cw, ch);
+    }
 
     // Contorno del cuadrilátero
     ctx.strokeStyle = '#00e5ff';
@@ -633,6 +682,8 @@ export function VectorCanvas({
     tool,
     calibPts,
     hardwareMarkers,
+    showSobelOverlay,
+    sobelCanvas,
   ]);
 
   const toCanvasCoords = (e: React.PointerEvent<HTMLCanvasElement>): Point2D => {
@@ -678,7 +729,11 @@ export function VectorCanvas({
       dstH,
       { x: effX, y: effY },
       params.boardThickness,
-      { seedPoint, parallaxAware: true, horizonV: 0.5 },
+      {
+        seedPoint,
+        parallaxAware: true,
+        horizonV: cameraPose?.estimatedHorizonV ?? 0.5,
+      },
     );
 
     const legsHint = detectLowerGapHint(frontBitmap.rgba, frontBitmap.w, frontBitmap.h, quad);
@@ -1271,6 +1326,25 @@ export function VectorCanvas({
             <button
               type="button"
               className="chip-btn"
+              onClick={handleAutoQuad}
+              disabled={!hasPhoto}
+              title="Re-detectar 4 esquinas automáticamente usando contraste + bordes Sobel 3×3"
+            >
+              <Scan size={13} /> Auto-esquinas
+            </button>
+            <button
+              type="button"
+              className={showSobelOverlay ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => setShowSobelOverlay((v) => !v)}
+              disabled={!hasPhoto}
+              title="Mostrar bordes Sobel 3×3 sobre la fotografía para alinear con mayor precisión"
+            >
+              <Contrast size={13} /> Bordes Sobel
+            </button>
+            <span className="toolbar-sep" />
+            <button
+              type="button"
+              className="chip-btn"
               onClick={handleUndo}
               disabled={undoStack.length === 0}
               title="Deshacer último cambio (Ctrl+Z)"
@@ -1383,6 +1457,21 @@ export function VectorCanvas({
           <div className="mono small-note">
             W/H est.: <strong>{estimatedAspectXY.toFixed(3)}</strong>
           </div>
+          {cameraPose && (
+            <div className={`pose-badge pose-${cameraPose.distanceQuality}`}>
+              <div>
+                Dist. cámara: <strong>~{cameraPose.distanceMeters.toFixed(1)} m</strong>
+                {cameraPose.distanceQuality === 'very_close'
+                  ? ' (muy cerca)'
+                  : cameraPose.distanceQuality === 'close'
+                    ? ' (aléjate ≥2.5m)'
+                    : ''}
+              </div>
+              <div className="mono" style={{ fontSize: 10.5, opacity: 0.9 }}>
+                Pitch {cameraPose.pitchDeg > 0 ? '+' : ''}{cameraPose.pitchDeg.toFixed(1)}° · Horiz. v={cameraPose.estimatedHorizonV.toFixed(2)}
+              </div>
+            </div>
+          )}
           {conf !== undefined && topology.detectionSource === 'auto' && (
             <div className={`conf-badge ${confClass}`}>
               {detectedModeLabel ? `${detectedModeLabel} · ` : ''}

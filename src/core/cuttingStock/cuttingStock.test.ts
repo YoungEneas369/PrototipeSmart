@@ -7,6 +7,7 @@ import {
   clonePreset,
 } from '../mathEngine';
 import {
+  estimateProjectBomAndCost,
   generateCuttingPlan,
   generateDespieceCsv,
   generateExcelSpreadsheetML,
@@ -206,5 +207,21 @@ describe('SmartFurniture Bloque 2 — Cutting Stock 2D, SVG y Exportadores Excel
     expect(xls).toContain('<Worksheet ss:Name="Herrajes_y_Patas">');
     expect(xls).toContain('<Worksheet ss:Name="Resumen_U3_y_Planchas">');
     expect(xls).toContain('Patas independientes externas (150 mm)');
+    expect(xls).toContain('Vector Unitario de Forma');
+    expect(xls).toContain('DIN 68874-1');
+    expect(xls).toContain('Presupuesto Referencial Total (CLP)');
+
+    // Estimador BOM + CLP
+    const bom = estimateProjectBomAndCost(despiece, plan, params);
+    expect(bom.fasteners.some((f) => f.id === 'bom_tornillos' && f.cantidad >= 8)).toBe(true);
+    expect(bom.fasteners.some((f) => f.id === 'bom_patines')).toBe(false); // rack_tv tiene patas externas
+    expect(bom.externalHardwareClp).toBeGreaterThan(0);
+    expect(bom.totalClp).toBe(
+      bom.melamineSheetsClp +
+        bom.backPanelSheetsClp +
+        bom.edgeBandingClp +
+        bom.fastenersClp +
+        bom.externalHardwareClp,
+    );
   });
 });

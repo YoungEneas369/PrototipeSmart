@@ -374,12 +374,149 @@ button:disabled {
   color: #ffffff;
 }
 
-.viewer3d-pandeo-bar {
+.viewer3d-bottom-stack {
   position: absolute;
   left: 12px;
   right: 12px;
   bottom: 12px;
   z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  pointer-events: none;
+}
+
+.viewer3d-bottom-stack > * {
+  pointer-events: auto;
+}
+
+.viewer3d-piece-hud {
+  background: rgba(15, 23, 42, 0.92);
+  color: #f8fafc;
+  border: 1px solid #38bdf8;
+  border-radius: 9px;
+  padding: 8px 11px;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 12px;
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.25);
+}
+
+.piece-hud-content {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.piece-hud-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.piece-hud-tag {
+  background: rgba(56, 189, 248, 0.2);
+  color: #7dd3fc;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.piece-hud-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: #cbd5e1;
+}
+
+.hud-close-btn {
+  background: rgba(255, 255, 255, 0.12);
+  color: #f8fafc;
+  border: none;
+  border-radius: 6px;
+  padding: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.hud-close-btn:hover {
+  background: rgba(255, 255, 255, 0.24);
+}
+
+.din-pill {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.din-pill.ok {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.din-pill.warn {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.din-pill.bad {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.bom-total-pill {
+  background: #0f2b4c;
+  color: #38bdf8;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 800;
+  font-family: Consolas, monospace;
+}
+
+.pose-badge {
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid transparent;
+}
+
+.pose-optimal {
+  background: #dcfce7;
+  border-color: #86efac;
+  color: #166534;
+}
+
+.pose-close,
+.pose-very_close {
+  background: #fef3c7;
+  border-color: #f59e0b;
+  color: #92400e;
+}
+
+.pose-far {
+  background: #e2e8f0;
+  border-color: #cbd5e1;
+  color: #334155;
+}
+
+.viewer3d-pandeo-bar {
   background: rgba(254, 243, 199, 0.96);
   border: 1px solid #f59e0b;
   color: #92400e;

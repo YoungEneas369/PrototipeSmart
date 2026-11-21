@@ -3,6 +3,7 @@
  * Flujo de 4 pasos + 3 Presets oficiales + Vista Dividida Foto <-> 3D + Exportación Excel/CSV/SVG.
  */
 import { useMemo, useState } from 'react';
+import { Lock, Unlock } from 'lucide-react';
 import type {
   FurnitureTopology,
   HardwareItem,
@@ -15,6 +16,8 @@ import {
   PRESETS,
   calculateDespiece,
   clonePreset,
+  compareShapeAspect,
+  computeUnitDirectionVector,
   type PresetKey,
 } from './core/mathEngine';
 import { generateCuttingPlan } from './core/cuttingStock';
@@ -34,12 +37,24 @@ export default function App() {
   const [explodeFactor, setExplodeFactor] = useState<number>(0);
   const [sheetStandard, setSheetStandard] = useState<SheetStandard>('pauta');
   const [activeStep, setActiveStep] = useState<ActiveStep>('3d');
+  const [lockProportion, setLockProportion] = useState<boolean>(false);
+  const [lockedRatioXY, setLockedRatioXY] = useState<number>(initial.topology.aspectRatioXY);
 
   const despiece = useMemo(() => calculateDespiece(topology, params), [topology, params]);
 
   const cuttingPlan = useMemo(
     () => generateCuttingPlan(despiece.matrizDespiece, params),
     [despiece.matrizDespiece, params],
+  );
+
+  const unitVec = useMemo(
+    () => computeUnitDirectionVector(params.targetDimensions),
+    [params.targetDimensions],
+  );
+
+  const shapeComp = useMemo(
+    () => compareShapeAspect(topology.aspectRatioXY, params.targetDimensions.x, params.targetDimensions.y),
+    [topology.aspectRatioXY, params.targetDimensions.x, params.targetDimensions.y],
   );
 
   const handleLoadPreset = (key: PresetKey) => {
@@ -51,6 +66,8 @@ export default function App() {
     setActivePreset(key);
     setTopology(cloned.topology);
     setParams(cloned.params);
+    setLockProportion(false);
+    setLockedRatioXY(cloned.topology.aspectRatioXY);
     setExplodeFactor(0);
   };
 
@@ -68,9 +85,51 @@ export default function App() {
       axis === 'z'
         ? Math.max(200, Math.min(800, value))
         : Math.max(300, Math.min(2400, value));
+
+    if (lockProportion && (axis === 'x' || axis === 'y') && lockedRatioXY > 0.05) {
+      setParams((prev) => {
+        if (axis === 'x') {
+          const nextY = Math.max(300, Math.min(2400, Math.round(clamped / lockedRatioXY)));
+          return {
+            ...prev,
+            targetDimensions: { ...prev.targetDimensions, x: clamped, y: nextY },
+          };
+        }
+        const nextX = Math.max(300, Math.min(2400, Math.round(clamped * lockedRatioXY)));
+        return {
+          ...prev,
+          targetDimensions: { ...prev.targetDimensions, x: nextX, y: clamped },
+        };
+      });
+      return;
+    }
+
     setParams((prev) => ({
       ...prev,
       targetDimensions: { ...prev.targetDimensions, [axis]: clamped },
+    }));
+  };
+
+  const handleToggleLockProportion = () => {
+    setLockProportion((prev) => {
+      if (!prev) {
+        const curRatio =
+          params.targetDimensions.y > 0
+            ? params.targetDimensions.x / params.targetDimensions.y
+            : topology.aspectRatioXY;
+        setLockedRatioXY(curRatio);
+      }
+      return !prev;
+    });
+  };
+
+  const handleRestoreShapeProportion = () => {
+    const refRatio = Math.max(0.2, Math.min(4, topology.aspectRatioXY));
+    const nextY = Math.max(300, Math.min(2400, Math.round(params.targetDimensions.x / refRatio)));
+    setLockedRatioXY(refRatio);
+    setParams((prev) => ({
+      ...prev,
+      targetDimensions: { ...prev.targetDimensions, y: nextY },
     }));
   };
 
@@ -122,9 +181,9 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <div className="brand-title">SmartFurniture v3.1 — Diseño Paramétrico &amp; Corte 2D</div>
+          <div className="brand-title">SmartFurniture v3.2 — Diseño Paramétrico &amp; Corte 2D</div>
           <div className="brand-sub">
-            100% Local Offline · INACAP Funciones y Matrices (Unidad 3) · Melamina {params.boardThickness} mm
+            100% Local Offline (PWA) · INACAP Funciones y Matrices (Unidad 3) · Melamina {params.boardThickness} mm
           </div>
         </div>
         <div className="preset-bar">
@@ -175,7 +234,38 @@ export default function App() {
         {/* PANEL LATERAL DE PARÁMETROS (pasa debajo del 3D/Foto automáticamente en móvil) */}
         <aside className="sidebar-controls">
           <div className="control-group">
-            <h3>Dimensiones Cuerpo V<sub>f</sub> (mm)</h3>
+            <div className="card-header-row">
+              <h3>Dimensiones Cuerpo V<sub>f</sub> (mm)</h3>
+              <button
+                type="button"
+                className={lockProportion ? 'chip-btn active' : 'chip-btn'}
+                onClick={handleToggleLockProportion}
+                title="Bloquea el vector unitario frontal û_XY para escalar Ancho y Alto proporcionalmente sin deformar la silueta"
+              >
+                {lockProportion ? <Lock size={12} /> : <Unlock size={12} />}
+                {lockProportion ? 'û_XY fijo' : 'Proporción'}
+              </button>
+            </div>
+            <div className="mono small-note muted">
+              û<sub>XY</sub> = ({unitVec.unitXY[0].toFixed(3)}, {unitVec.unitXY[1].toFixed(3)}) · r ={' '}
+              {unitVec.aspectRatioXY.toFixed(2)}
+            </div>
+            {shapeComp?.warn && (
+              <div className="alert-box warning compact-alert">
+                <span>
+                  Silueta{' '}
+                  {shapeComp.direction === 'estirado_horizontal' ? 'muy ancha' : 'muy alta'} vs
+                  foto ({(shapeComp.deformationFactor * 100).toFixed(0)}%).
+                </span>
+                <button
+                  type="button"
+                  className="btn-small"
+                  onClick={handleRestoreShapeProportion}
+                >
+                  Restaurar
+                </button>
+              </div>
+            )}
             <div className="slider-row">
               <div className="slider-head">
                 <label>Ancho X</label>
@@ -476,6 +566,9 @@ export default function App() {
                   setTopology(next);
                 }}
                 onApplyCalibratedDims={(dims) => {
+                  if (dims.y > 0) {
+                    setLockedRatioXY(dims.x / dims.y);
+                  }
                   setParams((p) => ({
                     ...p,
                     referenceDimensions: { ...dims },

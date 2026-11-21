@@ -1,0 +1,19 @@
+{
+  "name": "SmartFurniture — Diseño Paramétrico y Corte 2D",
+  "short_name": "SmartFurniture",
+  "description": "Prototipo 100% offline para reconstrucción paramétrica Foto a 3D, Unidad 3 (Vectores y Matrices) y optimización de corte en melamina.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f2b4c",
+  "theme_color": "#0f2b4c",
+  "lang": "es-CL",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

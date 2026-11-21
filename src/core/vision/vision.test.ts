@@ -3,8 +3,11 @@ import type { Point2D } from '../../types/contracts';
 import { computeQuadToUnitHomography, interiorToExterior } from '../mathEngine';
 import {
   analyzeRectifiedFurniture,
+  autoDetectFurnitureQuad,
   computeRectifiedSize,
+  computeSobelEdgeOverlayRGBA,
   estimateAspectRatioFixedFocal,
+  estimateCameraPoseMeters,
   extrapolateDimensionsFromSingleMeasure,
   rectifyImageRGBA,
 } from './index';
@@ -522,5 +525,104 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     expect(res.furnitureMode).toBe('open');
     expect(res.vDividers).toHaveLength(0);
     expect(res.hShelves).toHaveLength(3);
+  });
+
+  it('Escenario 11 (Distancia cámara Z y horizonte dinámico): error < 3% a 2.5m, 3.0m, 4.0m con pitch 0° y 15°', () => {
+    const imgW = 1000;
+    const imgH = 750;
+    const f = (26 / 43.27) * Math.hypot(imgW, imgH);
+    const Wmm = 1500;
+    const Hmm = 2100;
+
+    for (const [Dmm, pitchDeg] of [
+      [2500, 0],
+      [3000, 10],
+      [4000, 15],
+    ] as const) {
+      const pitch = (pitchDeg * Math.PI) / 180;
+      const project = (X: number, Y: number): Point2D => {
+        const Yc = Y * Math.cos(pitch);
+        const Zc = Dmm + Y * Math.sin(pitch);
+        return {
+          x: imgW / 2 + (f * X) / Zc,
+          y: imgH / 2 - (f * Yc) / Zc,
+        };
+      };
+
+      const quad: [Point2D, Point2D, Point2D, Point2D] = [
+        project(-Wmm / 2, Hmm / 2),
+        project(Wmm / 2, Hmm / 2),
+        project(Wmm / 2, -Hmm / 2),
+        project(-Wmm / 2, -Hmm / 2),
+      ];
+
+      const poseX = estimateCameraPoseMeters(quad, imgW, imgH, 'x', Wmm, 26)!;
+      expect(poseX).not.toBeNull();
+      const relErrX = Math.abs(poseX.distanceMeters - Dmm / 1000) / (Dmm / 1000);
+      expect(relErrX).toBeLessThan(0.03);
+      expect(Math.abs(poseX.pitchDeg - pitchDeg)).toBeLessThan(1.0);
+
+      const expectedHorizon = Math.max(
+        0.05,
+        Math.min(0.95, 0.5 - (Dmm * Math.sin(pitch)) / Hmm),
+      );
+      expect(Math.abs(poseX.estimatedHorizonV - expectedHorizon)).toBeLessThan(0.05);
+
+      const poseY = estimateCameraPoseMeters(quad, imgW, imgH, 'y', Hmm, 26)!;
+      const relErrY = Math.abs(poseY.distanceMeters - Dmm / 1000) / (Dmm / 1000);
+      expect(relErrY).toBeLessThan(0.03);
+    }
+  });
+
+  it('Escenario 12 (Auto-esquinas Sobel 3×3 + contraste de fondo): localiza mueble con error < 5% e ignora ruido aislado', () => {
+    const W = 400;
+    const H = 300;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    // Pared clara uniforme
+    for (let i = 0; i < W * H; i++) {
+      rgba[i * 4] = 232;
+      rgba[i * 4 + 1] = 236;
+      rgba[i * 4 + 2] = 240;
+      rgba[i * 4 + 3] = 255;
+    }
+
+    // Mueble de roble centrado en [100..300] × [50..250]
+    const trueX0 = 100, trueX1 = 300, trueY0 = 50, trueY1 = 250;
+    for (let y = trueY0; y <= trueY1; y++) {
+      for (let x = trueX0; x <= trueX1; x++) {
+        const i = (y * W + x) * 4;
+        rgba[i] = 178;
+        rgba[i + 1] = 126;
+        rgba[i + 2] = 74;
+        rgba[i + 3] = 255;
+      }
+    }
+
+    // Ruido puntual aislado en la pared (interruptor pequeño en esquina superior izquierda)
+    for (let y = 18; y < 23; y++) {
+      for (let x = 22; x < 27; x++) {
+        const i = (y * W + x) * 4;
+        rgba[i] = 40;
+        rgba[i + 1] = 40;
+        rgba[i + 2] = 40;
+      }
+    }
+
+    const res = autoDetectFurnitureQuad(rgba, W, H);
+    expect(res.usedFallback).toBe(false);
+    expect(res.confidence).toBeGreaterThanOrEqual(0.5);
+
+    const [tl, tr, br, bl] = res.quadCorners;
+    expect(Math.abs(tl.x - trueX0)).toBeLessThan(W * 0.05);
+    expect(Math.abs(tl.y - trueY0)).toBeLessThan(H * 0.05);
+    expect(Math.abs(tr.x - trueX1)).toBeLessThan(W * 0.05);
+    expect(Math.abs(br.y - trueY1)).toBeLessThan(H * 0.05);
+    expect(Math.abs(bl.x - trueX0)).toBeLessThan(W * 0.05);
+
+    // Verificar mapa Sobel 3×3 (borde en x=trueX0 más brillante que el interior plano)
+    const sobel = computeSobelEdgeOverlayRGBA(rgba, W, H);
+    const edgeBlue = sobel[(150 * W + trueX0) * 4 + 2];
+    const flatBlue = sobel[(150 * W + 200) * 4 + 2];
+    expect(edgeBlue).toBeGreaterThan(flatBlue + 80);
   });
 });

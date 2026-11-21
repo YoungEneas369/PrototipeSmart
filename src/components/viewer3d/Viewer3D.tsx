@@ -9,7 +9,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentRef } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
 import { Edges, Html, Line, OrbitControls } from '@react-three/drei';
-import { AlertTriangle, Eye, EyeOff, RotateCcw } from 'lucide-react';
+import { AlertTriangle, Eye, EyeOff, RotateCcw, X } from 'lucide-react';
 import * as THREE from 'three';
 import type {
   BoardPiece,
@@ -18,6 +18,7 @@ import type {
   MelamineMaterial,
   ScaleAndBoardParams,
 } from '../../types/contracts';
+import { calculateShelfDeflectionDIN } from '../../core/mathEngine';
 
 interface Viewer3DProps {
   despiece: DespieceResult;
@@ -130,6 +131,8 @@ function CameraRig({
 
 interface MeshGroupProps extends Viewer3DProps {
   showDimensions: boolean;
+  selectedPieceId: string | null;
+  onSelectPiece: (id: string | null) => void;
 }
 
 function FurnitureMeshGroup({
@@ -138,7 +141,14 @@ function FurnitureMeshGroup({
   params,
   explodeFactor,
   showDimensions,
+  selectedPieceId,
+  onSelectPiece,
 }: MeshGroupProps) {
+  useEffect(() => {
+    return () => {
+      document.body.style.cursor = 'auto';
+    };
+  }, []);
   const { x: xf, y: yf, z: zf } = params.targetDimensions;
   const legHeightMm = topology.hasExternalLegs ? Math.max(40, topology.externalLegHeightMm ?? 150) : 0;
   const legOffsetY = legHeightMm / 1000;
@@ -246,18 +256,43 @@ function FurnitureMeshGroup({
               ? textures.melamineVert
               : textures.melamineHoriz;
 
+          const isSelected = selectedPieceId === piece.id;
+
           return (
-            <mesh key={piece.id} position={pos} castShadow receiveShadow>
+            <mesh
+              key={piece.id}
+              position={pos}
+              castShadow
+              receiveShadow
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectPiece(isSelected ? null : piece.id);
+              }}
+              onPointerOver={(e) => {
+                e.stopPropagation();
+                document.body.style.cursor = 'pointer';
+              }}
+              onPointerOut={() => {
+                document.body.style.cursor = 'auto';
+              }}
+            >
               <boxGeometry args={[dx / 1000, dy / 1000, dz / 1000]} />
               {sev ? (
                 <meshStandardMaterial
                   color={sev === 'critical' ? '#ef4444' : '#f59e0b'}
+                  emissive={isSelected ? '#0284c7' : '#000000'}
+                  emissiveIntensity={isSelected ? 0.35 : 0}
                   roughness={0.45}
                 />
               ) : (
-                <meshStandardMaterial map={tex} roughness={isBack ? 0.85 : 0.55} />
+                <meshStandardMaterial
+                  map={tex}
+                  emissive={isSelected ? '#0284c7' : '#000000'}
+                  emissiveIntensity={isSelected ? 0.28 : 0}
+                  roughness={isBack ? 0.85 : 0.55}
+                />
               )}
-              <Edges color={sev ? '#7f1d1d' : edgeLineColor} />
+              <Edges color={isSelected ? '#0284c7' : sev ? '#7f1d1d' : edgeLineColor} />
             </mesh>
           );
         })}
@@ -319,6 +354,22 @@ export function Viewer3D({
   const [camPreset, setCamPreset] = useState<CameraPreset>('iso');
   const [camTrigger, setCamTrigger] = useState<number>(0);
   const [showDimensions, setShowDimensions] = useState<boolean>(true);
+  const [selectedPieceId, setSelectedPieceId] = useState<string | null>(null);
+
+  const selectedPiece = useMemo(
+    () => despiece.matrizDespiece.find((p) => p.id === selectedPieceId) ?? null,
+    [despiece.matrizDespiece, selectedPieceId],
+  );
+
+  const selectedPieceDin = useMemo(() => {
+    if (!selectedPiece || selectedPiece.tipo !== 'repisa') return null;
+    return calculateShelfDeflectionDIN(
+      selectedPiece.ancho,
+      selectedPiece.alto,
+      selectedPiece.espesor,
+      25,
+    );
+  }, [selectedPiece]);
 
   const legExtraMm = topology.hasExternalLegs ? (topology.externalLegHeightMm ?? 150) : 0;
   const maxDim =
@@ -341,6 +392,7 @@ export function Viewer3D({
         <div className="viewer3d-badges">
           <span className="viewer3d-pill">
             Visor 3D Offline · {despiece.matrizDespiece.length} placas
+            {!selectedPiece ? ' · Clic en pieza' : ''}
           </span>
           {topology.hasExternalLegs && (
             <span className="badge-legs">
@@ -393,16 +445,62 @@ export function Viewer3D({
         </div>
       </div>
 
-      {pandeoAlerts.length > 0 && (
-        <div className="viewer3d-pandeo-bar">
-          <span>
-            <AlertTriangle size={14} /> Pandeo en {pandeoAlerts.length} repisa(s) (luz máx.{' '}
-            {Math.round(maxSpan)} mm &gt; 850 mm)
-          </span>
-          {onAddCenterDivider && (
-            <button type="button" className="btn-fix-pandeo" onClick={onAddCenterDivider}>
-              + Divisor central
-            </button>
+      {(selectedPiece || pandeoAlerts.length > 0) && (
+        <div className="viewer3d-bottom-stack">
+          {selectedPiece && (
+            <div className="viewer3d-piece-hud">
+              <div className="piece-hud-content">
+                <div className="piece-hud-title">
+                  <strong>{selectedPiece.nombre}</strong>
+                  <span className="piece-hud-tag">{selectedPiece.tipo}</span>
+                  <span className="mono">
+                    Corte: <strong>{selectedPiece.ancho.toFixed(1)} × {selectedPiece.alto.toFixed(1)} × {selectedPiece.espesor} mm</strong>
+                  </span>
+                </div>
+                <div className="piece-hud-meta mono">
+                  <span>
+                    Centro ℝ³: ({selectedPiece.posicion3D.map((v) => Math.round(v)).join(', ')}) mm
+                  </span>
+                  <span>
+                    Veta: {selectedPiece.respectGrain ? 'Eje ancho' : 'Libre'}
+                  </span>
+                  {selectedPieceDin && (
+                    <span
+                      className={
+                        selectedPieceDin.passesDIN ? 'din-pill ok' : 'din-pill bad'
+                      }
+                    >
+                      DIN 68874-1: δ={selectedPieceDin.deflectionMm.toFixed(2)} mm /{' '}
+                      {selectedPieceDin.allowableMm.toFixed(2)} mm (máx.{' '}
+                      {selectedPieceDin.maxLoadKg.toFixed(1)} kg)
+                    </span>
+                  )}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="hud-close-btn"
+                onClick={() => setSelectedPieceId(null)}
+                aria-label="Cerrar inspector de pieza"
+                title="Cerrar"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
+
+          {pandeoAlerts.length > 0 && (
+            <div className="viewer3d-pandeo-bar">
+              <span>
+                <AlertTriangle size={14} /> Pandeo en {pandeoAlerts.length} repisa(s) (luz máx.{' '}
+                {Math.round(maxSpan)} mm &gt; 850 mm)
+              </span>
+              {onAddCenterDivider && (
+                <button type="button" className="btn-fix-pandeo" onClick={onAddCenterDivider}>
+                  + Divisor central
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -410,6 +508,7 @@ export function Viewer3D({
       <Canvas
         shadows
         camera={{ position: [camDist * 0.72, Math.max(targetY * 1.15, camDist * 0.58), camDist * 1.05], fov: 42 }}
+        onPointerMissed={() => setSelectedPieceId(null)}
       >
         <color attach="background" args={['#eef2f6']} />
         <ambientLight intensity={0.75} />
@@ -423,6 +522,8 @@ export function Viewer3D({
           params={params}
           explodeFactor={explodeFactor}
           showDimensions={showDimensions}
+          selectedPieceId={selectedPieceId}
+          onSelectPiece={setSelectedPieceId}
         />
         <CameraRig
           preset={camPreset}

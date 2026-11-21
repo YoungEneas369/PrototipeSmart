@@ -240,9 +240,9 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <div className="brand-title">SmartFurniture v4.0 — Visión Híbrida, Plano 2D &amp; Corte</div>
+          <div className="brand-title">SmartFurniture v5.0 — Vectores 2D, 3D &amp; Corte 244×122</div>
           <div className="brand-sub">
-            100% Local Offline (PWA) · INACAP Funciones y Matrices (Unidad 3) · Melamina {params.boardThickness} mm
+            100% Local Offline · Sube tu foto → Vectores y Márgenes → Modelo 3D → Plano de Corte
           </div>
         </div>
         <div className="preset-bar">
@@ -263,7 +263,7 @@ export default function App() {
             aria-label="Catálogo QA de 14 muebles reales con foto"
             title="Cargar cualquiera de los 14 muebles reales de prueba con su foto original"
           >
-            <option value="">Catálogo QA (14 Fotos Reales)…</option>
+            <option value="">Probar 14 Fotos Reales…</option>
             {CATALOG_14_MUEBLES.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.name}
@@ -280,33 +280,37 @@ export default function App() {
             className={activeStep === 'split' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('split')}
           >
-            1. Foto ↔ 3D en Vivo
+            1. Foto, Vectores y 3D
           </button>
           <button
             type="button"
             className={activeStep === 'blueprint' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('blueprint')}
           >
-            2. Plano 2D Vectorial (V₀ vs V_f)
+            2. Plano 2D y Medidas
           </button>
           <button
             type="button"
             className={activeStep === '3d' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('3d')}
           >
-            3. Visor 3D, Unidad 3 y Corte
+            3. Taller: 3D, Unidad 3 y Corte
           </button>
           <button
             type="button"
             className={activeStep === 'foto' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('foto')}
           >
-            Solo Foto
+            Ampliar Foto
           </button>
         </div>
         <span className="small-note muted">
-          Cuerpo: <strong>{params.targetDimensions.x}×{params.targetDimensions.y}×{params.targetDimensions.z} mm</strong> ·{' '}
-          {cuttingPlan.totalSheetsCount} plancha(s) ({cuttingPlan.usagePercentage.toFixed(1)}% uso)
+          <strong>
+            {(params.targetDimensions.x / 10).toFixed(0)}×{(params.targetDimensions.y / 10).toFixed(0)}×
+            {(params.targetDimensions.z / 10).toFixed(0)} cm
+          </strong>{' '}
+          ({params.targetDimensions.x}×{params.targetDimensions.y}×{params.targetDimensions.z} mm) ·{' '}
+          {cuttingPlan.totalSheetsCount} plancha(s) ({cuttingPlan.usagePercentage.toFixed(0)}% uso)
         </span>
       </nav>
 
@@ -348,7 +352,7 @@ export default function App() {
             )}
             <div className="slider-row">
               <div className="slider-head">
-                <label>Ancho X</label>
+                <label>Ancho X ({(params.targetDimensions.x / 10).toFixed(0)} cm)</label>
                 <NumericInput
                   min={300}
                   max={2400}
@@ -370,7 +374,7 @@ export default function App() {
 
             <div className="slider-row">
               <div className="slider-head">
-                <label>Alto Y (cuerpo)</label>
+                <label>Alto Y ({(params.targetDimensions.y / 10).toFixed(0)} cm)</label>
                 <NumericInput
                   min={300}
                   max={2400}
@@ -392,7 +396,7 @@ export default function App() {
 
             <div className="slider-row">
               <div className="slider-head">
-                <label>Profundidad Z</label>
+                <label>Profundidad Z ({(params.targetDimensions.z / 10).toFixed(0)} cm)</label>
                 <NumericInput
                   min={200}
                   max={800}
@@ -502,124 +506,23 @@ export default function App() {
           </div>
 
           <div className="control-group">
-            <h3>Carpintería y Sierra</h3>
-            <label className="small-note">
-              Formato de plancha:
-              <select
-                className="select-input"
-                value={sheetStandard}
-                onChange={(e) => handleSheetStandardChange(e.target.value as SheetStandard)}
-              >
-                <option value="pauta">Estándar Pauta (2440×1220 mm)</option>
-                <option value="chile">Chile (2500×1830 + Durolac 2440×1520)</option>
-              </select>
-            </label>
-
-            <label className="small-note">
-              Encuentro en esquinas:
-              <select
-                className="select-input"
-                value={params.cornerJointType}
-                onChange={(e) =>
-                  setParams((p) => ({
-                    ...p,
-                    cornerJointType: e.target.value as ScaleAndBoardParams['cornerJointType'],
-                  }))
-                }
-              >
-                <option value="topOverSides">Cubierta sobre laterales (topOverSides)</option>
-                <option value="topBetweenSides">Cubierta entre laterales (topBetweenSides)</option>
-              </select>
-            </label>
-
-            <label className="small-note">
-              Tapacanto:
-              <select
-                className="select-input"
-                value={params.edgeBandingMode}
-                onChange={(e) =>
-                  setParams((p) => ({
-                    ...p,
-                    edgeBandingMode: e.target.value as ScaleAndBoardParams['edgeBandingMode'],
-                  }))
-                }
-              >
-                <option value="visibleEdgesOnly">Solo cantos vistos</option>
-                <option value="fullPerimeter">Perímetro completo</option>
-              </select>
-            </label>
-
-            <label className="small-note">
-              Estrategia de corte 2D:
-              <select
-                className="select-input"
-                value={params.packingStrategy ?? 'guillotine'}
-                onChange={(e) =>
-                  setParams((p) => ({
-                    ...p,
-                    packingStrategy: e.target.value as 'guillotine' | 'maxrects',
-                  }))
-                }
-              >
-                <option value="guillotine">Guillotina 2 etapas (Taller)</option>
-                <option value="maxrects">MaxRects BSSF (CNC)</option>
-              </select>
-            </label>
-
-            <label className="toggle-label">
-              <input
-                type="checkbox"
-                checked={params.respectGrain}
-                onChange={(e) => setParams((p) => ({ ...p, respectGrain: e.target.checked }))}
-              />
-              Respetar sentido de veta (bloquea 90°)
-            </label>
-
-            <div className="chip-row">
-              <label className="small-note">
-                Kerf (mm):
-                <select
-                  value={params.kerf}
-                  onChange={(e) => setParams((p) => ({ ...p, kerf: Number(e.target.value) }))}
-                  style={{ marginLeft: 4 }}
-                >
-                  <option value={3.2}>3.2</option>
-                  <option value={3.5}>3.5</option>
-                  <option value={4}>4.0</option>
-                </select>
-              </label>
-              <label className="small-note">
-                Trim (mm):
-                <select
-                  value={params.trimMm ?? 0}
-                  onChange={(e) => setParams((p) => ({ ...p, trimMm: Number(e.target.value) }))}
-                  style={{ marginLeft: 4 }}
-                >
-                  <option value={0}>0</option>
-                  <option value={10}>10</option>
-                  <option value={15}>15</option>
-                </select>
-              </label>
-            </div>
-          </div>
-
-          <div className="control-group">
             <h3>Acabado 3D y Vista Explotada</h3>
             <div className="chip-row">
               {(['blanco', 'roble', 'grafito'] as MelamineMaterial[]).map((m) => (
                 <button
                   key={m}
                   type="button"
-                  className={params.material === m ? 'chip-btn active' : 'chip-btn'}
+                  className={params.material === m ? 'chip-btn swatch-btn active' : 'chip-btn swatch-btn'}
                   onClick={() => setParams((p) => ({ ...p, material: m }))}
                 >
-                  {m === 'blanco' ? 'Blanco' : m === 'roble' ? 'Roble Claro' : 'Grafito'}
+                  <i className={`swatch-dot swatch-${m}`} />
+                  {m === 'blanco' ? 'Blanco' : m === 'roble' ? 'Roble' : 'Grafito'}
                 </button>
               ))}
             </div>
             <div className="slider-row">
               <div className="slider-head">
-                <label>Vista Explotada</label>
+                <label>Separar piezas (Explotada)</label>
                 <strong>{Math.round(explodeFactor * 100)}%</strong>
               </div>
               <input
@@ -632,6 +535,110 @@ export default function App() {
               />
             </div>
           </div>
+
+          <details className="control-group advanced-drawer">
+            <summary>Ajustes de Taller y Sierra (Opcional)</summary>
+            <div className="advanced-drawer-body">
+              <label className="small-note">
+                Formato de plancha:
+                <select
+                  className="select-input"
+                  value={sheetStandard}
+                  onChange={(e) => handleSheetStandardChange(e.target.value as SheetStandard)}
+                >
+                  <option value="pauta">Estándar Pauta (2440×1220 mm)</option>
+                  <option value="chile">Chile (2500×1830 + Durolac 2440×1520)</option>
+                </select>
+              </label>
+
+              <label className="small-note">
+                Encuentro en esquinas:
+                <select
+                  className="select-input"
+                  value={params.cornerJointType}
+                  onChange={(e) =>
+                    setParams((p) => ({
+                      ...p,
+                      cornerJointType: e.target.value as ScaleAndBoardParams['cornerJointType'],
+                    }))
+                  }
+                >
+                  <option value="topOverSides">Cubierta sobre laterales (topOverSides)</option>
+                  <option value="topBetweenSides">Cubierta entre laterales (topBetweenSides)</option>
+                </select>
+              </label>
+
+              <label className="small-note">
+                Tapacanto:
+                <select
+                  className="select-input"
+                  value={params.edgeBandingMode}
+                  onChange={(e) =>
+                    setParams((p) => ({
+                      ...p,
+                      edgeBandingMode: e.target.value as ScaleAndBoardParams['edgeBandingMode'],
+                    }))
+                  }
+                >
+                  <option value="visibleEdgesOnly">Solo cantos vistos</option>
+                  <option value="fullPerimeter">Perímetro completo</option>
+                </select>
+              </label>
+
+              <label className="small-note">
+                Estrategia de corte 2D:
+                <select
+                  className="select-input"
+                  value={params.packingStrategy ?? 'guillotine'}
+                  onChange={(e) =>
+                    setParams((p) => ({
+                      ...p,
+                      packingStrategy: e.target.value as 'guillotine' | 'maxrects',
+                    }))
+                  }
+                >
+                  <option value="guillotine">Guillotina 2 etapas (Taller)</option>
+                  <option value="maxrects">MaxRects BSSF (CNC)</option>
+                </select>
+              </label>
+
+              <label className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={params.respectGrain}
+                  onChange={(e) => setParams((p) => ({ ...p, respectGrain: e.target.checked }))}
+                />
+                Respetar sentido de veta (bloquea 90°)
+              </label>
+
+              <div className="chip-row">
+                <label className="small-note">
+                  Kerf (mm):
+                  <select
+                    value={params.kerf}
+                    onChange={(e) => setParams((p) => ({ ...p, kerf: Number(e.target.value) }))}
+                    style={{ marginLeft: 4 }}
+                  >
+                    <option value={3.2}>3.2</option>
+                    <option value={3.5}>3.5</option>
+                    <option value={4}>4.0</option>
+                  </select>
+                </label>
+                <label className="small-note">
+                  Trim (mm):
+                  <select
+                    value={params.trimMm ?? 0}
+                    onChange={(e) => setParams((p) => ({ ...p, trimMm: Number(e.target.value) }))}
+                    style={{ marginLeft: 4 }}
+                  >
+                    <option value={0}>0</option>
+                    <option value={10}>10</option>
+                    <option value={15}>15</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </details>
         </aside>
 
         {/* ESCENARIO CENTRAL (siempre arriba en móvil; VectorCanvas permanece montado) */}
@@ -641,6 +648,7 @@ export default function App() {
               <VectorCanvas
                 topology={topology}
                 params={params}
+                despiece={despiece}
                 externalPhotoUrl={externalPhotoUrl}
                 externalPhotoLabel={externalPhotoLabel}
                 onUpdateTopology={(next) => {

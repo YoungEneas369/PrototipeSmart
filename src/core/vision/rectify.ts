@@ -335,7 +335,9 @@ function segmentForegroundGrid(
   const gR = new Float32Array(n);
   const gG = new Float32Array(n);
   const gB = new Float32Array(n);
+  const gA = new Uint8Array(n);
   const gLum = new Float32Array(n);
+  let transparentCount = 0;
 
   for (let y = 0; y < gh; y++) {
     const sy = Math.min(imgH - 1, Math.floor(((y + 0.5) / gh) * imgH));
@@ -343,13 +345,23 @@ function segmentForegroundGrid(
       const sx = Math.min(imgW - 1, Math.floor(((x + 0.5) / gw) * imgW));
       const si = (sy * imgW + sx) * 4;
       const gi = y * gw + x;
-      const r = rgba[si];
-      const g = rgba[si + 1];
-      const b = rgba[si + 2];
-      gR[gi] = r;
-      gG[gi] = g;
-      gB[gi] = b;
-      gLum[gi] = 0.299 * r + 0.587 * g + 0.114 * b;
+      const a = rgba[si + 3];
+      gA[gi] = a;
+      if (a < 128) {
+        transparentCount++;
+        gR[gi] = 255;
+        gG[gi] = 255;
+        gB[gi] = 255;
+        gLum[gi] = 255;
+      } else {
+        const r = rgba[si];
+        const g = rgba[si + 1];
+        const b = rgba[si + 2];
+        gR[gi] = r;
+        gG[gi] = g;
+        gB[gi] = b;
+        gLum[gi] = 0.299 * r + 0.587 * g + 0.114 * b;
+      }
     }
   }
 
@@ -408,27 +420,45 @@ function segmentForegroundGrid(
   const bgGs: number[] = [];
   const bgBs: number[] = [];
   for (let x = 0; x < gw; x++) {
-    bgRs.push(gR[x]);
-    bgGs.push(gG[x]);
-    bgBs.push(gB[x]);
+    if (gA[x] >= 128) {
+      bgRs.push(gR[x]);
+      bgGs.push(gG[x]);
+      bgBs.push(gB[x]);
+    }
   }
   const sideEndY = Math.round(gh * 0.72);
   for (let y = 1; y < sideEndY; y++) {
     const l = y * gw;
     const r = y * gw + (gw - 1);
-    bgRs.push(gR[l], gR[r]);
-    bgGs.push(gG[l], gG[r]);
-    bgBs.push(gB[l], gB[r]);
+    if (gA[l] >= 128) {
+      bgRs.push(gR[l]);
+      bgGs.push(gG[l]);
+      bgBs.push(gB[l]);
+    }
+    if (gA[r] >= 128) {
+      bgRs.push(gR[r]);
+      bgGs.push(gG[r]);
+      bgBs.push(gB[r]);
+    }
   }
-  const medR = medianNum(bgRs);
-  const medG = medianNum(bgGs);
-  const medB = medianNum(bgBs);
+  const medR = bgRs.length >= 12 ? medianNum(bgRs) : 250;
+  const medG = bgGs.length >= 12 ? medianNum(bgGs) : 250;
+  const medB = bgBs.length >= 12 ? medianNum(bgBs) : 250;
 
-  // Etapa 2: Flood-Fill BFS iterativo desde techo y laterales (NO piso central)
+  // Etapa 2: Flood-Fill BFS iterativo desde transparencia + techo + laterales + esquinas inferiores
   const bgMask = new Uint8Array(n);
   const queue = new Int32Array(n);
   let qHead = 0;
   let qTail = 0;
+
+  if (transparentCount > 16) {
+    for (let i = 0; i < n; i++) {
+      if (gA[i] < 128) {
+        bgMask[i] = 1;
+        queue[qTail++] = i;
+      }
+    }
+  }
 
   const trySeed = (x: number, y: number) => {
     const idx = y * gw + x;
@@ -441,9 +471,15 @@ function segmentForegroundGrid(
   for (let x = 0; x < gw; x++) {
     trySeed(x, 0);
   }
-  for (let y = 1; y < Math.round(gh * 0.85); y++) {
+  for (let y = 1; y < Math.round(gh * 0.92); y++) {
     trySeed(0, y);
     trySeed(gw - 1, y);
+  }
+  // Sembrar SOLO extremos inferiores izquierdo/derecho (limpia alfombra/piso sin invadir hueco de piernas central)
+  const cornerW = Math.max(3, Math.round(gw * 0.08));
+  for (let x = 0; x < cornerW; x++) {
+    trySeed(x, gh - 1);
+    trySeed(gw - 1 - x, gh - 1);
   }
 
   const edgeBarrier = 60;
@@ -679,7 +715,49 @@ export function autoDetectFurnitureQuad(
   };
 
   const [bx0, bx1] = findMainSpan(colCounts, 1, gw - 1, colThresh);
-  const [by0, by1] = findMainSpan(rowCounts, 1, gh - 1, rowThresh);
+  let [by0, by1] = findMainSpan(rowCounts, 1, gh - 1, rowThresh);
+
+  // Recortar objetos decorativos estrechos apoyados encima de la cubierta (floreros, relojes, cuadros)
+  if (by0 >= 0 && by1 > by0 + 12) {
+    const bodySpan = by1 - by0;
+    const topBodyThresh = Math.max(0.22, maxRowD * 0.45);
+    const maxTrimY = by0 + Math.round(bodySpan * 0.32);
+    if (rowCounts[by0] < topBodyThresh) {
+      for (let y = by0; y <= maxTrimY; y++) {
+        if (rowCounts[y] >= topBodyThresh && (rowCounts[y + 1] ?? 0) >= topBodyThresh) {
+          by0 = y;
+          break;
+        }
+      }
+    }
+
+    // Si el primer plano llegó hasta el borde inferior (piso/alfombra sin cortar), buscar el zócalo/base real
+    if (by1 >= gh - 3 && bx1 > bx0 + 12) {
+      const scanMinY = by0 + Math.round((by1 - by0) * 0.45);
+      const scanMaxY = gh - 5;
+      let bestLineY = -1;
+      let bestEdgeScore = 0;
+      for (let y = scanMaxY; y >= scanMinY; y--) {
+        let edgeSum = 0;
+        let spanCnt = 0;
+        for (let x = bx0 + 2; x <= bx1 - 2; x++) {
+          edgeSum += seg.sobelMag[y * gw + x];
+          spanCnt++;
+        }
+        const avgEdge = edgeSum / Math.max(1, spanCnt);
+        if (avgEdge >= 38 && avgEdge > bestEdgeScore) {
+          bestEdgeScore = avgEdge;
+          bestLineY = y;
+          // Preferir la línea fuerte más baja (base real del mueble sobre el piso)
+          if (avgEdge >= 58) break;
+        }
+      }
+      if (bestLineY > scanMinY && bestLineY < by1 - 4) {
+        by1 = bestLineY;
+      }
+    }
+  }
+
   const bw = bx1 - bx0;
   const bh = by1 - by0;
 

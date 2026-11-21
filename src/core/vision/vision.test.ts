@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { Point2D } from '../../types/contracts';
-import { computeQuadToUnitHomography, interiorToExterior } from '../mathEngine';
+import type { FurnitureTopology, Point2D, ScaleAndBoardParams } from '../../types/contracts';
+import { calculateDespiece, computeQuadToUnitHomography, interiorToExterior } from '../mathEngine';
 import {
   analyzeRectifiedFurniture,
   autoDetectFurnitureQuad,
@@ -8,8 +8,12 @@ import {
   computeSobelEdgeOverlayRGBA,
   estimateAspectRatioFixedFocal,
   estimateCameraPoseMeters,
+  evaluate3DvsPhotoSimilarity,
+  evaluateMarginsAgainstPhoto,
+  extractStructuralVectorLines,
   extrapolateDimensionsFromSingleMeasure,
   rectifyImageRGBA,
+  runIterativePhotoTo3D,
 } from './index';
 
 /** PRNG determinista (LCG) para renders sintéticos reproducibles al 100%. */
@@ -907,5 +911,144 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     expect(res.hShelves.length).toBeGreaterThanOrEqual(1);
     expect(res.inferredZones.some((z) => z.kind === 'open')).toBe(true);
     expect(res.inferredZones.some((z) => z.materialOverride === 'roble')).toBe(true);
+  });
+
+  it('Escenario 19 (Vectores 2D + Evaluación de Márgenes v5.0): cada línea es un vector unitario válido y penaliza márgenes desfasados', () => {
+    const W = 400;
+    const H = 320;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const fill = (x0: number, y0: number, x1: number, y1: number, rgb: [number, number, number]) => {
+      for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) {
+        for (let x = Math.max(0, x0); x < Math.min(W, x1); x++) {
+          const i = (y * W + x) * 4;
+          rgba[i] = rgb[0];
+          rgba[i + 1] = rgb[1];
+          rgba[i + 2] = rgb[2];
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+
+    fill(0, 0, W, H, [242, 244, 248]);
+    fill(60, 50, 340, 270, [195, 145, 92]);
+    fill(74, 64, 194, 152, [45, 38, 32]);
+    fill(206, 64, 326, 152, [45, 38, 32]);
+    fill(74, 166, 194, 256, [45, 38, 32]);
+    fill(206, 166, 326, 256, [45, 38, 32]);
+
+    const goodQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 60, y: 50 },
+      { x: 340, y: 50 },
+      { x: 340, y: 270 },
+      { x: 60, y: 270 },
+    ];
+    const badQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 10, y: 10 },
+      { x: 250, y: 10 },
+      { x: 250, y: 180 },
+      { x: 10, y: 180 },
+    ];
+
+    const vecGood = extractStructuralVectorLines(rgba, W, H, goodQuad);
+    expect(vecGood.lines.length).toBeGreaterThanOrEqual(6);
+    expect(vecGood.horizontalCount).toBeGreaterThanOrEqual(2);
+    expect(vecGood.verticalCount).toBeGreaterThanOrEqual(2);
+    for (const ln of vecGood.lines) {
+      expect(Math.abs(Math.hypot(ln.unitVec[0], ln.unitVec[1]) - 1)).toBeLessThan(0.01);
+    }
+
+    const evalGood = evaluateMarginsAgainstPhoto(rgba, W, H, goodQuad, vecGood, [242, 244, 248]);
+    const vecBad = extractStructuralVectorLines(rgba, W, H, badQuad);
+    const evalBad = evaluateMarginsAgainstPhoto(rgba, W, H, badQuad, vecBad, [242, 244, 248]);
+    expect(evalGood.overallScore).toBeGreaterThanOrEqual(70);
+    expect(evalGood.overallScore).toBeGreaterThan(evalBad.overallScore + 20);
+  });
+
+  it('Escenario 20 (Similitud 3D vs Foto + Orquestador Auto-Iterativo v5.0): un 3D correcto supera claramente a uno erróneo', () => {
+    const W = 400;
+    const H = 300;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const fill = (x0: number, y0: number, x1: number, y1: number, rgb: [number, number, number]) => {
+      for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) {
+        for (let x = Math.max(0, x0); x < Math.min(W, x1); x++) {
+          const i = (y * W + x) * 4;
+          rgba[i] = rgb[0];
+          rgba[i + 1] = rgb[1];
+          rgba[i + 2] = rgb[2];
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+    fill(0, 0, W, H, [245, 247, 250]);
+    fill(50, 40, 350, 260, [202, 155, 104]);
+    fill(64, 54, 194, 246, [55, 48, 42]);
+    fill(204, 54, 336, 246, [196, 148, 98]);
+
+    const iterRes = runIterativePhotoTo3D(rgba, W, H, { boardThicknessMm: 18 });
+    expect(iterRes).not.toBeNull();
+    expect(iterRes!.marginEval.overallScore).toBeGreaterThanOrEqual(65);
+    expect(iterRes!.similarity3D.overallScore).toBeGreaterThanOrEqual(60);
+    expect(iterRes!.iterationsRun).toBeGreaterThanOrEqual(2);
+
+    const rectCrop = new Uint8ClampedArray(300 * 220 * 4);
+    for (let y = 0; y < 220; y++) {
+      for (let x = 0; x < 300; x++) {
+        const si = ((y + 40) * W + (x + 50)) * 4;
+        const di = (y * 300 + x) * 4;
+        rectCrop[di] = rgba[si];
+        rectCrop[di + 1] = rgba[si + 1];
+        rectCrop[di + 2] = rgba[si + 2];
+        rectCrop[di + 3] = 255;
+      }
+    }
+    const baseTopo: FurnitureTopology = {
+      viewsMode: 1,
+      aspectRatioXY: 300 / 220,
+      vDividers: [{ id: 'd1', position: 0.5, start: 0, end: 1 }],
+      hShelves: [],
+      shelfMode: 'custom',
+      equalShelfCount: 0,
+      hasBackPanel: true,
+      frontZones: [
+        { id: 'z1', uStart: 0, uEnd: 0.5, vStart: 0, vEnd: 1, kind: 'open' },
+        { id: 'z2', uStart: 0.5, uEnd: 1, vStart: 0, vEnd: 1, kind: 'door_right' },
+      ],
+    };
+    const mkP = (material: 'roble' | 'grafito'): ScaleAndBoardParams => ({
+      targetDimensions: { x: 1200, y: 880, z: 400 },
+      referenceDimensions: { x: 1200, y: 880, z: 400 },
+      boardThickness: 18,
+      backPanelThickness: 3,
+      sheetDimensions: { width: 2440, height: 1220 },
+      trimMm: 0,
+      kerf: 4,
+      respectGrain: true,
+      packingStrategy: 'guillotine',
+      cornerJointType: 'topOverSides',
+      edgeBandingMode: 'visibleEdgesOnly',
+      material,
+    });
+    const simGood = evaluate3DvsPhotoSimilarity(
+      rectCrop,
+      300,
+      220,
+      calculateDespiece(baseTopo, mkP('roble')),
+      baseTopo,
+      mkP('roble'),
+    );
+    const wrongTopo: FurnitureTopology = {
+      ...baseTopo,
+      vDividers: [],
+      frontZones: [{ id: 'z_all', uStart: 0, uEnd: 1, vStart: 0, vEnd: 1, kind: 'door_left' }],
+    };
+    const simWrong = evaluate3DvsPhotoSimilarity(
+      rectCrop,
+      300,
+      220,
+      calculateDespiece(wrongTopo, mkP('grafito')),
+      wrongTopo,
+      mkP('grafito'),
+    );
+    expect(simGood.overallScore).toBeGreaterThan(simWrong.overallScore + 15);
   });
 });

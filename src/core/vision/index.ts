@@ -22,3 +22,21 @@ export {
   rectifyImageRGBA,
 } from './rectify';
 export type { AutoQuadResult, CameraPoseEstimate } from './rectify';
+export {
+  evaluate3DvsPhotoSimilarity,
+  evaluateMarginsAgainstPhoto,
+  extractStructuralVectorLines,
+  reconstructStructureFromVectors,
+  runIterativePhotoTo3D,
+} from './vectorLines';
+export type {
+  IterativePhoto3DOptions,
+  IterativePhoto3DResult,
+  MarginEvaluationResult,
+  VectorLine2D,
+  VectorLineExtractionResult,
+  VectorLineOrientation,
+  VectorLineRole,
+  VectorStructureReconstruction,
+  Visual3DSimilarityResult,
+} from './vectorLines';

@@ -555,7 +555,8 @@ export function calculateDespiece(
       const fw = fx1 - fx0;
       const fTop = e + v.vEnd * yInt - e / 2;
       const fh = Math.max(160, Math.min(360, (v.vEnd - v.vStart) * yInt * 0.45));
-      if (fw > 40 && fTop - fh > e) {
+      // Generar faldón trasero solo en el hueco principal de piernas (evita duplicarlo bajo cajoneras estrechas)
+      if (fw >= xInt * 0.34 && fTop - fh > e) {
         pieces.push({
           id: `faldon_${v.id}`,
           nombre: 'Faldón Trasero Escritorio',

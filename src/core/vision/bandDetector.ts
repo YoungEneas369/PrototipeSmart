@@ -116,10 +116,64 @@ function boxBlur2D(src: Float32Array, W: number, H: number, radius: number): Flo
 function inferMelamineFromRgb(r: number, g: number, b: number): MelamineMaterial {
   const lum = 0.299 * r + 0.587 * g + 0.114 * b;
   const warmth = r - b;
-  if (warmth > 24 && r > g - 5) return 'roble';
-  if (lum >= 185) return 'blanco';
-  if (lum <= 105) return 'grafito';
+  if (lum >= 175 && Math.abs(r - b) < 28) return 'blanco';
+  if (lum <= 96) return 'grafito';
+  if (warmth > 20 && r > g - 6) return 'roble';
+  if (lum >= 165) return 'blanco';
   return warmth > 12 ? 'roble' : 'grafito';
+}
+
+/**
+ * Detecta si una celda cerrada corresponde a una PUERTA VIDRIADA (`door_glass`):
+ * marco exterior de melamina relativamente uniforme + interior rectangular notablemente más oscuro.
+ */
+function isGlassDoorCell(
+  lum: Float32Array,
+  W: number,
+  H: number,
+  u0: number,
+  u1: number,
+  v0: number,
+  v1: number,
+  cellHmm: number,
+): boolean {
+  if (cellHmm < 360) return false;
+  const x0 = Math.max(0, Math.round(u0 * W));
+  const x1 = Math.min(W - 1, Math.round(u1 * W));
+  const y0 = Math.max(0, Math.round((1 - v1) * H));
+  const y1 = Math.min(H - 1, Math.round((1 - v0) * H));
+  const cw = x1 - x0;
+  const ch = y1 - y0;
+  if (cw < 24 || ch < 32) return false;
+
+  const bx = Math.max(3, Math.round(cw * 0.14));
+  const by = Math.max(3, Math.round(ch * 0.12));
+  const ix0 = x0 + Math.round(cw * 0.22);
+  const ix1 = x1 - Math.round(cw * 0.22);
+  const iy0 = y0 + Math.round(ch * 0.18);
+  const iy1 = y1 - Math.round(ch * 0.18);
+
+  let fSum = 0, fSum2 = 0, fCnt = 0;
+  let cSum = 0, cCnt = 0;
+
+  for (let y = y0 + 2; y <= y1 - 2; y += 2) {
+    for (let x = x0 + 2; x <= x1 - 2; x += 2) {
+      const l = lum[y * W + x];
+      if (x >= ix0 && x <= ix1 && y >= iy0 && y <= iy1) {
+        cSum += l;
+        cCnt++;
+      } else if (x <= x0 + bx || x >= x1 - bx || y <= y0 + by || y >= y1 - by) {
+        fSum += l;
+        fSum2 += l * l;
+        fCnt++;
+      }
+    }
+  }
+  if (fCnt < 16 || cCnt < 16) return false;
+  const fMean = fSum / fCnt;
+  const fStd = Math.sqrt(Math.max(0, fSum2 / fCnt - fMean * fMean));
+  const cMean = cSum / cCnt;
+  return fStd < 38 && cMean < fMean - 11;
 }
 
 interface HybridStructureResult {
@@ -195,13 +249,21 @@ function detectHybridEdgeTransitions(
         rgba[iU + 2] - rgba[iD + 2],
       );
       const flankLum = 0.5 * (lum[(y - stepPad) * W + x] + lum[(y + stepPad) * W + x]);
-      const valley = flankLum - Math.min(lum[(y - 1) * W + x], lum[y * W + x], lum[(y + 1) * W + x]);
+      const valley =
+        flankLum -
+        Math.min(
+          lum[Math.max(0, y - 2) * W + x],
+          lum[(y - 1) * W + x],
+          lum[y * W + x],
+          lum[(y + 1) * W + x],
+          lum[Math.min(H - 1, y + 2) * W + x],
+        );
       const centerColor = Math.max(
         Math.hypot(rgba[iC] - rgba[iU], rgba[iC + 1] - rgba[iU + 1], rgba[iC + 2] - rgba[iU + 2]),
         Math.hypot(rgba[iC] - rgba[iD], rgba[iC + 1] - rgba[iD + 1], rgba[iC + 2] - rgba[iD + 2]),
       );
       const eff = Math.max(stepColor * 0.72, valley * 1.15, centerColor * 0.6);
-      if (eff >= 30) hits++;
+      if (eff >= 28) hits++;
       sumDiff += eff;
     }
     return { ratio: hits / count, meanDiff: sumDiff / count };
@@ -221,8 +283,8 @@ function detectHybridEdgeTransitions(
     const yB = ry1 - Math.round(regH * 0.05);
     const yTop1 = ry0 + Math.round(regH * 0.18);
     const yBot0 = ry1 - Math.round(regH * 0.18);
-    const minX = Math.max(rx0 + stepPad + 2, Math.round(rx0 + regW * 0.1));
-    const maxX = Math.min(rx1 - stepPad - 3, Math.round(rx1 - regW * 0.1));
+    const minX = Math.max(rx0 + stepPad + 2, Math.round(rx0 + regW * 0.14));
+    const maxX = Math.min(rx1 - stepPad - 3, Math.round(rx1 - regW * 0.14));
     const scores = new Float32Array(W);
 
     for (let x = minX; x <= maxX; x++) {
@@ -230,35 +292,42 @@ function detectHybridEdgeTransitions(
       const top = evalVertStep(x, yA, yTop1);
       const bot = evalVertStep(x, yBot0, yB);
       if (!allowPartialAnchor) {
-        if (all.ratio < 0.68 || all.meanDiff < 32) continue;
-        if (top.ratio < 0.55 || bot.ratio < 0.55) continue;
+        if (all.ratio < 0.72 || all.meanDiff < 36) continue;
+        if (top.ratio < 0.62 || bot.ratio < 0.62) continue;
         scores[x] = all.ratio * all.meanDiff;
       } else {
         // Permite módulos suspendidos en esquina (ej. cajonera derecha de escritorio):
-        // exige que el borde arranque limpio en techo o base y tenga al menos 32% de corrida fuerte.
-        const anchoredTop = top.ratio >= 0.7;
-        const anchoredBot = bot.ratio >= 0.7;
+        // exige que el borde arranque limpio en techo o base y tenga al menos 35% de corrida fuerte.
+        const anchoredTop = top.ratio >= 0.72;
+        const anchoredBot = bot.ratio >= 0.72;
         if (!anchoredTop && !anchoredBot) continue;
-        if (all.ratio < 0.32 || all.meanDiff < 30) continue;
+        if (all.ratio < 0.35 || all.meanDiff < 34) continue;
         scores[x] = all.ratio * all.meanDiff;
       }
     }
 
-    const nms = Math.max(22, Math.round(regW * 0.08));
+    const nms = Math.max(28, Math.round(regW * 0.14));
     const peaks: Array<{ x: number; score: number }> = [];
     for (let x = minX; x <= maxX; x++) {
       const s = scores[x];
-      if (s <= (allowPartialAnchor ? 14 : 26)) continue;
+      if (s <= (allowPartialAnchor ? 17 : 32)) continue;
       let isPeak = true;
       for (let dx = -nms; dx <= nms; dx++) {
-        if (dx !== 0 && x + dx >= minX && x + dx <= maxX && scores[x + dx] > s) {
-          isPeak = false;
-          break;
+        if (dx === 0) continue;
+        const nx = x + dx;
+        if (nx >= minX && nx <= maxX) {
+          if (dx < 0 ? scores[nx] >= s : scores[nx] > s) {
+            isPeak = false;
+            break;
+          }
         }
       }
       if (isPeak) peaks.push({ x, score: s });
     }
-    return peaks.sort((a, b) => a.x - b.x);
+    return peaks
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 4)
+      .sort((a, b) => a.x - b.x);
   };
 
   const findFullHorizSteps = (
@@ -266,6 +335,7 @@ function detectHybridEdgeTransitions(
     rx1: number,
     ry0: number,
     ry1: number,
+    isRoot = false,
   ): Array<{ y: number; score: number }> => {
     const regW = rx1 - rx0;
     const regH = ry1 - ry0;
@@ -274,13 +344,14 @@ function detectHybridEdgeTransitions(
     const xB = rx1 - Math.round(regW * 0.05);
     const xL1 = rx0 + Math.round(regW * 0.18);
     const xR0 = rx1 - Math.round(regW * 0.18);
-    const minY = Math.max(ry0 + stepPad + 2, Math.round(ry0 + regH * 0.1));
-    const maxY = Math.min(ry1 - stepPad - 3, Math.round(ry1 - regH * 0.1));
+    const minY = Math.max(ry0 + stepPad + 2, Math.round(ry0 + regH * 0.12));
+    // En la raíz evitar tomar el zócalo inferior (< 15% altura) como división principal antes de dividir columnas
+    const maxY = Math.min(ry1 - stepPad - 3, Math.round(ry1 - regH * (isRoot ? 0.16 : 0.11)));
     const scores = new Float32Array(H);
 
     for (let y = minY; y <= maxY; y++) {
       const all = evalHorizStep(y, xA, xB);
-      if (all.ratio < 0.68 || all.meanDiff < 32) continue;
+      if (all.ratio < 0.65 || all.meanDiff < 29) continue;
       const left = evalHorizStep(y, xA, xL1);
       if (left.ratio < 0.55) continue;
       const right = evalHorizStep(y, xR0, xB);
@@ -288,21 +359,28 @@ function detectHybridEdgeTransitions(
       scores[y] = all.ratio * all.meanDiff;
     }
 
-    const nms = Math.max(18, Math.round(regH * 0.09));
+    const nms = Math.max(18, Math.round(regH * 0.11));
     const peaks: Array<{ y: number; score: number }> = [];
     for (let y = minY; y <= maxY; y++) {
       const s = scores[y];
-      if (s <= 26) continue;
+      if (s <= 24) continue;
       let isPeak = true;
       for (let dy = -nms; dy <= nms; dy++) {
-        if (dy !== 0 && y + dy >= minY && y + dy <= maxY && scores[y + dy] > s) {
-          isPeak = false;
-          break;
+        if (dy === 0) continue;
+        const ny = y + dy;
+        if (ny >= minY && ny <= maxY) {
+          if (dy < 0 ? scores[ny] >= s : scores[ny] > s) {
+            isPeak = false;
+            break;
+          }
         }
       }
       if (isPeak) peaks.push({ y, score: s });
     }
-    return peaks.sort((a, b) => a.y - b.y);
+    return peaks
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 4)
+      .sort((a, b) => a.y - b.y);
   };
 
   // Recursive XY-Cut sobre transiciones de bordes/colores/juntas
@@ -338,7 +416,7 @@ function detectHybridEdgeTransitions(
     }
 
     let vPks = findFullVertSteps(rx0, rx1, ry0, ry1, false);
-    const hPks = findFullHorizSteps(rx0, rx1, ry0, ry1);
+    const hPks = findFullHorizSteps(rx0, rx1, ry0, ry1, depth === 0);
 
     // Si en el nivel raíz no hay cortes de punta a punta (ej. escritorio con cajonera suspendida
     // arriba-derecha sobre hueco blanco), habilitar detección anclada al techo/piso.
@@ -486,52 +564,78 @@ function detectHybridEdgeTransitions(
       const bgRatio = bgHits / nSafe;
       const matchRatio = matchHits / nSafe;
       const isLegVoid =
-        c.v0 <= 0.04 &&
-        bgRatio >= 0.55 &&
-        matchRatio < 0.35 &&
+        c.v0 <= 0.05 &&
+        bgRatio >= 0.48 &&
+        matchRatio < 0.42 &&
         (c.u1 - c.u0 < 0.94 || c.v1 - c.v0 < 0.92);
-      const isDarkOpen = !isLegVoid && meanL < refLum - 35 && distCarcass > 35 && matchRatio < 0.35;
-      const isClosedPanel = !isLegVoid && !isDarkOpen && stdL < 38;
+      const isDarkOpen =
+        !isLegVoid &&
+        ((meanL < refLum - 28 && distCarcass > 32 && matchRatio < 0.42) || stdL > 34);
+      const cellHmm = (c.v1 - c.v0) * dimsMm.y;
+      const isGlass =
+        !isLegVoid && !isDarkOpen && isGlassDoorCell(lum, W, H, c.u0, c.u1, c.v0, c.v1, cellHmm);
+      const isClosedPanel = !isLegVoid && !isDarkOpen && !isGlass && stdL <= 34;
       const cellMat = inferMelamineFromRgb(meanR, meanG, meanB);
       const matOverride = distCarcass > 45 && cellMat !== carcassMaterial ? cellMat : undefined;
 
-      return { c, isLegVoid, isDarkOpen, isClosedPanel, matOverride };
+      return { c, isLegVoid, isDarkOpen, isGlass, isClosedPanel, matOverride };
     });
 
-    // Si toda una pila de ≥2 celdas cerradas uniformes tiene el mismo material y ancho -> consolidar en 1 zona de Cajones
-    const closedStack = stats.filter((s) => s.isClosedPanel);
-    if (
-      cells.length >= 2 &&
-      closedStack.length === cells.length &&
-      cells.every((c) => (c.u1 - c.u0) * dimsMm.x > (c.v1 - c.v0) * dimsMm.y * 0.8)
-    ) {
-      const u0 = cells[0].u0;
-      const u1 = cells[0].u1;
-      const v0 = Math.min(...cells.map((c) => c.v0));
-      const v1 = Math.max(...cells.map((c) => c.v1));
-      inferredZones.push({
-        id: `zone_drawers_${inferredZones.length + 1}`,
-        uStart: Number(u0.toFixed(4)),
-        uEnd: Number(u1.toFixed(4)),
-        vStart: Number(v0.toFixed(4)),
-        vEnd: Number(v1.toFixed(4)),
-        kind: 'drawers',
-        drawerCount: cells.length,
-        label: `${cells.length} Cajones`,
-        materialOverride: stats[0].matOverride,
-      });
-      cavities.push({
-        id: `cav_hyb_${cavities.length + 1}`,
-        u0: Number(u0.toFixed(4)),
-        u1: Number(u1.toFixed(4)),
-        v0: Number(v0.toFixed(4)),
-        v1: Number(v1.toFixed(4)),
-        kind: 'open_bay',
-      });
-      continue;
+    // Consolidar corridas contiguas de ≥2 celdas cerradas con proporción de cajón en 1 zona de Cajones
+    // (soporta cajonera suspendida sobre hueco de piernas como Escritorio #11 y cajoneras sobre puertas)
+    const sortedStats = [...stats].sort((a, b) => a.c.v0 - b.c.v0);
+    const isDrawerShaped = (st: (typeof sortedStats)[number]): boolean => {
+      if (!st.isClosedPanel) return false;
+      const wMm = (st.c.u1 - st.c.u0) * dimsMm.x;
+      const hMm = (st.c.v1 - st.c.v0) * dimsMm.y;
+      return hMm <= 360 && wMm > hMm * 0.85;
+    };
+
+    const emittedIndices = new Set<number>();
+    let runStart = 0;
+    while (runStart < sortedStats.length) {
+      if (!isDrawerShaped(sortedStats[runStart])) {
+        runStart++;
+        continue;
+      }
+      let runEnd = runStart;
+      while (runEnd + 1 < sortedStats.length && isDrawerShaped(sortedStats[runEnd + 1])) {
+        runEnd++;
+      }
+      const runLen = runEnd - runStart + 1;
+      if (runLen >= 2) {
+        const runItems = sortedStats.slice(runStart, runEnd + 1);
+        const u0 = runItems[0].c.u0;
+        const u1 = runItems[0].c.u1;
+        const v0 = Math.min(...runItems.map((r) => r.c.v0));
+        const v1 = Math.max(...runItems.map((r) => r.c.v1));
+        inferredZones.push({
+          id: `zone_drawers_${inferredZones.length + 1}`,
+          uStart: Number(u0.toFixed(4)),
+          uEnd: Number(u1.toFixed(4)),
+          vStart: Number(v0.toFixed(4)),
+          vEnd: Number(v1.toFixed(4)),
+          kind: 'drawers',
+          drawerCount: runLen,
+          label: `${runLen} Cajones`,
+          materialOverride: runItems[0].matOverride,
+        });
+        cavities.push({
+          id: `cav_hyb_${cavities.length + 1}`,
+          u0: Number(u0.toFixed(4)),
+          u1: Number(u1.toFixed(4)),
+          v0: Number(v0.toFixed(4)),
+          v1: Number(v1.toFixed(4)),
+          kind: 'open_bay',
+        });
+        for (let k = runStart; k <= runEnd; k++) emittedIndices.add(k);
+      }
+      runStart = runEnd + 1;
     }
 
-    for (const st of stats) {
+    for (let idxSt = 0; idxSt < sortedStats.length; idxSt++) {
+      if (emittedIndices.has(idxSt)) continue;
+      const st = sortedStats[idxSt];
       const { c } = st;
       cavities.push({
         id: `cav_hyb_${cavities.length + 1}`,
@@ -562,9 +666,29 @@ function detectHybridEdgeTransitions(
           kind: 'open',
           label: `Nicho ${inferredZones.length + 1}`,
         });
+      } else if (st.isGlass) {
+        inferredZones.push({
+          id: `zone_glass_${inferredZones.length + 1}`,
+          uStart: Number(c.u0.toFixed(4)),
+          uEnd: Number(c.u1.toFixed(4)),
+          vStart: Number(c.v0.toFixed(4)),
+          vEnd: Number(c.v1.toFixed(4)),
+          kind: 'door_glass',
+          label: 'Vitrina',
+          materialOverride: st.matOverride,
+        });
       } else {
-        const aspectCell = ((c.u1 - c.u0) * dimsMm.x) / Math.max(1, (c.v1 - c.v0) * dimsMm.y);
-        const kind = aspectCell > 1.45 ? 'drawers' : aspectCell > 0.95 ? 'door_double' : c.u0 < 0.5 ? 'door_left' : 'door_right';
+        const cellWmm = (c.u1 - c.u0) * dimsMm.x;
+        const cellHmm = (c.v1 - c.v0) * dimsMm.y;
+        const aspectCell = cellWmm / Math.max(1, cellHmm);
+        const kind =
+          aspectCell > 1.45 && cellHmm <= 340
+            ? 'drawers'
+            : aspectCell > 0.95 && cellWmm >= 520
+              ? 'door_double'
+              : c.u0 < 0.5
+                ? 'door_left'
+                : 'door_right';
         inferredZones.push({
           id: `zone_front_${inferredZones.length + 1}`,
           uStart: Number(c.u0.toFixed(4)),
@@ -981,11 +1105,20 @@ export function analyzeRectifiedFurniture(
   const sampleG: number[] = [];
   const sampleB: number[] = [];
 
-  const pushPixel = (x: number, y: number): void => {
+  const pushPixel = (x: number, y: number, filterBg = false): void => {
     const cx = Math.max(0, Math.min(W - 1, Math.round(x)));
     const cy = Math.max(0, Math.min(H - 1, Math.round(y)));
     const idx = cy * W + cx;
     const p = idx * 4;
+    if (rgba[p + 3] < 128) return;
+    if (filterBg && opts.exteriorBgRgb) {
+      const dBg = Math.hypot(
+        rgba[p] - opts.exteriorBgRgb[0],
+        rgba[p + 1] - opts.exteriorBgRgb[1],
+        rgba[p + 2] - opts.exteriorBgRgb[2],
+      );
+      if (dBg < 34) return;
+    }
     sampleLum.push(lum[idx]);
     sampleFlat.push(lumFlat[idx]);
     sampleC1.push(c1[idx]);
@@ -1001,30 +1134,39 @@ export function analyzeRectifiedFurniture(
     const r = Math.max(2, Math.floor(Math.min(tPx, tPy) / 2));
     for (let dy = -r; dy <= r; dy++) {
       for (let dx = -r; dx <= r; dx++) {
-        pushPixel(sx + dx, sy + dy);
+        pushPixel(sx + dx, sy + dy, false);
       }
     }
   } else {
-    const bx = Math.max(2, Math.floor(tPx * 0.8));
-    const by = Math.max(2, Math.floor(tPy * 0.8));
+    const bxStart = Math.max(2, Math.floor(tPx * 0.25));
+    const bxEnd = Math.max(bxStart + 2, Math.floor(tPx * 1.15));
+    const byStart = Math.max(2, Math.floor(tPy * 0.25));
+    const byEnd = Math.max(byStart + 2, Math.floor(tPy * 1.15));
     const stepY = Math.max(1, Math.floor(H / 90));
     const stepX = Math.max(1, Math.floor(W / 90));
 
-    // Laterales izquierdo y derecho completos
-    for (let y = by; y < H - by; y += stepY) {
-      for (let dx = 1; dx < bx; dx++) {
-        pushPixel(dx, y);
-        pushPixel(W - 1 - dx, y);
-      }
-    }
-    // Cubierta superior completa + extremos del borde inferior (evita contaminar con hueco de piernas en escritorios)
-    for (let x = bx; x < W - bx; x += stepX) {
-      for (let dy = 1; dy < by; dy++) {
-        pushPixel(x, dy);
-        if (x < W * 0.16 || x > W * 0.84) {
-          pushPixel(x, H - 1 - dy);
+    const collectBorder = (filterBg: boolean) => {
+      for (let y = byEnd; y < H - byEnd; y += stepY) {
+        for (let dx = bxStart; dx < bxEnd; dx++) {
+          pushPixel(dx, y, filterBg);
+          pushPixel(W - 1 - dx, y, filterBg);
         }
       }
+      for (let x = bxEnd; x < W - bxEnd; x += stepX) {
+        for (let dy = byStart; dy < byEnd; dy++) {
+          pushPixel(x, dy, filterBg);
+          if (x < W * 0.16 || x > W * 0.84) {
+            pushPixel(x, H - 1 - dy, filterBg);
+          }
+        }
+      }
+    };
+
+    // Primer intento filtrando píxeles del fondo exterior (evita contaminar escritorios/muebles en 3/4 con pared blanca)
+    collectBorder(true);
+    // Fallback si el mueble en sí es del mismo color que el fondo (ej. mueble blanco sobre pared blanca)
+    if (sampleLum.length < 24) {
+      collectBorder(false);
     }
   }
 
@@ -1139,17 +1281,60 @@ export function analyzeRectifiedFurniture(
             label: `Nicho ${b + 1}`,
           });
         } else if (bayShelves.length >= 1) {
-          closedZones.push({
-            id: `zone_drawers_${b + 1}`,
-            uStart: Number(u0.toFixed(4)),
-            uEnd: Number(u1.toFixed(4)),
-            vStart: 0,
-            vEnd: 1,
-            kind: 'drawers',
-            drawerCount: bayShelves.length + 1,
-            label: `${bayShelves.length + 1} Cajones`,
+          // Distinguir cajones apilados (franjas anchas y bajas <= 360 mm) de puertas/vitrinas apiladas en niveles (ej. Vitrina #06)
+          const cellWmm = (u1 - u0) * dimsMm.x;
+          const allDrawerShaped = vEdges.slice(0, -1).every((vLow, idxR) => {
+            const hMm = (vEdges[idxR + 1] - vLow) * dimsMm.y;
+            return hMm <= 360 && cellWmm > hMm * 0.82;
           });
+          if (allDrawerShaped) {
+            closedZones.push({
+              id: `zone_drawers_${b + 1}`,
+              uStart: Number(u0.toFixed(4)),
+              uEnd: Number(u1.toFixed(4)),
+              vStart: 0,
+              vEnd: 1,
+              kind: 'drawers',
+              drawerCount: bayShelves.length + 1,
+              label: `${bayShelves.length + 1} Cajones`,
+            });
+          } else {
+            // Clasificar cada nivel vertical independientemente (puerta vidrio / nicho abierto / puerta ciega)
+            for (let r = 0; r < vEdges.length - 1; r++) {
+              const vLow = vEdges[r];
+              const vHigh = vEdges[r + 1];
+              const hMm = (vHigh - vLow) * dimsMm.y;
+              const glass = isGlassDoorCell(lum, W, H, u0, u1, vLow, vHigh, hMm);
+              if (glass) {
+                hasOpenBayInside = true;
+                closedZones.push({
+                  id: `zone_glass_${b + 1}_${r + 1}`,
+                  uStart: Number(u0.toFixed(4)),
+                  uEnd: Number(u1.toFixed(4)),
+                  vStart: Number(vLow.toFixed(4)),
+                  vEnd: Number(vHigh.toFixed(4)),
+                  kind: 'door_glass',
+                  label: `Vitrina ${b + 1}`,
+                });
+              } else {
+                const colHandle = closed.detectedHandles.find(
+                  (h) => h.u >= u0 - 0.02 && h.u <= u1 + 0.02 && h.v >= vLow && h.v <= vHigh,
+                );
+                const opensLeft = colHandle ? colHandle.u >= uMid : b % 2 === 0;
+                closedZones.push({
+                  id: `zone_door_${b + 1}_${r + 1}`,
+                  uStart: Number(u0.toFixed(4)),
+                  uEnd: Number(u1.toFixed(4)),
+                  vStart: Number(vLow.toFixed(4)),
+                  vEnd: Number(vHigh.toFixed(4)),
+                  kind: opensLeft ? 'door_left' : 'door_right',
+                  label: `Puerta ${b + 1}`,
+                });
+              }
+            }
+          }
         } else {
+          const glass = isGlassDoorCell(lum, W, H, u0, u1, 0, 1, dimsMm.y);
           const colHandle = closed.detectedHandles.find((h) => h.u >= u0 - 0.02 && h.u <= u1 + 0.02);
           const opensLeft = colHandle ? colHandle.u >= uMid : b % 2 === 0;
           closedZones.push({
@@ -1158,8 +1343,8 @@ export function analyzeRectifiedFurniture(
             uEnd: Number(u1.toFixed(4)),
             vStart: 0,
             vEnd: 1,
-            kind: opensLeft ? 'door_left' : 'door_right',
-            label: `Puerta ${b + 1}`,
+            kind: glass ? 'door_glass' : opensLeft ? 'door_left' : 'door_right',
+            label: glass ? `Vitrina ${b + 1}` : `Puerta ${b + 1}`,
           });
         }
       }
@@ -1779,10 +1964,10 @@ export function analyzeRectifiedFurniture(
     const distCarcass = Math.hypot(meanR - refRgb[0], meanG - refRgb[1], meanB - refRgb[2]);
     const isContrastingWoodDoor =
       cavities.length >= 2 &&
-      stdL < 22 &&
-      warmth > 28 &&
+      stdL < 38 &&
+      warmth > 18 &&
       detectedMaterial !== 'roble' &&
-      distCarcass > 45;
+      distCarcass > 36;
 
     if (isContrastingWoodDoor) {
       hasClosedFrontPanel = true;

@@ -625,4 +625,171 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     const flatBlue = sobel[(150 * W + 200) * 4 + 2];
     expect(edgeBlue).toBeGreaterThan(flatBlue + 80);
   });
+
+  it('Escenario 13 (Escritorio asimétrico multi-recuadro): XY-Cut detecta cubierta, pedestal parcial, 3 cubos superiores y vano piernas', () => {
+    const xMm = 1400;
+    const yMm = 1200;
+    const eMm = 18;
+    const { width: W, height: H } = computeRectifiedSize(xMm, yMm, eMm);
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const tPx = Math.max(3, Math.round((eMm / xMm) * W));
+    const tPy = Math.max(3, Math.round((eMm / yMm) * H));
+    const boardRgb: [number, number, number] = [218, 184, 138];
+    const cavityRgb: [number, number, number] = [56, 60, 68];
+
+    const paintRect = (x0: number, y0: number, x1: number, y1: number, rgb: [number, number, number]) => {
+      for (let y = Math.max(0, Math.floor(y0)); y < Math.min(H, Math.ceil(y1)); y++) {
+        for (let x = Math.max(0, Math.floor(x0)); x < Math.min(W, Math.ceil(x1)); x++) {
+          const i = (y * W + x) * 4;
+          rgba[i] = rgb[0];
+          rgba[i + 1] = rgb[1];
+          rgba[i + 2] = rgb[2];
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+
+    paintRect(0, 0, W, H, cavityRgb);
+    // Carcasa exterior
+    paintRect(0, 0, W, tPy, boardRgb);
+    paintRect(0, H - tPy, W, H, boardRgb);
+    paintRect(0, 0, tPx, H, boardRgb);
+    paintRect(W - tPx, 0, W, H, boardRgb);
+
+    const yOfV = (vInt: number) => (1 - interiorToExterior(vInt, eMm, yMm)) * H;
+    const xOfU = (uInt: number) => interiorToExterior(uInt, eMm, xMm) * W;
+
+    // 1. Cubierta horizontal completa del escritorio (v = 0.58)
+    const yDesk = yOfV(0.58);
+    paintRect(tPx, yDesk - tPy / 2, W - tPx, yDesk + tPy / 2, boardRgb);
+
+    // 2. Divisor parcial inferior del pedestal derecho (u = 0.65, v = 0..0.58)
+    const xPed = xOfU(0.65);
+    paintRect(xPed - tPx / 2, yDesk + tPy / 2, xPed + tPx / 2, H - tPy, boardRgb);
+
+    // 3. Dos repisas dentro del pedestal derecho (u = 0.65..1, v = 0.20 y 0.39)
+    for (const vRep of [0.2, 0.39]) {
+      const yr = yOfV(vRep);
+      paintRect(xPed + tPx / 2, yr - tPy / 2, W - tPx, yr + tPy / 2, boardRgb);
+    }
+
+    // 4. Dos divisores parciales superiores formando 3 cubos (u = 1/3, 2/3, v = 0.58..1)
+    for (const uCub of [1 / 3, 2 / 3]) {
+      const xc = xOfU(uCub);
+      paintRect(xc - tPx / 2, tPy, xc + tPx / 2, yDesk - tPy / 2, boardRgb);
+    }
+
+    const res = analyzeRectifiedFurniture(rgba, W, H, { x: xMm, y: yMm }, eMm);
+    expect(res.furnitureMode).toBe('open');
+    expect(res.confidence).toBeGreaterThanOrEqual(0.6);
+    // Debe detectar cubierta + 2 repisas de pedestal = 3 segmentos horizontales
+    expect(res.hShelves).toHaveLength(3);
+    // Debe detectar 3 divisores verticales parciales (1 pedestal + 2 superiores)
+    expect(res.vDividers).toHaveLength(3);
+    // Debe marcar el espacio inferior izquierdo como vano de piernas (`knee_space`)
+    expect(res.cavities.some((c) => c.kind === 'knee_space')).toBe(true);
+    expect(res.cavities.length).toBeGreaterThanOrEqual(7);
+  });
+
+  it('Escenario 14 (Estantería de recuadros escalonados): XY-Cut detecta 2 niveles horizontales y 4 divisores parciales alternados', () => {
+    const xMm = 1200;
+    const yMm = 1400;
+    const eMm = 18;
+    const { width: W, height: H } = computeRectifiedSize(xMm, yMm, eMm);
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const tPx = Math.max(3, Math.round((eMm / xMm) * W));
+    const tPy = Math.max(3, Math.round((eMm / yMm) * H));
+    const boardRgb: [number, number, number] = [232, 232, 232];
+    const cavityRgb: [number, number, number] = [52, 58, 68];
+
+    const paintRect = (x0: number, y0: number, x1: number, y1: number, rgb: [number, number, number]) => {
+      for (let y = Math.max(0, Math.floor(y0)); y < Math.min(H, Math.ceil(y1)); y++) {
+        for (let x = Math.max(0, Math.floor(x0)); x < Math.min(W, Math.ceil(x1)); x++) {
+          const i = (y * W + x) * 4;
+          rgba[i] = rgb[0];
+          rgba[i + 1] = rgb[1];
+          rgba[i + 2] = rgb[2];
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+
+    paintRect(0, 0, W, H, cavityRgb);
+    paintRect(0, 0, W, tPy, boardRgb);
+    paintRect(0, H - tPy, W, H, boardRgb);
+    paintRect(0, 0, tPx, H, boardRgb);
+    paintRect(W - tPx, 0, W, H, boardRgb);
+
+    const yOfV = (vInt: number) => (1 - interiorToExterior(vInt, eMm, yMm)) * H;
+    const xOfU = (uInt: number) => interiorToExterior(uInt, eMm, xMm) * W;
+
+    const yLow = yOfV(1 / 3);
+    const yHigh = yOfV(2 / 3);
+    paintRect(tPx, yLow - tPy / 2, W - tPx, yLow + tPy / 2, boardRgb);
+    paintRect(tPx, yHigh - tPy / 2, W - tPx, yHigh + tPy / 2, boardRgb);
+
+    // Nivel inferior y superior: 1 divisor al centro (u=0.5)
+    const xMid = xOfU(0.5);
+    paintRect(xMid - tPx / 2, yLow + tPy / 2, xMid + tPx / 2, H - tPy, boardRgb);
+    paintRect(xMid - tPx / 2, tPy, xMid + tPx / 2, yHigh - tPy / 2, boardRgb);
+
+    // Nivel medio: 2 divisores en 1/3 y 2/3
+    for (const u of [1 / 3, 2 / 3]) {
+      const xc = xOfU(u);
+      paintRect(xc - tPx / 2, yHigh + tPy / 2, xc + tPx / 2, yLow - tPy / 2, boardRgb);
+    }
+
+    const res = analyzeRectifiedFurniture(rgba, W, H, { x: xMm, y: yMm }, eMm);
+    expect(res.hShelves).toHaveLength(2);
+    expect(res.vDividers).toHaveLength(4);
+    expect(res.cavities).toHaveLength(7);
+  });
+
+  it('Escenario 15 (Flood-Fill con gradiente de pared y cuadro lejano): aísla el mueble central con error < 5%', () => {
+    const W = 420;
+    const H = 320;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    // Pared con gradiente fuerte de luz (izquierda clara 240 -> derecha sombreada 155)
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4;
+        const lum = Math.round(240 - 85 * (x / W));
+        rgba[i] = lum;
+        rgba[i + 1] = lum;
+        rgba[i + 2] = Math.min(255, lum + 5);
+        rgba[i + 3] = 255;
+      }
+    }
+
+    // Cuadro pequeño colgado en la esquina superior izquierda (debe ser descartado por mayor componente conexa)
+    for (let y = 16; y < 50; y++) {
+      for (let x = 18; x < 54; x++) {
+        const i = (y * W + x) * 4;
+        rgba[i] = 45;
+        rgba[i + 1] = 55;
+        rgba[i + 2] = 75;
+      }
+    }
+
+    // Mueble central [110..330] × [85..275]
+    const fx0 = 110, fx1 = 330, fy0 = 85, fy1 = 275;
+    for (let y = fy0; y <= fy1; y++) {
+      for (let x = fx0; x <= fx1; x++) {
+        const i = (y * W + x) * 4;
+        rgba[i] = 165;
+        rgba[i + 1] = 115;
+        rgba[i + 2] = 68;
+      }
+    }
+
+    const res = autoDetectFurnitureQuad(rgba, W, H);
+    expect(res.usedFallback).toBe(false);
+    expect(res.backgroundCoverage).toBeGreaterThan(0.45);
+    const [tl, tr, br, bl] = res.quadCorners;
+    expect(Math.abs(tl.x - fx0)).toBeLessThan(W * 0.05);
+    expect(Math.abs(tl.y - fy0)).toBeLessThan(H * 0.05);
+    expect(Math.abs(tr.x - fx1)).toBeLessThan(W * 0.05);
+    expect(Math.abs(br.y - fy1)).toBeLessThan(H * 0.05);
+    expect(Math.abs(bl.x - fx0)).toBeLessThan(W * 0.05);
+  });
 });

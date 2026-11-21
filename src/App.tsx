@@ -36,7 +36,7 @@ export default function App() {
   const [params, setParams] = useState<ScaleAndBoardParams>(initial.params);
   const [explodeFactor, setExplodeFactor] = useState<number>(0);
   const [sheetStandard, setSheetStandard] = useState<SheetStandard>('pauta');
-  const [activeStep, setActiveStep] = useState<ActiveStep>('3d');
+  const [activeStep, setActiveStep] = useState<ActiveStep>('split');
   const [lockProportion, setLockProportion] = useState<boolean>(false);
   const [lockedRatioXY, setLockedRatioXY] = useState<number>(initial.topology.aspectRatioXY);
 
@@ -133,6 +133,19 @@ export default function App() {
     }));
   };
 
+  const handleAutoPhotoReconstructed = (dims: { x: number; y: number; z: number }) => {
+    if (dims.y > 0) {
+      setLockedRatioXY(dims.x / dims.y);
+      setLockProportion(true);
+    }
+    setParams((p) => ({
+      ...p,
+      referenceDimensions: { ...dims },
+      targetDimensions: { ...dims },
+    }));
+    setActiveStep((cur) => (cur === 'foto' ? 'split' : cur));
+  };
+
   const handleToggleCenterDivider = () => {
     setTopology((prev) => {
       const hasCenter = prev.vDividers.some((d) => Math.abs(d.position - 0.5) < 0.03);
@@ -181,7 +194,7 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <div className="brand-title">SmartFurniture v3.2 — Diseño Paramétrico &amp; Corte 2D</div>
+          <div className="brand-title">SmartFurniture v3.3 — Diseño Paramétrico &amp; Corte 2D</div>
           <div className="brand-sub">
             100% Local Offline (PWA) · INACAP Funciones y Matrices (Unidad 3) · Melamina {params.boardThickness} mm
           </div>
@@ -204,13 +217,6 @@ export default function App() {
         <div className="step-group">
           <button
             type="button"
-            className={activeStep === 'foto' ? 'step-btn active' : 'step-btn'}
-            onClick={() => setActiveStep('foto')}
-          >
-            1–2. Foto y Visión
-          </button>
-          <button
-            type="button"
             className={activeStep === 'split' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('split')}
           >
@@ -221,7 +227,14 @@ export default function App() {
             className={activeStep === '3d' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('3d')}
           >
-            3–4. 3D, Unidad 3 y Corte
+            3D, Unidad 3 y Corte
+          </button>
+          <button
+            type="button"
+            className={activeStep === 'foto' ? 'step-btn active' : 'step-btn'}
+            onClick={() => setActiveStep('foto')}
+          >
+            Solo Foto (Pantalla completa)
           </button>
         </div>
         <span className="small-note muted">
@@ -575,8 +588,8 @@ export default function App() {
                     targetDimensions: { ...dims },
                   }));
                 }}
+                onAutoPhotoReconstructed={handleAutoPhotoReconstructed}
                 onToggleExternalLegs={handleToggleExternalLegs}
-                onAddHardwareItem={handleAddHardwareItem}
                 onSelectDepthMm={(z) => updateTargetDim('z', z)}
               />
             </div>

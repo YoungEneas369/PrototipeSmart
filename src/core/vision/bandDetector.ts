@@ -26,11 +26,22 @@ export interface DetectedHandlePoint {
   v: number;
 }
 
+export interface DetectedCavity {
+  id: string;
+  u0: number;
+  u1: number;
+  v0: number;
+  v1: number;
+  kind: 'open_bay' | 'knee_space';
+}
+
 export interface BandDetectionResult {
   furnitureMode: 'open' | 'closed_front' | 'uncertain';
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
   detectedHandles: DetectedHandlePoint[];
+  /** Espacios vacíos / recuadros detectados en espacio interior [0,1]^2. */
+  cavities: DetectedCavity[];
   confidence: number;
   interiorMatch: number;
   refLum: number;
@@ -567,11 +578,33 @@ export function analyzeRectifiedFurniture(
     const totalSeams = closed.vDividers.length + closed.hShelves.length;
     if (totalSeams > 0 && closed.seamStrength >= 30) {
       const closedConf = Math.max(0.62, Math.min(0.95, 0.55 + closed.seamStrength / 240));
+      const uEdges = [0, ...closed.vDividers.map((d) => d.position), 1];
+      const closedCavities: DetectedCavity[] = [];
+      for (let b = 0; b < uEdges.length - 1; b++) {
+        const u0 = uEdges[b];
+        const u1 = uEdges[b + 1];
+        const bayShelves = closed.hShelves
+          .filter((s) => s.start <= u0 + 0.03 && s.end >= u1 - 0.03)
+          .map((s) => s.position)
+          .sort((a, c) => a - c);
+        const vEdges = [0, ...bayShelves, 1];
+        for (let r = 0; r < vEdges.length - 1; r++) {
+          closedCavities.push({
+            id: `cav_closed_${closedCavities.length + 1}`,
+            u0: Number(u0.toFixed(4)),
+            u1: Number(u1.toFixed(4)),
+            v0: Number(vEdges[r].toFixed(4)),
+            v1: Number(vEdges[r + 1].toFixed(4)),
+            kind: 'open_bay',
+          });
+        }
+      }
       return {
         furnitureMode: 'closed_front',
         vDividers: closed.vDividers,
         hShelves: closed.hShelves,
         detectedHandles: closed.detectedHandles,
+        cavities: closedCavities,
         confidence: Number(closedConf.toFixed(3)),
         interiorMatch: Number(interiorMatch.toFixed(3)),
         refLum: Number(refLum.toFixed(1)),
@@ -585,6 +618,7 @@ export function analyzeRectifiedFurniture(
       vDividers: [],
       hShelves: [],
       detectedHandles: [],
+      cavities: [],
       confidence: Number(rawConf.toFixed(3)),
       interiorMatch: Number(interiorMatch.toFixed(3)),
       refLum: Number(refLum.toFixed(1)),
@@ -592,81 +626,145 @@ export function analyzeRectifiedFurniture(
   }
 
   // =========================================================================
-  // RAMA A: MUEBLE ABIERTO (CANTOS DE MELAMINA + HUECOS + ANCLAJE DE PARALAJE)
+  // RAMA A: MUEBLE ABIERTO / MULTI-RECUADRO (RECURSIVE XY-CUT + CAVIDADES)
+  // Soporta estanterías, racks, clósets, escritorios con vano de piernas y
+  // muebles con recuadros asimétricos (divisores verticales continuos y parciales).
   // =========================================================================
   const confidence = Math.max(0.52, Math.min(1, 1 - interiorMatch * 1.05));
 
-  const colProfile = new Float32Array(W);
+  const xStartInt = tPx;
+  const xEndInt = W - tPx;
   const yStartInt = tPy + 2;
   const yEndInt = H - tPy - 2;
-  const spanY = Math.max(1, yEndInt - yStartInt);
-
-  for (let x = 0; x < W; x++) {
-    let sum = 0;
-    for (let y = yStartInt; y < yEndInt; y++) {
-      sum += matchMap[y * W + x];
-    }
-    colProfile[x] = sum / spanY;
-  }
-
   const fwX = Math.max(tPx + 2, Math.round(tPx * 1.6));
-  const minDivX = Math.max(tPx + fwX, Math.round(W * 0.08));
-  const maxDivX = Math.min(W - tPx - fwX - 1, Math.round(W * 0.92) - tPx);
-  const divScores = new Float32Array(W);
+  const fhY = Math.max(tPy + 2, Math.round(tPy * 1.6));
 
-  for (let x = minDivX; x <= maxDivX; x++) {
-    const bandCov = rangeMean(colProfile, x, x + tPx);
-    if (bandCov < 0.42) continue;
-
-    const uCenter = (x + tPx / 2) / W;
-    const leftFlank = rangeMean(colProfile, x - fwX, x);
-    const rightFlank = rangeMean(colProfile, x + tPx, x + tPx + fwX);
-
-    let score: number;
-    if (!parallaxAware || Math.abs(uCenter - 0.5) < 0.06) {
-      score = bandCov - 0.5 * (leftFlank + rightFlank);
-    } else if (uCenter < 0.5) {
-      score = bandCov - leftFlank;
-    } else {
-      score = bandCov - rightFlank;
-    }
-
-    if (score > 0.24) {
-      divScores[x] = score;
-    }
+  interface RawVDiv {
+    uInt: number;
+    vStart: number;
+    vEnd: number;
+    pxCenter: number;
+    score: number;
+  }
+  interface RawHShelf {
+    vInt: number;
+    uStart: number;
+    uEnd: number;
+    pyCenter: number;
+    score: number;
   }
 
-  const nmsRadX = Math.max(tPx * 3, Math.round(W * 0.07));
-  const divCandidates: Array<{ x: number; score: number }> = [];
-  for (let x = minDivX; x <= maxDivX; x++) {
-    const s = divScores[x];
-    if (s <= 0) continue;
-    let isPeak = true;
-    for (let dx = -nmsRadX; dx <= nmsRadX; dx++) {
-      if (dx === 0) continue;
-      const nx = x + dx;
-      if (nx >= minDivX && nx <= maxDivX && divScores[nx] > s) {
-        isPeak = false;
-        break;
+  const colAvgAt = (x0: number, x1: number, y: number): number => {
+    const cx0 = Math.max(0, x0);
+    const cx1 = Math.min(W - 1, x1);
+    const cy = Math.max(0, Math.min(H - 1, y));
+    let sum = 0;
+    const rowOff = cy * W;
+    for (let cx = cx0; cx <= cx1; cx++) sum += matchMap[rowOff + cx];
+    return sum / Math.max(1, cx1 - cx0 + 1);
+  };
+
+  /**
+   * Guardia estructural de carpintería (anti-objetos flotantes):
+   * Un divisor vertical parcial real DEBE descansar en ambos extremos contra la carcasa
+   * o una repisa horizontal (unión en T), nunca terminar flotando en medio de un vano vacío.
+   */
+  const hasHorizontalSupportAt = (xCenter: number, yEdge: number): boolean => {
+    if (yEdge <= yStartInt + Math.max(tPy * 2.5, H * 0.035)) return true;
+    if (yEdge >= yEndInt - 1 - Math.max(tPy * 2.5, H * 0.035)) return true;
+    const flankSpan = Math.max(tPx * 2, 12);
+    const l0 = Math.max(xStartInt, Math.round(xCenter - tPx - flankSpan));
+    const l1 = Math.max(xStartInt, Math.round(xCenter - tPx));
+    const r0 = Math.min(xEndInt - 1, Math.round(xCenter + tPx));
+    const r1 = Math.min(xEndInt - 1, Math.round(xCenter + tPx + flankSpan));
+    const bandHalf = Math.max(2, Math.round(tPy * 0.8));
+
+    let bestSupport = 0;
+    for (let dy = -bandHalf; dy <= bandHalf; dy++) {
+      const yy = Math.max(0, Math.min(H - 1, Math.round(yEdge + dy)));
+      const leftM = l1 > l0 ? colAvgAt(l0, l1, yy) : 0;
+      const rightM = r1 > r0 ? colAvgAt(r0, r1, yy) : 0;
+      bestSupport = Math.max(bestSupport, Math.max(leftM, rightM));
+    }
+    return bestSupport >= 0.42;
+  };
+
+  const findVerticalCutsInRegion = (
+    rx0: number,
+    rx1: number,
+    ry0: number,
+    ry1: number,
+    isPartialTier: boolean,
+  ): Array<{ x: number; score: number }> => {
+    const regW = rx1 - rx0;
+    const regH = ry1 - ry0;
+    if (regW < Math.max(28, tPx * 4) || regH < Math.max(24, tPy * 4)) return [];
+
+    const colProfile = new Float32Array(W);
+    for (let x = rx0; x < rx1; x++) {
+      let sum = 0;
+      for (let y = ry0; y < ry1; y++) sum += matchMap[y * W + x];
+      colProfile[x] = sum / regH;
+    }
+
+    const minX = Math.max(rx0 + fwX, Math.round(rx0 + regW * 0.08));
+    const maxX = Math.min(rx1 - tPx - fwX - 1, Math.round(rx1 - regW * 0.08) - tPx);
+    if (maxX <= minX) return [];
+
+    const divScores = new Float32Array(W);
+    for (let x = minX; x <= maxX; x++) {
+      const bandCov = rangeMean(colProfile, x, x + tPx);
+      if (bandCov < 0.42) continue;
+
+      const uCenter = (x + tPx / 2) / W;
+      const leftFlank = rangeMean(colProfile, x - fwX, x);
+      const rightFlank = rangeMean(colProfile, x + tPx, x + tPx + fwX);
+
+      let score: number;
+      if (!parallaxAware || Math.abs(uCenter - 0.5) < 0.06) {
+        score = bandCov - 0.5 * (leftFlank + rightFlank);
+      } else if (uCenter < 0.5) {
+        score = bandCov - leftFlank;
+      } else {
+        score = bandCov - rightFlank;
+      }
+
+      if (score > 0.24) {
+        divScores[x] = score;
       }
     }
-    if (isPeak) {
-      // Prior estructural: un divisor vertical real en mueble abierto debe ser continuo
-      // de cubierta a base (descarta pilas altas de libros o cajas claras).
+
+    const nmsRadX = Math.max(tPx * 3, Math.round(regW * 0.07));
+    const cands: Array<{ x: number; score: number }> = [];
+    for (let x = minX; x <= maxX; x++) {
+      const s = divScores[x];
+      if (s <= 0) continue;
+      let isPeak = true;
+      for (let dx = -nmsRadX; dx <= nmsRadX; dx++) {
+        if (dx === 0) continue;
+        const nx = x + dx;
+        if (nx >= minX && nx <= maxX && divScores[nx] > s) {
+          isPeak = false;
+          break;
+        }
+      }
+      if (!isPeak) continue;
+
+      // Verificar continuidad de extremo a extremo dentro de la región [ry0..ry1]
       const cx0 = Math.max(0, x);
       const cx1 = Math.min(W - 1, x + tPx - 1);
-      let bestStart = yStartInt;
-      let bestEnd = yStartInt;
+      let bestStart = ry0;
+      let bestEnd = ry0;
       let runStart = -1;
       let lastHit = -1;
-      for (let y = yStartInt; y < yEndInt; y++) {
-        let rowSum = 0;
-        for (let cx = cx0; cx <= cx1; cx++) rowSum += matchMap[y * W + cx];
-        const rowAvg = rowSum / Math.max(1, cx1 - cx0 + 1);
+      const gapTol = Math.max(4, Math.round(tPy * 1.4));
+
+      for (let y = ry0; y < ry1; y++) {
+        const rowAvg = colAvgAt(cx0, cx1, y);
         if (rowAvg >= 0.42) {
           if (runStart < 0) runStart = y;
           lastHit = y;
-        } else if (runStart >= 0 && y - lastHit > Math.max(4, Math.round(tPy * 1.4))) {
+        } else if (runStart >= 0 && y - lastHit > gapTol) {
           if (lastHit - runStart > bestEnd - bestStart) {
             bestStart = runStart;
             bestEnd = lastHit;
@@ -679,73 +777,79 @@ export function analyzeRectifiedFurniture(
         bestEnd = lastHit;
       }
 
-      const endTol = Math.max(tPy * 2.5, Math.round(H * 0.04));
-      if (bestStart - yStartInt > endTol || yEndInt - 1 - bestEnd > endTol) {
+      const endTol = Math.max(tPy * 2.5, Math.round(regH * 0.06));
+      if (bestStart - ry0 > endTol || ry1 - 1 - bestEnd > endTol) {
         continue;
+      }
+
+      // Si es divisor parcial (en un subnivel), trazar su corrida completa global para
+      // descartar pilas de libros que sobresalen y terminan flotando en el aire.
+      if (isPartialTier) {
+        let fullTop = ry0;
+        let miss = 0;
+        for (let y = ry0 - 1; y >= yStartInt; y--) {
+          if (colAvgAt(cx0, cx1, y) >= 0.42) {
+            fullTop = y;
+            miss = 0;
+          } else {
+            miss++;
+            if (miss > gapTol) break;
+          }
+        }
+        let fullBot = ry1 - 1;
+        miss = 0;
+        for (let y = ry1; y < yEndInt; y++) {
+          if (colAvgAt(cx0, cx1, y) >= 0.42) {
+            fullBot = y;
+            miss = 0;
+          } else {
+            miss++;
+            if (miss > gapTol) break;
+          }
+        }
+        const xMid = x + tPx / 2;
+        if (!hasHorizontalSupportAt(xMid, fullTop) || !hasHorizontalSupportAt(xMid, fullBot)) {
+          continue;
+        }
       }
 
       const sL = divScores[x - 1] ?? 0;
       const sR = divScores[x + 1] ?? 0;
       const denom = sL - 2 * s + sR;
-      const subShift = Math.abs(denom) > 1e-6 ? Math.max(-0.5, Math.min(0.5, 0.5 * (sL - sR) / denom)) : 0;
-      divCandidates.push({ x: x + subShift, score: s });
+      const subShift =
+        Math.abs(denom) > 1e-6 ? Math.max(-0.5, Math.min(0.5, (0.5 * (sL - sR)) / denom)) : 0;
+      cands.push({ x: x + subShift, score: s });
     }
-  }
 
-  divCandidates.sort((a, b) => a.x - b.x);
-  const vDividers: NormalizedSegment[] = divCandidates.map((cand, idx) => {
-    const uExt = (cand.x + tPx / 2) / W;
-    const uInt = exteriorToInterior(uExt, boardThicknessMm, dimsMm.x);
-    return {
-      id: `auto_div_${idx + 1}`,
-      position: Number(uInt.toFixed(4)),
-      start: 0,
-      end: 1,
-    };
-  });
+    cands.sort((a, b) => a.x - b.x);
+    return cands;
+  };
 
-  const bayPxBounds: Array<{ x0: number; x1: number; uStart: number; uEnd: number }> = [];
-  const divPxPositions = divCandidates.map((c) => c.x + tPx / 2);
-  const divIntPositions = vDividers.map((d) => d.position);
+  const findHorizontalCutsInRegion = (
+    rx0: number,
+    rx1: number,
+    ry0: number,
+    ry1: number,
+    requireFullSpanEnds: boolean,
+  ): Array<{ y: number; score: number }> => {
+    const regW = rx1 - rx0;
+    const regH = ry1 - ry0;
+    if (regW < Math.max(12, tPx * 2) || regH < Math.max(24, tPy * 4)) return [];
 
-  const pxStops = [tPx, ...divPxPositions, W - tPx];
-  const uStops = [0, ...divIntPositions, 1];
-  const bayPad = Math.max(tPx + 2, Math.round(tPx * 1.4));
-
-  for (let b = 0; b < pxStops.length - 1; b++) {
-    const bx0 = Math.round(pxStops[b] + (b === 0 ? 3 : bayPad));
-    const bx1 = Math.round(pxStops[b + 1] - (b === pxStops.length - 2 ? 3 : bayPad));
-    if (bx1 - bx0 >= Math.max(12, tPx * 2)) {
-      bayPxBounds.push({
-        x0: bx0,
-        x1: bx1,
-        uStart: uStops[b],
-        uEnd: uStops[b + 1],
-      });
-    }
-  }
-
-  const fhY = Math.max(tPy + 2, Math.round(tPy * 1.6));
-  const minShY = Math.max(tPy + fhY, Math.round(H * 0.06));
-  const maxShY = Math.min(H - tPy - fhY - 1, Math.round(H * 0.94) - tPy);
-  const nmsRadY = Math.max(tPy * 3, Math.round(H * 0.06));
-
-  const rawShelves: Array<{ vInt: number; uStart: number; uEnd: number }> = [];
-
-  for (const bay of bayPxBounds) {
     const rowProfile = new Float32Array(H);
-    const bayW = bay.x1 - bay.x0;
-    for (let y = 0; y < H; y++) {
+    for (let y = ry0; y < ry1; y++) {
       const rowOff = y * W;
       let sum = 0;
-      for (let x = bay.x0; x < bay.x1; x++) {
-        sum += matchMap[rowOff + x];
-      }
-      rowProfile[y] = sum / bayW;
+      for (let x = rx0; x < rx1; x++) sum += matchMap[rowOff + x];
+      rowProfile[y] = sum / regW;
     }
 
+    const minY = Math.max(ry0 + fhY, Math.round(ry0 + regH * 0.06));
+    const maxY = Math.min(ry1 - tPy - fhY - 1, Math.round(ry1 - regH * 0.06) - tPy);
+    if (maxY <= minY) return [];
+
     const rowScores = new Float32Array(H);
-    for (let y = minShY; y <= maxShY; y++) {
+    for (let y = minY; y <= maxY; y++) {
       const bandCov = rangeMean(rowProfile, y, y + tPy);
       if (bandCov < 0.36) continue;
 
@@ -767,34 +871,201 @@ export function analyzeRectifiedFurniture(
       }
     }
 
-    for (let y = minShY; y <= maxShY; y++) {
+    const nmsRadY = Math.max(tPy * 3, Math.round(regH * 0.06));
+    const cands: Array<{ y: number; score: number }> = [];
+
+    for (let y = minY; y <= maxY; y++) {
       const s = rowScores[y];
       if (s <= 0) continue;
       let isPeak = true;
       for (let dy = -nmsRadY; dy <= nmsRadY; dy++) {
         if (dy === 0) continue;
         const ny = y + dy;
-        if (ny >= minShY && ny <= maxShY && rowScores[ny] > s) {
+        if (ny >= minY && ny <= maxY && rowScores[ny] > s) {
           isPeak = false;
           break;
         }
       }
-      if (isPeak) {
-        const sU = rowScores[y - 1] ?? 0;
-        const sD = rowScores[y + 1] ?? 0;
-        const denom = sU - 2 * s + sD;
-        const subShift = Math.abs(denom) > 1e-6 ? Math.max(-0.5, Math.min(0.5, 0.5 * (sU - sD) / denom)) : 0;
-        const vExt = 1 - (y + subShift + tPy / 2) / H;
-        const vInt = exteriorToInterior(vExt, boardThicknessMm, dimsMm.y);
-        rawShelves.push({
-          vInt,
-          uStart: bay.uStart,
-          uEnd: bay.uEnd,
+      if (!isPeak) continue;
+
+      if (requireFullSpanEnds) {
+        // Exigir continuidad horizontal de extremo a extremo (evita tomar repisa parcial como corte total)
+        const cy0 = Math.max(0, y);
+        const cy1 = Math.min(H - 1, y + tPy - 1);
+        let bestStart = rx0;
+        let bestEnd = rx0;
+        let runStart = -1;
+        let lastHit = -1;
+        const gapTolX = Math.max(6, Math.round(tPx * 1.8));
+        for (let x = rx0; x < rx1; x++) {
+          let colSum = 0;
+          for (let cy = cy0; cy <= cy1; cy++) colSum += matchMap[cy * W + x];
+          const colAvg = colSum / Math.max(1, cy1 - cy0 + 1);
+          if (colAvg >= 0.36) {
+            if (runStart < 0) runStart = x;
+            lastHit = x;
+          } else if (runStart >= 0 && x - lastHit > gapTolX) {
+            if (lastHit - runStart > bestEnd - bestStart) {
+              bestStart = runStart;
+              bestEnd = lastHit;
+            }
+            runStart = -1;
+          }
+        }
+        if (runStart >= 0 && lastHit - runStart > bestEnd - bestStart) {
+          bestStart = runStart;
+          bestEnd = lastHit;
+        }
+        const endTolX = Math.max(tPx * 2.5, Math.round(regW * 0.08));
+        if (bestStart - rx0 > endTolX || rx1 - 1 - bestEnd > endTolX) {
+          continue;
+        }
+      }
+
+      const sU = rowScores[y - 1] ?? 0;
+      const sD = rowScores[y + 1] ?? 0;
+      const denom = sU - 2 * s + sD;
+      const subShift =
+        Math.abs(denom) > 1e-6 ? Math.max(-0.5, Math.min(0.5, (0.5 * (sU - sD)) / denom)) : 0;
+      cands.push({ y: y + subShift, score: s });
+    }
+
+    cands.sort((a, b) => a.y - b.y);
+    return cands;
+  };
+
+  const rawVDivs: RawVDiv[] = [];
+  const rawShelves: RawHShelf[] = [];
+  const cavities: DetectedCavity[] = [];
+  const bayPadX = Math.max(tPx + 2, Math.round(tPx * 1.4));
+  const tierPadY = Math.max(tPy + 2, Math.round(tPy * 1.3));
+
+  const recurseXYCut = (
+    rx0: number,
+    rx1: number,
+    ry0: number,
+    ry1: number,
+    u0: number,
+    u1: number,
+    v0: number,
+    v1: number,
+    depth: number,
+  ): void => {
+    if (depth >= 3 || rx1 - rx0 < Math.max(18, tPx * 2.5) || ry1 - ry0 < Math.max(18, tPy * 2.5)) {
+      const spanU = u1 - u0;
+      const spanV = v1 - v0;
+      const isKneeSpace = v0 <= 0.02 && spanU >= 0.34 && spanV >= 0.32 && spanU < 0.92;
+      cavities.push({
+        id: `cav_${cavities.length + 1}`,
+        u0: Number(u0.toFixed(4)),
+        u1: Number(u1.toFixed(4)),
+        v0: Number(v0.toFixed(4)),
+        v1: Number(v1.toFixed(4)),
+        kind: isKneeSpace ? 'knee_space' : 'open_bay',
+      });
+      return;
+    }
+
+    const isPartialTier = depth > 0 && (v0 > 0.02 || v1 < 0.98);
+    const vCuts = findVerticalCutsInRegion(rx0, rx1, ry0, ry1, isPartialTier);
+    const hCuts = findHorizontalCutsInRegion(rx0, rx1, ry0, ry1, depth === 0);
+
+    // Priorizar cortes verticales cuando existen a altura completa de la región
+    // (mantiene 100% compatibilidad con Rack TV, Clóset y grillas completas;
+    // cuando solo hay cortes horizontales, particiona por niveles y detecta divisores parciales).
+    if (vCuts.length > 0) {
+      const divUs: number[] = [];
+      const divPxs: number[] = [];
+
+      for (const vc of vCuts) {
+        const pxCenter = vc.x + tPx / 2;
+        const uExt = pxCenter / W;
+        const uInt = exteriorToInterior(uExt, boardThicknessMm, dimsMm.x);
+        if (uInt <= u0 + 0.04 || uInt >= u1 - 0.04) continue;
+        divUs.push(uInt);
+        divPxs.push(pxCenter);
+        rawVDivs.push({
+          uInt,
+          vStart: v0,
+          vEnd: v1,
+          pxCenter,
+          score: vc.score,
         });
       }
-    }
-  }
 
+      if (divUs.length > 0) {
+        const pxStops = [rx0, ...divPxs, rx1];
+        const uStops = [u0, ...divUs, u1];
+        for (let b = 0; b < pxStops.length - 1; b++) {
+          const bx0 = Math.round(pxStops[b] + (b === 0 ? 3 : bayPadX));
+          const bx1 = Math.round(pxStops[b + 1] - (b === pxStops.length - 2 ? 3 : bayPadX));
+          recurseXYCut(bx0, bx1, ry0, ry1, uStops[b], uStops[b + 1], v0, v1, depth + 1);
+        }
+        return;
+      }
+    }
+
+    if (hCuts.length > 0) {
+      // hCuts están ordenados de arriba (y pequeño -> v alto) hacia abajo (y grande -> v bajo)
+      const shelfVs: number[] = [];
+      const shelfPys: number[] = [];
+
+      for (const hc of hCuts) {
+        const pyCenter = hc.y + tPy / 2;
+        const vExt = 1 - pyCenter / H;
+        const vInt = exteriorToInterior(vExt, boardThicknessMm, dimsMm.y);
+        if (vInt <= v0 + 0.04 || vInt >= v1 - 0.04) continue;
+        shelfVs.push(vInt);
+        shelfPys.push(pyCenter);
+        rawShelves.push({
+          vInt,
+          uStart: u0,
+          uEnd: u1,
+          pyCenter,
+          score: hc.score,
+        });
+      }
+
+      if (shelfVs.length > 0) {
+        const pyStops = [ry0, ...shelfPys, ry1];
+        const vTopToBotStops = [v1, ...shelfVs, v0];
+        for (let t = 0; t < pyStops.length - 1; t++) {
+          const ty0 = Math.round(pyStops[t] + (t === 0 ? 2 : tierPadY));
+          const ty1 = Math.round(pyStops[t + 1] - (t === pyStops.length - 2 ? 2 : tierPadY));
+          const tierVHigh = vTopToBotStops[t];
+          const tierVLow = vTopToBotStops[t + 1];
+          recurseXYCut(rx0, rx1, ty0, ty1, u0, u1, tierVLow, tierVHigh, depth + 1);
+        }
+        return;
+      }
+    }
+
+    // Hoja sin más subdivisiones -> registrar cavidad/espacio vacío
+    const spanU = u1 - u0;
+    const spanV = v1 - v0;
+    const isKneeSpace = v0 <= 0.02 && spanU >= 0.34 && spanV >= 0.32 && spanU < 0.92;
+    cavities.push({
+      id: `cav_${cavities.length + 1}`,
+      u0: Number(u0.toFixed(4)),
+      u1: Number(u1.toFixed(4)),
+      v0: Number(v0.toFixed(4)),
+      v1: Number(v1.toFixed(4)),
+      kind: isKneeSpace ? 'knee_space' : 'open_bay',
+    });
+  };
+
+  recurseXYCut(xStartInt, xEndInt, yStartInt, yEndInt, 0, 1, 0, 1, 0);
+
+  // Consolidar divisores verticales (ordenados por u, luego vStart)
+  rawVDivs.sort((a, b) => a.uInt - b.uInt || a.vStart - b.vStart);
+  const vDividers: NormalizedSegment[] = rawVDivs.map((d, idx) => ({
+    id: `auto_div_${idx + 1}`,
+    position: Number(d.uInt.toFixed(4)),
+    start: Number(d.vStart.toFixed(4)),
+    end: Number(d.vEnd.toFixed(4)),
+  }));
+
+  // Fusión de repisas horizontales colineales entre vanos adyacentes
   rawShelves.sort((a, b) => a.vInt - b.vInt || a.uStart - b.uStart);
   const merged: Array<{ vInt: number; uStart: number; uEnd: number; count: number }> = [];
   for (const rs of rawShelves) {
@@ -806,7 +1077,7 @@ export function analyzeRectifiedFurniture(
       matchMerge.uEnd = rs.uEnd;
       matchMerge.count++;
     } else {
-      merged.push({ ...rs, count: 1 });
+      merged.push({ vInt: rs.vInt, uStart: rs.uStart, uEnd: rs.uEnd, count: 1 });
     }
   }
 
@@ -822,6 +1093,7 @@ export function analyzeRectifiedFurniture(
     vDividers,
     hShelves,
     detectedHandles: [],
+    cavities,
     confidence: Number(confidence.toFixed(3)),
     interiorMatch: Number(interiorMatch.toFixed(3)),
     refLum: Number(refLum.toFixed(1)),

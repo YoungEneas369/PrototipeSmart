@@ -298,4 +298,36 @@ describe('SmartFurniture Bloque 1 — Motor Matemático y Homografía (v3.0)', (
     expect(reports).toHaveLength(8);
     expect(reports.every((r) => r.passesDIN && r.status === 'Excelente')).toBe(true);
   });
+
+  it('Escritorio asimétrico con divisores verticales parciales (XY-Cut) -> cero solapamiento 3D exacto', () => {
+    const { topology, params } = clonePreset('estanteria');
+    params.targetDimensions = { x: 1400, y: 1200, z: 550 };
+    params.referenceDimensions = { x: 1400, y: 1200, z: 550 };
+    topology.shelfMode = 'custom';
+    topology.vDividers = [
+      { id: 'pedestal_div', position: 0.65, start: 0, end: 0.58 },
+      { id: 'cubo_div_1', position: 1 / 3, start: 0.58, end: 1 },
+      { id: 'cubo_div_2', position: 2 / 3, start: 0.58, end: 1 },
+    ];
+    topology.hShelves = [
+      { id: 'escritorio_cubierta', position: 0.58, start: 0, end: 1 },
+      { id: 'pedestal_rep_1', position: 0.2, start: 0.65, end: 1 },
+      { id: 'pedestal_rep_2', position: 0.39, start: 0.65, end: 1 },
+    ];
+
+    const res = calculateDespiece(topology, params);
+    assertNo3DOverlap(res.matrizDespiece);
+
+    // La cubierta intermedia del escritorio queda en una sola pieza continua (no partida por divisores parciales)
+    const desktop = res.matrizDespiece.find((p) => p.id === 'escritorio_cubierta')!;
+    expect(desktop).toBeDefined();
+    expect(desktop.ancho).toBeCloseTo(1400 - 36, 3);
+
+    // Las 2 repisas del pedestal tienen ancho neto exacto descontando e/2 del divisor pedestal
+    const pedShelves = res.matrizDespiece.filter((p) => p.id.startsWith('pedestal_rep_'));
+    expect(pedShelves).toHaveLength(2);
+    for (const ps of pedShelves) {
+      expect(ps.ancho).toBeCloseTo((1400 - 36) * 0.35 - 9, 2);
+    }
+  });
 });

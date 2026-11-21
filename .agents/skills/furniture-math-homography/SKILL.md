@@ -51,8 +51,9 @@ Zero external linear algebra libraries.
 3. **Corner Joint Deductions:**
    - `topOverSides`: top/base = `x_f × z_f`; sides = `(y_f - 2e) × z_f`.
    - `topBetweenSides`: sides = `y_f × z_f`; top/base = `(x_f - 2e) × z_f`.
-4. **Mixed-Bay Deductions & Exact Presets:**
+4. **Mixed-Bay Deductions, Partial Dividers (v3.3) & Exact Presets:**
    - Deduct `e / 2` at both interior crossings AND divider boundary contacts (`<= 1e-3`).
+   - Symmetrically, partial vertical dividers (`start > 0` or `end < 1` from Recursive XY-Cut) deduct `+e / 2` when starting on a horizontal shelf and `-e / 2` when ending under a horizontal shelf -> zero 3D AABB overlap on asymmetric desks and staggered cubby units.
    - Use exact `1 / 3` and `2 / 3` in Preset 2 (`rack_tv`) -> center shelf `503.33 mm`.
 5. **Back Panel Split Guard:**
    - If `hasBackPanel === true`: using `sheet = backPanelSheetDimensions ?? sheetDimensions`, split vertically along interior `vDividers` (or equal vertical strips) whenever `(x_f > minS && y_f > minS)` **OR** `x_f > maxS` **OR** `y_f > maxS`.

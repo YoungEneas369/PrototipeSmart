@@ -290,6 +290,8 @@ export interface AutoQuadResult {
   confidence: number;
   usedFallback: boolean;
   aspectRatioEst: number;
+  /** Fracción de la imagen clasificada como fondo exterior (0..1). */
+  backgroundCoverage: number;
 }
 
 function medianNum(values: number[]): number {
@@ -299,11 +301,224 @@ function medianNum(values: number[]): number {
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
+interface BackgroundSegGrid {
+  gw: number;
+  gh: number;
+  bgMask: Uint8Array;
+  fgMain: Uint8Array;
+  sobelMag: Float32Array;
+  backgroundCoverage: number;
+}
+
+/**
+ * Segmentación pixel a pixel en 2 etapas (100% offline):
+ *   1. Calcula gradiente Sobel 3×3 como barrera estructural de bordes.
+ *   2. Ejecuta Flood-Fill iterativo BFS desde los bordes de la imagen (pared/fondo)
+ *      deteniéndose ante bordes Sobel fuertes o saltos bruscos de color (soporta gradientes de luz).
+ *   3. Extrae la mayor componente conexa de primer plano (descarta objetos pequeños en la pared).
+ */
+function segmentForegroundGrid(
+  rgba: Uint8ClampedArray,
+  imgW: number,
+  imgH: number,
+  maxSide = 144,
+): BackgroundSegGrid {
+  const scale = Math.min(1, maxSide / Math.max(imgW, imgH));
+  const gw = Math.max(24, Math.round(imgW * scale));
+  const gh = Math.max(24, Math.round(imgH * scale));
+  const n = gw * gh;
+
+  const gR = new Float32Array(n);
+  const gG = new Float32Array(n);
+  const gB = new Float32Array(n);
+  const gLum = new Float32Array(n);
+
+  for (let y = 0; y < gh; y++) {
+    const sy = Math.min(imgH - 1, Math.floor(((y + 0.5) / gh) * imgH));
+    for (let x = 0; x < gw; x++) {
+      const sx = Math.min(imgW - 1, Math.floor(((x + 0.5) / gw) * imgW));
+      const si = (sy * imgW + sx) * 4;
+      const gi = y * gw + x;
+      const r = rgba[si];
+      const g = rgba[si + 1];
+      const b = rgba[si + 2];
+      gR[gi] = r;
+      gG[gi] = g;
+      gB[gi] = b;
+      gLum[gi] = 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+  }
+
+  // Etapa 1: Barreras de bordes Sobel 3×3
+  const sobelMag = new Float32Array(n);
+  for (let y = 1; y < gh - 1; y++) {
+    const up = (y - 1) * gw;
+    const mid = y * gw;
+    const dn = (y + 1) * gw;
+    for (let x = 1; x < gw - 1; x++) {
+      const gx =
+        -gLum[up + x - 1] +
+        gLum[up + x + 1] -
+        2 * gLum[mid + x - 1] +
+        2 * gLum[mid + x + 1] -
+        gLum[dn + x - 1] +
+        gLum[dn + x + 1];
+      const gy =
+        -gLum[up + x - 1] -
+        2 * gLum[up + x] -
+        gLum[up + x + 1] +
+        gLum[dn + x - 1] +
+        2 * gLum[dn + x] +
+        gLum[dn + x + 1];
+      sobelMag[mid + x] = Math.hypot(gx, gy);
+    }
+  }
+
+  // Color mediano perimetral (pared superior y laterales)
+  const bgRs: number[] = [];
+  const bgGs: number[] = [];
+  const bgBs: number[] = [];
+  for (let x = 0; x < gw; x++) {
+    bgRs.push(gR[x]);
+    bgGs.push(gG[x]);
+    bgBs.push(gB[x]);
+  }
+  const sideEndY = Math.round(gh * 0.8);
+  for (let y = 1; y < sideEndY; y++) {
+    const l = y * gw;
+    const r = y * gw + (gw - 1);
+    bgRs.push(gR[l], gR[r]);
+    bgGs.push(gG[l], gG[r]);
+    bgBs.push(gB[l], gB[r]);
+  }
+  const medR = medianNum(bgRs);
+  const medG = medianNum(bgGs);
+  const medB = medianNum(bgBs);
+
+  // Etapa 2: Flood-Fill BFS iterativo desde el perímetro externo con barreras de borde
+  const bgMask = new Uint8Array(n);
+  const queue = new Int32Array(n);
+  let qHead = 0;
+  let qTail = 0;
+
+  const trySeed = (x: number, y: number) => {
+    const idx = y * gw + x;
+    if (bgMask[idx] === 1) return;
+    if (sobelMag[idx] > 85) return;
+    bgMask[idx] = 1;
+    queue[qTail++] = idx;
+  };
+
+  for (let x = 0; x < gw; x++) {
+    trySeed(x, 0);
+  }
+  for (let y = 1; y < gh; y++) {
+    trySeed(0, y);
+    trySeed(gw - 1, y);
+  }
+  // Sembrar esquinas inferiores (si hay piso/pared visible bajo los costados)
+  const botCornerSpan = Math.max(4, Math.round(gw * 0.08));
+  for (let x = 0; x < botCornerSpan; x++) {
+    trySeed(x, gh - 1);
+    trySeed(gw - 1 - x, gh - 1);
+  }
+
+  const edgeBarrier = 58;
+  const localStepTol = 18;
+  const globalBgTol = 34;
+
+  while (qHead < qTail) {
+    const cur = queue[qHead++];
+    const cx = cur % gw;
+    const cy = (cur - cx) / gw;
+    const cr = gR[cur];
+    const cg = gG[cur];
+    const cb = gB[cur];
+
+    const checkNeighbor = (nx: number, ny: number) => {
+      const ni = ny * gw + nx;
+      if (bgMask[ni] === 1) return;
+      if (sobelMag[ni] >= edgeBarrier) return;
+      const dLocal = Math.hypot(gR[ni] - cr, gG[ni] - cg, gB[ni] - cb);
+      const dGlobal = Math.hypot(gR[ni] - medR, gG[ni] - medG, gB[ni] - medB);
+      if (dLocal <= localStepTol || dGlobal <= globalBgTol) {
+        bgMask[ni] = 1;
+        queue[qTail++] = ni;
+      }
+    };
+
+    if (cx > 0) checkNeighbor(cx - 1, cy);
+    if (cx < gw - 1) checkNeighbor(cx + 1, cy);
+    if (cy > 0) checkNeighbor(cx, cy - 1);
+    if (cy < gh - 1) checkNeighbor(cx, cy + 1);
+  }
+
+  const backgroundCoverage = qTail / n;
+
+  // Etapa 3: Mayor componente conexa de primer plano (descarta cuadros/enchufes sueltos en la pared)
+  const visited = new Uint8Array(n);
+  const compPixels = new Int32Array(n);
+  let bestPixels: Int32Array | null = null;
+  let bestScore = -1;
+
+  const centerX = gw / 2;
+  const centerY = gh / 2;
+
+  for (let y = 1; y < gh - 1; y++) {
+    for (let x = 1; x < gw - 1; x++) {
+      const startIdx = y * gw + x;
+      if (bgMask[startIdx] === 1 || visited[startIdx] === 1) continue;
+
+      let h = 0;
+      let t = 0;
+      visited[startIdx] = 1;
+      compPixels[t++] = startIdx;
+      let sumDistCenter = 0;
+
+      while (h < t) {
+        const cur = compPixels[h++];
+        const cx = cur % gw;
+        const cy = (cur - cx) / gw;
+        sumDistCenter += Math.hypot((cx - centerX) / gw, (cy - centerY) / gh);
+
+        const pushFg = (nx: number, ny: number) => {
+          const ni = ny * gw + nx;
+          if (bgMask[ni] === 0 && visited[ni] === 0) {
+            visited[ni] = 1;
+            compPixels[t++] = ni;
+          }
+        };
+
+        if (cx > 1) pushFg(cx - 1, cy);
+        if (cx < gw - 2) pushFg(cx + 1, cy);
+        if (cy > 1) pushFg(cx, cy - 1);
+        if (cy < gh - 2) pushFg(cx, cy + 1);
+      }
+
+      // Priorizar área grande + cercanía al centro de la foto (donde el usuario encuadró el mueble)
+      const meanDist = sumDistCenter / Math.max(1, t);
+      const score = t * Math.max(0.35, 1.15 - meanDist);
+      if (score > bestScore) {
+        bestScore = score;
+        bestPixels = compPixels.slice(0, t);
+      }
+    }
+  }
+
+  const fgMain = new Uint8Array(n);
+  if (bestPixels) {
+    for (let i = 0; i < bestPixels.length; i++) {
+      fgMain[bestPixels[i]] = 1;
+    }
+  }
+
+  return { gw, gh, bgMask, fgMain, sobelMag, backgroundCoverage };
+}
+
 /**
  * Auto-propone las 4 esquinas iniciales [TL, TR, BR, BL] del mueble en la fotografía
- * combinando contraste perimetral mediano contra el fondo + gradiente Sobel 3×3
- * y proyecciones recortadas inmunes a píxeles ruidosos aislados (heredado y reforzado
- * desde SmartFurniture v35, 100% offline sobre RGBA puro).
+ * usando segmentación en 2 etapas: barreras de bordes Sobel 3×3 + Flood-Fill BFS del fondo
+ * exterior + mayor componente conexa + ajuste trapecial superior/inferior (100% offline).
  */
 export function autoDetectFurnitureQuad(
   rgba: Uint8ClampedArray,
@@ -323,120 +538,61 @@ export function autoDetectFurnitureQuad(
       confidence: 0.25,
       usedFallback: true,
       aspectRatioEst: imgW > 0 && imgH > 0 ? imgW / imgH : 1,
+      backgroundCoverage: 0,
     };
   }
 
-  // Downsample rápido preservando proporción (máx 128 px por lado)
-  const scale = Math.min(1, 128 / Math.max(imgW, imgH));
-  const gw = Math.max(24, Math.round(imgW * scale));
-  const gh = Math.max(24, Math.round(imgH * scale));
-  const gR = new Float32Array(gw * gh);
-  const gG = new Float32Array(gw * gh);
-  const gB = new Float32Array(gw * gh);
-  const gLum = new Float32Array(gw * gh);
+  const seg = segmentForegroundGrid(rgba, imgW, imgH, 144);
+  const { gw, gh, fgMain, backgroundCoverage } = seg;
 
-  for (let y = 0; y < gh; y++) {
-    const sy = Math.min(imgH - 1, Math.floor(((y + 0.5) / gh) * imgH));
-    for (let x = 0; x < gw; x++) {
-      const sx = Math.min(imgW - 1, Math.floor(((x + 0.5) / gw) * imgW));
-      const si = (sy * imgW + sx) * 4;
-      const gi = y * gw + x;
-      const r = rgba[si];
-      const g = rgba[si + 1];
-      const b = rgba[si + 2];
-      gR[gi] = r;
-      gG[gi] = g;
-      gB[gi] = b;
-      gLum[gi] = 0.299 * r + 0.587 * g + 0.114 * b;
-    }
-  }
-
-  // Color mediano del fondo muestreado en borde superior, izquierdo y derecho (evita piso inferior)
-  const bgRs: number[] = [];
-  const bgGs: number[] = [];
-  const bgBs: number[] = [];
-  const pushBg = (x: number, y: number) => {
-    const i = y * gw + x;
-    bgRs.push(gR[i]);
-    bgGs.push(gG[i]);
-    bgBs.push(gB[i]);
-  };
-  for (let x = 0; x < gw; x++) {
-    pushBg(x, 0);
-    pushBg(x, 1);
-  }
-  const sideEndY = Math.round(gh * 0.78);
-  for (let y = 2; y < sideEndY; y++) {
-    pushBg(0, y);
-    pushBg(1, y);
-    pushBg(gw - 1, y);
-    pushBg(gw - 2, y);
-  }
-
-  const bgR = medianNum(bgRs);
-  const bgG = medianNum(bgGs);
-  const bgB = medianNum(bgBs);
-
-  // Máscara de primer plano: diferencia de color contra fondo OR magnitud Sobel 3×3
-  const fg = new Uint8Array(gw * gh);
   const rowCounts = new Float32Array(gh);
   const colCounts = new Float32Array(gw);
+  let fgTotal = 0;
 
-  for (let y = 2; y < gh - 2; y++) {
-    for (let x = 2; x < gw - 2; x++) {
-      const i = y * gw + x;
-      const distBg = Math.hypot(gR[i] - bgR, gG[i] - bgG, gB[i] - bgB);
-      const gx =
-        -gLum[(y - 1) * gw + (x - 1)] +
-        gLum[(y - 1) * gw + (x + 1)] -
-        2 * gLum[y * gw + (x - 1)] +
-        2 * gLum[y * gw + (x + 1)] -
-        gLum[(y + 1) * gw + (x - 1)] +
-        gLum[(y + 1) * gw + (x + 1)];
-      const gy =
-        -gLum[(y - 1) * gw + (x - 1)] -
-        2 * gLum[(y - 1) * gw + x] -
-        gLum[(y - 1) * gw + (x + 1)] +
-        gLum[(y + 1) * gw + (x - 1)] +
-        2 * gLum[(y + 1) * gw + x] +
-        gLum[(y + 1) * gw + (x + 1)];
-      const mag = Math.hypot(gx, gy);
-
-      if (distBg > 34 || mag > 90) {
-        fg[i] = 1;
+  for (let y = 1; y < gh - 1; y++) {
+    const rowOff = y * gw;
+    for (let x = 1; x < gw - 1; x++) {
+      if (fgMain[rowOff + x] === 1) {
         rowCounts[y] += 1;
         colCounts[x] += 1;
+        fgTotal++;
       }
     }
   }
 
-  // Normalizar densidades y localizar intervalo principal robusto (ignora ruido puntual)
-  const innerW = Math.max(1, gw - 4);
-  const innerH = Math.max(1, gh - 4);
+  const fgRatio = fgTotal / (gw * gh);
+  if (fgRatio < 0.05 || fgRatio > 0.95) {
+    return {
+      quadCorners: fallbackQuad,
+      confidence: 0.28,
+      usedFallback: true,
+      aspectRatioEst: imgW / imgH,
+      backgroundCoverage: Number(backgroundCoverage.toFixed(2)),
+    };
+  }
+
+  const innerW = Math.max(1, gw - 2);
+  const innerH = Math.max(1, gh - 2);
   let maxRowD = 0;
   let maxColD = 0;
-  for (let y = 2; y < gh - 2; y++) {
+  for (let y = 1; y < gh - 1; y++) {
     rowCounts[y] /= innerW;
     if (rowCounts[y] > maxRowD) maxRowD = rowCounts[y];
   }
-  for (let x = 2; x < gw - 2; x++) {
+  for (let x = 1; x < gw - 1; x++) {
     colCounts[x] /= innerH;
     if (colCounts[x] > maxColD) maxColD = colCounts[x];
   }
 
-  if (maxRowD < 0.12 || maxColD < 0.12) {
-    return {
-      quadCorners: fallbackQuad,
-      confidence: 0.25,
-      usedFallback: true,
-      aspectRatioEst: imgW / imgH,
-    };
-  }
+  const rowThresh = Math.max(0.06, maxRowD * 0.22);
+  const colThresh = Math.max(0.06, maxColD * 0.22);
 
-  const rowThresh = Math.max(0.08, maxRowD * 0.28);
-  const colThresh = Math.max(0.08, maxColD * 0.28);
-
-  const findMainSpan = (arr: Float32Array, start: number, end: number, thresh: number): [number, number] => {
+  const findMainSpan = (
+    arr: Float32Array,
+    start: number,
+    end: number,
+    thresh: number,
+  ): [number, number] => {
     let bestA = -1;
     let bestB = -1;
     let curA = -1;
@@ -462,28 +618,28 @@ export function autoDetectFurnitureQuad(
     return [bestA, bestB];
   };
 
-  const [bx0, bx1] = findMainSpan(colCounts, 2, gw - 2, colThresh);
-  const [by0, by1] = findMainSpan(rowCounts, 2, gh - 2, rowThresh);
+  const [bx0, bx1] = findMainSpan(colCounts, 1, gw - 1, colThresh);
+  const [by0, by1] = findMainSpan(rowCounts, 1, gh - 1, rowThresh);
   const bw = bx1 - bx0;
   const bh = by1 - by0;
 
-  // Rechazar cajas degeneradas (< 14% o > 95% del encuadre)
   if (
     bx0 < 0 ||
     by0 < 0 ||
     bw < gw * 0.14 ||
     bh < gh * 0.14 ||
-    (bw > gw * 0.94 && bh > gh * 0.94)
+    (bw > gw * 0.95 && bh > gh * 0.95)
   ) {
     return {
       quadCorners: fallbackQuad,
       confidence: 0.3,
       usedFallback: true,
       aspectRatioEst: imgW / imgH,
+      backgroundCoverage: Number(backgroundCoverage.toFixed(2)),
     };
   }
 
-  // Refinar inclinación trapecial superior e inferior (para fotos con perspectiva moderada)
+  // Refinar inclinación trapecial superior e inferior
   const bandH = Math.max(3, Math.round(bh * 0.12));
   const findBandX = (yA: number, yB: number): [number, number] => {
     const bandCols = new Float32Array(gw);
@@ -491,7 +647,7 @@ export function autoDetectFurnitureQuad(
     let maxD = 0;
     for (let x = bx0; x <= bx1; x++) {
       let c = 0;
-      for (let y = yA; y <= yB; y++) c += fg[y * gw + x];
+      for (let y = yA; y <= yB; y++) c += fgMain[y * gw + x];
       bandCols[x] = c / rows;
       if (bandCols[x] > maxD) maxD = bandCols[x];
     }
@@ -516,15 +672,14 @@ export function autoDetectFurnitureQuad(
     { x: toImgX(botX0), y: toImgY(by1) },
   ];
 
-  // Medir relleno de primer plano dentro de la caja para estimar confianza
   let fgInside = 0;
   for (let y = by0; y <= by1; y++) {
     for (let x = bx0; x <= bx1; x++) {
-      fgInside += fg[y * gw + x];
+      fgInside += fgMain[y * gw + x];
     }
   }
   const fillRatio = fgInside / Math.max(1, (bw + 1) * (bh + 1));
-  const confidence = Number(Math.max(0.45, Math.min(0.95, 0.4 + fillRatio * 0.65)).toFixed(2));
+  const confidence = Number(Math.max(0.5, Math.min(0.96, 0.45 + fillRatio * 0.52)).toFixed(2));
   const estW = ((topX1 - topX0 + (botX1 - botX0)) / 2 / gw) * imgW;
   const estH = (bh / gh) * imgH;
 
@@ -533,12 +688,13 @@ export function autoDetectFurnitureQuad(
     confidence,
     usedFallback: false,
     aspectRatioEst: estH > 1 ? estW / estH : imgW / imgH,
+    backgroundCoverage: Number(backgroundCoverage.toFixed(2)),
   };
 }
 
 /**
- * Genera mapa visual de bordes Sobel 3×3 (100% offline) para asistir la alineación
- * manual de las 4 esquinas en fotografías con baja iluminación o sombras.
+ * Genera mapa visual combinado de Bordes Sobel 3×3 + Fondo Exterior Atenuado (100% offline)
+ * para mostrar al usuario exactamente qué separó como fondo y qué bordes estructurales calcó.
  */
 export function computeSobelEdgeOverlayRGBA(
   rgba: Uint8ClampedArray,
@@ -546,6 +702,7 @@ export function computeSobelEdgeOverlayRGBA(
   H: number,
 ): Uint8ClampedArray {
   const nPx = W * H;
+  const seg = segmentForegroundGrid(rgba, W, H, 144);
   const lum = new Float32Array(nPx);
   for (let i = 0; i < nPx; i++) {
     const p = i * 4;
@@ -553,13 +710,26 @@ export function computeSobelEdgeOverlayRGBA(
   }
 
   const out = new Uint8ClampedArray(nPx * 4);
-  for (let i = 0; i < nPx; i++) {
-    const p = i * 4;
-    // Fondo atenuado del original para conservar contexto visual
-    out[p] = Math.round(rgba[p] * 0.32);
-    out[p + 1] = Math.round(rgba[p + 1] * 0.34);
-    out[p + 2] = Math.round(rgba[p + 2] * 0.4);
-    out[p + 3] = 255;
+  for (let y = 0; y < H; y++) {
+    const gy = Math.min(seg.gh - 1, Math.floor((y / H) * seg.gh));
+    const rowOff = y * W;
+    for (let x = 0; x < W; x++) {
+      const gx = Math.min(seg.gw - 1, Math.floor((x / W) * seg.gw));
+      const isBg = seg.bgMask[gy * seg.gw + gx] === 1;
+      const p = (rowOff + x) * 4;
+      if (isBg) {
+        // Fondo detectado fuertemente atenuado en azul oscuro
+        out[p] = Math.round(rgba[p] * 0.16 + 8);
+        out[p + 1] = Math.round(rgba[p + 1] * 0.18 + 12);
+        out[p + 2] = Math.round(rgba[p + 2] * 0.24 + 24);
+      } else {
+        // Silueta del mueble preservada con contraste claro
+        out[p] = Math.round(rgba[p] * 0.58);
+        out[p + 1] = Math.round(rgba[p + 1] * 0.6);
+        out[p + 2] = Math.round(rgba[p + 2] * 0.64);
+      }
+      out[p + 3] = 255;
+    }
   }
 
   for (let y = 1; y < H - 1; y++) {
@@ -582,11 +752,11 @@ export function computeSobelEdgeOverlayRGBA(
         2 * lum[rowDn + x] +
         lum[rowDn + x + 1];
       const mag = Math.hypot(gx, gy);
-      if (mag > 48) {
-        const intensity = Math.min(1, (mag - 48) / 210);
+      if (mag > 44) {
+        const intensity = Math.min(1, (mag - 44) / 200);
         const p = (rowMid + x) * 4;
-        out[p] = Math.min(255, Math.round(out[p] + intensity * 70));
-        out[p + 1] = Math.min(255, Math.round(out[p + 1] + intensity * 220));
+        out[p] = Math.min(255, Math.round(out[p] + intensity * 60));
+        out[p + 1] = Math.min(255, Math.round(out[p + 1] + intensity * 225));
         out[p + 2] = Math.min(255, Math.round(out[p + 2] + intensity * 255));
       }
     }

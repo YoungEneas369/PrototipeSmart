@@ -560,20 +560,91 @@ export function calculateDespiece(
     material: mat,
   });
 
-  // 2. DIVISORES VERTICALES (con sanitización anti-colisión lateral)
+  // 2. PREPARACIÓN DE REPISAS VIRTUALES (permite recorte simétrico ±e/2 en divisores parciales)
+  const virtualShelves: VirtualShelf[] = [];
+  const minCy = e + e / 2;
+  const maxCy = yf - e - e / 2;
+
+  if (topology.shelfMode === 'equidistant') {
+    shelfProgression.terms.forEach((an, idx) => {
+      const cy = an + e / 2;
+      if (cy >= minCy - GEOM_EPS && cy <= maxCy + GEOM_EPS) {
+        virtualShelves.push({
+          id: `repisa_eq_${idx + 1}`,
+          labelPrefix: `Repisa ${idx + 1}`,
+          cy,
+          uStart: 0,
+          uEnd: 1,
+        });
+      }
+    });
+  } else {
+    topology.hShelves.forEach((seg, idx) => {
+      const rawCy = e + clamp01(seg.position) * yInt;
+      const cy = clamp(rawCy, minCy, maxCy);
+      const uStart = clamp01(Math.min(seg.start, seg.end));
+      const uEnd = clamp01(Math.max(seg.start, seg.end));
+      if (uEnd - uStart <= GEOM_EPS) {
+        alerts.push({
+          id: `alert_rep_invalida_${seg.id}`,
+          severidad: 'critical',
+          tipo: 'dimension_invalida',
+          mensaje: `Repisa "${seg.id}" tiene extensión horizontal nula.`,
+          piezaId: seg.id,
+        });
+        return;
+      }
+      virtualShelves.push({
+        id: seg.id || `repisa_${idx + 1}`,
+        labelPrefix: `Repisa ${idx + 1}`,
+        cy,
+        uStart,
+        uEnd,
+      });
+    });
+  }
+
+  // 3. DIVISORES VERTICALES (continuos y parciales con recorte exacto contra repisas + anti-colisión)
   const minMarginU = Math.min(0.49, (e / 2) / xInt);
   const sortedDivs = [...topology.vDividers].sort((a, b) => a.position - b.position);
   const activeDividers: ActiveDividerSpan[] = [];
+  const shelfTouchTolMm = Math.max(e * 0.65, yInt * 0.015);
 
   for (let i = 0; i < sortedDivs.length; i++) {
     const seg = sortedDivs[i];
     const u = clamp(seg.position, minMarginU, 1 - minMarginU);
     const vStart = clamp01(Math.min(seg.start, seg.end));
     const vEnd = clamp01(Math.max(seg.start, seg.end));
-    const divY0 = e + vStart * yInt;
-    const divY1 = e + vEnd * yInt;
-    const dy = divY1 - divY0;
+    let divY0 = e + vStart * yInt;
+    let divY1 = e + vEnd * yInt;
     const cx = e + u * xInt;
+
+    // Si es un divisor parcial que arranca o termina sobre una repisa horizontal,
+    // descontar exactamente ±e/2 para topar contra la cara superior/inferior sin solapar en 3D.
+    if (vStart > SEGMENT_TOUCH_TOL) {
+      const bottomShelf = virtualShelves.find(
+        (sh) =>
+          Math.abs(sh.cy - divY0) <= shelfTouchTolMm &&
+          u >= sh.uStart - SEGMENT_TOUCH_TOL &&
+          u <= sh.uEnd + SEGMENT_TOUCH_TOL,
+      );
+      if (bottomShelf) {
+        divY0 = bottomShelf.cy + e / 2;
+      }
+    }
+    if (vEnd < 1 - SEGMENT_TOUCH_TOL) {
+      const topShelf = virtualShelves.find(
+        (sh) =>
+          Math.abs(sh.cy - divY1) <= shelfTouchTolMm &&
+          u >= sh.uStart - SEGMENT_TOUCH_TOL &&
+          u <= sh.uEnd + SEGMENT_TOUCH_TOL,
+      );
+      if (topShelf) {
+        divY1 = topShelf.cy - e / 2;
+      }
+    }
+
+    const dy = divY1 - divY0;
 
     if (dy <= GEOM_EPS) {
       alerts.push({
@@ -623,49 +694,7 @@ export function calculateDespiece(
     });
   }
 
-  // 3. PIPELINE UNIFICADO DE REPISAS (`equidistant` y `custom` pasan por el MISMO recortador)
-  const virtualShelves: VirtualShelf[] = [];
-  const minCy = e + e / 2;
-  const maxCy = yf - e - e / 2;
-
-  if (topology.shelfMode === 'equidistant') {
-    shelfProgression.terms.forEach((an, idx) => {
-      const cy = an + e / 2;
-      if (cy >= minCy - GEOM_EPS && cy <= maxCy + GEOM_EPS) {
-        virtualShelves.push({
-          id: `repisa_eq_${idx + 1}`,
-          labelPrefix: `Repisa ${idx + 1}`,
-          cy,
-          uStart: 0,
-          uEnd: 1,
-        });
-      }
-    });
-  } else {
-    topology.hShelves.forEach((seg, idx) => {
-      const rawCy = e + clamp01(seg.position) * yInt;
-      const cy = clamp(rawCy, minCy, maxCy);
-      const uStart = clamp01(Math.min(seg.start, seg.end));
-      const uEnd = clamp01(Math.max(seg.start, seg.end));
-      if (uEnd - uStart <= GEOM_EPS) {
-        alerts.push({
-          id: `alert_rep_invalida_${seg.id}`,
-          severidad: 'critical',
-          tipo: 'dimension_invalida',
-          mensaje: `Repisa "${seg.id}" tiene extensión horizontal nula.`,
-          piezaId: seg.id,
-        });
-        return;
-      }
-      virtualShelves.push({
-        id: seg.id || `repisa_${idx + 1}`,
-        labelPrefix: `Repisa ${idx + 1}`,
-        cy,
-        uStart,
-        uEnd,
-      });
-    });
-  }
+  // 4. PIPELINE UNIFICADO DE REPISAS (`equidistant` y `custom` pasan por el MISMO recortador)
 
   // Registro de repisas colocadas para validar colisiones verticales en el mismo vano
   const placedShelves: Array<{ x0: number; x1: number; cy: number }> = [];

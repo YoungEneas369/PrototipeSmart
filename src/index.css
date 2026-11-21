@@ -1385,3 +1385,43 @@ button:disabled {
   gap: 8px;
   padding-top: 8px;
 }
+
+/* v6.0 Barra guiada de 3 pasos para recalcar márgenes y vectorizar */
+.trace-stepper {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+@media (max-width: 700px) {
+  .trace-stepper {
+    grid-template-columns: 1fr;
+  }
+}
+
+.trace-step-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1.5px solid #cbd5e1;
+  background: #f8fafc;
+  color: #334155;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.trace-step-btn:hover {
+  background: #e2e8f0;
+  border-color: #94a3b8;
+}
+
+.trace-step-btn.active {
+  background: #0f2b4c;
+  color: #ffffff;
+  border-color: #0284c7;
+  box-shadow: 0 2px 6px rgba(2, 132, 199, 0.25);
+}

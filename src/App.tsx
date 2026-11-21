@@ -240,9 +240,9 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <div className="brand-title">SmartFurniture v5.0 — Vectores 2D, 3D &amp; Corte 244×122</div>
+          <div className="brand-title">SmartFurniture v6.0 — Recalca Márgenes → Vectores → 3D</div>
           <div className="brand-sub">
-            100% Local Offline · Sube tu foto → Vectores y Márgenes → Modelo 3D → Plano de Corte
+            100% Local Offline · Contorno y líneas recalcadas con imán de bordes → 3D exacto y Corte 244×122
           </div>
         </div>
         <div className="preset-bar">

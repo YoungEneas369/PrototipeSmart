@@ -1,4 +1,4 @@
-const CACHE_NAME = 'smartfurniture-pwa-v50';
+const CACHE_NAME = 'smartfurniture-pwa-v60';
 const PRECACHE_URLS = [
   './',
   './index.html',

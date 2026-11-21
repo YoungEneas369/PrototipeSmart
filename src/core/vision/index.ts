@@ -40,3 +40,10 @@ export type {
   VectorStructureReconstruction,
   Visual3DSimilarityResult,
 } from './vectorLines';
+export {
+  classifyPartitionedZonesFromPhoto,
+  partitionCellsFromVectors,
+  snapPointToStrongEdge,
+  vectorizeUserStroke,
+} from './userVectorTrace';
+export type { PartitionRectCell, TracedStrokeResult } from './userVectorTrace';

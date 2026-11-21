@@ -12,8 +12,11 @@ import {
   evaluateMarginsAgainstPhoto,
   extractStructuralVectorLines,
   extrapolateDimensionsFromSingleMeasure,
+  partitionCellsFromVectors,
   rectifyImageRGBA,
   runIterativePhotoTo3D,
+  snapPointToStrongEdge,
+  vectorizeUserStroke,
 } from './index';
 
 /** PRNG determinista (LCG) para renders sintéticos reproducibles al 100%. */
@@ -1050,5 +1053,105 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
       mkP('grafito'),
     );
     expect(simGood.overallScore).toBeGreaterThan(simWrong.overallScore + 15);
+  });
+
+  it('Escenario 21 (Recalcar Márgenes + Imán Sobel + Trazo Universal v6.0): imán encaja al borde y cada trazo crea un vector H/V exacto', () => {
+    const W = 400;
+    const H = 300;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4;
+        const inside = x >= 60 && x <= 340 && y >= 40 && y <= 260;
+        rgba[i] = inside ? 190 : 245;
+        rgba[i + 1] = inside ? 140 : 245;
+        rgba[i + 2] = inside ? 95 : 245;
+        rgba[i + 3] = 255;
+      }
+    }
+
+    // Imán de bordes debe atraer un clic 4 px afuera hacia x = 60
+    const snap = snapPointToStrongEdge(rgba, W, H, { x: 56, y: 150 }, 8);
+    expect(snap.didSnap).toBe(true);
+    expect(Math.abs(snap.snapped.x - 60)).toBeLessThanOrEqual(2);
+
+    const hom = computeQuadToUnitHomography([
+      { x: 60, y: 40 },
+      { x: 340, y: 40 },
+      { x: 340, y: 260 },
+      { x: 60, y: 260 },
+    ])!;
+
+    // Trazo horizontal -> vector repisa (hShelf) extendido a [0, 1]
+    const hStroke = vectorizeUserStroke(
+      { x: 80, y: 150 },
+      { x: 320, y: 154 },
+      hom.toUnit,
+      [],
+      [],
+      18,
+      { x: 1200, y: 900 },
+    );
+    expect(hStroke).not.toBeNull();
+    expect(hStroke!.kind).toBe('hShelf');
+    expect(hStroke!.segment.start).toBe(0);
+    expect(hStroke!.segment.end).toBe(1);
+    expect(Math.abs(hStroke!.segment.position - 0.5)).toBeLessThan(0.03);
+
+    // Trazo vertical SOLO en mitad superior -> divisor parcial que se apoya en la repisa central (T-junction)
+    const vStroke = vectorizeUserStroke(
+      { x: 200, y: 48 },
+      { x: 202, y: 145 },
+      hom.toUnit,
+      [],
+      [hStroke!.segment],
+      18,
+      { x: 1200, y: 900 },
+    );
+    expect(vStroke).not.toBeNull();
+    expect(vStroke!.kind).toBe('vDivider');
+    expect(Math.abs(vStroke!.segment.start - hStroke!.segment.position)).toBeLessThan(0.03);
+    expect(vStroke!.segment.end).toBe(1);
+  });
+
+  it('Escenario 22 (Partición Planar Rectangular Exacta de Vectores Recalcados v6.0): escritorio asimétrico en L y armario 3-cubículos/2-puertas producen celdas disjuntas con suma de área 1.0', () => {
+    const assertDisjointFullCover = (cells: ReadonlyArray<{ uStart: number; uEnd: number; vStart: number; vEnd: number }>) => {
+      const areaSum = cells.reduce(
+        (acc, c) => acc + (c.uEnd - c.uStart) * (c.vEnd - c.vStart),
+        0,
+      );
+      expect(Math.abs(areaSum - 1)).toBeLessThan(0.005);
+      for (let i = 0; i < cells.length; i++) {
+        for (let j = i + 1; j < cells.length; j++) {
+          const a = cells[i];
+          const b = cells[j];
+          const overlapU = Math.min(a.uEnd, b.uEnd) - Math.max(a.uStart, b.uStart);
+          const overlapV = Math.min(a.vEnd, b.vEnd) - Math.max(a.vStart, b.vStart);
+          expect(overlapU > 0.001 && overlapV > 0.001).toBe(false);
+        }
+      }
+    };
+
+    // Armario #04: 1 repisa horizontal en v = 0.65, 2 divisores arriba (u = 0.33, 0.67), 1 divisor abajo (u = 0.50)
+    const cells04 = partitionCellsFromVectors(
+      [
+        { id: 'd1', position: 0.333, start: 0.65, end: 1 },
+        { id: 'd2', position: 0.667, start: 0.65, end: 1 },
+        { id: 'd3', position: 0.5, start: 0, end: 0.65 },
+      ],
+      [{ id: 'r1', position: 0.65, start: 0, end: 1 }],
+    );
+    expect(cells04).toHaveLength(5); // 3 cubículos arriba + 2 puertas abajo
+    assertDisjointFullCover(cells04);
+
+    // Escritorio #11 (vacío en L): divisor parcial derecho u=0.64 en v=0.56..1 + repisa v=0.56 en u=0.64..1
+    const cells11 = partitionCellsFromVectors(
+      [{ id: 'd_caj', position: 0.64, start: 0.56, end: 1 }],
+      [{ id: 'r_caj', position: 0.56, start: 0.64, end: 1 }],
+    );
+    expect(cells11).toHaveLength(3); // hueco izq completo + cajonera arriba-der + hueco bajo cajonera
+    assertDisjointFullCover(cells11);
+    expect(cells11.some((c) => c.uStart >= 0.6 && c.vStart >= 0.5)).toBe(true);
+    expect(cells11.some((c) => c.uStart === 0 && c.uEnd <= 0.65 && c.vStart === 0 && c.vEnd === 1)).toBe(true);
   });
 });

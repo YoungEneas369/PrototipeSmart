@@ -103,8 +103,10 @@ export function MathPanel({
   const dinReports = analyzeShelvesDeflectionDIN(despiece.matrizDespiece, 25);
   const bomCost = estimateProjectBomAndCost(despiece, cuttingPlan, params);
   const melamineAreaM2 = Math.max(0, despiece.totalNetAreaM2 - despiece.backPanelAreaM2);
+  const hasThinPanels =
+    topology.hasBackPanel || despiece.matrizDespiece.some((p) => p.espesor < 10);
   const activeMatrixView: 'nx3' | 'nx5' =
-    matrixOverride === 'auto' ? (topology.hasBackPanel ? 'nx5' : 'nx3') : matrixOverride;
+    matrixOverride === 'auto' ? (hasThinPanels ? 'nx5' : 'nx3') : matrixOverride;
   const hasCriticalAlert = despiece.alerts.some((a) => a.severidad === 'critical');
 
   const handleFixV0 = () => {
@@ -449,7 +451,7 @@ export function MathPanel({
                   </thead>
                   <tbody>
                     {despiece.matrizDespiece
-                      .filter((p) => p.tipo !== 'fondo')
+                      .filter((p) => p.tipo !== 'fondo' && p.tipo !== 'fondo_cajon')
                       .map((p) => (
                         <tr key={p.id}>
                           <td>{p.nombre}</td>
@@ -675,6 +677,8 @@ export function MathPanel({
               <span><i style={{ background: '#dbeafe', borderColor: '#1d4ed8' }} /> Laterales</span>
               <span><i style={{ background: '#ede9fe', borderColor: '#6d28d9' }} /> Divisores</span>
               <span><i style={{ background: '#e0f2fe', borderColor: '#0369a1' }} /> Repisas</span>
+              <span><i style={{ background: '#fce7f3', borderColor: '#be185d' }} /> Puertas</span>
+              <span><i style={{ background: '#ffedd5', borderColor: '#c2410c' }} /> Cajones</span>
               <span><i style={{ background: '#fef3c7', borderColor: '#b45309' }} /> Fondo 3 mm</span>
             </div>
 

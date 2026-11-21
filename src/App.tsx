@@ -1,10 +1,12 @@
 /**
- * SMARTFURNITURE v3.1 — APLICACIÓN PRINCIPAL 100% LOCAL Y OFFLINE
- * Flujo de 4 pasos + 3 Presets oficiales + Vista Dividida Foto <-> 3D + Exportación Excel/CSV/SVG.
+ * SMARTFURNITURE v4.0 — APLICACIÓN PRINCIPAL 100% LOCAL Y OFFLINE
+ * Visión Híbrida 1-Drag + Catálogo QA (14 muebles reales) + Plano Vectorial 2D (V0 vs Vf)
+ * + Visor 3D Bicolor/Vidrio/Tiradores + Unidad 3 + Corte 2D 244×122 + Exportación Excel/CSV/SVG.
  */
 import { useMemo, useState } from 'react';
 import { Lock, Unlock } from 'lucide-react';
 import type {
+  FrontZone,
   FurnitureTopology,
   HardwareItem,
   MelamineMaterial,
@@ -21,22 +23,28 @@ import {
   type PresetKey,
 } from './core/mathEngine';
 import { generateCuttingPlan } from './core/cuttingStock';
+import { CATALOG_14_MUEBLES, cloneCatalogFurniture } from './core/vectorBlueprint/catalog14';
 import { Viewer3D } from './components/viewer3d/Viewer3D';
 import { MathPanel } from './components/mathPanel/MathPanel';
 import { VectorCanvas } from './components/vectorCanvas/VectorCanvas';
+import { VectorBlueprintPanel } from './components/vectorBlueprint/VectorBlueprintPanel';
 import { NumericInput } from './components/NumericInput';
 
-type ActiveStep = 'foto' | 'split' | '3d';
+type ActiveStep = 'split' | 'blueprint' | '3d' | 'foto';
 type SheetStandard = 'pauta' | 'chile';
 
 export default function App() {
   const initial = useMemo(() => clonePreset('estanteria'), []);
   const [activePreset, setActivePreset] = useState<PresetKey | null>('estanteria');
+  const [activeCatalogId, setActiveCatalogId] = useState<string>('');
+  const [externalPhotoUrl, setExternalPhotoUrl] = useState<string | null>(null);
+  const [externalPhotoLabel, setExternalPhotoLabel] = useState<string | null>(null);
   const [topology, setTopology] = useState<FurnitureTopology>(initial.topology);
   const [params, setParams] = useState<ScaleAndBoardParams>(initial.params);
   const [explodeFactor, setExplodeFactor] = useState<number>(0);
   const [sheetStandard, setSheetStandard] = useState<SheetStandard>('pauta');
   const [activeStep, setActiveStep] = useState<ActiveStep>('split');
+  const [modelApproved, setModelApproved] = useState<boolean>(false);
   const [lockProportion, setLockProportion] = useState<boolean>(false);
   const [lockedRatioXY, setLockedRatioXY] = useState<number>(initial.topology.aspectRatioXY);
 
@@ -64,11 +72,44 @@ export default function App() {
       cloned.params.backPanelSheetDimensions = { ...CHILE_DUROLAC_SHEET };
     }
     setActivePreset(key);
+    setActiveCatalogId('');
     setTopology(cloned.topology);
     setParams(cloned.params);
+    setModelApproved(false);
     setLockProportion(false);
     setLockedRatioXY(cloned.topology.aspectRatioXY);
     setExplodeFactor(0);
+  };
+
+  const handleLoadCatalogFurniture = (catalogId: string) => {
+    if (!catalogId) return;
+    const cloned = cloneCatalogFurniture(catalogId);
+    if (!cloned) return;
+    if (sheetStandard === 'chile') {
+      cloned.params.sheetDimensions = { ...CHILE_MELAMINE_SHEET };
+      cloned.params.backPanelSheetDimensions = { ...CHILE_DUROLAC_SHEET };
+    }
+    setActivePreset(null);
+    setActiveCatalogId(catalogId);
+    setTopology(cloned.topology);
+    setParams(cloned.params);
+    setExternalPhotoUrl(`./ejemplos/${cloned.spec.photoFile}`);
+    setExternalPhotoLabel(cloned.spec.name);
+    setModelApproved(false);
+    setLockProportion(false);
+    setLockedRatioXY(cloned.topology.aspectRatioXY);
+    setExplodeFactor(0);
+    setActiveStep('split');
+  };
+
+  const handleUpdateFrontZones = (zones: FrontZone[]) => {
+    setActivePreset(null);
+    setModelApproved(false);
+    setTopology((prev) => ({
+      ...prev,
+      frontZones: zones,
+      hasBackPanel: zones.some((z) => z.kind === 'leg_void') ? false : prev.hasBackPanel,
+    }));
   };
 
   const handleSheetStandardChange = (std: SheetStandard) => {
@@ -133,15 +174,20 @@ export default function App() {
     }));
   };
 
-  const handleAutoPhotoReconstructed = (dims: { x: number; y: number; z: number }) => {
+  const handleAutoPhotoReconstructed = (
+    dims: { x: number; y: number; z: number },
+    detectedMaterial?: MelamineMaterial,
+  ) => {
     if (dims.y > 0) {
       setLockedRatioXY(dims.x / dims.y);
       setLockProportion(true);
     }
+    setModelApproved(false);
     setParams((p) => ({
       ...p,
       referenceDimensions: { ...dims },
       targetDimensions: { ...dims },
+      material: detectedMaterial ?? p.material,
     }));
     setActiveStep((cur) => (cur === 'foto' ? 'split' : cur));
   };
@@ -194,7 +240,7 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <div className="brand-title">SmartFurniture v3.3 — Diseño Paramétrico &amp; Corte 2D</div>
+          <div className="brand-title">SmartFurniture v4.0 — Visión Híbrida, Plano 2D &amp; Corte</div>
           <div className="brand-sub">
             100% Local Offline (PWA) · INACAP Funciones y Matrices (Unidad 3) · Melamina {params.boardThickness} mm
           </div>
@@ -210,6 +256,20 @@ export default function App() {
               {PRESETS[k].label}
             </button>
           ))}
+          <select
+            className="catalog-select"
+            value={activeCatalogId}
+            onChange={(e) => handleLoadCatalogFurniture(e.target.value)}
+            aria-label="Catálogo QA de 14 muebles reales con foto"
+            title="Cargar cualquiera de los 14 muebles reales de prueba con su foto original"
+          >
+            <option value="">Catálogo QA (14 Fotos Reales)…</option>
+            {CATALOG_14_MUEBLES.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
         </div>
       </header>
 
@@ -220,21 +280,28 @@ export default function App() {
             className={activeStep === 'split' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('split')}
           >
-            Foto ↔ 3D en Vivo
+            1. Foto ↔ 3D en Vivo
+          </button>
+          <button
+            type="button"
+            className={activeStep === 'blueprint' ? 'step-btn active' : 'step-btn'}
+            onClick={() => setActiveStep('blueprint')}
+          >
+            2. Plano 2D Vectorial (V₀ vs V_f)
           </button>
           <button
             type="button"
             className={activeStep === '3d' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('3d')}
           >
-            3D, Unidad 3 y Corte
+            3. Visor 3D, Unidad 3 y Corte
           </button>
           <button
             type="button"
             className={activeStep === 'foto' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('foto')}
           >
-            Solo Foto (Pantalla completa)
+            Solo Foto
           </button>
         </div>
         <span className="small-note muted">
@@ -570,18 +637,23 @@ export default function App() {
         {/* ESCENARIO CENTRAL (siempre arriba en móvil; VectorCanvas permanece montado) */}
         <main className="main-stage">
           <div className={activeStep === 'split' ? 'split-stage' : ''}>
-            <div className={activeStep === '3d' ? 'hidden-panel' : ''}>
+            <div className={activeStep === '3d' || activeStep === 'blueprint' ? 'hidden-panel' : ''}>
               <VectorCanvas
                 topology={topology}
                 params={params}
+                externalPhotoUrl={externalPhotoUrl}
+                externalPhotoLabel={externalPhotoLabel}
                 onUpdateTopology={(next) => {
                   setActivePreset(null);
+                  setModelApproved(false);
                   setTopology(next);
                 }}
+                onUpdateFrontZones={handleUpdateFrontZones}
                 onApplyCalibratedDims={(dims) => {
                   if (dims.y > 0) {
                     setLockedRatioXY(dims.x / dims.y);
                   }
+                  setModelApproved(false);
                   setParams((p) => ({
                     ...p,
                     referenceDimensions: { ...dims },
@@ -594,7 +666,7 @@ export default function App() {
               />
             </div>
 
-            {activeStep !== 'foto' && (
+            {(activeStep === 'split' || activeStep === '3d') && (
               <Viewer3D
                 despiece={despiece}
                 topology={topology}
@@ -606,6 +678,22 @@ export default function App() {
               />
             )}
           </div>
+
+          {activeStep === 'blueprint' && (
+            <VectorBlueprintPanel
+              topology={topology}
+              params={params}
+              despiece={despiece}
+              cuttingPlan={cuttingPlan}
+              modelApproved={modelApproved}
+              onUpdateDim={updateTargetDim}
+              onUpdateFrontZones={handleUpdateFrontZones}
+              onApproveModel={() => {
+                setModelApproved(true);
+                setActiveStep('3d');
+              }}
+            />
+          )}
 
           <MathPanel
             despiece={despiece}

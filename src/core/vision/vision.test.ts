@@ -792,4 +792,120 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     expect(Math.abs(br.y - fy1)).toBeLessThan(H * 0.05);
     expect(Math.abs(bl.x - fx0)).toBeLessThan(W * 0.05);
   });
+
+  it('Escenario 16 (Foto real #11 — Escritorio cajonera derecha sobre fondo blanco): detecta hueco de piernas (leg_void) y 2 cajones sin base central', () => {
+    const W = 480;
+    const H = 300;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const whiteBg: [number, number, number] = [252, 252, 252];
+    const woodRgb: [number, number, number] = [210, 125, 58];
+    const seamRgb: [number, number, number] = [95, 52, 22];
+
+    const fill = (x0: number, y0: number, x1: number, y1: number, rgb: [number, number, number]) => {
+      for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) {
+        for (let x = Math.max(0, x0); x < Math.min(W, x1); x++) {
+          const i = (y * W + x) * 4;
+          rgba[i] = rgb[0];
+          rgba[i + 1] = rgb[1];
+          rgba[i + 2] = rgb[2];
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+
+    // Fondo blanco (hueco de piernas abierto hasta el piso)
+    fill(0, 0, W, H, whiteBg);
+    // Cubierta superior + laterales izquierdo y derecho
+    fill(0, 0, W, 12, woodRgb);
+    fill(0, 0, 12, H, woodRgb);
+    fill(W - 12, 0, W, H, woodRgb);
+    // Bloque de 2 cajones suspendido arriba-derecha (u = 0.64..1, v = 0.56..1 -> y = 12..132)
+    const xCaj = Math.round(W * 0.64);
+    const yCajBot = Math.round(H * 0.44);
+    fill(xCaj, 12, W - 12, yCajBot, woodRgb);
+    // Ranura entre los 2 cajones (y = 72)
+    fill(xCaj, 70, W - 12, 74, seamRgb);
+
+    const res = analyzeRectifiedFurniture(rgba, W, H, { x: 1200, y: 750 }, 18, {
+      exteriorBgRgb: whiteBg,
+    });
+    expect(res.confidence).toBeGreaterThanOrEqual(0.55);
+    expect(res.detectedMaterial).toBe('roble');
+    expect(res.vDividers.length).toBeGreaterThanOrEqual(1);
+    expect(res.inferredZones.some((z) => z.kind === 'leg_void')).toBe(true);
+    expect(res.inferredZones.some((z) => z.kind === 'drawers')).toBe(true);
+  });
+
+  it('Escenario 17 (Foto real #07 — Rack TV blanco mixto: 2 cajones + nicho abierto + puertas): detecta módulos híbridos', () => {
+    const W = 540;
+    const H = 180;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const whiteRgb: [number, number, number] = [240, 240, 240];
+    const darkCavity: [number, number, number] = [78, 76, 72];
+    const seamRgb: [number, number, number] = [145, 145, 145];
+
+    const fill = (x0: number, y0: number, x1: number, y1: number, rgb: [number, number, number]) => {
+      for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) {
+        for (let x = Math.max(0, x0); x < Math.min(W, x1); x++) {
+          const i = (y * W + x) * 4;
+          rgba[i] = rgb[0];
+          rgba[i + 1] = rgb[1];
+          rgba[i + 2] = rgb[2];
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+
+    fill(0, 0, W, H, whiteRgb);
+    // Nicho abierto central [180..360] con repisa blanca al medio
+    fill(180, 12, 360, H - 12, darkCavity);
+    fill(180, 86, 360, 94, whiteRgb);
+    // Ranura de 2 cajones en columna izquierda [10..176]
+    fill(10, 88, 176, 92, seamRgb);
+    // Junta vertical entre 2 puertas derechas (x = 450)
+    fill(448, 10, 452, H - 10, seamRgb);
+
+    const res = analyzeRectifiedFurniture(rgba, W, H, { x: 1800, y: 480 }, 18);
+    expect(res.confidence).toBeGreaterThanOrEqual(0.55);
+    expect(res.detectedMaterial).toBe('blanco');
+    expect(res.vDividers.length).toBeGreaterThanOrEqual(2);
+    expect(res.inferredZones.some((z) => z.kind === 'open')).toBe(true);
+    expect(res.inferredZones.some((z) => z.kind === 'drawers' || z.kind === 'door_double' || z.kind === 'door_left' || z.kind === 'door_right')).toBe(true);
+  });
+
+  it('Escenario 18 (Foto real #04 — Armario oficina bicolor grafito + puertas nogal): detecta división horizontal, cubículos y materialOverride roble', () => {
+    const W = 360;
+    const H = 540;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const greyRgb: [number, number, number] = [108, 110, 114];
+    const darkCav: [number, number, number] = [44, 46, 50];
+    const walnutRgb: [number, number, number] = [126, 78, 46];
+
+    const fill = (x0: number, y0: number, x1: number, y1: number, rgb: [number, number, number]) => {
+      for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) {
+        for (let x = Math.max(0, x0); x < Math.min(W, x1); x++) {
+          const i = (y * W + x) * 4;
+          rgba[i] = rgb[0];
+          rgba[i + 1] = rgb[1];
+          rgba[i + 2] = rgb[2];
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+
+    // Carcasa grafito
+    fill(0, 0, W, H, greyRgb);
+    // Zona superior [y = 14..190]: 3 cubículos oscuros con 2 divisores grises
+    fill(12, 14, W - 12, 190, darkCav);
+    fill(118, 14, 126, 190, greyRgb);
+    fill(234, 14, 242, 190, greyRgb);
+    // Zona inferior [y = 198..H-14]: puertas cerradas color nogal/roble
+    fill(12, 198, W - 12, H - 14, walnutRgb);
+
+    const res = analyzeRectifiedFurniture(rgba, W, H, { x: 800, y: 1200 }, 18);
+    expect(res.confidence).toBeGreaterThanOrEqual(0.55);
+    expect(res.hShelves.length).toBeGreaterThanOrEqual(1);
+    expect(res.inferredZones.some((z) => z.kind === 'open')).toBe(true);
+    expect(res.inferredZones.some((z) => z.materialOverride === 'roble')).toBe(true);
+  });
 });

@@ -1,18 +1,19 @@
 /**
- * SMARTFURNITURE — VECTORCANVAS v3.3 (AUTO-RECONSTRUCCIÓN 1 PASO + ANÁLISIS PIXEL A PIXEL)
- * - Al subir una foto frontal ejecuta automáticamente en <150 ms:
- *   1) Barreras Sobel 3×3 + Flood-Fill BFS del fondo -> Auto-Quad [TL, TR, BR, BL].
- *   2) Proporción frontal por vector unitario û_XY (focal fija 26/52 mm) + distancia cámara Z.
- *   3) Rectificación RGBA + Recursive XY-Cut + segmentación de espacios vacíos (cavidades).
- *   4) Actualización inmediata del modelo 3D en vista dividida Foto ↔ 3D.
- * - Inspección visual transparente: `Foto` | `Bordes + Fondo` | `Espacios vacíos`.
- * - Puntos [TL, TR, BR, BL] y trazado manual relegados a "Ajuste preciso (opcional)".
- *   Mover cualquier esquina re-analiza automáticamente al soltar (nunca durante onPointerMove).
+ * SMARTFURNITURE — VECTORCANVAS v4.0
+ * - Encuadre Rápido 1-Drag (Rectángulo frontal limpio) por defecto en vez de forzar 4 esquinas sueltas;
+ *   modo Perspectiva 4 pts (Homografía H 3×3) disponible a 1 clic para fotos con inclinación fuerte.
+ * - Detector Híbrido v4.0: fondo exterior aislado (respetando huecos de piernas en escritorios),
+ *   clasificación automática de zonas (Abierto / Puerta / Cajones 5 pzas / Hueco Piernas / Bicolor)
+ *   y estimación automática de acabado de melamina (Blanco / Roble / Grafito).
+ * - Edición directa sin calcar líneas: toca cualquier zona en la foto (capa "Zonas") para alternar
+ *   su tipo de módulo (Abierto → Puerta → Doble → Cajones → Hueco Piernas) al instante.
+ * - Carga directa de fotos reales del Catálogo QA (14 muebles) y fotos propias del usuario 100% offline.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Camera,
   Contrast,
+  Crop,
   Eraser,
   LayoutGrid,
   Move,
@@ -27,7 +28,10 @@ import {
   Upload,
 } from 'lucide-react';
 import type {
+  FrontModuleKind,
+  FrontZone,
   FurnitureTopology,
+  MelamineMaterial,
   NormalizedSegment,
   Point2D,
   ScaleAndBoardParams,
@@ -55,36 +59,76 @@ import { NumericInput } from '../NumericInput';
 interface VectorCanvasProps {
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
+  externalPhotoUrl?: string | null;
+  externalPhotoLabel?: string | null;
   onUpdateTopology: (next: FurnitureTopology) => void;
+  onUpdateFrontZones: (zones: FrontZone[]) => void;
   onApplyCalibratedDims: (dims: { x: number; y: number; z: number }) => void;
-  onAutoPhotoReconstructed: (dims: { x: number; y: number; z: number }) => void;
+  onAutoPhotoReconstructed: (
+    dims: { x: number; y: number; z: number },
+    detectedMaterial?: MelamineMaterial,
+  ) => void;
   onToggleExternalLegs: (checked: boolean, heightMm?: number, count?: number) => void;
   onSelectDepthMm: (zMm: number) => void;
 }
 
+type FrameMode = 'box' | 'quad';
+
 type ToolMode =
   | 'corners'
+  | 'drawBox'
   | 'vDivider'
   | 'hShelf'
   | 'eyedropper'
   | 'calibA4'
   | 'erase';
 
-type VisualLayerMode = 'photo' | 'edges' | 'cavities';
+type VisualLayerMode = 'photo' | 'zones' | 'edges';
 
 type DragTarget =
   | { kind: 'corner'; idx: number }
+  | { kind: 'drawBox'; start: Point2D }
   | { kind: 'vDivider'; id: string }
   | { kind: 'hShelf'; id: string };
 
 interface LineSnapshot {
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
+  frontZones?: FrontZone[];
 }
 
 const CORNER_LABELS = ['TL', 'TR', 'BR', 'BL'] as const;
 const SNAP_TOL = 0.03;
 const MAX_WORK_DIM = 1600;
+
+const ZONE_CYCLE: readonly FrontModuleKind[] = [
+  'open',
+  'door_left',
+  'door_double',
+  'drawers',
+  'door_glass',
+  'leg_void',
+];
+
+const ZONE_LABELS: Record<FrontModuleKind, string> = {
+  open: 'Abierto',
+  door_left: 'Puerta Izq',
+  door_right: 'Puerta Der',
+  door_double: '2 Puertas',
+  door_glass: 'Vidrio',
+  drawers: 'Cajones',
+  leg_void: 'Hueco Piernas',
+};
+
+const ZONE_COLORS: Record<FrontModuleKind, { fill: string; stroke: string }> = {
+  open: { fill: 'rgba(14, 165, 233, 0.20)', stroke: '#38bdf8' },
+  door_left: { fill: 'rgba(250, 204, 21, 0.24)', stroke: '#facc15' },
+  door_right: { fill: 'rgba(250, 204, 21, 0.24)', stroke: '#facc15' },
+  door_double: { fill: 'rgba(245, 158, 11, 0.24)', stroke: '#f59e0b' },
+  door_glass: { fill: 'rgba(125, 211, 252, 0.28)', stroke: '#7dd3fc' },
+  drawers: { fill: 'rgba(249, 115, 22, 0.25)', stroke: '#fb923c' },
+  leg_void: { fill: 'rgba(168, 85, 247, 0.24)', stroke: '#c084fc' },
+};
 
 interface WorkingBitmap {
   canvas: HTMLCanvasElement;
@@ -112,6 +156,58 @@ function prepareWorkingBitmap(image: HTMLImageElement): WorkingBitmap {
   return { canvas: off, rgba: data.data, w, h };
 }
 
+function makeAxisAlignedQuad(x0: number, y0: number, x1: number, y1: number): [Point2D, Point2D, Point2D, Point2D] {
+  const minX = Math.min(x0, x1);
+  const maxX = Math.max(x0, x1);
+  const minY = Math.min(y0, y1);
+  const maxY = Math.max(y0, y1);
+  return [
+    { x: minX, y: minY },
+    { x: maxX, y: minY },
+    { x: maxX, y: maxY },
+    { x: minX, y: maxY },
+  ];
+}
+
+function quadToBoundingBox(q: readonly [Point2D, Point2D, Point2D, Point2D]): [Point2D, Point2D, Point2D, Point2D] {
+  const xs = q.map((p) => p.x);
+  const ys = q.map((p) => p.y);
+  return makeAxisAlignedQuad(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
+}
+
+function resizeBoxCorner(
+  prev: readonly [Point2D, Point2D, Point2D, Point2D],
+  idx: number,
+  pt: Point2D,
+  w: number,
+  h: number,
+): [Point2D, Point2D, Point2D, Point2D] {
+  const minGap = 24;
+  let minX = Math.min(prev[0].x, prev[3].x);
+  let maxX = Math.max(prev[1].x, prev[2].x);
+  let minY = Math.min(prev[0].y, prev[1].y);
+  let maxY = Math.max(prev[2].y, prev[3].y);
+
+  const cx = Math.max(2, Math.min(w - 2, pt.x));
+  const cy = Math.max(2, Math.min(h - 2, pt.y));
+
+  if (idx === 0) {
+    minX = Math.min(cx, maxX - minGap);
+    minY = Math.min(cy, maxY - minGap);
+  } else if (idx === 1) {
+    maxX = Math.max(cx, minX + minGap);
+    minY = Math.min(cy, maxY - minGap);
+  } else if (idx === 2) {
+    maxX = Math.max(cx, minX + minGap);
+    maxY = Math.max(cy, minY + minGap);
+  } else {
+    minX = Math.min(cx, maxX - minGap);
+    maxY = Math.max(cy, minY + minGap);
+  }
+
+  return makeAxisAlignedQuad(minX, minY, maxX, maxY);
+}
+
 function snapValue(val: number, anchors: readonly number[]): number {
   for (const a of anchors) {
     if (Math.abs(val - a) <= SNAP_TOL) {
@@ -121,10 +217,6 @@ function snapValue(val: number, anchors: readonly number[]): number {
   return val;
 }
 
-/**
- * Calcula una escala inicial ergonómica preservando la proporción real W/H (vector unitario û_XY)
- * para que el 3D luzca proporcionado desde el primer segundo, antes de calibrar medidas exactas.
- */
 function estimateInitialProportionalDims(
   aspectRatioXY: number,
   currentDepthMm: number,
@@ -133,12 +225,10 @@ function estimateInitialProportionalDims(
   const round10 = (v: number) => Math.max(450, Math.min(2200, Math.round(v / 10) * 10));
 
   if (safeRatio >= 1.15) {
-    // Mueble horizontal (escritorio, rack TV, cómoda ancha)
     const x = 1400;
     const y = round10(x / safeRatio);
     return { x, y, z: Math.max(300, Math.min(700, currentDepthMm)) };
   }
-  // Mueble vertical o cuadrado (estantería, clóset, módulo)
   const y = 1800;
   const x = round10(y * safeRatio);
   return { x, y, z: Math.max(280, Math.min(650, currentDepthMm)) };
@@ -154,18 +244,18 @@ function generateSampleFurnitureDataUrl(): string {
   if (!ctx) return '';
 
   const wallGrad = ctx.createLinearGradient(0, 0, w, 0);
-  wallGrad.addColorStop(0, '#cbd5e1');
-  wallGrad.addColorStop(1, '#e2e8f0');
+  wallGrad.addColorStop(0, '#e2e8f0');
+  wallGrad.addColorStop(1, '#f1f5f9');
   ctx.fillStyle = wallGrad;
-  ctx.fillRect(0, 0, w, 595);
-  ctx.fillStyle = '#94a3b8';
-  ctx.fillRect(0, 595, w, 85);
+  ctx.fillRect(0, 0, w, 585);
+  ctx.fillStyle = '#cbd5e1';
+  ctx.fillRect(0, 585, w, 95);
 
   const quad: [Point2D, Point2D, Point2D, Point2D] = [
-    { x: 175, y: 85 },
-    { x: 715, y: 95 },
-    { x: 735, y: 535 },
-    { x: 155, y: 540 },
+    { x: 165, y: 120 },
+    { x: 735, y: 120 },
+    { x: 735, y: 540 },
+    { x: 165, y: 540 },
   ];
 
   const hom = computeQuadToUnitHomography(quad);
@@ -177,8 +267,6 @@ function generateSampleFurnitureDataUrl(): string {
     ctx.fill();
   };
 
-  fillPoly(quad, '#334155');
-
   if (hom) {
     const mapRect = (u0: number, v0: number, u1: number, v1: number, color: string) => {
       const p0 = applyHomography(hom.toCanvas, { x: u0, y: v1 });
@@ -188,38 +276,23 @@ function generateSampleFurnitureDataUrl(): string {
       if (p0 && p1 && p2 && p3) fillPoly([p0, p1, p2, p3], color);
     };
 
-    // Croquis de escritorio asimétrico con vano piernas + pedestal + 3 cubos superiores
-    const boardCol = '#cfa06e';
-    const eU = 0.022;
-    const eV = 0.026;
+    const woodCol = '#cfa06e';
+    const seamCol = '#3b2412';
+    const eU = 0.025;
+    const eV = 0.032;
 
-    // Carcasa exterior
-    mapRect(0, 1 - eV, 1, 1, boardCol);
-    mapRect(0, 0, 1, eV, boardCol);
-    mapRect(0, 0, eU, 1, boardCol);
-    mapRect(1 - eU, 0, 1, 1, boardCol);
-    // Cubierta horizontal del escritorio (v = 0.58)
-    mapRect(eU, 0.58 - eV / 2, 1 - eU, 0.58 + eV / 2, boardCol);
-    // Divisor parcial inferior del pedestal derecho (u = 0.65, v = 0..0.58)
-    mapRect(0.65 - eU / 2, eV, 0.65 + eU / 2, 0.58 - eV / 2, boardCol);
-    // Dos repisas dentro del pedestal derecho
-    mapRect(0.65 + eU / 2, 0.21 - eV / 2, 1 - eU, 0.21 + eV / 2, boardCol);
-    mapRect(0.65 + eU / 2, 0.40 - eV / 2, 1 - eU, 0.40 + eV / 2, boardCol);
-    // Dos divisores parciales superiores formando 3 recuadros (u = 1/3, 2/3)
-    mapRect(0.333 - eU / 2, 0.58 + eV / 2, 0.333 + eU / 2, 1 - eV, boardCol);
-    mapRect(0.667 - eU / 2, 0.58 + eV / 2, 0.667 + eU / 2, 1 - eV, boardCol);
-
-    // Hoja A4 en el vano superior derecho para demo de calibración
-    mapRect(0.73, 0.65, 0.90, 0.90, '#ffffff');
-    const a4Label = applyHomography(hom.toCanvas, { x: 0.815, y: 0.775 });
-    if (a4Label) {
-      ctx.fillStyle = '#0f172a';
-      ctx.font = 'bold 12px system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('A4', a4Label.x, a4Label.y - 4);
-      ctx.font = '10px system-ui, sans-serif';
-      ctx.fillText('297mm', a4Label.x, a4Label.y + 10);
-    }
+    // Escritorio roble con hueco de piernas a la izquierda + cajonera suspendida derecha (2 cajones)
+    mapRect(0, 1 - eV, 1, 1, woodCol); // Cubierta
+    mapRect(0, 0, eU, 1, woodCol); // Lateral izq
+    mapRect(1 - eU, 0, 1, 1, woodCol); // Lateral der
+    // Cajonera derecha suspendida (u = 0.64..1, v = 0.50..1)
+    mapRect(0.64, 0.50, 1 - eU, 1 - eV, '#c79663');
+    mapRect(0.64 - 0.008, 0.50, 0.64 + 0.008, 1 - eV, seamCol);
+    mapRect(0.64, 0.50 - 0.01, 1 - eU, 0.50 + 0.01, seamCol);
+    mapRect(0.64, 0.74 - 0.008, 1 - eU, 0.74 + 0.008, seamCol); // Ranura entre 2 cajones
+    // Tiradores metálicos
+    mapRect(0.79, 0.85, 0.85, 0.87, '#1e293b');
+    mapRect(0.79, 0.61, 0.85, 0.63, '#1e293b');
   }
 
   return c.toDataURL('image/png');
@@ -228,23 +301,27 @@ function generateSampleFurnitureDataUrl(): string {
 export function VectorCanvas({
   topology,
   params,
+  externalPhotoUrl,
+  externalPhotoLabel,
   onUpdateTopology,
+  onUpdateFrontZones,
   onApplyCalibratedDims,
   onAutoPhotoReconstructed,
   onToggleExternalLegs,
   onSelectDepthMm,
 }: VectorCanvasProps) {
   const [viewTab, setViewTab] = useState<'frontal' | 'lateral'>('frontal');
+  const [frameMode, setFrameMode] = useState<FrameMode>('box');
   const [showPrecisionTools, setShowPrecisionTools] = useState(false);
   const [showProtocol, setShowProtocol] = useState(false);
-  const [visualLayer, setVisualLayer] = useState<VisualLayerMode>('photo');
+  const [visualLayer, setVisualLayer] = useState<VisualLayerMode>('zones');
   const [isDragOver, setIsDragOver] = useState(false);
 
   const [imgUrl, setImgUrl] = useState<string | null>(null);
   const [frontBitmap, setFrontBitmap] = useState<WorkingBitmap | null>(null);
   const [imgSize, setImgSize] = useState<{ w: number; h: number }>({ w: 900, h: 680 });
+  const [exteriorBgRgb, setExteriorBgRgb] = useState<[number, number, number] | undefined>(undefined);
 
-  // Vista lateral opcional ZY (dentro de Ajuste preciso para cumplimiento pauta.md)
   const [sideImgUrl, setSideImgUrl] = useState<string | null>(null);
   const [sideBitmap, setSideBitmap] = useState<WorkingBitmap | null>(null);
   const [sideQuad, setSideQuad] = useState<[Point2D, Point2D, Point2D, Point2D]>([
@@ -256,10 +333,10 @@ export function VectorCanvas({
 
   const [quad, setQuad] = useState<[Point2D, Point2D, Point2D, Point2D]>(
     topology.quadCorners ?? [
-      { x: 175, y: 85 },
-      { x: 715, y: 95 },
-      { x: 735, y: 535 },
-      { x: 155, y: 540 },
+      { x: 165, y: 120 },
+      { x: 735, y: 120 },
+      { x: 735, y: 540 },
+      { x: 165, y: 540 },
     ],
   );
   const [tool, setTool] = useState<ToolMode>('corners');
@@ -269,7 +346,6 @@ export function VectorCanvas({
   const [draftLineStart, setDraftLineStart] = useState<Point2D | null>(null);
   const [undoStack, setUndoStack] = useState<LineSnapshot[]>([]);
 
-  // Calibración rápida con 1 sola medida (extrapolación)
   const [knownAxis, setKnownAxis] = useState<'x' | 'y'>('x');
   const [knownMeasureMm, setKnownMeasureMm] = useState<number>(params.targetDimensions.x);
 
@@ -277,13 +353,11 @@ export function VectorCanvas({
     setKnownMeasureMm(knownAxis === 'x' ? params.targetDimensions.x : params.targetDimensions.y);
   }, [knownAxis, params.targetDimensions.x, params.targetDimensions.y]);
 
-  // Calibración A4 por segmento [p1, p2]
   const [calibPts, setCalibPts] = useState<Point2D[]>([]);
   const [calibRefMm, setCalibRefMm] = useState<number>(297);
 
-  // Feedback del detector pixel a pixel
   const [statusMsg, setStatusMsg] = useState<string>(
-    'Sube una foto frontal (o prueba el croquis local): el software analiza fondo, bordes, espacios vacíos y reconstruye el 3D automáticamente.',
+    'Sube una foto o elige un mueble del Catálogo QA arriba. Usa "Encuadrar (1 arrastre)" para marcar el frente rápido y toca cada zona para cambiar entre Abierto / Puerta / Cajones / Hueco Piernas.',
   );
   const [legHintDetected, setLegHintDetected] = useState<boolean>(false);
   const [detectedModeLabel, setDetectedModeLabel] = useState<string>('');
@@ -294,6 +368,7 @@ export function VectorCanvas({
   const rectPreviewRef = useRef<HTMLCanvasElement | null>(null);
   const fileFrontalInputRef = useRef<HTMLInputElement | null>(null);
   const fileSideInputRef = useRef<HTMLInputElement | null>(null);
+  const lastExternalUrlRef = useRef<string | null>(null);
 
   const pushUndo = () => {
     setUndoStack((prev) => [
@@ -301,6 +376,7 @@ export function VectorCanvas({
       {
         vDividers: topology.vDividers.map((d) => ({ ...d })),
         hShelves: topology.hShelves.map((s) => ({ ...s })),
+        frontZones: (topology.frontZones ?? []).map((z) => ({ ...z })),
       },
     ]);
   };
@@ -314,8 +390,9 @@ export function VectorCanvas({
         shelfMode: 'custom',
         vDividers: last.vDividers,
         hShelves: last.hShelves,
+        frontZones: last.frontZones,
       });
-      setStatusMsg('Último cambio de trazos deshecho.');
+      setStatusMsg('Último cambio deshecho.');
       return prev.slice(0, -1);
     });
   };
@@ -329,12 +406,14 @@ export function VectorCanvas({
       shelfMode: 'custom',
       vDividers: [],
       hShelves: [],
+      frontZones: [
+        { id: 'zone_full', uStart: 0, uEnd: 1, vStart: 0, vEnd: 1, kind: 'open', label: 'Vano Principal' },
+      ],
       detectionSource: 'manual',
     });
     setStatusMsg('Líneas internas limpiadas. Puedes pulsar "Re-analizar" o editar en Ajuste preciso.');
   };
 
-  // Atajo Ctrl+Z para deshacer trazos
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && undoStack.length > 0) {
@@ -359,6 +438,33 @@ export function VectorCanvas({
       if (sideImgUrl && sideImgUrl.startsWith('blob:')) URL.revokeObjectURL(sideImgUrl);
     };
   }, [sideImgUrl]);
+
+  // Carga automática de foto real cuando se elige un mueble del Catálogo QA (SIN sobrescribir su topología curada)
+  useEffect(() => {
+    if (!externalPhotoUrl || externalPhotoUrl === lastExternalUrlRef.current) return;
+    lastExternalUrlRef.current = externalPhotoUrl;
+    const img = new Image();
+    img.onload = () => {
+      const bmp = prepareWorkingBitmap(img);
+      setImgUrl(externalPhotoUrl);
+      setFrontBitmap(bmp);
+      setImgSize({ w: bmp.w, h: bmp.h });
+      setViewTab('frontal');
+      setCalibPts([]);
+      setTool('corners');
+      const autoQ = autoDetectFurnitureQuad(bmp.rgba, bmp.w, bmp.h);
+      setExteriorBgRgb(autoQ.exteriorBgRgb);
+      setQuad(autoQ.quadCorners);
+      setFrameMode('box');
+      setDetectedCavities([]);
+      setDetectedHandlesPts([]);
+      setDetectedModeLabel('Catálogo QA');
+      setStatusMsg(
+        `Foto real cargada (${externalPhotoLabel ?? 'Catálogo QA'}). Arrastra el recuadro o pulsa "Re-analizar" para probar la visión en vivo, o haz clic en cualquier zona para editarla.`,
+      );
+    };
+    img.src = externalPhotoUrl;
+  }, [externalPhotoUrl, externalPhotoLabel]);
 
   const homography = useMemo(() => computeQuadToUnitHomography(quad), [quad]);
 
@@ -394,15 +500,12 @@ export function VectorCanvas({
     return c;
   }, [visualLayer, frontBitmap]);
 
-  /**
-   * Pipeline completo de análisis pixel a pixel sobre un bitmap + cuadrilátero dados:
-   * Homografía -> Proporción û_XY -> Pose/Horizonte -> Rectificación -> Recursive XY-Cut + Cavidades -> 3D.
-   */
   const executeAnalysisPipeline = (
     bmp: WorkingBitmap,
     targetQuad: [Point2D, Point2D, Point2D, Point2D],
     opts: {
       seedPoint?: { u: number; v: number };
+      bgRgb?: [number, number, number];
       applyProportionalDims?: boolean;
       recordUndo?: boolean;
       autoQuadNote?: string;
@@ -410,7 +513,7 @@ export function VectorCanvas({
   ) => {
     const hom = computeQuadToUnitHomography(targetQuad);
     if (!bmp || bmp.w === 0 || !hom) {
-      setStatusMsg('Cuadrilátero inválido o cruzado. Separa los 4 nodos TL/TR/BR/BL.');
+      setStatusMsg('Marco inválido o cruzado. Usa "Encuadrar (1 arrastre)" o separa las esquinas.');
       return;
     }
 
@@ -428,7 +531,6 @@ export function VectorCanvas({
       const autoDims = estimateInitialProportionalDims(safeRatio, params.targetDimensions.z);
       effX = autoDims.x;
       effY = autoDims.y;
-      onAutoPhotoReconstructed(autoDims);
     } else {
       const currentRatio = params.targetDimensions.x / Math.max(1, params.targetDimensions.y);
       const ratioMismatch = Math.abs(currentRatio - safeRatio) / safeRatio > 0.15;
@@ -467,8 +569,16 @@ export function VectorCanvas({
         seedPoint: opts.seedPoint,
         parallaxAware: true,
         horizonV: pose?.estimatedHorizonV ?? 0.5,
+        exteriorBgRgb: opts.bgRgb ?? exteriorBgRgb,
       },
     );
+
+    if (opts.applyProportionalDims) {
+      onAutoPhotoReconstructed(
+        { x: effX, y: effY, z: Math.max(300, Math.min(700, params.targetDimensions.z)) },
+        det.detectedMaterial,
+      );
+    }
 
     const legsHint = detectLowerGapHint(bmp.rgba, bmp.w, bmp.h, targetQuad);
     setLegHintDetected(legsHint.possibleExternalLegs);
@@ -488,19 +598,23 @@ export function VectorCanvas({
         categoria: 'tiradores',
         descripcion: `Tiradores / manillas detectados en frente (${det.detectedHandles.length} u.)`,
         cantidad: det.detectedHandles.length,
-        notaCompra: `Detectados automáticamente sobre mueble cerrado. Adquirir ${det.detectedHandles.length} tiradores aparte (no son melamina).`,
+        notaCompra: `Detectados automáticamente. Adquirir ${det.detectedHandles.length} tiradores aparte (no son melamina).`,
         origen: 'detectado',
       });
     }
     setDetectedHandlesPts(projectedHandles);
 
     const modeText =
-      det.furnitureMode === 'closed_front'
-        ? 'Mueble Cerrado'
-        : det.furnitureMode === 'open'
-          ? 'Estructura Multi-Recuadro'
-          : 'Baja Confianza';
+      det.furnitureMode === 'hybrid'
+        ? 'Híbrido (Abierto + Cerrado)'
+        : det.furnitureMode === 'closed_front'
+          ? 'Mueble Cerrado'
+          : det.furnitureMode === 'open'
+            ? 'Estructura Abierta'
+            : 'Baja Confianza';
     setDetectedModeLabel(modeText);
+
+    const hasLegVoid = det.inferredZones.some((z) => z.kind === 'leg_void');
 
     onUpdateTopology({
       ...topology,
@@ -510,29 +624,34 @@ export function VectorCanvas({
       shelfMode: 'custom',
       vDividers: det.vDividers,
       hShelves: det.hShelves,
+      frontZones: det.inferredZones,
+      hasBackPanel: hasLegVoid ? false : topology.hasBackPanel,
       hardwareItems: nextHardware,
       detectionSource: 'auto',
       detectionConfidence: det.confidence,
     });
 
     const prefix = opts.autoQuadNote ? `${opts.autoQuadNote} ` : '';
+    const zoneSummary = `${det.inferredZones.length} zona(s)`;
     if (det.confidence < 0.5) {
       setStatusMsg(
-        `${prefix}Confianza baja (${Math.round(det.confidence * 100)}%). Ajusta las 4 esquinas al borde exacto o usa "Gotero" en Ajuste preciso.`,
+        `${prefix}Confianza baja (${Math.round(det.confidence * 100)}%). Usa "Encuadrar (1 arrastre)" sobre el frente del mueble o toca cada zona en la foto para definir Puerta / Cajones / Abierto.`,
       );
     } else {
-      const kneeMsg = det.cavities.some((c) => c.kind === 'knee_space')
-        ? ' + vano libre inferior'
-        : '';
-      const handleMsg =
-        det.detectedHandles.length > 0 ? ` + ${det.detectedHandles.length} tirador(es)` : '';
+      const matLabel =
+        det.detectedMaterial === 'roble'
+          ? 'Roble'
+          : det.detectedMaterial === 'grafito'
+            ? 'Grafito'
+            : 'Blanco';
       setStatusMsg(
-        `${prefix}[${modeText}] ${det.vDividers.length} divisor(es), ${det.hShelves.length} repisa(s) y ${det.cavities.length} espacio(s)${kneeMsg}${handleMsg} (${Math.round(det.confidence * 100)}% conf.). Modifica Ancho/Alto/Profundidad o afina las 4 esquinas si deseas más exactitud.`,
+        `${prefix}[${modeText} · ${matLabel}] ${det.vDividers.length} div., ${det.hShelves.length} rep. y ${zoneSummary} (${Math.round(det.confidence * 100)}% conf.). Toca cualquier zona en la foto para cambiar su tipo (Abierto/Puerta/Cajones/Hueco).`,
       );
     }
   };
 
   const loadFrontalFromUrl = (url: string, isSample = false) => {
+    lastExternalUrlRef.current = null;
     const img = new Image();
     img.onload = () => {
       const bmp = prepareWorkingBitmap(img);
@@ -541,30 +660,31 @@ export function VectorCanvas({
       setImgSize({ w: bmp.w, h: bmp.h });
       setShowProtocol(false);
       setViewTab('frontal');
+      setFrameMode('box');
       setCalibPts([]);
       setTool('corners');
 
       let initialQuad: [Point2D, Point2D, Point2D, Point2D];
+      let bgRgb: [number, number, number] | undefined;
       let autoNote = '';
 
       if (isSample) {
-        initialQuad = [
-          { x: 175, y: 85 },
-          { x: 715, y: 95 },
-          { x: 735, y: 535 },
-          { x: 155, y: 540 },
-        ];
-        autoNote = 'Croquis de escritorio reconstruido automáticamente.';
+        initialQuad = makeAxisAlignedQuad(165, 120, 735, 540);
+        bgRgb = [232, 238, 244];
+        autoNote = 'Escritorio de muestra analizado.';
       } else {
         const autoQ = autoDetectFurnitureQuad(bmp.rgba, bmp.w, bmp.h);
         initialQuad = autoQ.quadCorners;
+        bgRgb = autoQ.exteriorBgRgb;
         autoNote = autoQ.usedFallback
-          ? 'Fondo complejo (marco base aplicado).'
-          : `Fondo aislado (${Math.round(autoQ.backgroundCoverage * 100)}%) y contorno detectado.`;
+          ? 'Fondo complejo (arrastra "Encuadrar" sobre la cara frontal).'
+          : `Frente aislado (${Math.round(autoQ.backgroundCoverage * 100)}% fondo).`;
       }
 
+      setExteriorBgRgb(bgRgb);
       setQuad(initialQuad);
       executeAnalysisPipeline(bmp, initialQuad, {
+        bgRgb,
         applyProportionalDims: true,
         recordUndo: false,
         autoQuadNote: autoNote,
@@ -580,12 +700,14 @@ export function VectorCanvas({
       const bmp = prepareWorkingBitmap(img);
       setSideImgUrl(url);
       setSideBitmap(bmp);
-      setSideQuad([
-        { x: Math.round(bmp.w * 0.25), y: Math.round(bmp.h * 0.14) },
-        { x: Math.round(bmp.w * 0.75), y: Math.round(bmp.h * 0.14) },
-        { x: Math.round(bmp.w * 0.75), y: Math.round(bmp.h * 0.86) },
-        { x: Math.round(bmp.w * 0.25), y: Math.round(bmp.h * 0.86) },
-      ]);
+      setSideQuad(
+        makeAxisAlignedQuad(
+          Math.round(bmp.w * 0.25),
+          Math.round(bmp.h * 0.14),
+          Math.round(bmp.w * 0.75),
+          Math.round(bmp.h * 0.86),
+        ),
+      );
     };
     img.src = url;
   };
@@ -627,26 +749,43 @@ export function VectorCanvas({
   const handleAutoQuad = () => {
     if (!frontBitmap || frontBitmap.w === 0) return;
     const autoQ = autoDetectFurnitureQuad(frontBitmap.rgba, frontBitmap.w, frontBitmap.h);
+    setExteriorBgRgb(autoQ.exteriorBgRgb);
     setQuad(autoQ.quadCorners);
+    setFrameMode('box');
     setTool('corners');
     executeAnalysisPipeline(frontBitmap, autoQ.quadCorners, {
+      bgRgb: autoQ.exteriorBgRgb,
       applyProportionalDims: true,
       recordUndo: true,
       autoQuadNote: autoQ.usedFallback
         ? 'Marco base restablecido.'
-        : `Auto-contorno recalculado (fondo ${Math.round(autoQ.backgroundCoverage * 100)}%).`,
+        : `Auto-encuadre recalculado (fondo ${Math.round(autoQ.backgroundCoverage * 100)}%).`,
     });
   };
 
-  // Render de miniatura rectificada (200px durante arrastre, 320px al soltar)
+  const handleToggleFrameMode = (nextMode: FrameMode) => {
+    setFrameMode(nextMode);
+    if (nextMode === 'box') {
+      setQuad((prev) => quadToBoundingBox(prev));
+      setStatusMsg(
+        'Modo Recuadro Frontal (rectángulo recto): arrastra cualquier esquina o usa "Encuadrar (1 arrastre)" sin deformar el trapecio.',
+      );
+    } else {
+      setStatusMsg(
+        'Modo Perspectiva 4 pts (Homografía H 3×3): ajusta las 4 esquinas TL/TR/BR/BL libremente para corregir inclinaciones.',
+      );
+    }
+  };
+
+  // Render de miniatura rectificada
   useEffect(() => {
     const previewCanvas = rectPreviewRef.current;
     if (!previewCanvas || !frontBitmap || frontBitmap.w === 0 || !homography) return;
 
-    const previewW = dragTarget?.kind === 'corner' ? 200 : 320;
+    const previewW = dragTarget?.kind === 'corner' || dragTarget?.kind === 'drawBox' ? 180 : 300;
     const previewH = Math.max(
-      110,
-      Math.min(340, Math.round(previewW / Math.max(0.25, estimatedAspectXY))),
+      100,
+      Math.min(320, Math.round(previewW / Math.max(0.25, estimatedAspectXY))),
     );
     previewCanvas.width = previewW;
     previewCanvas.height = previewH;
@@ -688,9 +827,24 @@ export function VectorCanvas({
       ctx.drawImage(activeBmp.canvas, 0, 0, cw, ch);
     }
 
-    // Contorno del cuadrilátero
-    ctx.strokeStyle = '#00e5ff';
-    ctx.lineWidth = Math.max(2, cw / 360);
+    // Sombra suave fuera del recuadro para resaltar el frente seleccionado
+    if (viewTab === 'frontal' && visualLayer !== 'edges') {
+      ctx.save();
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.28)';
+      ctx.beginPath();
+      ctx.rect(0, 0, cw, ch);
+      ctx.moveTo(activeQuad[0].x, activeQuad[0].y);
+      ctx.lineTo(activeQuad[3].x, activeQuad[3].y);
+      ctx.lineTo(activeQuad[2].x, activeQuad[2].y);
+      ctx.lineTo(activeQuad[1].x, activeQuad[1].y);
+      ctx.closePath();
+      ctx.fill('evenodd');
+      ctx.restore();
+    }
+
+    // Contorno del marco frontal
+    ctx.strokeStyle = frameMode === 'box' ? '#38bdf8' : '#00e5ff';
+    ctx.lineWidth = Math.max(2.2, cw / 340);
     ctx.beginPath();
     activeQuad.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
     ctx.closePath();
@@ -702,8 +856,51 @@ export function VectorCanvas({
       const xf = params.targetDimensions.x;
       const yf = params.targetDimensions.y;
 
-      // Capa de Espacios Vacíos / Recuadros detectados
-      if (visualLayer === 'cavities' && detectedCavities.length > 0) {
+      // Capa de Zonas Funcionales interactivas (clic para ciclar Abierto / Puerta / Cajones / Hueco)
+      const zones = topology.frontZones ?? [];
+      if (visualLayer === 'zones' && zones.length > 0) {
+        for (const z of zones) {
+          const u0 = interiorToExterior(z.uStart, e, xf);
+          const u1 = interiorToExterior(z.uEnd, e, xf);
+          const v0 = interiorToExterior(z.vStart, e, yf);
+          const v1 = interiorToExterior(z.vEnd, e, yf);
+          const pTL = applyHomography(toCanvas, { x: u0, y: v1 });
+          const pTR = applyHomography(toCanvas, { x: u1, y: v1 });
+          const pBR = applyHomography(toCanvas, { x: u1, y: v0 });
+          const pBL = applyHomography(toCanvas, { x: u0, y: v0 });
+          if (pTL && pTR && pBR && pBL) {
+            const palette = ZONE_COLORS[z.kind];
+            ctx.beginPath();
+            ctx.moveTo(pTL.x, pTL.y);
+            ctx.lineTo(pTR.x, pTR.y);
+            ctx.lineTo(pBR.x, pBR.y);
+            ctx.lineTo(pBL.x, pBL.y);
+            ctx.closePath();
+            ctx.fillStyle = palette.fill;
+            ctx.fill();
+            ctx.strokeStyle = palette.stroke;
+            ctx.lineWidth = Math.max(1.5, cw / 480);
+            ctx.stroke();
+
+            const center = applyHomography(toCanvas, { x: (u0 + u1) / 2, y: (v0 + v1) / 2 });
+            if (center) {
+              const tagText =
+                z.kind === 'drawers'
+                  ? `${z.drawerCount ?? 2} Caj.`
+                  : ZONE_LABELS[z.kind];
+              const fontPx = Math.max(11, Math.min(18, Math.round(cw / 62)));
+              ctx.font = `bold ${fontPx}px system-ui, sans-serif`;
+              const tw = ctx.measureText(tagText).width;
+              ctx.fillStyle = 'rgba(15, 23, 42, 0.78)';
+              ctx.fillRect(center.x - tw / 2 - 5, center.y - fontPx * 0.7, tw + 10, fontPx * 1.4);
+              ctx.fillStyle = '#ffffff';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'middle';
+              ctx.fillText(tagText, center.x, center.y);
+            }
+          }
+        }
+      } else if (visualLayer === 'zones' && detectedCavities.length > 0) {
         detectedCavities.forEach((cav, idx) => {
           const u0 = interiorToExterior(cav.u0, e, xf);
           const u1 = interiorToExterior(cav.u1, e, xf);
@@ -723,7 +920,7 @@ export function VectorCanvas({
             ctx.fillStyle =
               cav.kind === 'knee_space'
                 ? 'rgba(168, 85, 247, 0.24)'
-                : 'rgba(14, 165, 233, 0.22)';
+                : 'rgba(14, 165, 233, 0.20)';
             ctx.fill();
             ctx.strokeStyle = cav.kind === 'knee_space' ? '#c084fc' : '#38bdf8';
             ctx.lineWidth = Math.max(1.5, cw / 500);
@@ -736,7 +933,7 @@ export function VectorCanvas({
               ctx.textAlign = 'center';
               ctx.textBaseline = 'middle';
               ctx.fillText(
-                cav.kind === 'knee_space' ? 'Vano libre' : `R${idx + 1}`,
+                cav.kind === 'knee_space' ? 'Hueco' : `Z${idx + 1}`,
                 center.x,
                 center.y,
               );
@@ -745,7 +942,7 @@ export function VectorCanvas({
         });
       }
 
-      // Divisores verticales (incluye divisores parciales XY-Cut)
+      // Divisores verticales
       for (const div of topology.vDividers) {
         const isActive = dragTarget?.kind === 'vDivider' && dragTarget.id === div.id;
         ctx.strokeStyle = isActive ? '#38bdf8' : '#22c55e';
@@ -800,7 +997,7 @@ export function VectorCanvas({
         }
       }
 
-      // Vista previa en vivo al arrastrar nueva repisa
+      // Vista previa al arrastrar nueva repisa
       if (tool === 'hShelf' && draftLineStart && cursorImgPt) {
         ctx.save();
         ctx.strokeStyle = '#fbbf24';
@@ -813,8 +1010,8 @@ export function VectorCanvas({
         ctx.restore();
       }
 
-      // Marcadores de tiradores auto-detectados en frente cerrado
-      const hwR = Math.max(7, cw / 110);
+      // Marcadores de tiradores auto-detectados
+      const hwR = Math.max(6, cw / 120);
       for (const hm of detectedHandlesPts) {
         ctx.fillStyle = '#a855f7';
         ctx.beginPath();
@@ -826,22 +1023,31 @@ export function VectorCanvas({
       }
     }
 
-    // Nodos arrastrables [TL, TR, BR, BL] (siempre accesibles para refinamiento exacto)
-    const nodeR = Math.max(10, cw / 88);
+    // Manijas del marco: cuadradas limpias en modo 'box', circulares TL/TR/BR/BL en modo 'quad'
+    const nodeR = Math.max(9, cw / 92);
     activeQuad.forEach((p, idx) => {
       const isDraggingCorner = dragTarget?.kind === 'corner' && dragTarget.idx === idx;
-      ctx.fillStyle = isDraggingCorner ? '#f59e0b' : '#0284c7';
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, nodeR, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.fillStyle = '#ffffff';
-      ctx.font = `bold ${Math.round(nodeR * 1.02)}px system-ui, sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(CORNER_LABELS[idx], p.x, p.y);
+      if (frameMode === 'box' && viewTab === 'frontal') {
+        const hs = nodeR * 1.35;
+        ctx.fillStyle = isDraggingCorner ? '#f59e0b' : '#0284c7';
+        ctx.fillRect(p.x - hs / 2, p.y - hs / 2, hs, hs);
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(p.x - hs / 2, p.y - hs / 2, hs, hs);
+      } else {
+        ctx.fillStyle = isDraggingCorner ? '#f59e0b' : '#0284c7';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, nodeR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `bold ${Math.round(nodeR * 1.02)}px system-ui, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(CORNER_LABELS[idx], p.x, p.y);
+      }
     });
 
     // Lupa 4× al arrastrar esquina
@@ -881,6 +1087,7 @@ export function VectorCanvas({
     }
   }, [
     viewTab,
+    frameMode,
     frontBitmap,
     sideBitmap,
     quad,
@@ -888,6 +1095,7 @@ export function VectorCanvas({
     homography,
     topology.vDividers,
     topology.hShelves,
+    topology.frontZones,
     params.boardThickness,
     params.targetDimensions.x,
     params.targetDimensions.y,
@@ -917,6 +1125,16 @@ export function VectorCanvas({
     const eMm = params.boardThickness;
     const xf = params.targetDimensions.x;
     const yf = params.targetDimensions.y;
+
+    // Herramienta 1-Drag para dibujar el recuadro frontal completo en un solo gesto
+    if (viewTab === 'frontal' && tool === 'drawBox') {
+      setFrameMode('box');
+      setDragTarget({ kind: 'drawBox', start: pt });
+      setCursorImgPt(pt);
+      setQuad(makeAxisAlignedQuad(pt.x, pt.y, pt.x + 12, pt.y + 12));
+      (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+      return;
+    }
 
     if (tool === 'corners' || viewTab === 'lateral') {
       const hitTol = Math.max(26, (canvasRef.current?.width ?? 900) * 0.038);
@@ -960,6 +1178,39 @@ export function VectorCanvas({
             setDragTarget(found);
             setCursorImgPt(pt);
             (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+            return;
+          }
+
+          // Clic directo en una zona frontal (capa "Zonas"): ciclar tipo en 1 clic sin calcar líneas
+          const zones = topology.frontZones ?? [];
+          if (visualLayer === 'zones' && zones.length > 0) {
+            const hitZone = zones.find(
+              (z) =>
+                uClick >= z.uStart &&
+                uClick <= z.uEnd &&
+                vClick >= z.vStart &&
+                vClick <= z.vEnd,
+            );
+            if (hitZone) {
+              pushUndo();
+              const curIdx = ZONE_CYCLE.indexOf(hitZone.kind);
+              const nextKind = ZONE_CYCLE[(curIdx + 1) % ZONE_CYCLE.length];
+              const nextZones = zones.map((z) =>
+                z.id === hitZone.id
+                  ? {
+                      ...z,
+                      kind: nextKind,
+                      drawerCount: nextKind === 'drawers' ? (z.drawerCount ?? 2) : undefined,
+                      label: ZONE_LABELS[nextKind],
+                    }
+                  : z,
+              );
+              onUpdateFrontZones(nextZones);
+              setStatusMsg(
+                `Zona cambiada a "${ZONE_LABELS[nextKind]}" y sincronizada en 3D (clic nuevamente para alternar).`,
+              );
+              return;
+            }
           }
         }
       }
@@ -978,7 +1229,7 @@ export function VectorCanvas({
         },
         applyProportionalDims: false,
         recordUndo: true,
-        autoQuadNote: 'Color de tablero muestreado por gotero.',
+        autoQuadNote: 'Color de melamina muestreado por gotero.',
       });
       setTool('corners');
       return;
@@ -1078,18 +1329,33 @@ export function VectorCanvas({
 
     setCursorImgPt(pt);
 
+    if (dragTarget.kind === 'drawBox') {
+      const cw = frontBitmap?.w ?? 900;
+      const ch = frontBitmap?.h ?? 680;
+      const cx = Math.max(2, Math.min(cw - 2, pt.x));
+      const cy = Math.max(2, Math.min(ch - 2, pt.y));
+      setQuad(makeAxisAlignedQuad(dragTarget.start.x, dragTarget.start.y, cx, cy));
+      return;
+    }
+
     if (dragTarget.kind === 'corner') {
       if (viewTab === 'frontal') {
-        setQuad((prev) => {
-          const copy: [Point2D, Point2D, Point2D, Point2D] = [
-            { ...prev[0] },
-            { ...prev[1] },
-            { ...prev[2] },
-            { ...prev[3] },
-          ];
-          copy[dragTarget.idx] = pt;
-          return copy;
-        });
+        if (frameMode === 'box') {
+          const cw = frontBitmap?.w ?? 900;
+          const ch = frontBitmap?.h ?? 680;
+          setQuad((prev) => resizeBoxCorner(prev, dragTarget.idx, pt, cw, ch));
+        } else {
+          setQuad((prev) => {
+            const copy: [Point2D, Point2D, Point2D, Point2D] = [
+              { ...prev[0] },
+              { ...prev[1] },
+              { ...prev[2] },
+              { ...prev[3] },
+            ];
+            copy[dragTarget.idx] = pt;
+            return copy;
+          });
+        }
       } else {
         setSideQuad((prev) => {
           const copy: [Point2D, Point2D, Point2D, Point2D] = [
@@ -1141,16 +1407,40 @@ export function VectorCanvas({
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (dragTarget) {
-      const finishedKind = dragTarget.kind;
+      const finished = dragTarget;
       setDragTarget(null);
       setCursorImgPt(null);
-      if (finishedKind === 'corner') {
+
+      if (finished.kind === 'drawBox') {
+        const endPt = toCanvasCoords(e);
+        const boxW = Math.abs(endPt.x - finished.start.x);
+        const boxH = Math.abs(endPt.y - finished.start.y);
+        setTool('corners');
+        if (frontBitmap && boxW >= 30 && boxH >= 30) {
+          const nextQuad = makeAxisAlignedQuad(
+            finished.start.x,
+            finished.start.y,
+            endPt.x,
+            endPt.y,
+          );
+          setQuad(nextQuad);
+          executeAnalysisPipeline(frontBitmap, nextQuad, {
+            applyProportionalDims: true,
+            recordUndo: true,
+            autoQuadNote: 'Frente encuadrado:',
+          });
+        } else {
+          setStatusMsg('Arrastra de esquina a esquina sobre la cara frontal del mueble (mín. 30 px).');
+        }
+        return;
+      }
+
+      if (finished.kind === 'corner') {
         if (viewTab === 'frontal' && frontBitmap && homography) {
-          // Al soltar una esquina para mayor exactitud, re-analiza automáticamente en vivo
           executeAnalysisPipeline(frontBitmap, quad, {
             applyProportionalDims: false,
             recordUndo: false,
-            autoQuadNote: 'Esquinas afinadas:',
+            autoQuadNote: frameMode === 'box' ? 'Recuadro ajustado:' : 'Perspectiva afinada:',
           });
         } else if (viewTab === 'lateral' && sideBitmap) {
           const ratioZY = estimateAspectRatioFixedFocal(sideQuad, sideBitmap.w, sideBitmap.h, focal35mm);
@@ -1270,26 +1560,40 @@ export function VectorCanvas({
     conf === undefined ? '' : conf >= 0.7 ? 'conf-high' : conf >= 0.5 ? 'conf-mid' : 'conf-low';
   const activeBmp = viewTab === 'frontal' ? frontBitmap : sideBitmap;
   const hasPhoto = Boolean(frontBitmap);
+  const zonesCount = (topology.frontZones ?? []).length;
   const canvasCursor =
     dragTarget !== null
       ? 'grabbing'
-      : tool === 'corners' || viewTab === 'lateral'
-        ? 'grab'
-        : tool === 'erase'
-          ? 'pointer'
-          : 'crosshair';
+      : tool === 'drawBox'
+        ? 'crosshair'
+        : tool === 'corners' || viewTab === 'lateral'
+          ? visualLayer === 'zones'
+            ? 'pointer'
+            : 'grab'
+          : tool === 'erase'
+            ? 'pointer'
+            : 'crosshair';
 
   return (
     <div className="vector-card">
-      {/* Cabecera limpia enfocada en 1 foto frontal */}
       <div className="card-header-row">
-        <h3>Análisis Automático de Foto Frontal → 3D</h3>
+        <h3>Visión Híbrida v4.0 — Foto Frontal → Zonas → 3D</h3>
         <div className="chip-row">
+          {hasPhoto && viewTab === 'frontal' && (
+            <button
+              type="button"
+              className={frameMode === 'quad' ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => handleToggleFrameMode(frameMode === 'box' ? 'quad' : 'box')}
+              title="Alterna entre Recuadro Frontal recto (fácil para la mayoría de fotos) y Homografía 4 esquinas libres (fotos inclinadas)"
+            >
+              {frameMode === 'quad' ? 'Perspectiva 4 pts (H 3×3)' : 'Recuadro Frontal'}
+            </button>
+          )}
           <button
             type="button"
             className={showPrecisionTools ? 'chip-btn active' : 'chip-btn'}
             onClick={() => setShowPrecisionTools((v) => !v)}
-            title="Mostrar u ocultar herramientas de calibración A4, edición manual y vista lateral ZY"
+            title="Mostrar u ocultar herramientas de calibración A4, gotero, trazos manuales y vista lateral ZY"
           >
             <SlidersHorizontal size={12} /> Ajuste preciso
           </button>
@@ -1305,19 +1609,22 @@ export function VectorCanvas({
 
       {showProtocol && (
         <div className="protocol-box">
-          <strong>Foto Frontal Ideal (100 % Local):</strong> Toma 1 foto de frente centrada a media altura, distancia ≥ 2.5–3 m, zoom{' '}
-          <strong>1× o 2×</strong> (nunca 0.5×), sin recortar. El sistema aísla el fondo, calca bordes, detecta espacios vacíos/recuadros y construye el 3D automáticamente; luego solo ajustas Ancho, Alto y Profundidad.
+          <strong>Foto Frontal Ideal (100 % Offline):</strong> Encuadra solo la{' '}
+          <strong>cara frontal</strong> del mueble (sin incluir el costado en fotos 3/4) con{' '}
+          <strong>"Encuadrar (1 arrastre)"</strong>. Si la foto tiene perspectiva inclinada, activa{' '}
+          <strong>Perspectiva 4 pts (H 3×3)</strong>. Luego haz clic sobre cualquier zona coloreada
+          para cambiar entre <em>Abierto, Puerta, 2 Puertas, Cajones (5 pzas), Vidrio o Hueco Piernas</em>.
         </div>
       )}
 
-      {/* Barra primaria simplificada (4 controles esenciales) */}
+      {/* Barra primaria simplificada */}
       <div className="canvas-toolbar">
         <button
           type="button"
           className="btn-primary"
           onClick={() => fileFrontalInputRef.current?.click()}
         >
-          <Camera size={14} /> {hasPhoto ? 'Subir otra foto' : 'Subir foto frontal'}
+          <Camera size={14} /> {hasPhoto ? 'Subir otra foto' : 'Subir foto'}
         </button>
         <input
           ref={fileFrontalInputRef}
@@ -1338,36 +1645,50 @@ export function VectorCanvas({
           <>
             <button
               type="button"
+              className={tool === 'drawBox' ? 'btn-primary' : 'btn-secondary'}
+              onClick={() => {
+                setFrameMode('box');
+                setTool((t) => (t === 'drawBox' ? 'corners' : 'drawBox'));
+                setStatusMsg(
+                  'Arrastra un rectángulo sobre la cara frontal del mueble (en fotos 3/4 excluye el costado y TV/pared).',
+                );
+              }}
+              title="Dibuja el recuadro del frente del mueble en 1 solo arrastre (reemplaza acomodar 4 puntos uno por uno)"
+            >
+              <Crop size={14} /> Encuadrar (1 arrastre)
+            </button>
+            <button
+              type="button"
               className="btn-secondary"
               onClick={handleFullReanalyze}
               disabled={!homography}
-              title="Volver a analizar estructura pixel a pixel dentro del marco actual"
+              title="Re-analizar estructura, puertas, cajones y color dentro del recuadro actual"
             >
               <ScanSearch size={14} /> Re-analizar
             </button>
             <span className="toolbar-sep" />
             <button
               type="button"
+              className={visualLayer === 'zones' ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => setVisualLayer('zones')}
+              title="Ver zonas detectadas (clic sobre una zona para alternar Abierto / Puerta / Cajones / Hueco)"
+            >
+              <LayoutGrid size={13} /> Zonas ({zonesCount})
+            </button>
+            <button
+              type="button"
               className={visualLayer === 'photo' ? 'chip-btn active' : 'chip-btn'}
               onClick={() => setVisualLayer('photo')}
             >
-              Foto
+              Foto limpia
             </button>
             <button
               type="button"
               className={visualLayer === 'edges' ? 'chip-btn active' : 'chip-btn'}
               onClick={() => setVisualLayer('edges')}
-              title="Ver bordes Sobel 3×3 calcados y fondo exterior separado por Flood-Fill"
+              title="Ver bordes Sobel 3×3 y fondo aislado por Flood-Fill"
             >
               <Contrast size={13} /> Bordes + Fondo
-            </button>
-            <button
-              type="button"
-              className={visualLayer === 'cavities' ? 'chip-btn active' : 'chip-btn'}
-              onClick={() => setVisualLayer('cavities')}
-              title="Ver los espacios vacíos / recuadros detectados en la imagen"
-            >
-              <LayoutGrid size={13} /> Espacios ({detectedCavities.length})
             </button>
           </>
         )}
@@ -1383,7 +1704,7 @@ export function VectorCanvas({
         )}
       </div>
 
-      {/* Cajón colapsable de Ajuste Preciso (opcional — mantiene 100% cumplimiento pauta.md) */}
+      {/* Cajón colapsable de Ajuste Preciso */}
       {showPrecisionTools && (
         <div className="precision-drawer">
           <div className="canvas-toolbar">
@@ -1417,7 +1738,6 @@ export function VectorCanvas({
                   className={tool === 'corners' ? 'chip-btn active' : 'chip-btn'}
                   onClick={() => setTool('corners')}
                   disabled={!hasPhoto}
-                  title="Arrastra esquinas TL/TR/BR/BL o líneas existentes"
                 >
                   <Move size={13} /> Mover
                 </button>
@@ -1438,7 +1758,6 @@ export function VectorCanvas({
                     setTool('calibA4');
                   }}
                   disabled={!hasPhoto}
-                  title="Marca 2 puntos sobre una hoja A4 (297 mm)"
                 >
                   <Ruler size={13} /> A4
                 </button>
@@ -1447,9 +1766,9 @@ export function VectorCanvas({
                   className="chip-btn"
                   onClick={handleAutoQuad}
                   disabled={!hasPhoto}
-                  title="Recalcular las 4 esquinas por Flood-Fill + Sobel 3×3"
+                  title="Recalcular el encuadre automático por Flood-Fill + Sobel"
                 >
-                  <Scan size={13} /> Auto-contorno
+                  <Scan size={13} /> Auto-encuadre
                 </button>
                 <span className="toolbar-sep" />
                 <button
@@ -1492,13 +1811,6 @@ export function VectorCanvas({
                 >
                   <Trash2 size={13} /> Limpiar
                 </button>
-                <button
-                  type="button"
-                  className="chip-btn"
-                  onClick={() => loadFrontalFromUrl(generateSampleFurnitureDataUrl(), true)}
-                >
-                  <Sparkles size={13} /> Muestra
-                </button>
               </>
             )}
           </div>
@@ -1520,7 +1832,7 @@ export function VectorCanvas({
 
       {!homography && viewTab === 'frontal' && hasPhoto && (
         <div className="alert-box critical">
-          Cuadrilátero degenerado o cruzado. Separa las 4 esquinas en orden horario (TL, TR, BR, BL).
+          Marco inválido o cruzado. Pulsa "Encuadrar (1 arrastre)" o cambia a "Recuadro Frontal".
         </div>
       )}
 
@@ -1549,11 +1861,12 @@ export function VectorCanvas({
               <Upload size={32} />
               <strong>
                 {viewTab === 'frontal'
-                  ? 'Sube o arrastra 1 foto frontal de tu mueble'
+                  ? 'Sube 1 foto de tu mueble o elige uno del Catálogo QA (14 fotos reales)'
                   : 'Arrastra una foto lateral (ZY) opcional'}
               </strong>
               <p className="small-note muted">
-                Auto-detección 100 % local: aísla el fondo, calca bordes, detecta recuadros y arma el 3D automáticamente.
+                Encuadre rápido en 1 arrastre (sin pelear con 4 puntos) + detección automática de
+                puertas, cajones (5 pzas), huecos de escritorio y bicolor.
               </p>
               <div className="chip-row">
                 <button
@@ -1583,7 +1896,7 @@ export function VectorCanvas({
 
         <div className="rect-preview-panel">
           <div className="card-header-row">
-            <strong>Vista Rectificada</strong>
+            <strong>Frente Rectificado</strong>
             <select
               className="select-mini"
               value={focal35mm}
@@ -1614,21 +1927,18 @@ export function VectorCanvas({
               </div>
             </div>
           )}
-          {conf !== undefined && topology.detectionSource === 'auto' && (
+          {conf !== undefined && (
             <div className={`conf-badge ${confClass}`}>
               {detectedModeLabel ? `${detectedModeLabel} · ` : ''}
               {Math.round(conf * 100)}%
-              {conf < 0.5 ? ' (Afinar)' : conf < 0.7 ? ' (Revisar)' : ' (Alta)'}
             </div>
           )}
           <div className="small-note muted">
-            Divisores: {topology.vDividers.length} · Repisas: {topology.hShelves.length} · Espacios:{' '}
-            {detectedCavities.length}
+            Div.: {topology.vDividers.length} · Rep.: {topology.hShelves.length} · Zonas: {zonesCount}
           </div>
         </div>
       </div>
 
-      {/* Estado + Calibración métrica rápida */}
       <p className="status-line">{statusMsg}</p>
 
       {viewTab === 'frontal' && hasPhoto && (

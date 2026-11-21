@@ -150,25 +150,66 @@ function FurnitureMeshGroup({
     };
   }, []);
   const { x: xf, y: yf, z: zf } = params.targetDimensions;
+  const hasLegVoidAtBottom = (topology.frontZones ?? []).some(
+    (z) => z.kind === 'leg_void' && z.vStart <= 1e-3,
+  );
   const legHeightMm = topology.hasExternalLegs ? Math.max(40, topology.externalLegHeightMm ?? 150) : 0;
+  const toeKickMm =
+    !topology.hasExternalLegs && !hasLegVoidAtBottom && (topology.toeKickHeightMm ?? 0) > 0
+      ? Math.min(200, Math.max(40, topology.toeKickHeightMm ?? 0))
+      : 0;
   const legOffsetY = legHeightMm / 1000;
+  const bodyOffsetY = (legHeightMm + toeKickMm) / 1000;
 
-  // Texturas memorizadas SOLO por params.material + limpieza explícita dispose()
-  const textures = useMemo(() => {
+  // Banco completo de texturas procedurales offline (soporta muebles bicolor realistas) + dispose()
+  const textureBank = useMemo(() => {
     return {
-      melamineHoriz: createProceduralTexture(params.material, false),
-      melamineVert: createProceduralTexture(params.material, true),
+      blanco: {
+        h: createProceduralTexture('blanco', false),
+        v: createProceduralTexture('blanco', true),
+      },
+      roble: {
+        h: createProceduralTexture('roble', false),
+        v: createProceduralTexture('roble', true),
+      },
+      grafito: {
+        h: createProceduralTexture('grafito', false),
+        v: createProceduralTexture('grafito', true),
+      },
       durolac: createProceduralTexture('durolac_3mm', false),
     };
-  }, [params.material]);
+  }, []);
 
   useEffect(() => {
     return () => {
-      textures.melamineHoriz.dispose();
-      textures.melamineVert.dispose();
-      textures.durolac.dispose();
+      textureBank.blanco.h.dispose();
+      textureBank.blanco.v.dispose();
+      textureBank.roble.h.dispose();
+      textureBank.roble.v.dispose();
+      textureBank.grafito.h.dispose();
+      textureBank.grafito.v.dispose();
+      textureBank.durolac.dispose();
     };
-  }, [textures]);
+  }, [textureBank]);
+
+  const { glassDoorIds, doorHandleSide } = useMemo(() => {
+    const glass = new Set<string>();
+    const sideMap = new Map<string, 'left' | 'right'>();
+    for (const z of topology.frontZones ?? []) {
+      if (z.kind === 'door_glass') {
+        glass.add(`puerta_${z.id}`);
+        sideMap.set(`puerta_${z.id}`, 'right');
+      } else if (z.kind === 'door_left') {
+        sideMap.set(`puerta_${z.id}`, 'right');
+      } else if (z.kind === 'door_right') {
+        sideMap.set(`puerta_${z.id}`, 'left');
+      } else if (z.kind === 'door_double') {
+        sideMap.set(`puerta_${z.id}_izq`, 'right');
+        sideMap.set(`puerta_${z.id}_der`, 'left');
+      }
+    }
+    return { glassDoorIds: glass, doorHandleSide: sideMap };
+  }, [topology.frontZones]);
 
   const alertMap = useMemo(() => {
     const map = new Map<string, 'warning' | 'critical'>();
@@ -242,27 +283,49 @@ function FurnitureMeshGroup({
         </group>
       )}
 
-      {/* Cuerpo de Melamina + Fondo Durolac 3 mm (correspondencia física 1:1) */}
-      <group position={[0, legOffsetY, 0]}>
+      {/* Cuerpo de Melamina + Puertas/Cajones + Fondo Durolac 3 mm (correspondencia física 1:1) */}
+      <group position={[0, bodyOffsetY, 0]}>
         {despiece.matrizDespiece.map((piece) => {
           const [dx, dy, dz] = piece.dimensiones3D;
           const pos = piecePosition(piece);
           const sev = alertMap.get(piece.id);
-          const isBack = piece.tipo === 'fondo';
-          const isVertical = piece.tipo === 'lateral' || piece.tipo === 'division_vertical';
+          const isBack = piece.tipo === 'fondo' || piece.tipo === 'fondo_cajon';
+          const isGlassDoor = glassDoorIds.has(piece.id);
+          const isVertical =
+            piece.tipo === 'lateral' ||
+            piece.tipo === 'division_vertical' ||
+            piece.tipo === 'puerta';
+          const melMat: MelamineMaterial =
+            piece.material === 'blanco' ||
+            piece.material === 'roble' ||
+            piece.material === 'grafito'
+              ? piece.material
+              : params.material;
           const tex = isBack
-            ? textures.durolac
+            ? textureBank.durolac
             : isVertical
-              ? textures.melamineVert
-              : textures.melamineHoriz;
+              ? textureBank[melMat].v
+              : textureBank[melMat].h;
 
           const isSelected = selectedPieceId === piece.id;
+          const pieceEdgeColor = melMat === 'grafito' ? '#94a3b8' : edgeLineColor;
+          const dxM = dx / 1000;
+          const dyM = dy / 1000;
+          const dzM = dz / 1000;
+
+          const handleSide = doorHandleSide.get(piece.id);
+          const showDoorHandle = piece.tipo === 'puerta' && dxM > 0.14 && dyM > 0.18;
+          const showDrawerHandle = piece.tipo === 'frente_cajon' && dxM > 0.14 && dyM > 0.06;
+          const doorHandleX =
+            handleSide === 'left'
+              ? -dxM / 2 + Math.min(0.042, dxM * 0.16)
+              : dxM / 2 - Math.min(0.042, dxM * 0.16);
 
           return (
             <mesh
               key={piece.id}
               position={pos}
-              castShadow
+              castShadow={!isGlassDoor}
               receiveShadow
               onClick={(e) => {
                 e.stopPropagation();
@@ -276,13 +339,23 @@ function FurnitureMeshGroup({
                 document.body.style.cursor = 'auto';
               }}
             >
-              <boxGeometry args={[dx / 1000, dy / 1000, dz / 1000]} />
+              <boxGeometry args={[dxM, dyM, dzM]} />
               {sev ? (
                 <meshStandardMaterial
                   color={sev === 'critical' ? '#ef4444' : '#f59e0b'}
                   emissive={isSelected ? '#0284c7' : '#000000'}
                   emissiveIntensity={isSelected ? 0.35 : 0}
                   roughness={0.45}
+                />
+              ) : isGlassDoor ? (
+                <meshStandardMaterial
+                  color="#bae6fd"
+                  transparent
+                  opacity={0.44}
+                  emissive={isSelected ? '#0284c7' : '#000000'}
+                  emissiveIntensity={isSelected ? 0.25 : 0}
+                  roughness={0.14}
+                  metalness={0.15}
                 />
               ) : (
                 <meshStandardMaterial
@@ -292,7 +365,21 @@ function FurnitureMeshGroup({
                   roughness={isBack ? 0.85 : 0.55}
                 />
               )}
-              <Edges color={isSelected ? '#0284c7' : sev ? '#7f1d1d' : edgeLineColor} />
+              <Edges color={isSelected ? '#0284c7' : sev ? '#7f1d1d' : pieceEdgeColor} />
+
+              {showDoorHandle && (
+                <mesh position={[doorHandleX, 0, dzM / 2 + 0.008]}>
+                  <boxGeometry args={[0.01, Math.min(0.12, dyM * 0.24), 0.012]} />
+                  <meshStandardMaterial color="#1e293b" metalness={0.75} roughness={0.28} />
+                </mesh>
+              )}
+
+              {showDrawerHandle && (
+                <mesh position={[0, 0, dzM / 2 + 0.008]}>
+                  <boxGeometry args={[Math.min(0.13, dxM * 0.32), 0.01, 0.012]} />
+                  <meshStandardMaterial color="#1e293b" metalness={0.75} roughness={0.28} />
+                </mesh>
+              )}
             </mesh>
           );
         })}
@@ -371,7 +458,9 @@ export function Viewer3D({
     );
   }, [selectedPiece]);
 
-  const legExtraMm = topology.hasExternalLegs ? (topology.externalLegHeightMm ?? 150) : 0;
+  const legExtraMm = topology.hasExternalLegs
+    ? Math.max(40, topology.externalLegHeightMm ?? 150)
+    : (topology.toeKickHeightMm ?? 0);
   const maxDim =
     Math.max(params.targetDimensions.x, params.targetDimensions.y + legExtraMm, params.targetDimensions.z) /
     1000;
@@ -460,6 +549,9 @@ export function Viewer3D({
                 <div className="piece-hud-meta mono">
                   <span>
                     Centro ℝ³: ({selectedPiece.posicion3D.map((v) => Math.round(v)).join(', ')}) mm
+                  </span>
+                  <span>
+                    Acabado: {selectedPiece.material}
                   </span>
                   <span>
                     Veta: {selectedPiece.respectGrain ? 'Eje ancho' : 'Libre'}

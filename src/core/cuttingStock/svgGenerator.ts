@@ -16,6 +16,11 @@ function escapeXml(str: string): string {
 function colorForPiece(nombre: string): { fill: string; stroke: string } {
   const n = nombre.toLowerCase();
   if (n.includes('fondo')) return { fill: '#fef3c7', stroke: '#b45309' };
+  if (n.includes('puerta')) return { fill: '#fce7f3', stroke: '#be185d' };
+  if (n.includes('cajón') || n.includes('cajon')) return { fill: '#ffedd5', stroke: '#c2410c' };
+  if (n.includes('zócalo') || n.includes('zocalo') || n.includes('faldón') || n.includes('faldon')) {
+    return { fill: '#f1f5f9', stroke: '#475569' };
+  }
   if (n.includes('lateral')) return { fill: '#dbeafe', stroke: '#1d4ed8' };
   if (n.includes('cubierta') || n.includes('base')) return { fill: '#dcfce7', stroke: '#15803d' };
   if (n.includes('divisor')) return { fill: '#ede9fe', stroke: '#6d28d9' };

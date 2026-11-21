@@ -15,7 +15,8 @@ description: >-
    - `src/core/mathEngine/`: Pure TypeScript math only (zero React, zero DOM, zero Three.js).
    - `src/core/cuttingStock/`: Pure 2D optimizer + XML-safe SVG generator (zero React, zero DOM).
    - `src/core/vision/`: Pure offline image rectification, fixed-focal AR, and chroma+parallax band detector (zero React, zero WASM, zero network).
-   - `src/components/`: UI modules (`vectorCanvas`, `viewer3d`, `mathPanel`) consuming `contracts.ts` exclusively.
+   - `src/components/`: UI modules (`vectorCanvas`, `vectorBlueprint`, `viewer3d`, `mathPanel`) consuming `contracts.ts` exclusively.
+   - Additive v4.0 carpentry contract extensions in `src/types/contracts.ts`: `FrontModuleKind`, `FrontZone` (doors, glass doors, 5-piece drawers with 13 mm slide clearance, `leg_void` omitting base + adding rear `faldon`, two-tone `materialOverride`), optional `toeKickHeightMm`, and `CATALOG_14_MUEBLES` in `src/core/vectorBlueprint/catalog14.ts`.
 3. **100% Local / Offline Constraint (Etapa 2):** No backend, no external APIs, no CDNs, no Google Fonts, no remote HDRIs.
 4. **Preserve Documentation:** Never overwrite or delete project documentation files (`pauta.md`, `Auditoria y Prompts.txt`, `docs/`).
 

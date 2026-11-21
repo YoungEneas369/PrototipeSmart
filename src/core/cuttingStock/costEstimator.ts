@@ -47,8 +47,12 @@ export function estimateProjectBomAndCost(
   cuttingPlan: CuttingPlanResult,
   params: ScaleAndBoardParams,
 ): ProjectCostEstimate {
-  const structuralBoards = despiece.matrizDespiece.filter((p) => p.tipo !== 'fondo');
-  const backPanels = despiece.matrizDespiece.filter((p) => p.tipo === 'fondo');
+  const structuralBoards = despiece.matrizDespiece.filter(
+    (p) => p.tipo !== 'fondo' && p.tipo !== 'fondo_cajon',
+  );
+  const backPanels = despiece.matrizDespiece.filter(
+    (p) => p.tipo === 'fondo' || p.tipo === 'fondo_cajon',
+  );
   const hasExternalLegs = despiece.hardwareSummary.some((h) => h.categoria === 'patas');
 
   const screwCount = Math.max(8, structuralBoards.length * 4);

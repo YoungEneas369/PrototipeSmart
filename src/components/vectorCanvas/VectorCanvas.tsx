@@ -1,21 +1,23 @@
 /**
- * SMARTFURNITURE — VECTORCANVAS COMPLETO (FOTO -> HOMOGRAFÍA -> VISIÓN -> 3D) v3.0
- * - 100% offline: URL.createObjectURL + revokeObjectURL, croquis procedural local.
- * - 4 nodos [TL, TR, BR, BL] con Lupa 4x al arrastrar + vista previa rectificada en vivo.
- * - Focal fija 1x (26 mm) / 2x (52 mm) con Zhang + Calibración por 1 Medida (extrapolación) + Calibración A4.
- * - Auto-detección con anclaje de paralaje, gotero 1 clic, heurística de patas externas,
- *   edición manual con snap (vanos mixtos), marcado de tiradores y pestaña opcional Vista Lateral ZY.
+ * SMARTFURNITURE — VECTORCANVAS UX v3.1 (FOTO -> HOMOGRAFÍA -> VISIÓN -> 3D)
+ * - Dropzone drag-and-drop en estado vacío + protocolo auto-colapsable al cargar imagen.
+ * - Reescalado único a máx. 1600 px + `touch-action: none` + Lupa 4×.
+ * - Modo "Mover / Esquinas": arrastra tanto los 4 nodos [TL,TR,BR,BL] como divisores y repisas existentes.
+ * - Deshacer (Ctrl+Z) y Limpiar líneas + Gotero 1 clic + Calibración 1 medida / A4 debajo del lienzo.
  * - Rendimiento protegido: `bandDetector` NUNCA corre en `onPointerMove`.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Camera,
-  Crosshair,
   Eraser,
+  Move,
   Pipette,
   Ruler,
   ScanSearch,
   Sparkles,
+  Trash2,
+  Undo2,
+  Upload,
   Wrench,
 } from 'lucide-react';
 import type {
@@ -39,13 +41,13 @@ import {
   extrapolateDimensionsFromSingleMeasure,
   rectifyImageRGBA,
 } from '../../core/vision';
+import { NumericInput } from '../NumericInput';
 
 interface VectorCanvasProps {
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
   onUpdateTopology: (next: FurnitureTopology) => void;
   onApplyCalibratedDims: (dims: { x: number; y: number; z: number }) => void;
-  onToggleBackPanel: (checked: boolean) => void;
   onToggleExternalLegs: (checked: boolean, heightMm?: number, count?: number) => void;
   onAddHardwareItem: (item: HardwareItem) => void;
   onSelectDepthMm: (zMm: number) => void;
@@ -60,6 +62,16 @@ type ToolMode =
   | 'hardware'
   | 'erase';
 
+type DragTarget =
+  | { kind: 'corner'; idx: number }
+  | { kind: 'vDivider'; id: string }
+  | { kind: 'hShelf'; id: string };
+
+interface LineSnapshot {
+  vDividers: NormalizedSegment[];
+  hShelves: NormalizedSegment[];
+}
+
 const CORNER_LABELS = ['TL', 'TR', 'BR', 'BL'] as const;
 const SNAP_TOL = 0.03;
 const MAX_WORK_DIM = 1600;
@@ -71,10 +83,6 @@ interface WorkingBitmap {
   h: number;
 }
 
-/**
- * Reescala una foto de celular (12–48 MP) UNA sola vez a máx. 1600 px en su lado mayor
- * preservando la relación de aspecto exacta para fluidez 60 fps y bajo uso de RAM.
- */
 function prepareWorkingBitmap(image: HTMLImageElement): WorkingBitmap {
   const nw = Math.max(1, image.naturalWidth);
   const nh = Math.max(1, image.naturalHeight);
@@ -103,10 +111,6 @@ function snapValue(val: number, anchors: readonly number[]): number {
   return val;
 }
 
-/**
- * Genera proceduralmente un croquis de ejemplo offline en canvas (estantería roble
- * en perspectiva leve con 1 divisor central, 3 repisas, 4 patas metálicas abajo y hoja A4 visible).
- */
 function generateSampleFurnitureDataUrl(): string {
   const w = 900;
   const h = 680;
@@ -116,7 +120,6 @@ function generateSampleFurnitureDataUrl(): string {
   const ctx = c.getContext('2d');
   if (!ctx) return '';
 
-  // Pared y piso
   const wallGrad = ctx.createLinearGradient(0, 0, w, 0);
   wallGrad.addColorStop(0, '#cbd5e1');
   wallGrad.addColorStop(1, '#e2e8f0');
@@ -125,7 +128,6 @@ function generateSampleFurnitureDataUrl(): string {
   ctx.fillStyle = '#94a3b8';
   ctx.fillRect(0, 595, w, 85);
 
-  // Coordenadas en perspectiva leve del cuerpo de melamina (excluyendo patas)
   const quad: [Point2D, Point2D, Point2D, Point2D] = [
     { x: 185, y: 85 },
     { x: 675, y: 98 },
@@ -133,10 +135,8 @@ function generateSampleFurnitureDataUrl(): string {
     { x: 165, y: 525 },
   ];
 
-  // Patas metálicas independientes debajo del cuerpo (para probar aislamiento de patas)
   ctx.fillStyle = '#1e293b';
-  const legsX = [195, 255, 625, 675];
-  for (const lx of legsX) {
+  for (const lx of [195, 255, 625, 675]) {
     ctx.fillRect(lx, 515, 14, 82);
   }
 
@@ -149,7 +149,6 @@ function generateSampleFurnitureDataUrl(): string {
     ctx.fill();
   };
 
-  // Fondo hueco interior oscuro del mueble
   fillPoly(quad, '#334155');
 
   if (hom) {
@@ -165,21 +164,15 @@ function generateSampleFurnitureDataUrl(): string {
     const eU = 0.025;
     const eV = 0.03;
 
-    // Carcasa 4 bordes
     mapRect(0, 1 - eV, 1, 1, boardCol);
     mapRect(0, 0, 1, eV, boardCol);
     mapRect(0, 0, eU, 1, boardCol);
     mapRect(1 - eU, 0, 1, 1, boardCol);
-
-    // Divisor central
     mapRect(0.5 - eU / 2, eV, 0.5 + eU / 2, 1 - eV, boardCol);
-
-    // 2 repisas izquierda + 1 derecha
     mapRect(eU, 0.34 - eV / 2, 0.5 - eU / 2, 0.34 + eV / 2, boardCol);
     mapRect(eU, 0.67 - eV / 2, 0.5 - eU / 2, 0.67 + eV / 2, boardCol);
     mapRect(0.5 + eU / 2, 0.52 - eV / 2, 1 - eU, 0.52 + eV / 2, boardCol);
 
-    // Hoja A4 blanca (297 mm alto) pegada en vano derecho superior para probar calibración A4
     mapRect(0.68, 0.58, 0.85, 0.86, '#ffffff');
     const a4Label = applyHomography(hom.toCanvas, { x: 0.765, y: 0.72 });
     if (a4Label) {
@@ -200,13 +193,13 @@ export function VectorCanvas({
   params,
   onUpdateTopology,
   onApplyCalibratedDims,
-  onToggleBackPanel,
   onToggleExternalLegs,
   onAddHardwareItem,
   onSelectDepthMm,
 }: VectorCanvasProps) {
   const [viewTab, setViewTab] = useState<'frontal' | 'lateral'>('frontal');
-  const [showProtocol, setShowProtocol] = useState(true);
+  const [showProtocol, setShowProtocol] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
   const [imgUrl, setImgUrl] = useState<string | null>(null);
   const [frontBitmap, setFrontBitmap] = useState<WorkingBitmap | null>(null);
   const [imgSize, setImgSize] = useState<{ w: number; h: number }>({ w: 900, h: 680 });
@@ -231,9 +224,10 @@ export function VectorCanvas({
   );
   const [tool, setTool] = useState<ToolMode>('corners');
   const [focal35mm, setFocal35mm] = useState<26 | 52>(26);
-  const [dragCornerIdx, setDragCornerIdx] = useState<number | null>(null);
+  const [dragTarget, setDragTarget] = useState<DragTarget | null>(null);
   const [cursorImgPt, setCursorImgPt] = useState<Point2D | null>(null);
   const [draftLineStart, setDraftLineStart] = useState<Point2D | null>(null);
+  const [undoStack, setUndoStack] = useState<LineSnapshot[]>([]);
 
   // Calibración rápida con 1 sola medida (extrapolación)
   const [knownAxis, setKnownAxis] = useState<'x' | 'y'>('x');
@@ -249,7 +243,7 @@ export function VectorCanvas({
 
   // Feedback del detector
   const [statusMsg, setStatusMsg] = useState<string>(
-    'Carga una foto frontal (o el croquis local) y ajusta las 4 esquinas del cuerpo de melamina.',
+    'Sube una foto frontal (o prueba el croquis local) para ajustar las 4 esquinas y detectar la estructura.',
   );
   const [legHintDetected, setLegHintDetected] = useState<boolean>(false);
   const [detectedModeLabel, setDetectedModeLabel] = useState<string>('');
@@ -257,8 +251,61 @@ export function VectorCanvas({
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rectPreviewRef = useRef<HTMLCanvasElement | null>(null);
+  const fileFrontalInputRef = useRef<HTMLInputElement | null>(null);
+  const fileSideInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Limpieza segura de URLs creadas con createObjectURL
+  const pushUndo = () => {
+    setUndoStack((prev) => [
+      ...prev.slice(-19),
+      {
+        vDividers: topology.vDividers.map((d) => ({ ...d })),
+        hShelves: topology.hShelves.map((s) => ({ ...s })),
+      },
+    ]);
+  };
+
+  const handleUndo = () => {
+    setUndoStack((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      onUpdateTopology({
+        ...topology,
+        shelfMode: 'custom',
+        vDividers: last.vDividers,
+        hShelves: last.hShelves,
+      });
+      setStatusMsg('Último cambio de trazos deshecho.');
+      return prev.slice(0, -1);
+    });
+  };
+
+  const handleClearLines = () => {
+    if (topology.vDividers.length === 0 && topology.hShelves.length === 0) return;
+    pushUndo();
+    onUpdateTopology({
+      ...topology,
+      shelfMode: 'custom',
+      vDividers: [],
+      hShelves: [],
+      detectionSource: 'manual',
+    });
+    setStatusMsg('Líneas internas limpiadas. Puedes volver a detectar o trazar manualmente.');
+  };
+
+  // Atajo Ctrl+Z para deshacer trazos
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && undoStack.length > 0) {
+        const tag = (e.target as HTMLElement | null)?.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+        e.preventDefault();
+        handleUndo();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
+
   useEffect(() => {
     return () => {
       if (imgUrl && imgUrl.startsWith('blob:')) URL.revokeObjectURL(imgUrl);
@@ -284,6 +331,7 @@ export function VectorCanvas({
       setImgUrl(url);
       setFrontBitmap(bmp);
       setImgSize({ w: bmp.w, h: bmp.h });
+      setShowProtocol(false);
 
       const defaultQuad: [Point2D, Point2D, Point2D, Point2D] = isSample
         ? [
@@ -302,25 +350,17 @@ export function VectorCanvas({
       setCalibPts([]);
       setHardwareMarkers([]);
       setLegHintDetected(false);
+      setTool('corners');
       setStatusMsg(
         isSample
-          ? 'Croquis local cargado (incluye patas externas y hoja A4). Pulsa "Detectar estructura" o calibra con 1 medida / A4.'
-          : `Foto cargada (${bmp.w}×${bmp.h} px). Alinea TL, TR, BR, BL sobre las 4 esquinas del cuerpo de melamina (excluyendo patas).`,
+          ? 'Croquis cargado. Pulsa "Detectar estructura" o arrastra los nodos TL/TR/BR/BL.'
+          : `Foto lista (${bmp.w}×${bmp.h} px). Alinea las 4 esquinas al cuerpo de melamina (sin patas) y pulsa "Detectar".`,
       );
     };
     img.src = url;
   };
 
-  const handleFileFrontal = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    loadFrontalFromUrl(url, false);
-  };
-
-  const handleFileSide = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const loadSideFromFile = (file: File) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
@@ -337,12 +377,38 @@ export function VectorCanvas({
     img.src = url;
   };
 
+  const handleFileFrontal = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    loadFrontalFromUrl(URL.createObjectURL(file), false);
+    e.target.value = '';
+  };
+
+  const handleFileSide = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    loadSideFromFile(file);
+    e.target.value = '';
+  };
+
+  const handleDropFile = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (!file || !file.type.startsWith('image/')) return;
+    if (viewTab === 'frontal') {
+      loadFrontalFromUrl(URL.createObjectURL(file), false);
+    } else {
+      loadSideFromFile(file);
+    }
+  };
+
   // Render de miniatura rectificada (liviana 200px durante arrastre, detallada 320px al soltar)
   useEffect(() => {
     const previewCanvas = rectPreviewRef.current;
     if (!previewCanvas || !frontBitmap || frontBitmap.w === 0 || !homography) return;
 
-    const previewW = dragCornerIdx !== null ? 200 : 320;
+    const previewW = dragTarget?.kind === 'corner' ? 200 : 320;
     const previewH = Math.max(110, Math.min(340, Math.round(previewW / Math.max(0.25, estimatedAspectXY))));
     previewCanvas.width = previewW;
     previewCanvas.height = previewH;
@@ -360,9 +426,9 @@ export function VectorCanvas({
       const imgData = new ImageData(new Uint8ClampedArray(rectRgba), previewW, previewH);
       ctx.putImageData(imgData, 0, 0);
     }
-  }, [frontBitmap, quad, homography, estimatedAspectXY, dragCornerIdx]);
+  }, [frontBitmap, quad, homography, estimatedAspectXY, dragTarget]);
 
-  // Dibujo del lienzo principal con malla proyectiva, líneas detectadas, tiradores y Lupa 4x
+  // Dibujo del lienzo principal
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -371,29 +437,14 @@ export function VectorCanvas({
 
     const activeBmp = viewTab === 'frontal' ? frontBitmap : sideBitmap;
     const activeQuad = viewTab === 'frontal' ? quad : sideQuad;
-    const cw = activeBmp ? activeBmp.w : 900;
-    const ch = activeBmp ? activeBmp.h : 680;
+    if (!activeBmp) return;
+
+    const cw = activeBmp.w;
+    const ch = activeBmp.h;
     canvas.width = cw;
     canvas.height = ch;
 
-    ctx.fillStyle = '#0f172a';
-    ctx.fillRect(0, 0, cw, ch);
-
-    if (activeBmp) {
-      ctx.drawImage(activeBmp.canvas, 0, 0, cw, ch);
-    } else {
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = 'bold 20px system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(
-        viewTab === 'frontal'
-          ? 'Carga una foto frontal o pulsa "Cargar croquis de ejemplo local"'
-          : 'Vista Lateral ZY opcional: carga una foto de costado para estimar profundidad Z',
-        cw / 2,
-        ch / 2,
-      );
-      return;
-    }
+    ctx.drawImage(activeBmp.canvas, 0, 0, cw, ch);
 
     // Contorno del cuadrilátero
     ctx.strokeStyle = '#00e5ff';
@@ -405,7 +456,6 @@ export function VectorCanvas({
 
     if (viewTab === 'frontal' && homography) {
       const { toCanvas } = homography;
-      // Grilla proyectiva tenue 4×4
       ctx.strokeStyle = 'rgba(0, 229, 255, 0.28)';
       ctx.lineWidth = 1;
       for (const k of [0.25, 0.5, 0.75]) {
@@ -427,14 +477,15 @@ export function VectorCanvas({
         }
       }
 
-      // Divisores verticales (convertidos interior -> exterior para dibujar sobre la foto)
       const e = params.boardThickness;
       const xf = params.targetDimensions.x;
       const yf = params.targetDimensions.y;
 
-      ctx.strokeStyle = '#22c55e';
-      ctx.lineWidth = Math.max(3, cw / 280);
+      // Divisores verticales
       for (const div of topology.vDividers) {
+        const isActive = dragTarget?.kind === 'vDivider' && dragTarget.id === div.id;
+        ctx.strokeStyle = isActive ? '#38bdf8' : '#22c55e';
+        ctx.lineWidth = Math.max(isActive ? 5 : 3, cw / (isActive ? 210 : 280));
         const uExt = interiorToExterior(div.position, e, xf);
         const v0 = interiorToExterior(div.start, e, yf);
         const v1 = interiorToExterior(div.end, e, yf);
@@ -449,9 +500,10 @@ export function VectorCanvas({
       }
 
       // Repisas horizontales
-      ctx.strokeStyle = '#f59e0b';
-      ctx.lineWidth = Math.max(3, cw / 280);
       for (const sh of topology.hShelves) {
+        const isActive = dragTarget?.kind === 'hShelf' && dragTarget.id === sh.id;
+        ctx.strokeStyle = isActive ? '#38bdf8' : '#f59e0b';
+        ctx.lineWidth = Math.max(isActive ? 5 : 3, cw / (isActive ? 210 : 280));
         const vExt = interiorToExterior(sh.position, e, yf);
         const u0 = interiorToExterior(sh.start, e, xf);
         const u1 = interiorToExterior(sh.end, e, xf);
@@ -465,7 +517,7 @@ export function VectorCanvas({
         }
       }
 
-      // Segmento de calibración A4 si existe (tamaño proporcional al ancho)
+      // Segmento de calibración A4
       const markerR = Math.max(7, cw / 110);
       if (calibPts.length >= 1) {
         ctx.fillStyle = '#ec4899';
@@ -484,7 +536,7 @@ export function VectorCanvas({
         }
       }
 
-      // Vista previa en vivo al arrastrar una repisa horizontal
+      // Vista previa en vivo al arrastrar nueva repisa
       if (tool === 'hShelf' && draftLineStart && cursorImgPt) {
         ctx.save();
         ctx.strokeStyle = '#fbbf24';
@@ -497,7 +549,7 @@ export function VectorCanvas({
         ctx.restore();
       }
 
-      // Marcadores de tiradores / herrajes (tamaño proporcional)
+      // Marcadores de tiradores / herrajes
       const hwR = Math.max(8, cw / 100);
       for (const hm of hardwareMarkers) {
         ctx.fillStyle = '#a855f7';
@@ -511,9 +563,10 @@ export function VectorCanvas({
     }
 
     // Nodos arrastrables [TL, TR, BR, BL]
-    const nodeR = Math.max(9, cw / 90);
+    const nodeR = Math.max(10, cw / 85);
     activeQuad.forEach((p, idx) => {
-      ctx.fillStyle = dragCornerIdx === idx ? '#f59e0b' : '#0284c7';
+      const isDraggingCorner = dragTarget?.kind === 'corner' && dragTarget.idx === idx;
+      ctx.fillStyle = isDraggingCorner ? '#f59e0b' : '#0284c7';
       ctx.beginPath();
       ctx.arc(p.x, p.y, nodeR, 0, Math.PI * 2);
       ctx.fill();
@@ -521,15 +574,15 @@ export function VectorCanvas({
       ctx.lineWidth = 2;
       ctx.stroke();
       ctx.fillStyle = '#ffffff';
-      ctx.font = `bold ${Math.round(nodeR * 1.1)}px system-ui, sans-serif`;
+      ctx.font = `bold ${Math.round(nodeR * 1.05)}px system-ui, sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(CORNER_LABELS[idx], p.x, p.y);
     });
 
-    // Lupa 4× al arrastrar una esquina
-    if (dragCornerIdx !== null && cursorImgPt && activeBmp) {
-      const magSize = Math.min(180, Math.round(cw * 0.22));
+    // Lupa 4× al arrastrar esquina
+    if (dragTarget?.kind === 'corner' && cursorImgPt) {
+      const magSize = Math.min(180, Math.round(cw * 0.24));
       const zoom = 4;
       const srcSpan = magSize / zoom;
       const mx = cursorImgPt.x < cw / 2 ? cw - magSize - 16 : 16;
@@ -552,7 +605,6 @@ export function VectorCanvas({
       ctx.strokeStyle = '#00e5ff';
       ctx.lineWidth = 2;
       ctx.strokeRect(mx, my, magSize, magSize);
-      // Mira central de la lupa
       ctx.strokeStyle = '#f59e0b';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
@@ -575,7 +627,7 @@ export function VectorCanvas({
     params.boardThickness,
     params.targetDimensions.x,
     params.targetDimensions.y,
-    dragCornerIdx,
+    dragTarget,
     cursorImgPt,
     draftLineStart,
     tool,
@@ -598,8 +650,8 @@ export function VectorCanvas({
       return;
     }
 
-    // Evitar deformación si el usuario aún tiene las dimensiones de otro preset:
-    // si la relación x/y actual difiere > 15% de estimatedAspectXY, rectificar con la proporción real de la foto.
+    pushUndo();
+
     const safeRatio = Math.max(0.25, Math.min(4, estimatedAspectXY));
     const currentRatio = params.targetDimensions.x / Math.max(1, params.targetDimensions.y);
     const ratioMismatch = Math.abs(currentRatio - safeRatio) / safeRatio > 0.15;
@@ -610,11 +662,7 @@ export function VectorCanvas({
       ? Math.max(400, Math.min(2200, Math.round(effX / safeRatio)))
       : params.targetDimensions.y;
 
-    const { width: dstW, height: dstH } = computeRectifiedSize(
-      effX,
-      effY,
-      params.boardThickness,
-    );
+    const { width: dstW, height: dstH } = computeRectifiedSize(effX, effY, params.boardThickness);
     const rectRgba = rectifyImageRGBA(
       frontBitmap.rgba,
       frontBitmap.w,
@@ -636,7 +684,6 @@ export function VectorCanvas({
     const legsHint = detectLowerGapHint(frontBitmap.rgba, frontBitmap.w, frontBitmap.h, quad);
     setLegHintDetected(legsHint.possibleExternalLegs);
 
-    // Proyectar tiradores detectados sobre la foto y registrarlos en Herrajes (sin duplicar)
     const manualHardware = (topology.hardwareItems ?? []).filter((h) => h.origen !== 'detectado');
     const nextHardware = [...manualHardware];
     const projectedHandles: Point2D[] = [];
@@ -680,18 +727,14 @@ export function VectorCanvas({
 
     if (det.confidence < 0.5) {
       setStatusMsg(
-        `Confianza baja (${Math.round(det.confidence * 100)}%, interiorMatch=${Math.round(det.interiorMatch * 100)}%). Verifica que las 4 esquinas TL/TR/BR/BL enmarquen EXACTAMENTE el cuerpo del mueble (sin pared ni patas) o usa "Gotero 1 clic" / trazado manual.`,
+        `Confianza baja (${Math.round(det.confidence * 100)}%). Ajusta las 4 esquinas al cuerpo exacto o usa "Gotero" / trazado manual.`,
       );
     } else {
       const handleMsg =
-        det.detectedHandles.length > 0
-          ? ` + ${det.detectedHandles.length} tirador(es) registrados en Herrajes.`
-          : '.';
-      const legsMsg = legsHint.possibleExternalLegs
-        ? ' Se detectaron posibles patas externas debajo del cuerpo.'
-        : '';
+        det.detectedHandles.length > 0 ? ` + ${det.detectedHandles.length} tirador(es).` : '.';
+      const legsMsg = legsHint.possibleExternalLegs ? ' Posibles patas externas detectadas.' : '';
       setStatusMsg(
-        `[${modeText}] Detectado (${Math.round(det.confidence * 100)}% confianza): ${det.vDividers.length} división(es) vertical(es) y ${det.hShelves.length} horizontal(es)${handleMsg}${legsMsg}`,
+        `[${modeText}] ${det.vDividers.length} divisor(es) y ${det.hShelves.length} repisa(s) (${Math.round(det.confidence * 100)}% conf.)${handleMsg}${legsMsg} Arrastra cualquier línea en "Mover" para afinar.`,
       );
     }
   };
@@ -699,15 +742,53 @@ export function VectorCanvas({
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const pt = toCanvasCoords(e);
     const activeQuad = viewTab === 'frontal' ? quad : sideQuad;
+    const eMm = params.boardThickness;
+    const xf = params.targetDimensions.x;
+    const yf = params.targetDimensions.y;
 
-    // Prioridad: si estamos en modo esquinas (o cerca de un nodo), arrastrar esquina
+    // Modo Mover / Esquinas (o pestaña lateral): primero intenta agarrar esquina, luego línea existente
     if (tool === 'corners' || viewTab === 'lateral') {
-      const hitTol = Math.max(22, (canvasRef.current?.width ?? 900) * 0.032);
+      const hitTol = Math.max(26, (canvasRef.current?.width ?? 900) * 0.038);
       const hitIdx = activeQuad.findIndex((p) => Math.hypot(p.x - pt.x, p.y - pt.y) <= hitTol);
       if (hitIdx !== -1) {
-        setDragCornerIdx(hitIdx);
+        setDragTarget({ kind: 'corner', idx: hitIdx });
         setCursorImgPt(pt);
         (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+        return;
+      }
+
+      if (viewTab === 'frontal' && homography) {
+        const unitPt = applyHomography(homography.toUnit, pt);
+        if (unitPt) {
+          const uClick = exteriorToInterior(unitPt.x, eMm, xf);
+          const vClick = exteriorToInterior(unitPt.y, eMm, yf);
+          let bestDist = 0.032;
+          let found: DragTarget | null = null;
+
+          for (const d of topology.vDividers) {
+            const dist = Math.abs(d.position - uClick);
+            if (dist < bestDist) {
+              bestDist = dist;
+              found = { kind: 'vDivider', id: d.id };
+            }
+          }
+          for (const s of topology.hShelves) {
+            if (uClick >= s.start - 0.02 && uClick <= s.end + 0.02) {
+              const dist = Math.abs(s.position - vClick);
+              if (dist < bestDist) {
+                bestDist = dist;
+                found = { kind: 'hShelf', id: s.id };
+              }
+            }
+          }
+
+          if (found) {
+            pushUndo();
+            setDragTarget(found);
+            setCursorImgPt(pt);
+            (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+          }
+        }
       }
       return;
     }
@@ -716,12 +797,11 @@ export function VectorCanvas({
     const unitPt = applyHomography(homography.toUnit, pt);
     if (!unitPt) return;
 
-    const eMm = params.boardThickness;
-    const xf = params.targetDimensions.x;
-    const yf = params.targetDimensions.y;
-
     if (tool === 'eyedropper') {
-      runAutoDetection({ u: Math.max(0, Math.min(1, unitPt.x)), v: Math.max(0, Math.min(1, unitPt.y)) });
+      runAutoDetection({
+        u: Math.max(0, Math.min(1, unitPt.x)),
+        v: Math.max(0, Math.min(1, unitPt.y)),
+      });
       setTool('corners');
       return;
     }
@@ -741,13 +821,14 @@ export function VectorCanvas({
         notaCompra: 'Elemento ajeno a la melamina — marcado sobre foto frontal.',
         origen: 'manual',
       });
-      setStatusMsg('Tirador / herraje registrado en la tabla de Herrajes (excluido del corte de melamina).');
+      setStatusMsg('Tirador / herraje agregado a la pestaña Herrajes.');
       return;
     }
 
     if (tool === 'vDivider') {
       const uInt = exteriorToInterior(unitPt.x, eMm, xf);
       if (uInt > 0.04 && uInt < 0.96) {
+        pushUndo();
         const nextDiv: NormalizedSegment = {
           id: `man_div_${Date.now()}`,
           position: Number(uInt.toFixed(4)),
@@ -778,7 +859,6 @@ export function VectorCanvas({
     if (tool === 'erase') {
       const uClick = exteriorToInterior(unitPt.x, eMm, xf);
       const vClick = exteriorToInterior(unitPt.y, eMm, yf);
-      // Buscar el divisor o repisa más cercano dentro de tolerancia 0.045
       let bestDist = 0.045;
       let targetKind: 'div' | 'shelf' | null = null;
       let targetId = '';
@@ -803,78 +883,112 @@ export function VectorCanvas({
       }
 
       if (targetKind === 'div') {
+        pushUndo();
         onUpdateTopology({
           ...topology,
           vDividers: topology.vDividers.filter((d) => d.id !== targetId),
         });
-        setStatusMsg('Divisor vertical eliminado.');
+        setStatusMsg('Divisor vertical eliminado (Ctrl+Z para deshacer).');
       } else if (targetKind === 'shelf') {
+        pushUndo();
         onUpdateTopology({
           ...topology,
           hShelves: topology.hShelves.filter((s) => s.id !== targetId),
         });
-        setStatusMsg('Repisa horizontal eliminada.');
+        setStatusMsg('Repisa horizontal eliminada (Ctrl+Z para deshacer).');
       }
     }
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (dragCornerIdx === null) {
+    const pt = toCanvasCoords(e);
+
+    if (!dragTarget) {
       if (draftLineStart !== null) {
-        setCursorImgPt(toCanvasCoords(e));
+        setCursorImgPt(pt);
       }
       return;
     }
-    const pt = toCanvasCoords(e);
+
     setCursorImgPt(pt);
 
-    if (viewTab === 'frontal') {
-      setQuad((prev) => {
-        const copy: [Point2D, Point2D, Point2D, Point2D] = [
-          { ...prev[0] },
-          { ...prev[1] },
-          { ...prev[2] },
-          { ...prev[3] },
-        ];
-        copy[dragCornerIdx] = pt;
-        return copy;
+    if (dragTarget.kind === 'corner') {
+      if (viewTab === 'frontal') {
+        setQuad((prev) => {
+          const copy: [Point2D, Point2D, Point2D, Point2D] = [
+            { ...prev[0] },
+            { ...prev[1] },
+            { ...prev[2] },
+            { ...prev[3] },
+          ];
+          copy[dragTarget.idx] = pt;
+          return copy;
+        });
+      } else {
+        setSideQuad((prev) => {
+          const copy: [Point2D, Point2D, Point2D, Point2D] = [
+            { ...prev[0] },
+            { ...prev[1] },
+            { ...prev[2] },
+            { ...prev[3] },
+          ];
+          copy[dragTarget.idx] = pt;
+          return copy;
+        });
+      }
+      return;
+    }
+
+    if (!homography) return;
+    const unitPt = applyHomography(homography.toUnit, pt);
+    if (!unitPt) return;
+
+    const eMm = params.boardThickness;
+    if (dragTarget.kind === 'vDivider') {
+      const nextU = Math.max(0.04, Math.min(0.96, exteriorToInterior(unitPt.x, eMm, params.targetDimensions.x)));
+      onUpdateTopology({
+        ...topology,
+        shelfMode: 'custom',
+        detectionSource: 'manual',
+        vDividers: topology.vDividers.map((d) =>
+          d.id === dragTarget.id ? { ...d, position: Number(nextU.toFixed(4)) } : d,
+        ),
       });
-    } else {
-      setSideQuad((prev) => {
-        const copy: [Point2D, Point2D, Point2D, Point2D] = [
-          { ...prev[0] },
-          { ...prev[1] },
-          { ...prev[2] },
-          { ...prev[3] },
-        ];
-        copy[dragCornerIdx] = pt;
-        return copy;
+    } else if (dragTarget.kind === 'hShelf') {
+      const nextV = Math.max(0.04, Math.min(0.96, exteriorToInterior(unitPt.y, eMm, params.targetDimensions.y)));
+      onUpdateTopology({
+        ...topology,
+        shelfMode: 'custom',
+        detectionSource: 'manual',
+        hShelves: topology.hShelves.map((s) =>
+          s.id === dragTarget.id ? { ...s, position: Number(nextV.toFixed(4)) } : s,
+        ),
       });
     }
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (dragCornerIdx !== null) {
-      setDragCornerIdx(null);
+    if (dragTarget) {
+      const finishedKind = dragTarget.kind;
+      setDragTarget(null);
       setCursorImgPt(null);
-      if (viewTab === 'frontal' && homography) {
-        onUpdateTopology({
-          ...topology,
-          aspectRatioXY: estimatedAspectXY,
-          quadCorners: quad,
-          homographyMatrix: homography.toUnit.map((r) => [...r]),
-        });
-      } else if (viewTab === 'lateral' && sideBitmap) {
-        const ratioZY = estimateAspectRatioFixedFocal(
-          sideQuad,
-          sideBitmap.w,
-          sideBitmap.h,
-          focal35mm,
-        );
-        const estDepth = Math.max(200, Math.min(800, Math.round(params.targetDimensions.y * ratioZY)));
-        onUpdateTopology({ ...topology, viewsMode: 2, aspectRatioZY: ratioZY });
-        onSelectDepthMm(estDepth);
-        setStatusMsg(`Profundidad Z actualizada desde Vista Lateral ZY: ${estDepth} mm.`);
+      if (finishedKind === 'corner') {
+        if (viewTab === 'frontal' && homography) {
+          onUpdateTopology({
+            ...topology,
+            aspectRatioXY: estimatedAspectXY,
+            quadCorners: quad,
+            homographyMatrix: homography.toUnit.map((r) => [...r]),
+          });
+        } else if (viewTab === 'lateral' && sideBitmap) {
+          const ratioZY = estimateAspectRatioFixedFocal(sideQuad, sideBitmap.w, sideBitmap.h, focal35mm);
+          const estDepth = Math.max(200, Math.min(800, Math.round(params.targetDimensions.y * ratioZY)));
+          onUpdateTopology({ ...topology, viewsMode: 2, aspectRatioZY: ratioZY });
+          onSelectDepthMm(estDepth);
+          setStatusMsg(`Profundidad Z actualizada desde Vista Lateral ZY: ${estDepth} mm.`);
+        }
+      } else {
+        setStatusMsg('Posición de línea ajustada y sincronizada en 3D (Ctrl+Z para deshacer).');
       }
       return;
     }
@@ -896,7 +1010,6 @@ export function VectorCanvas({
       const rawEnd = exteriorToInterior(Math.max(uA.x, uB.x), eMm, xf);
       const vMid = exteriorToInterior((uA.y + uB.y) / 2, eMm, yf);
 
-      // Si fue un clic corto (< 4%), llenar automáticamente el vano donde hizo clic
       let uStart = snapValue(rawStart, anchors);
       let uEnd = snapValue(rawEnd, anchors);
       if (Math.abs(uEnd - uStart) < 0.05) {
@@ -912,6 +1025,7 @@ export function VectorCanvas({
       }
 
       if (uEnd - uStart >= 0.04 && vMid > 0.03 && vMid < 0.97) {
+        pushUndo();
         const nextShelf: NormalizedSegment = {
           id: `man_rep_${Date.now()}`,
           position: Number(vMid.toFixed(4)),
@@ -927,7 +1041,9 @@ export function VectorCanvas({
           hShelves: [...topology.hShelves, nextShelf],
           detectionSource: 'manual',
         });
-        setStatusMsg(`Repisa agregada en v = ${(vMid * 100).toFixed(1)}% sobre vano [${(uStart * 100).toFixed(0)}%, ${(uEnd * 100).toFixed(0)}%].`);
+        setStatusMsg(
+          `Repisa agregada en v = ${(vMid * 100).toFixed(1)}% sobre vano [${(uStart * 100).toFixed(0)}%, ${(uEnd * 100).toFixed(0)}%].`,
+        );
       }
     }
   };
@@ -966,7 +1082,6 @@ export function VectorCanvas({
         }
       }
     }
-    // Fallback euclidiano
     const pxDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
     const bodyH = Math.hypot(quad[3].x - quad[0].x, quad[3].y - quad[0].y);
     if (pxDist > 1) {
@@ -981,105 +1096,203 @@ export function VectorCanvas({
   const conf = topology.detectionConfidence;
   const confClass =
     conf === undefined ? '' : conf >= 0.7 ? 'conf-high' : conf >= 0.5 ? 'conf-mid' : 'conf-low';
+  const activeBmp = viewTab === 'frontal' ? frontBitmap : sideBitmap;
+  const hasPhoto = Boolean(frontBitmap);
+  const canvasCursor =
+    dragTarget !== null
+      ? 'grabbing'
+      : tool === 'corners' || viewTab === 'lateral'
+        ? 'grab'
+        : tool === 'erase'
+          ? 'pointer'
+          : 'crosshair';
 
   return (
     <div className="vector-card">
+      {/* Cabecera compacta */}
       <div className="card-header-row">
-        <h3>Paso 1 y 2 — Foto → Homografía 3×3 → Visión Offline</h3>
+        <h3>Foto → Homografía 3×3 → Visión</h3>
         <div className="chip-row">
           <button
             type="button"
             className={viewTab === 'frontal' ? 'chip-btn active' : 'chip-btn'}
             onClick={() => setViewTab('frontal')}
           >
-            Vista Frontal (XY)
+            Frontal (XY)
           </button>
           <button
             type="button"
             className={viewTab === 'lateral' ? 'chip-btn active' : 'chip-btn'}
             onClick={() => setViewTab('lateral')}
           >
-            Vista Lateral ZY (Opcional)
+            Lateral ZY
           </button>
           <button
             type="button"
-            className="chip-btn"
+            className={showProtocol ? 'chip-btn active' : 'chip-btn'}
             onClick={() => setShowProtocol((s) => !s)}
           >
-            {showProtocol ? 'Ocultar protocolo' : 'Ver protocolo foto'}
+            Protocolo
           </button>
         </div>
       </div>
 
       {showProtocol && (
         <div className="protocol-box">
-          <strong>Protocolo de Foto para Alta Precisión (100 % Local):</strong>
-          <ul>
-            <li>Mueble abierto (sin puertas), cámara al centro y media altura, distancia ≥ 3 m, zoom <strong>1× o 2×</strong> (nunca 0.5×), sin recortar (WhatsApp como <em>Documento</em>).</li>
-            <li><strong>Patas externas:</strong> enmarca con los 4 nodos <strong>SOLO el cuerpo de melamina</strong>; excluye patas adicionales para que se listen como herraje aparte.</li>
-          </ul>
+          <strong>Protocolo de Foto (100 % Local):</strong> Cámara centrada a media altura, distancia ≥ 3 m, zoom{' '}
+          <strong>1× o 2×</strong> (nunca 0.5×), sin recortar (WhatsApp como <em>Documento</em>). Enmarca{' '}
+          <strong>solo el cuerpo de melamina</strong> (sin patas externas).
         </div>
       )}
 
-      {/* Carga de archivo + controles rápidos */}
+      {/* Barra única compacta de carga + herramientas */}
       <div className="canvas-toolbar">
         {viewTab === 'frontal' ? (
           <>
-            <label className="btn-primary">
-              <Camera size={15} /> Cargar Foto Frontal
-              <input type="file" accept="image/*" onChange={handleFileFrontal} hidden />
-            </label>
             <button
               type="button"
               className="btn-secondary"
+              onClick={() => fileFrontalInputRef.current?.click()}
+            >
+              <Camera size={14} /> {hasPhoto ? 'Cambiar foto' : 'Subir foto'}
+            </button>
+            <input
+              ref={fileFrontalInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleFileFrontal}
+              hidden
+            />
+            <button
+              type="button"
+              className="btn-small"
               onClick={() => loadFrontalFromUrl(generateSampleFurnitureDataUrl(), true)}
             >
-              <Sparkles size={15} /> Cargar croquis de ejemplo local
+              <Sparkles size={14} /> Croquis local
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={() => runAutoDetection()}
+              disabled={!hasPhoto || !homography}
+            >
+              <ScanSearch size={14} /> Detectar estructura
             </button>
           </>
         ) : (
-          <label className="btn-primary">
-            <Camera size={15} /> Cargar Foto Lateral (ZY)
-            <input type="file" accept="image/*" onChange={handleFileSide} hidden />
-          </label>
+          <>
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={() => fileSideInputRef.current?.click()}
+            >
+              <Camera size={14} /> Subir foto lateral (ZY)
+            </button>
+            <input
+              ref={fileSideInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleFileSide}
+              hidden
+            />
+          </>
         )}
 
-        <label className="toggle-label">
-          <input
-            type="checkbox"
-            checked={topology.hasBackPanel}
-            onChange={(e) => onToggleBackPanel(e.target.checked)}
-          />
-          Fondo Durolac 3 mm
-        </label>
-
-        <label className="toggle-label">
-          <input
-            type="checkbox"
-            checked={Boolean(topology.hasExternalLegs)}
-            onChange={(e) => onToggleExternalLegs(e.target.checked)}
-          />
-          Tiene patas separadas (no melamina)
-        </label>
-
-        <div className="chip-row">
-          <span className="small-note muted">Profundidad rápida:</span>
-          {[320, 400, 500, 550].map((d) => (
+        {viewTab === 'frontal' && (
+          <>
+            <span className="toolbar-sep" />
             <button
-              key={d}
               type="button"
-              className={params.targetDimensions.z === d ? 'chip-btn active' : 'chip-btn'}
-              onClick={() => onSelectDepthMm(d)}
+              className={tool === 'corners' ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => setTool('corners')}
+              disabled={!hasPhoto}
+              title="Arrastra esquinas TL/TR/BR/BL o mueve líneas existentes"
             >
-              {d} mm
+              <Move size={13} /> Mover
             </button>
-          ))}
-        </div>
+            <button
+              type="button"
+              className={tool === 'vDivider' ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => setTool('vDivider')}
+              disabled={!hasPhoto}
+              title="Clic en la foto para agregar divisor vertical"
+            >
+              + Divisor
+            </button>
+            <button
+              type="button"
+              className={tool === 'hShelf' ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => setTool('hShelf')}
+              disabled={!hasPhoto}
+              title="Arrastra o haz clic dentro de un vano para agregar repisa"
+            >
+              + Repisa
+            </button>
+            <button
+              type="button"
+              className={tool === 'eyedropper' ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => setTool('eyedropper')}
+              disabled={!hasPhoto}
+              title="Toca un canto de melamina para muestrear su color y re-detectar"
+            >
+              <Pipette size={13} /> Gotero
+            </button>
+            <button
+              type="button"
+              className={tool === 'calibA4' ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => {
+                setCalibPts([]);
+                setTool('calibA4');
+              }}
+              disabled={!hasPhoto}
+              title="Marca 2 puntos sobre una hoja A4 (297 mm) o medida conocida"
+            >
+              <Ruler size={13} /> A4
+            </button>
+            <button
+              type="button"
+              className={tool === 'hardware' ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => setTool('hardware')}
+              disabled={!hasPhoto}
+              title="Marcar tirador o herraje externo"
+            >
+              <Wrench size={13} /> Tirador
+            </button>
+            <button
+              type="button"
+              className={tool === 'erase' ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => setTool('erase')}
+              disabled={!hasPhoto}
+              title="Clic sobre una línea para borrarla"
+            >
+              <Eraser size={13} /> Borrar
+            </button>
+            <span className="toolbar-sep" />
+            <button
+              type="button"
+              className="chip-btn"
+              onClick={handleUndo}
+              disabled={undoStack.length === 0}
+              title="Deshacer último cambio (Ctrl+Z)"
+            >
+              <Undo2 size={13} /> Deshacer
+            </button>
+            <button
+              type="button"
+              className="chip-btn"
+              onClick={handleClearLines}
+              disabled={!hasPhoto || (topology.vDividers.length === 0 && topology.hShelves.length === 0)}
+              title="Quitar todas las líneas internas"
+            >
+              <Trash2 size={13} /> Limpiar
+            </button>
+          </>
+        )}
       </div>
 
       {legHintDetected && !topology.hasExternalLegs && (
-        <div className="alert-box warning">
-          <strong>Posibles patas independientes detectadas debajo del mueble:</strong> enfoca el cuadro solo en el cuerpo de melamina y{' '}
+        <div className="alert-box warning compact-alert">
+          <span>Posibles patas externas detectadas debajo del cuerpo.</span>
           <button
             type="button"
             className="btn-small"
@@ -1090,158 +1303,82 @@ export function VectorCanvas({
         </div>
       )}
 
-      {topology.hasExternalLegs && (
-        <div className="ok-box">
-          Cuerpo de melamina aislado de las patas ({topology.externalLegCount ?? 4} patas de {topology.externalLegHeightMm ?? 150} mm registradas en Herrajes para compra aparte).
-        </div>
-      )}
-
-      {/* Barra de herramientas de vectorización y visión */}
-      {viewTab === 'frontal' && (
-        <div className="canvas-toolbar">
-          <button
-            type="button"
-            className="btn-primary"
-            onClick={() => runAutoDetection()}
-            disabled={!frontBitmap || !homography}
-          >
-            <ScanSearch size={15} /> Detectar estructura automáticamente
-          </button>
-
-          <button
-            type="button"
-            className={tool === 'corners' ? 'chip-btn active' : 'chip-btn'}
-            onClick={() => setTool('corners')}
-          >
-            <Crosshair size={13} /> 4 Esquinas
-          </button>
-          <button
-            type="button"
-            className={tool === 'eyedropper' ? 'chip-btn active' : 'chip-btn'}
-            onClick={() => setTool('eyedropper')}
-          >
-            <Pipette size={13} /> Gotero 1 clic
-          </button>
-          <button
-            type="button"
-            className={tool === 'vDivider' ? 'chip-btn active' : 'chip-btn'}
-            onClick={() => setTool('vDivider')}
-          >
-            + Divisor Vertical
-          </button>
-          <button
-            type="button"
-            className={tool === 'hShelf' ? 'chip-btn active' : 'chip-btn'}
-            onClick={() => setTool('hShelf')}
-          >
-            + Repisa Horizontal
-          </button>
-          <button
-            type="button"
-            className={tool === 'hardware' ? 'chip-btn active' : 'chip-btn'}
-            onClick={() => setTool('hardware')}
-          >
-            <Wrench size={13} /> Marcar Tirador
-          </button>
-          <button
-            type="button"
-            className={tool === 'calibA4' ? 'chip-btn active' : 'chip-btn'}
-            onClick={() => {
-              setCalibPts([]);
-              setTool('calibA4');
-            }}
-          >
-            <Ruler size={13} /> Calibrar A4
-          </button>
-          <button
-            type="button"
-            className={tool === 'erase' ? 'chip-btn active' : 'chip-btn'}
-            onClick={() => setTool('erase')}
-          >
-            <Eraser size={13} /> Borrar
-          </button>
-
-          <select
-            className="select-input"
-            style={{ width: 135 }}
-            value={focal35mm}
-            onChange={(e) => setFocal35mm(Number(e.target.value) as 26 | 52)}
-          >
-            <option value={26}>Lente 1× (26 mm)</option>
-            <option value={52}>Lente 2× (52 mm)</option>
-          </select>
-        </div>
-      )}
-
-      {/* Calibración rápida por 1 sola medida (extrapolación) + Calibración A4 */}
-      {viewTab === 'frontal' && frontBitmap && (
-        <div className="calib-box">
-          <strong>Calibración rápida (1 medida → extrapola todo):</strong>
-          <select
-            value={knownAxis}
-            onChange={(e) => setKnownAxis(e.target.value as 'x' | 'y')}
-          >
-            <option value="x">Ancho total cuerpo (mm)</option>
-            <option value="y">Alto cuerpo sin patas (mm)</option>
-          </select>
-          <input
-            type="number"
-            min={300}
-            max={2600}
-            value={knownMeasureMm}
-            onChange={(e) => setKnownMeasureMm(Number(e.target.value) || 800)}
-            style={{ width: 82 }}
-          />
-          <button type="button" className="btn-small" onClick={handleApplySingleMeasure}>
-            Confirmar y extrapolar
-          </button>
-
-          {tool === 'calibA4' && (
-            <>
-              <span>| Ref. segmento (mm):</span>
-              <input
-                type="number"
-                value={calibRefMm}
-                onChange={(e) => setCalibRefMm(Number(e.target.value) || 297)}
-                style={{ width: 68 }}
-              />
-              <button type="button" className="chip-btn" onClick={() => setCalibRefMm(297)}>
-                Hoja A4 (297 mm)
-              </button>
-              <button
-                type="button"
-                className="btn-primary"
-                disabled={calibPts.length !== 2}
-                onClick={handleApplyCalibA4}
-              >
-                Aplicar calibración A4 ({calibPts.length}/2 pts)
-              </button>
-            </>
-          )}
-        </div>
-      )}
-
-      {!homography && viewTab === 'frontal' && (
+      {!homography && viewTab === 'frontal' && hasPhoto && (
         <div className="alert-box critical">
           Cuadrilátero degenerado o cruzado. Separa las 4 esquinas en orden horario (TL, TR, BR, BL).
         </div>
       )}
 
-      <p className="muted small-note">{statusMsg}</p>
-
+      {/* Lienzo principal (above the fold) + vista rectificada */}
       <div className="canvas-layout">
-        <div className="photo-canvas-wrap">
-          <canvas
-            ref={canvasRef}
-            className="photo-canvas"
-            onPointerDown={handlePointerDown}
-            onPointerMove={handlePointerMove}
-            onPointerUp={handlePointerUp}
-          />
+        <div
+          className={isDragOver ? 'photo-canvas-wrap drag-over' : 'photo-canvas-wrap'}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setIsDragOver(true);
+          }}
+          onDragLeave={() => setIsDragOver(false)}
+          onDrop={handleDropFile}
+        >
+          {activeBmp ? (
+            <canvas
+              ref={canvasRef}
+              className="photo-canvas"
+              style={{ cursor: canvasCursor }}
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerUp}
+            />
+          ) : (
+            <div className="photo-dropzone">
+              <Upload size={32} />
+              <strong>
+                {viewTab === 'frontal'
+                  ? 'Arrastra tu foto frontal aquí o selecciónala'
+                  : 'Arrastra una foto lateral (ZY) opcional'}
+              </strong>
+              <p className="small-note muted">
+                Procesamiento 100 % local en tu navegador · Compatible con fotos de celular
+              </p>
+              <div className="chip-row">
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={() =>
+                    viewTab === 'frontal'
+                      ? fileFrontalInputRef.current?.click()
+                      : fileSideInputRef.current?.click()
+                  }
+                >
+                  <Camera size={14} /> Elegir archivo
+                </button>
+                {viewTab === 'frontal' && (
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => loadFrontalFromUrl(generateSampleFurnitureDataUrl(), true)}
+                  >
+                    <Sparkles size={14} /> Probar con croquis local
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="rect-preview-panel">
-          <strong>Vista Rectificada (H)</strong>
+          <div className="card-header-row">
+            <strong>Vista Rectificada</strong>
+            <select
+              className="select-mini"
+              value={focal35mm}
+              onChange={(e) => setFocal35mm(Number(e.target.value) as 26 | 52)}
+              aria-label="Lente de cámara"
+            >
+              <option value={26}>1× (26mm)</option>
+              <option value={52}>2× (52mm)</option>
+            </select>
+          </div>
           <canvas ref={rectPreviewRef} className="rect-preview-canvas" />
           <div className="mono small-note">
             W/H est.: <strong>{estimatedAspectXY.toFixed(3)}</strong>
@@ -1249,8 +1386,8 @@ export function VectorCanvas({
           {conf !== undefined && topology.detectionSource === 'auto' && (
             <div className={`conf-badge ${confClass}`}>
               {detectedModeLabel ? `${detectedModeLabel} · ` : ''}
-              Confianza: {Math.round(conf * 100)}%
-              {conf < 0.5 ? ' — Trazar manual' : conf < 0.7 ? ' — Revisar' : ' — Alta'}
+              {Math.round(conf * 100)}%
+              {conf < 0.5 ? ' (Manual)' : conf < 0.7 ? ' (Revisar)' : ' (Alta)'}
             </div>
           )}
           <div className="small-note muted">
@@ -1258,6 +1395,60 @@ export function VectorCanvas({
           </div>
         </div>
       </div>
+
+      {/* Estado + Calibración métrica debajo del lienzo */}
+      <p className="status-line">{statusMsg}</p>
+
+      {viewTab === 'frontal' && hasPhoto && (
+        <div className="calib-box">
+          <strong>Calibrar escala:</strong>
+          <select
+            value={knownAxis}
+            onChange={(e) => setKnownAxis(e.target.value as 'x' | 'y')}
+          >
+            <option value="x">Ancho cuerpo (mm)</option>
+            <option value="y">Alto cuerpo sin patas (mm)</option>
+          </select>
+          <NumericInput
+            min={300}
+            max={2600}
+            step={10}
+            value={knownMeasureMm}
+            onCommit={setKnownMeasureMm}
+            style={{ width: 82 }}
+            ariaLabel="Medida conocida en milímetros"
+          />
+          <button type="button" className="btn-small" onClick={handleApplySingleMeasure}>
+            Extrapolar V<sub>f</sub>
+          </button>
+
+          {tool === 'calibA4' && (
+            <>
+              <span className="toolbar-sep" />
+              <span>Segmento (mm):</span>
+              <NumericInput
+                min={50}
+                max={2500}
+                value={calibRefMm}
+                onCommit={setCalibRefMm}
+                style={{ width: 68 }}
+                ariaLabel="Longitud de referencia A4 en milímetros"
+              />
+              <button type="button" className="chip-btn" onClick={() => setCalibRefMm(297)}>
+                A4 (297)
+              </button>
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={calibPts.length !== 2}
+                onClick={handleApplyCalibA4}
+              >
+                Aplicar A4 ({calibPts.length}/2)
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

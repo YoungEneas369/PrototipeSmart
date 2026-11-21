@@ -1,5 +1,5 @@
 /**
- * SMARTFURNITURE v3.0 — APLICACIÓN PRINCIPAL 100% LOCAL Y OFFLINE
+ * SMARTFURNITURE v3.1 — APLICACIÓN PRINCIPAL 100% LOCAL Y OFFLINE
  * Flujo de 4 pasos + 3 Presets oficiales + Vista Dividida Foto <-> 3D + Exportación Excel/CSV/SVG.
  */
 import { useMemo, useState } from 'react';
@@ -21,6 +21,7 @@ import { generateCuttingPlan } from './core/cuttingStock';
 import { Viewer3D } from './components/viewer3d/Viewer3D';
 import { MathPanel } from './components/mathPanel/MathPanel';
 import { VectorCanvas } from './components/vectorCanvas/VectorCanvas';
+import { NumericInput } from './components/NumericInput';
 
 type ActiveStep = 'foto' | 'split' | '3d';
 type SheetStandard = 'pauta' | 'chile';
@@ -34,10 +35,7 @@ export default function App() {
   const [sheetStandard, setSheetStandard] = useState<SheetStandard>('pauta');
   const [activeStep, setActiveStep] = useState<ActiveStep>('3d');
 
-  const despiece = useMemo(
-    () => calculateDespiece(topology, params),
-    [topology, params],
-  );
+  const despiece = useMemo(() => calculateDespiece(topology, params), [topology, params]);
 
   const cuttingPlan = useMemo(
     () => generateCuttingPlan(despiece.matrizDespiece, params),
@@ -124,9 +122,9 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <div className="brand-title">SmartFurniture v3.0 — Diseño Paramétrico &amp; Corte 2D</div>
+          <div className="brand-title">SmartFurniture v3.1 — Diseño Paramétrico &amp; Corte 2D</div>
           <div className="brand-sub">
-            100% Local Offline · INACAP Funciones y Matrices (Unidad 3) · Melamina {params.boardThickness} mm + Herrajes
+            100% Local Offline · INACAP Funciones y Matrices (Unidad 3) · Melamina {params.boardThickness} mm
           </div>
         </div>
         <div className="preset-bar">
@@ -150,43 +148,44 @@ export default function App() {
             className={activeStep === 'foto' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('foto')}
           >
-            1–2. Foto, Homografía y Visión
+            1–2. Foto y Visión
           </button>
           <button
             type="button"
             className={activeStep === 'split' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('split')}
           >
-            Vista Dividida (Foto ↔ 3D en Vivo)
+            Foto ↔ 3D en Vivo
           </button>
           <button
             type="button"
             className={activeStep === '3d' ? 'step-btn active' : 'step-btn'}
             onClick={() => setActiveStep('3d')}
           >
-            3–4. Visor 3D, Unidad 3 y Plano de Corte
+            3–4. 3D, Unidad 3 y Corte
           </button>
         </div>
         <span className="small-note muted">
-          Cuerpo: {params.targetDimensions.x}×{params.targetDimensions.y}×{params.targetDimensions.z} mm ·{' '}
+          Cuerpo: <strong>{params.targetDimensions.x}×{params.targetDimensions.y}×{params.targetDimensions.z} mm</strong> ·{' '}
           {cuttingPlan.totalSheetsCount} plancha(s) ({cuttingPlan.usagePercentage.toFixed(1)}% uso)
         </span>
       </nav>
 
       <div className="workspace-grid">
-        {/* PANEL LATERAL DE PARÁMETROS */}
+        {/* PANEL LATERAL DE PARÁMETROS (pasa debajo del 3D/Foto automáticamente en móvil) */}
         <aside className="sidebar-controls">
           <div className="control-group">
-            <h3>Dimensiones Cuerpo V_f (mm)</h3>
+            <h3>Dimensiones Cuerpo V<sub>f</sub> (mm)</h3>
             <div className="slider-row">
               <div className="slider-head">
                 <label>Ancho X</label>
-                <input
-                  type="number"
+                <NumericInput
                   min={300}
                   max={2400}
+                  step={10}
                   value={params.targetDimensions.x}
-                  onChange={(e) => updateTargetDim('x', Number(e.target.value) || 300)}
+                  onCommit={(v) => updateTargetDim('x', v)}
+                  ariaLabel="Ancho X en milímetros"
                 />
               </div>
               <input
@@ -201,13 +200,14 @@ export default function App() {
 
             <div className="slider-row">
               <div className="slider-head">
-                <label>Alto Y (cuerpo melamina)</label>
-                <input
-                  type="number"
+                <label>Alto Y (cuerpo)</label>
+                <NumericInput
                   min={300}
                   max={2400}
+                  step={10}
                   value={params.targetDimensions.y}
-                  onChange={(e) => updateTargetDim('y', Number(e.target.value) || 300)}
+                  onCommit={(v) => updateTargetDim('y', v)}
+                  ariaLabel="Alto Y en milímetros"
                 />
               </div>
               <input
@@ -223,12 +223,13 @@ export default function App() {
             <div className="slider-row">
               <div className="slider-head">
                 <label>Profundidad Z</label>
-                <input
-                  type="number"
+                <NumericInput
                   min={200}
                   max={800}
+                  step={10}
                   value={params.targetDimensions.z}
-                  onChange={(e) => updateTargetDim('z', Number(e.target.value) || 200)}
+                  onCommit={(v) => updateTargetDim('z', v)}
+                  ariaLabel="Profundidad Z en milímetros"
                 />
               </div>
               <input
@@ -289,7 +290,7 @@ export default function App() {
                   setTopology((prev) => ({ ...prev, hasBackPanel: e.target.checked }))
                 }
               />
-              Incluir Fondo Durolac 3 mm (n×3 → n×5)
+              Fondo Durolac 3 mm (n×3 → n×5)
             </label>
 
             <label className="toggle-label">
@@ -298,34 +299,32 @@ export default function App() {
                 checked={Boolean(topology.hasExternalLegs)}
                 onChange={(e) => handleToggleExternalLegs(e.target.checked)}
               />
-              Patas externas independientes (no melamina)
+              Patas externas independientes
             </label>
             {topology.hasExternalLegs && (
               <div className="chip-row">
-                <label className="small-note">
-                  Alto patas (mm):
-                  <input
-                    type="number"
+                <label className="small-note inline-num">
+                  Alto (mm):
+                  <NumericInput
                     min={40}
                     max={400}
+                    step={10}
                     value={topology.externalLegHeightMm ?? 150}
-                    onChange={(e) =>
-                      handleToggleExternalLegs(true, Number(e.target.value) || 150, topology.externalLegCount)
-                    }
-                    style={{ width: 64, marginLeft: 4 }}
+                    onCommit={(v) => handleToggleExternalLegs(true, v, topology.externalLegCount)}
+                    style={{ width: 62 }}
+                    ariaLabel="Alto de patas en milímetros"
                   />
                 </label>
-                <label className="small-note">
+                <label className="small-note inline-num">
                   Cant:
-                  <input
-                    type="number"
+                  <NumericInput
                     min={2}
                     max={12}
+                    step={2}
                     value={topology.externalLegCount ?? 4}
-                    onChange={(e) =>
-                      handleToggleExternalLegs(true, topology.externalLegHeightMm, Number(e.target.value) || 4)
-                    }
-                    style={{ width: 48, marginLeft: 4 }}
+                    onCommit={(v) => handleToggleExternalLegs(true, topology.externalLegHeightMm, v)}
+                    style={{ width: 48 }}
+                    ariaLabel="Cantidad de patas"
                   />
                 </label>
               </div>
@@ -403,7 +402,7 @@ export default function App() {
                 checked={params.respectGrain}
                 onChange={(e) => setParams((p) => ({ ...p, respectGrain: e.target.checked }))}
               />
-              Respetar sentido de veta (bloquea rotación 90°)
+              Respetar sentido de veta (bloquea 90°)
             </label>
 
             <div className="chip-row">
@@ -465,7 +464,7 @@ export default function App() {
           </div>
         </aside>
 
-        {/* ESCENARIO CENTRAL — VectorCanvas se mantiene SIEMPRE montado para no perder la foto al cambiar de vista */}
+        {/* ESCENARIO CENTRAL (siempre arriba en móvil; VectorCanvas permanece montado) */}
         <main className="main-stage">
           <div className={activeStep === 'split' ? 'split-stage' : ''}>
             <div className={activeStep === '3d' ? 'hidden-panel' : ''}>
@@ -483,9 +482,6 @@ export default function App() {
                     targetDimensions: { ...dims },
                   }));
                 }}
-                onToggleBackPanel={(checked) =>
-                  setTopology((prev) => ({ ...prev, hasBackPanel: checked }))
-                }
                 onToggleExternalLegs={handleToggleExternalLegs}
                 onAddHardwareItem={handleAddHardwareItem}
                 onSelectDepthMm={(z) => updateTargetDim('z', z)}
@@ -498,6 +494,9 @@ export default function App() {
                 topology={topology}
                 params={params}
                 explodeFactor={explodeFactor}
+                onAddCenterDivider={() => {
+                  if (!hasCenterDivider) handleToggleCenterDivider();
+                }}
               />
             )}
           </div>

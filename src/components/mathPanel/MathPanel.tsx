@@ -1,16 +1,21 @@
 /**
- * SMARTFURNITURE — PANEL MATEMÁTICO (UNIDAD 3), HERRAJES Y PLANO DE CORTE 2D (v3.0)
- * 5 pestañas limpias y legibles para grabación de video + exportación offline (.xls / .csv / .svg).
+ * SMARTFURNITURE — PANEL MATEMÁTICO (UNIDAD 3), HERRAJES Y PLANO DE CORTE 2D (v3.1 UX)
+ * - Tipografía matemática con subíndices reales para grabación de video.
+ * - Badge visual destacado en pestaña Alertas, toast de confirmación en descargas/acciones
+ *   y zoom + leyenda de colores en plano de corte SVG.
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
+  CheckCircle2,
   Download,
   FileSpreadsheet,
   Grid,
   Layers,
   Sigma,
   Wrench,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import type {
   CuttingPlanResult,
@@ -28,6 +33,7 @@ import {
   generateDespieceCsv,
   generateExcelSpreadsheetML,
 } from '../../core/cuttingStock';
+import { NumericInput } from '../NumericInput';
 
 interface MathPanelProps {
   despiece: DespieceResult;
@@ -66,9 +72,19 @@ export function MathPanel({
 }: MathPanelProps) {
   const [tab, setTab] = useState<PanelTab>('unidad3');
   const [matrixOverride, setMatrixOverride] = useState<'auto' | 'nx3' | 'nx5'>('auto');
+  const [svgZoom, setSvgZoom] = useState<number>(100);
+  const [toast, setToast] = useState<string | null>(null);
   const [hwCategory, setHwCategory] = useState<HardwareCategory>('tiradores');
   const [hwDesc, setHwDesc] = useState('Tirador metálico 128 mm');
   const [hwQty, setHwQty] = useState(2);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 2600);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  const showToast = (msg: string) => setToast(msg);
 
   const etapa2Demo = scaleBaseMatrix(ETAPA2_BASE_MATRIX_M0, 1.2, 1.2);
   const { kx, ky, kz } = despiece.scaleFactors;
@@ -76,31 +92,33 @@ export function MathPanel({
   const melamineAreaM2 = Math.max(0, despiece.totalNetAreaM2 - despiece.backPanelAreaM2);
   const activeMatrixView: 'nx3' | 'nx5' =
     matrixOverride === 'auto' ? (topology.hasBackPanel ? 'nx5' : 'nx3') : matrixOverride;
+  const hasCriticalAlert = despiece.alerts.some((a) => a.severidad === 'critical');
+
+  const handleFixV0 = () => {
+    onFixReferenceV0();
+    showToast(
+      `V₀ fijado en (${params.targetDimensions.x}, ${params.targetDimensions.y}, ${params.targetDimensions.z}) mm — mueve X/Y/Z para ver k.`,
+    );
+  };
 
   const handleExportExcel = () => {
     const xls = generateExcelSpreadsheetML(despiece, cuttingPlan, params);
-    triggerDownload(
-      `smartfurniture_despiece_${params.targetDimensions.x}x${params.targetDimensions.y}.xls`,
-      xls,
-      'application/vnd.ms-excel;charset=utf-8',
-    );
+    const filename = `smartfurniture_despiece_${params.targetDimensions.x}x${params.targetDimensions.y}.xls`;
+    triggerDownload(filename, xls, 'application/vnd.ms-excel;charset=utf-8');
+    showToast(`Descargado ${filename} (3 hojas offline)`);
   };
 
   const handleExportCsv = () => {
     const csv = generateDespieceCsv(despiece, ';');
-    triggerDownload(
-      `smartfurniture_despiece_${params.targetDimensions.x}x${params.targetDimensions.y}.csv`,
-      csv,
-      'text/csv;charset=utf-8',
-    );
+    const filename = `smartfurniture_despiece_${params.targetDimensions.x}x${params.targetDimensions.y}.csv`;
+    triggerDownload(filename, csv, 'text/csv;charset=utf-8');
+    showToast(`Descargado ${filename} (BOM UTF-8 + ;)`);
   };
 
   const handleExportSvg = () => {
-    triggerDownload(
-      `smartfurniture_corte_${params.targetDimensions.x}x${params.targetDimensions.y}.svg`,
-      cuttingPlan.svgMarkup,
-      'image/svg+xml;charset=utf-8',
-    );
+    const filename = `smartfurniture_corte_${params.targetDimensions.x}x${params.targetDimensions.y}.svg`;
+    triggerDownload(filename, cuttingPlan.svgMarkup, 'image/svg+xml;charset=utf-8');
+    showToast(`Descargado plano vectorial ${filename}`);
   };
 
   const handleAddHw = () => {
@@ -113,11 +131,18 @@ export function MathPanel({
       notaCompra: 'Accesorio ajeno a melamina — adquirir en ferretería aparte.',
       origen: 'manual',
     });
+    showToast(`Herraje agregado: ${hwDesc.trim()} × ${hwQty}`);
     setHwDesc('');
   };
 
   return (
     <div className="math-panel">
+      {toast && (
+        <div className="toast-banner" role="status" aria-live="polite">
+          <CheckCircle2 size={15} /> {toast}
+        </div>
+      )}
+
       <div className="panel-tabs">
         <button
           type="button"
@@ -128,10 +153,23 @@ export function MathPanel({
         </button>
         <button
           type="button"
-          className={tab === 'alertas' ? 'tab-btn active' : 'tab-btn'}
+          className={[
+            'tab-btn',
+            tab === 'alertas' ? 'active' : '',
+            despiece.alerts.length > 0
+              ? hasCriticalAlert
+                ? 'tab-alert-critical'
+                : 'tab-alert-warning'
+              : '',
+          ]
+            .filter(Boolean)
+            .join(' ')}
           onClick={() => setTab('alertas')}
         >
-          <AlertTriangle size={15} /> Alertas ({despiece.alerts.length})
+          <AlertTriangle size={15} /> Alertas
+          {despiece.alerts.length > 0 && (
+            <span className="tab-count-pill">{despiece.alerts.length}</span>
+          )}
         </button>
         <button
           type="button"
@@ -162,18 +200,21 @@ export function MathPanel({
             <div className="metric-card">
               <div className="card-header-row">
                 <h4>1. Vectores en ℝ³ y Escalamiento (e = {params.boardThickness} mm invariante)</h4>
-                <button type="button" className="btn-small" onClick={onFixReferenceV0}>
-                  Fijar V₀ actual
+                <button type="button" className="btn-small" onClick={handleFixV0}>
+                  Fijar V<sub>0</sub> actual
                 </button>
               </div>
-              <p className="mono">
-                V₀ = ({params.referenceDimensions.x}, {params.referenceDimensions.y}, {params.referenceDimensions.z}) mm
+              <p className="math-eq">
+                V<sub>0</sub> = ({params.referenceDimensions.x}, {params.referenceDimensions.y},{' '}
+                {params.referenceDimensions.z}) mm
               </p>
-              <p className="mono">
-                V_f = ({params.targetDimensions.x}, {params.targetDimensions.y}, {params.targetDimensions.z}) mm
+              <p className="math-eq">
+                V<sub>f</sub> = ({params.targetDimensions.x}, {params.targetDimensions.y},{' '}
+                {params.targetDimensions.z}) mm
               </p>
-              <p className="mono accent">
-                k = (k_x={kx.toFixed(3)}, k_y={ky.toFixed(3)}, k_z={kz.toFixed(3)}) · Espesor e = {params.boardThickness} mm constante
+              <p className="math-eq accent">
+                k = (k<sub>x</sub> = {kx.toFixed(3)}, k<sub>y</sub> = {ky.toFixed(3)}, k
+                <sub>z</sub> = {kz.toFixed(3)}) · Espesor e = {params.boardThickness} mm constante
               </p>
             </div>
 
@@ -181,19 +222,20 @@ export function MathPanel({
               <h4>2. Progresión Aritmética de Repisas ({topology.shelfMode})</h4>
               {topology.shelfMode === 'equidistant' && prog.count > 0 ? (
                 <>
-                  <p className="mono">
-                    H_int = {prog.hInteriorMm.toFixed(1)} mm · s_libre = {prog.clearSpanMm.toFixed(2)} mm
+                  <p className="math-eq">
+                    H<sub>int</sub> = {prog.hInteriorMm.toFixed(1)} mm · s<sub>libre</sub> ={' '}
+                    {prog.clearSpanMm.toFixed(2)} mm
                   </p>
-                  <p className="mono">
-                    a₁ = {prog.a1.toFixed(2)} mm · d = {prog.d.toFixed(2)} mm
+                  <p className="math-eq">
+                    a<sub>1</sub> = {prog.a1.toFixed(2)} mm · d = {prog.d.toFixed(2)} mm
                   </p>
-                  <p className="mono">
-                    a_n = [{prog.terms.map((t) => t.toFixed(1)).join(', ')}] mm
+                  <p className="math-eq">
+                    a<sub>n</sub> = [{prog.terms.map((t) => t.toFixed(1)).join(', ')}] mm
                   </p>
                 </>
               ) : (
-                <p className="muted">
-                  Modo personalizado (`custom`): {topology.hShelves.length} repisas definidas en espacio interior [0, 1]².
+                <p className="muted small-note">
+                  Modo personalizado (<code>custom</code>): {topology.hShelves.length} repisas definidas en espacio interior [0, 1]².
                 </p>
               )}
             </div>
@@ -214,12 +256,17 @@ export function MathPanel({
                   <strong>{despiece.totalNetAreaM2.toFixed(4)} m²</strong>
                 </div>
                 <div>
-                  <span className="kpi-label">Tapacanto ({params.edgeBandingMode === 'fullPerimeter' ? 'Perímetro' : 'Vistos'})</span>
+                  <span className="kpi-label">
+                    Tapacanto ({params.edgeBandingMode === 'fullPerimeter' ? 'Perímetro' : 'Vistos'})
+                  </span>
                   <strong>{despiece.totalEdgeBandingMeters.toFixed(2)} m</strong>
                 </div>
               </div>
               <p className="muted small-note">
-                Validación matricial Etapa 2 (M = M₀·diag(1.2, 1.2, 1)): {etapa2Demo.originalAreaM2.toFixed(4)} → {etapa2Demo.scaledAreaM2.toFixed(4)} m² · Tapacanto {etapa2Demo.originalEdgeBandingMeters.toFixed(2)} → {etapa2Demo.scaledEdgeBandingMeters.toFixed(2)} m.
+                Validación matricial Etapa 2 (M = M<sub>0</sub> · diag(1.2, 1.2, 1)):{' '}
+                {etapa2Demo.originalAreaM2.toFixed(4)} → {etapa2Demo.scaledAreaM2.toFixed(4)} m² · Tapacanto{' '}
+                {etapa2Demo.originalEdgeBandingMeters.toFixed(2)} →{' '}
+                {etapa2Demo.scaledEdgeBandingMeters.toFixed(2)} m.
               </p>
             </div>
 
@@ -249,7 +296,9 @@ export function MathPanel({
                     key={al.id}
                     className={al.severidad === 'critical' ? 'alert-box critical' : 'alert-box warning'}
                   >
-                    <strong>[{al.severidad.toUpperCase()}] {al.tipo}</strong>
+                    <strong>
+                      [{al.severidad.toUpperCase()}] {al.tipo}
+                    </strong>
                     <p>{al.mensaje}</p>
                   </div>
                 ))}
@@ -372,7 +421,9 @@ export function MathPanel({
                 {despiece.hardwareSummary.map((hw) => (
                   <div key={hw.id} className="hw-card">
                     <div>
-                      <strong>[{hw.categoria.toUpperCase()}] {hw.descripcion} × {hw.cantidad}</strong>
+                      <strong>
+                        [{hw.categoria.toUpperCase()}] {hw.descripcion} × {hw.cantidad}
+                      </strong>
                       <p className="muted small-note">{hw.notaCompra}</p>
                     </div>
                     {hw.id !== 'hw_patas_externas' && (
@@ -406,15 +457,15 @@ export function MathPanel({
                 onChange={(e) => setHwDesc(e.target.value)}
                 placeholder="Ej. Tirador metálico 128 mm"
               />
-              <input
-                type="number"
+              <NumericInput
                 min={1}
                 max={50}
                 value={hwQty}
-                onChange={(e) => setHwQty(Number(e.target.value) || 1)}
+                onCommit={setHwQty}
                 style={{ width: 64 }}
+                ariaLabel="Cantidad de herraje"
               />
-              <button type="button" className="btn-small" onClick={handleAddHw}>
+              <button type="button" className="btn-small" onClick={handleAddHw} disabled={!hwDesc.trim()}>
                 + Agregar
               </button>
             </div>
@@ -426,11 +477,11 @@ export function MathPanel({
             <div className="kpi-grid">
               <div>
                 <span className="kpi-label">Melamina 18 mm</span>
-                <strong>{cuttingPlan.melamineSheetsCount} planchas</strong>
+                <strong>{cuttingPlan.melamineSheetsCount} plancha(s)</strong>
               </div>
               <div>
                 <span className="kpi-label">Fondo 3 mm</span>
-                <strong>{cuttingPlan.backPanelSheetsCount} planchas</strong>
+                <strong>{cuttingPlan.backPanelSheetsCount} plancha(s)</strong>
               </div>
               <div>
                 <span className="kpi-label">Aprovechamiento</span>
@@ -449,19 +500,57 @@ export function MathPanel({
               </div>
             )}
 
-            <div className="export-bar">
-              <button type="button" className="btn-primary" onClick={handleExportSvg}>
-                <Download size={15} /> Descargar Plano SVG
-              </button>
-              <button type="button" className="btn-secondary" onClick={handleExportExcel}>
-                <FileSpreadsheet size={15} /> Exportar Excel (.xls)
-              </button>
+            <div className="card-header-row">
+              <div className="export-bar">
+                <button type="button" className="btn-primary" onClick={handleExportSvg}>
+                  <Download size={15} /> Descargar Plano SVG
+                </button>
+                <button type="button" className="btn-secondary" onClick={handleExportExcel}>
+                  <FileSpreadsheet size={15} /> Exportar Excel (.xls)
+                </button>
+              </div>
+              <div className="chip-row">
+                <button
+                  type="button"
+                  className="chip-btn"
+                  onClick={() => setSvgZoom((z) => Math.max(60, z - 20))}
+                  title="Alejar plano"
+                >
+                  <ZoomOut size={13} />
+                </button>
+                <button
+                  type="button"
+                  className="chip-btn"
+                  onClick={() => setSvgZoom(100)}
+                  title="Restablecer zoom"
+                >
+                  {svgZoom}%
+                </button>
+                <button
+                  type="button"
+                  className="chip-btn"
+                  onClick={() => setSvgZoom((z) => Math.min(200, z + 20))}
+                  title="Acercar plano"
+                >
+                  <ZoomIn size={13} />
+                </button>
+              </div>
             </div>
 
-            <div
-              className="svg-preview"
-              dangerouslySetInnerHTML={{ __html: cuttingPlan.svgMarkup }}
-            />
+            <div className="svg-legend">
+              <span><i style={{ background: '#dcfce7', borderColor: '#15803d' }} /> Cubierta / Base</span>
+              <span><i style={{ background: '#dbeafe', borderColor: '#1d4ed8' }} /> Laterales</span>
+              <span><i style={{ background: '#ede9fe', borderColor: '#6d28d9' }} /> Divisores</span>
+              <span><i style={{ background: '#e0f2fe', borderColor: '#0369a1' }} /> Repisas</span>
+              <span><i style={{ background: '#fef3c7', borderColor: '#b45309' }} /> Fondo 3 mm</span>
+            </div>
+
+            <div className="svg-preview">
+              <div
+                style={{ width: `${svgZoom}%`, minWidth: '100%' }}
+                dangerouslySetInnerHTML={{ __html: cuttingPlan.svgMarkup }}
+              />
+            </div>
           </div>
         )}
       </div>

@@ -1,13 +1,15 @@
 /**
- * SMARTFURNITURE — VISOR 3D PARAMÉTRICO 100% OFFLINE (v3.0)
+ * SMARTFURNITURE — VISOR 3D PARAMÉTRICO 100% OFFLINE (v3.1 UX)
  * - Three.js 0.162 + R3F 8.18 + Drei 9.122 (luces nativas, cero Environment/HDRI remoto).
- * - Texturas procedurales `THREE.CanvasTexture` memorizadas SOLO por `params.material` + dispose().
- * - Patas externas dibujadas como referencia metálica separada sin alterar cotas del cuerpo.
- * - Resaltado en ámbar/rojo para piezas con alerta de pandeo (> 850 mm) + Vista Explotada + Cotas 3D.
+ * - Texturas procedurales `THREE.CanvasTexture` con veta orientada (horizontal vs vertical en laterales).
+ * - Controles rápidos de cámara (Isométrica, Frontal, Lateral) y toggle de cotas 3D (auto-ocultas al explotar).
+ * - Aviso en vivo de pandeo (> 850 mm) con botón rápido "+ Divisor central".
  */
-import { useEffect, useMemo } from 'react';
-import { Canvas } from '@react-three/fiber';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ComponentRef } from 'react';
+import { Canvas, useThree } from '@react-three/fiber';
 import { Edges, Html, Line, OrbitControls } from '@react-three/drei';
+import { AlertTriangle, Eye, EyeOff, RotateCcw } from 'lucide-react';
 import * as THREE from 'three';
 import type {
   BoardPiece,
@@ -22,15 +24,27 @@ interface Viewer3DProps {
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
   explodeFactor: number;
+  onAddCenterDivider?: () => void;
 }
 
-function createProceduralTexture(kind: MelamineMaterial | 'durolac_3mm'): THREE.CanvasTexture {
+type CameraPreset = 'iso' | 'front' | 'side';
+
+function createProceduralTexture(
+  kind: MelamineMaterial | 'durolac_3mm',
+  verticalGrain = false,
+): THREE.CanvasTexture {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
   canvas.height = 256;
   const ctx = canvas.getContext('2d');
 
   if (ctx) {
+    if (verticalGrain) {
+      ctx.translate(128, 128);
+      ctx.rotate(Math.PI / 2);
+      ctx.translate(-128, -128);
+    }
+
     if (kind === 'blanco') {
       ctx.fillStyle = '#f4f6f8';
       ctx.fillRect(0, 0, 256, 256);
@@ -63,7 +77,6 @@ function createProceduralTexture(kind: MelamineMaterial | 'durolac_3mm'): THREE.
         ctx.stroke();
       }
     } else {
-      // durolac_3mm
       ctx.fillStyle = '#a47e58';
       ctx.fillRect(0, 0, 256, 256);
       ctx.fillStyle = 'rgba(65, 42, 20, 0.12)';
@@ -81,12 +94,51 @@ function createProceduralTexture(kind: MelamineMaterial | 'durolac_3mm'): THREE.
   return tex;
 }
 
+function CameraRig({
+  preset,
+  presetTrigger,
+  camDist,
+  targetY,
+}: {
+  preset: CameraPreset;
+  presetTrigger: number;
+  camDist: number;
+  targetY: number;
+}) {
+  const { camera } = useThree();
+  const controlsRef = useRef<ComponentRef<typeof OrbitControls> | null>(null);
+
+  useEffect(() => {
+    const pos: [number, number, number] =
+      preset === 'front'
+        ? [0, targetY, camDist * 1.38]
+        : preset === 'side'
+          ? [camDist * 1.38, targetY * 1.05, 0.02]
+          : [camDist * 0.72, Math.max(targetY * 1.15, camDist * 0.58), camDist * 1.05];
+
+    camera.position.set(pos[0], pos[1], pos[2]);
+    if (controlsRef.current) {
+      controlsRef.current.target.set(0, targetY, 0);
+      controlsRef.current.update();
+    } else {
+      camera.lookAt(0, targetY, 0);
+    }
+  }, [camera, preset, presetTrigger, camDist, targetY]);
+
+  return <OrbitControls ref={controlsRef} makeDefault enableDamping dampingFactor={0.08} />;
+}
+
+interface MeshGroupProps extends Viewer3DProps {
+  showDimensions: boolean;
+}
+
 function FurnitureMeshGroup({
   despiece,
   topology,
   params,
   explodeFactor,
-}: Viewer3DProps) {
+  showDimensions,
+}: MeshGroupProps) {
   const { x: xf, y: yf, z: zf } = params.targetDimensions;
   const legHeightMm = topology.hasExternalLegs ? Math.max(40, topology.externalLegHeightMm ?? 150) : 0;
   const legOffsetY = legHeightMm / 1000;
@@ -94,14 +146,16 @@ function FurnitureMeshGroup({
   // Texturas memorizadas SOLO por params.material + limpieza explícita dispose()
   const textures = useMemo(() => {
     return {
-      melamine: createProceduralTexture(params.material),
-      durolac: createProceduralTexture('durolac_3mm'),
+      melamineHoriz: createProceduralTexture(params.material, false),
+      melamineVert: createProceduralTexture(params.material, true),
+      durolac: createProceduralTexture('durolac_3mm', false),
     };
   }, [params.material]);
 
   useEffect(() => {
     return () => {
-      textures.melamine.dispose();
+      textures.melamineHoriz.dispose();
+      textures.melamineVert.dispose();
       textures.durolac.dispose();
     };
   }, [textures]);
@@ -162,6 +216,7 @@ function FurnitureMeshGroup({
   }, [topology.externalLegCount, xm, zm, legInset]);
 
   const edgeLineColor = params.material === 'grafito' ? '#94a3b8' : '#334155';
+  const renderDims = showDimensions && explodeFactor <= 0.1;
 
   return (
     <group position={[-xm / 2, 0, -zm / 2]}>
@@ -169,11 +224,7 @@ function FurnitureMeshGroup({
       {topology.hasExternalLegs && legHeightMm > 0 && (
         <group>
           {legCoords.map(([lx, lz], idx) => (
-            <mesh
-              key={`ext_leg_${idx}`}
-              position={[lx, legOffsetY / 2, lz]}
-              castShadow
-            >
+            <mesh key={`ext_leg_${idx}`} position={[lx, legOffsetY / 2, lz]} castShadow>
               <cylinderGeometry args={[0.016, 0.012, legOffsetY, 16]} />
               <meshStandardMaterial color="#1e293b" metalness={0.65} roughness={0.35} />
             </mesh>
@@ -188,6 +239,12 @@ function FurnitureMeshGroup({
           const pos = piecePosition(piece);
           const sev = alertMap.get(piece.id);
           const isBack = piece.tipo === 'fondo';
+          const isVertical = piece.tipo === 'lateral' || piece.tipo === 'division_vertical';
+          const tex = isBack
+            ? textures.durolac
+            : isVertical
+              ? textures.melamineVert
+              : textures.melamineHoriz;
 
           return (
             <mesh key={piece.id} position={pos} castShadow receiveShadow>
@@ -198,88 +255,161 @@ function FurnitureMeshGroup({
                   roughness={0.45}
                 />
               ) : (
-                <meshStandardMaterial
-                  map={isBack ? textures.durolac : textures.melamine}
-                  roughness={isBack ? 0.85 : 0.55}
-                />
+                <meshStandardMaterial map={tex} roughness={isBack ? 0.85 : 0.55} />
               )}
               <Edges color={sev ? '#7f1d1d' : edgeLineColor} />
             </mesh>
           );
         })}
 
-        {/* Cotas 3D dinámicas del cuerpo de melamina */}
-        {/* Cota Ancho X (frente inferior) */}
-        <Line
-          points={[
-            [0, -0.05, zm + 0.06],
-            [xm, -0.05, zm + 0.06],
-          ]}
-          color="#0284c7"
-          lineWidth={2}
-        />
-        <Html position={[xm / 2, -0.09, zm + 0.06]} center>
-          <div className="dim-badge">X: {Math.round(xf)} mm</div>
-        </Html>
+        {/* Cotas 3D dinámicas (ocultas automáticamente al explotar para no chocar con placas) */}
+        {renderDims && (
+          <>
+            <Line
+              points={[
+                [0, -0.05, zm + 0.06],
+                [xm, -0.05, zm + 0.06],
+              ]}
+              color="#0284c7"
+              lineWidth={2}
+            />
+            <Html position={[xm / 2, -0.09, zm + 0.06]} center>
+              <div className="dim-badge">X: {Math.round(xf)} mm</div>
+            </Html>
 
-        {/* Cota Alto Y (costado derecho) */}
-        <Line
-          points={[
-            [xm + 0.07, 0, zm],
-            [xm + 0.07, ym, zm],
-          ]}
-          color="#059669"
-          lineWidth={2}
-        />
-        <Html position={[xm + 0.14, ym / 2, zm]} center>
-          <div className="dim-badge dim-y">
-            Y: {Math.round(yf)} mm{topology.hasExternalLegs ? ` (+${legHeightMm} patas)` : ''}
-          </div>
-        </Html>
+            <Line
+              points={[
+                [xm + 0.07, 0, zm],
+                [xm + 0.07, ym, zm],
+              ]}
+              color="#059669"
+              lineWidth={2}
+            />
+            <Html position={[xm + 0.14, ym / 2, zm]} center>
+              <div className="dim-badge dim-y">
+                Y: {Math.round(yf)} mm{topology.hasExternalLegs ? ` (+${legHeightMm} patas)` : ''}
+              </div>
+            </Html>
 
-        {/* Cota Profundidad Z (lateral izquierdo superior) */}
-        <Line
-          points={[
-            [-0.07, ym + 0.03, 0],
-            [-0.07, ym + 0.03, zm],
-          ]}
-          color="#7c3aed"
-          lineWidth={2}
-        />
-        <Html position={[-0.12, ym + 0.07, zm / 2]} center>
-          <div className="dim-badge dim-z">Z: {Math.round(zf)} mm</div>
-        </Html>
+            <Line
+              points={[
+                [-0.07, ym + 0.03, 0],
+                [-0.07, ym + 0.03, zm],
+              ]}
+              color="#7c3aed"
+              lineWidth={2}
+            />
+            <Html position={[-0.12, ym + 0.07, zm / 2]} center>
+              <div className="dim-badge dim-z">Z: {Math.round(zf)} mm</div>
+            </Html>
+          </>
+        )}
       </group>
     </group>
   );
 }
 
-export function Viewer3D({ despiece, topology, params, explodeFactor }: Viewer3DProps) {
+export function Viewer3D({
+  despiece,
+  topology,
+  params,
+  explodeFactor,
+  onAddCenterDivider,
+}: Viewer3DProps) {
+  const [camPreset, setCamPreset] = useState<CameraPreset>('iso');
+  const [camTrigger, setCamTrigger] = useState<number>(0);
+  const [showDimensions, setShowDimensions] = useState<boolean>(true);
+
   const legExtraMm = topology.hasExternalLegs ? (topology.externalLegHeightMm ?? 150) : 0;
-  const maxDim = Math.max(
-    params.targetDimensions.x,
-    params.targetDimensions.y + legExtraMm,
-    params.targetDimensions.z,
-  ) / 1000;
+  const maxDim =
+    Math.max(params.targetDimensions.x, params.targetDimensions.y + legExtraMm, params.targetDimensions.z) /
+    1000;
   const camDist = Math.max(1.8, maxDim * 1.65);
-  const orbitTarget = useMemo<[number, number, number]>(
-    () => [0, (params.targetDimensions.y + legExtraMm) / 2000, 0],
-    [params.targetDimensions.y, legExtraMm],
-  );
+  const targetY = (params.targetDimensions.y + legExtraMm) / 2000;
+
+  const pandeoAlerts = despiece.alerts.filter((a) => a.tipo === 'pandeo');
+  const maxSpan = pandeoAlerts.reduce((m, a) => Math.max(m, a.luzLibreMm ?? 0), 0);
+
+  const selectView = (next: CameraPreset) => {
+    setCamPreset(next);
+    setCamTrigger((n) => n + 1);
+  };
 
   return (
     <div className="viewer3d-wrapper">
       <div className="viewer3d-overlay-top">
-        <span>Visor 3D Paramétrico Offline ({despiece.matrizDespiece.length} placas físicas)</span>
-        {topology.hasExternalLegs && (
-          <span className="badge-legs">
-            Patas externas ({topology.externalLegCount ?? 4} × {topology.externalLegHeightMm ?? 150} mm) excluidas de melamina
+        <div className="viewer3d-badges">
+          <span className="viewer3d-pill">
+            Visor 3D Offline · {despiece.matrizDespiece.length} placas
           </span>
-        )}
+          {topology.hasExternalLegs && (
+            <span className="badge-legs">
+              Patas ({topology.externalLegCount ?? 4} × {topology.externalLegHeightMm ?? 150} mm) aparte
+            </span>
+          )}
+        </div>
+
+        <div className="viewer3d-cam-bar">
+          <button
+            type="button"
+            className={camPreset === 'iso' ? 'cam-btn active' : 'cam-btn'}
+            onClick={() => selectView('iso')}
+            title="Vista isométrica 3/4"
+          >
+            Iso
+          </button>
+          <button
+            type="button"
+            className={camPreset === 'front' ? 'cam-btn active' : 'cam-btn'}
+            onClick={() => selectView('front')}
+            title="Vista frontal XY"
+          >
+            Frente
+          </button>
+          <button
+            type="button"
+            className={camPreset === 'side' ? 'cam-btn active' : 'cam-btn'}
+            onClick={() => selectView('side')}
+            title="Vista lateral ZY"
+          >
+            Lateral
+          </button>
+          <button
+            type="button"
+            className={showDimensions ? 'cam-btn active' : 'cam-btn'}
+            onClick={() => setShowDimensions((v) => !v)}
+            title="Mostrar u ocultar cotas 3D"
+          >
+            {showDimensions ? <Eye size={13} /> : <EyeOff size={13} />} Cotas
+          </button>
+          <button
+            type="button"
+            className="cam-btn"
+            onClick={() => selectView(camPreset)}
+            title="Centrar cámara"
+          >
+            <RotateCcw size={13} />
+          </button>
+        </div>
       </div>
+
+      {pandeoAlerts.length > 0 && (
+        <div className="viewer3d-pandeo-bar">
+          <span>
+            <AlertTriangle size={14} /> Pandeo en {pandeoAlerts.length} repisa(s) (luz máx.{' '}
+            {Math.round(maxSpan)} mm &gt; 850 mm)
+          </span>
+          {onAddCenterDivider && (
+            <button type="button" className="btn-fix-pandeo" onClick={onAddCenterDivider}>
+              + Divisor central
+            </button>
+          )}
+        </div>
+      )}
+
       <Canvas
         shadows
-        camera={{ position: [camDist * 0.72, camDist * 0.58, camDist * 1.05], fov: 42 }}
+        camera={{ position: [camDist * 0.72, Math.max(targetY * 1.15, camDist * 0.58), camDist * 1.05], fov: 42 }}
       >
         <color attach="background" args={['#eef2f6']} />
         <ambientLight intensity={0.75} />
@@ -292,8 +422,14 @@ export function Viewer3D({ despiece, topology, params, explodeFactor }: Viewer3D
           topology={topology}
           params={params}
           explodeFactor={explodeFactor}
+          showDimensions={showDimensions}
         />
-        <OrbitControls makeDefault target={orbitTarget} />
+        <CameraRig
+          preset={camPreset}
+          presetTrigger={camTrigger}
+          camDist={camDist}
+          targetY={targetY}
+        />
       </Canvas>
     </div>
   );

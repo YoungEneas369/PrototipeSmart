@@ -1,5 +1,8 @@
 /**
  * Álgebra lineal pura para Homografía Proyectiva 3×3 y su inversa.
+ * - Normalización isotrópica de Hartley previa al sistema 8×8 (estabilidad numérica).
+ * - Validación estricta de convexidad (rechaza colineales, cóncavos y "corbatines").
+ * - Inversión única reutilizada en `computeQuadToUnitHomography`.
  * Cero dependencias externas. 100% determinista y offline.
  */
 import type { Point2D } from '../../types/contracts';
@@ -11,6 +14,24 @@ export type Matrix3x3 = [
 ];
 
 const EPSILON = 1e-10;
+const COLLINEAR_EPS = 1e-6;
+
+function multiply3x3(A: Matrix3x3, B: Matrix3x3): Matrix3x3 {
+  const out: Matrix3x3 = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      out[r][c] =
+        A[r][0] * B[0][c] +
+        A[r][1] * B[1][c] +
+        A[r][2] * B[2][c];
+    }
+  }
+  return out;
+}
 
 /**
  * Resuelve un sistema lineal A·x = b (n×n) mediante eliminación gaussiana con pivoteo parcial.
@@ -31,7 +52,7 @@ function solveLinearSystem(A: number[][], b: number[]): number[] | null {
       }
     }
 
-    if (maxAbs < EPSILON) {
+    if (!Number.isFinite(maxAbs) || maxAbs < EPSILON) {
       return null;
     }
 
@@ -57,7 +78,7 @@ function solveLinearSystem(A: number[][], b: number[]): number[] | null {
       sum -= aug[r][c] * x[c];
     }
     const diag = aug[r][r];
-    if (Math.abs(diag) < EPSILON) {
+    if (!Number.isFinite(diag) || Math.abs(diag) < EPSILON) {
       return null;
     }
     x[r] = sum / diag;
@@ -81,7 +102,7 @@ function hasCollinearTriple(pts: readonly [Point2D, Point2D, Point2D, Point2D]):
     const b = pts[j];
     const c = pts[k];
     const cross = Math.abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
-    if (cross < 1e-6) {
+    if (!Number.isFinite(cross) || cross < COLLINEAR_EPS) {
       return true;
     }
   }
@@ -89,45 +110,88 @@ function hasCollinearTriple(pts: readonly [Point2D, Point2D, Point2D, Point2D]):
 }
 
 /**
- * Calcula la matriz de homografía 3×3 que mapea 4 puntos `src` a 4 puntos `dst`
- * resolviendo el sistema lineal 8×8 con h33 = 1.
+ * Valida que los 4 vértices formen un cuadrilátero estrictamente convexo y no auto-intersectado
+ * (rechaza cuadriláteros cóncavos y "corbatines" verificando signo consistente del producto cruzado).
  */
-export function computeHomography(
-  src: readonly [Point2D, Point2D, Point2D, Point2D],
-  dst: readonly [Point2D, Point2D, Point2D, Point2D],
-): Matrix3x3 | null {
-  if (hasCollinearTriple(src) || hasCollinearTriple(dst)) {
-    return null;
-  }
-
-  const A: number[][] = [];
-  const b: number[] = [];
-
+function isStrictlyConvexQuad(pts: readonly [Point2D, Point2D, Point2D, Point2D]): boolean {
+  let expectedSign = 0;
   for (let i = 0; i < 4; i++) {
-    const { x, y } = src[i];
-    const { x: u, y: v } = dst[i];
-    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]);
-    b.push(u);
-    A.push([0, 0, 0, x, y, 1, -v * x, -v * y]);
-    b.push(v);
+    const a = pts[i];
+    const b = pts[(i + 1) % 4];
+    const c = pts[(i + 2) % 4];
+    if (
+      !Number.isFinite(a.x) ||
+      !Number.isFinite(a.y) ||
+      !Number.isFinite(b.x) ||
+      !Number.isFinite(b.y) ||
+      !Number.isFinite(c.x) ||
+      !Number.isFinite(c.y)
+    ) {
+      return false;
+    }
+    const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+    if (!Number.isFinite(cross) || Math.abs(cross) < COLLINEAR_EPS) {
+      return false;
+    }
+    const sign = cross > 0 ? 1 : -1;
+    if (expectedSign === 0) {
+      expectedSign = sign;
+    } else if (sign !== expectedSign) {
+      return false;
+    }
   }
+  return true;
+}
 
-  const h = solveLinearSystem(A, b);
-  if (!h) {
+/**
+ * Normalización isotrópica de Hartley: centra en el origen y escala a distancia media √2.
+ */
+function computeHartleyNormalization(
+  pts: readonly [Point2D, Point2D, Point2D, Point2D],
+): {
+  normPts: [Point2D, Point2D, Point2D, Point2D];
+  T: Matrix3x3;
+  TInv: Matrix3x3;
+} | null {
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < 4; i++) {
+    mx += pts[i].x;
+    my += pts[i].y;
+  }
+  mx /= 4;
+  my /= 4;
+
+  let sumDist = 0;
+  for (let i = 0; i < 4; i++) {
+    sumDist += Math.hypot(pts[i].x - mx, pts[i].y - my);
+  }
+  const meanDist = sumDist / 4;
+  if (!Number.isFinite(meanDist) || meanDist < EPSILON) {
     return null;
   }
 
-  const H: Matrix3x3 = [
-    [h[0], h[1], h[2]],
-    [h[3], h[4], h[5]],
-    [h[6], h[7], 1],
+  const s = Math.SQRT2 / meanDist;
+  const invS = meanDist / Math.SQRT2;
+  const normPts: [Point2D, Point2D, Point2D, Point2D] = [
+    { x: (pts[0].x - mx) * s, y: (pts[0].y - my) * s },
+    { x: (pts[1].x - mx) * s, y: (pts[1].y - my) * s },
+    { x: (pts[2].x - mx) * s, y: (pts[2].y - my) * s },
+    { x: (pts[3].x - mx) * s, y: (pts[3].y - my) * s },
   ];
 
-  if (!invertMatrix3x3(H)) {
-    return null;
-  }
+  const T: Matrix3x3 = [
+    [s, 0, -s * mx],
+    [0, s, -s * my],
+    [0, 0, 1],
+  ];
+  const TInv: Matrix3x3 = [
+    [invS, 0, mx],
+    [0, invS, my],
+    [0, 0, 1],
+  ];
 
-  return H;
+  return { normPts, T, TInv };
 }
 
 /**
@@ -163,10 +227,84 @@ export function invertMatrix3x3(H: readonly (readonly number[])[]): Matrix3x3 | 
   ];
 }
 
+function computeHomographyPair(
+  src: readonly [Point2D, Point2D, Point2D, Point2D],
+  dst: readonly [Point2D, Point2D, Point2D, Point2D],
+): { H: Matrix3x3; invH: Matrix3x3 } | null {
+  if (
+    hasCollinearTriple(src) ||
+    hasCollinearTriple(dst) ||
+    !isStrictlyConvexQuad(src) ||
+    !isStrictlyConvexQuad(dst)
+  ) {
+    return null;
+  }
+
+  const normSrc = computeHartleyNormalization(src);
+  const normDst = computeHartleyNormalization(dst);
+  if (!normSrc || !normDst) {
+    return null;
+  }
+
+  const A: number[][] = [];
+  const b: number[] = [];
+
+  for (let i = 0; i < 4; i++) {
+    const { x, y } = normSrc.normPts[i];
+    const { x: u, y: v } = normDst.normPts[i];
+    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]);
+    b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v * x, -v * y]);
+    b.push(v);
+  }
+
+  const h = solveLinearSystem(A, b);
+  if (!h) {
+    return null;
+  }
+
+  const HNorm: Matrix3x3 = [
+    [h[0], h[1], h[2]],
+    [h[3], h[4], h[5]],
+    [h[6], h[7], 1],
+  ];
+
+  // Desnormalizar: H = T_dst^{-1} · H_norm · T_src
+  let H = multiply3x3(multiply3x3(normDst.TInv, HNorm), normSrc.T);
+
+  // Escalar canónicamente para mantener h33 = 1 cuando es estable
+  if (Math.abs(H[2][2]) > EPSILON) {
+    const invH33 = 1 / H[2][2];
+    H = [
+      [H[0][0] * invH33, H[0][1] * invH33, H[0][2] * invH33],
+      [H[1][0] * invH33, H[1][1] * invH33, H[1][2] * invH33],
+      [H[2][0] * invH33, H[2][1] * invH33, 1],
+    ];
+  }
+
+  const invH = invertMatrix3x3(H);
+  if (!invH) {
+    return null;
+  }
+
+  return { H, invH };
+}
+
+/**
+ * Calcula la matriz de homografía 3×3 que mapea 4 puntos `src` a 4 puntos `dst`
+ * aplicando normalización de Hartley y validando convexidad estricta.
+ */
+export function computeHomography(
+  src: readonly [Point2D, Point2D, Point2D, Point2D],
+  dst: readonly [Point2D, Point2D, Point2D, Point2D],
+): Matrix3x3 | null {
+  return computeHomographyPair(src, dst)?.H ?? null;
+}
+
 /**
  * Calcula las homografías duales entre un cuadrilátero de foto en orden horario estricto
  * `[TL, TR, BR, BL]` y el espacio normalizado exterior `[(0,1), (1,1), (1,0), (0,0)]`
- * (eje Y invertido: v = 0 en base, v = 1 en cubierta).
+ * (eje Y invertido: v = 0 en base, v = 1 en cubierta) sin invertir dos veces.
  */
 export function computeQuadToUnitHomography(
   quadCorners: readonly [Point2D, Point2D, Point2D, Point2D],
@@ -178,15 +316,11 @@ export function computeQuadToUnitHomography(
     { x: 0, y: 0 }, // BL -> (0, 0)
   ];
 
-  const toUnit = computeHomography(quadCorners, unitCorners);
-  if (!toUnit) {
+  const pair = computeHomographyPair(quadCorners, unitCorners);
+  if (!pair) {
     return null;
   }
-  const toCanvas = invertMatrix3x3(toUnit);
-  if (!toCanvas) {
-    return null;
-  }
-  return { toUnit, toCanvas };
+  return { toUnit: pair.H, toCanvas: pair.invH };
 }
 
 /**

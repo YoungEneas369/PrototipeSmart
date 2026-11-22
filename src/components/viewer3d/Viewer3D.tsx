@@ -1,9 +1,11 @@
 /**
- * SMARTFURNITURE — VISOR 3D PARAMÉTRICO 100% OFFLINE (v3.1 UX)
+ * SMARTFURNITURE — VISOR 3D PARAMÉTRICO 100% OFFLINE (v8.0)
  * - Three.js 0.162 + R3F 8.18 + Drei 9.122 (luces nativas, cero Environment/HDRI remoto).
- * - Texturas procedurales `THREE.CanvasTexture` con veta orientada (horizontal vs vertical en laterales).
- * - Controles rápidos de cámara (Isométrica, Frontal, Lateral) y toggle de cotas 3D (auto-ocultas al explotar).
- * - Aviso en vivo de pandeo (> 850 mm) con botón rápido "+ Divisor central".
+ * - Metadatos tipados desde `BoardPiece` (`isGlassDoor`, `handleSide`, `zoneId`, `miterAngleDeg`).
+ * - Texturas procedurales `THREE.CanvasTexture` bicolor con veta orientada + limpieza GPU (`dispose`).
+ * - `CameraRig` estable: nunca resetea la órbita al escalar X/Y/Z, espesor o altura de patas.
+ * - Sincronización bidireccional 2D ↔ 3D (`selectedZoneId`, `hoveredZoneId`, `onSelectZone`, `onHoverZone`).
+ * - Bastidor completo de zócalo de 4 lados (`zocalo`), patas, ruedas giratorias, canastos y vidrios con marco.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentRef } from 'react';
@@ -20,11 +22,17 @@ import type {
 } from '../../types/contracts';
 import { calculateShelfDeflectionDIN, resolveBaseSupport } from '../../core/mathEngine';
 
-interface Viewer3DProps {
+export interface Viewer3DProps {
   despiece: DespieceResult;
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
   explodeFactor: number;
+  variant?: 'default' | 'compact' | 'solo';
+  modelKey?: string;
+  selectedZoneId?: string | null;
+  hoveredZoneId?: string | null;
+  onSelectZone?: (zoneId: string | null) => void;
+  onHoverZone?: (zoneId: string | null) => void;
   onAddCenterDivider?: () => void;
 }
 
@@ -95,44 +103,67 @@ function createProceduralTexture(
   return tex;
 }
 
+/**
+ * Controlador de cámara estable:
+ * Solo mueve la cámara al montar inicialmente, cuando el usuario hace clic explícito en
+ * un botón de vista (`presetTrigger`) o al cargar un mueble distinto (`modelKey`).
+ * Nunca resetea la órbita al escalar X/Y/Z, espesor o altura de patas.
+ */
 function CameraRig({
   preset,
   presetTrigger,
+  modelKey,
   camDist,
   targetY,
 }: {
   preset: CameraPreset;
   presetTrigger: number;
+  modelKey?: string;
   camDist: number;
   targetY: number;
 }) {
   const { camera } = useThree();
   const controlsRef = useRef<ComponentRef<typeof OrbitControls> | null>(null);
+  const camDistRef = useRef<number>(camDist);
+  const targetYRef = useRef<number>(targetY);
+
+  camDistRef.current = camDist;
+  targetYRef.current = targetY;
 
   useEffect(() => {
+    const dist = camDistRef.current;
+    const ty = targetYRef.current;
     const pos: [number, number, number] =
       preset === 'front'
-        ? [0, targetY, camDist * 1.38]
+        ? [0, ty, dist * 1.38]
         : preset === 'side'
-          ? [camDist * 1.38, targetY * 1.05, 0.02]
-          : [camDist * 0.72, Math.max(targetY * 1.15, camDist * 0.58), camDist * 1.05];
+          ? [dist * 1.38, ty * 1.05, 0.02]
+          : [dist * 0.72, Math.max(ty * 1.15, dist * 0.58), dist * 1.05];
 
     camera.position.set(pos[0], pos[1], pos[2]);
     if (controlsRef.current) {
-      controlsRef.current.target.set(0, targetY, 0);
+      controlsRef.current.target.set(0, ty, 0);
       controlsRef.current.update();
     } else {
-      camera.lookAt(0, targetY, 0);
+      camera.lookAt(0, ty, 0);
     }
-  }, [camera, preset, presetTrigger, camDist, targetY]);
+  }, [camera, preset, presetTrigger, modelKey]);
 
   return <OrbitControls ref={controlsRef} makeDefault enableDamping dampingFactor={0.08} />;
 }
 
-interface MeshGroupProps extends Viewer3DProps {
+interface MeshGroupProps {
+  despiece: DespieceResult;
+  topology: FurnitureTopology;
+  params: ScaleAndBoardParams;
+  explodeFactor: number;
   showDimensions: boolean;
   selectedPieceId: string | null;
+  selectedZoneId?: string | null;
+  hoveredZoneId?: string | null;
   onSelectPiece: (id: string | null) => void;
+  onSelectZone?: (zoneId: string | null) => void;
+  onHoverZone?: (zoneId: string | null) => void;
 }
 
 function FurnitureMeshGroup({
@@ -142,24 +173,29 @@ function FurnitureMeshGroup({
   explodeFactor,
   showDimensions,
   selectedPieceId,
+  selectedZoneId,
+  hoveredZoneId,
   onSelectPiece,
+  onSelectZone,
+  onHoverZone,
 }: MeshGroupProps) {
   useEffect(() => {
     return () => {
       document.body.style.cursor = 'auto';
     };
   }, []);
+
   const { x: xf, y: yf, z: zf } = params.targetDimensions;
   const e = params.boardThickness;
   const xInt = Math.max(1, xf - 2 * e);
   const yInt = Math.max(1, yf - 2 * e);
   const support = resolveBaseSupport(topology);
-  const hasLegVoidAtBottom = (topology.frontZones ?? []).some(
-    (z) => z.kind === 'leg_void' && z.vStart <= 1e-3,
+  const hasToeKickPieces = useMemo(
+    () => despiece.matrizDespiece.some((p) => p.tipo === 'zocalo'),
+    [despiece.matrizDespiece],
   );
   const legHeightMm = support.type === 'legs' || support.type === 'wheels' ? support.heightMm : 0;
-  const toeKickMm =
-    support.type === 'toe_kick' && !hasLegVoidAtBottom ? support.heightMm : 0;
+  const toeKickMm = support.type === 'toe_kick' && hasToeKickPieces ? support.heightMm : 0;
   const isWheels = support.type === 'wheels';
   const legOffsetY = legHeightMm / 1000;
   const bodyOffsetY = (legHeightMm + toeKickMm) / 1000;
@@ -195,24 +231,10 @@ function FurnitureMeshGroup({
     };
   }, [textureBank]);
 
-  const { glassDoorIds, doorHandleSide } = useMemo(() => {
-    const glass = new Set<string>();
-    const sideMap = new Map<string, 'left' | 'right'>();
-    for (const z of topology.frontZones ?? []) {
-      if (z.kind === 'door_glass') {
-        glass.add(`puerta_${z.id}`);
-        sideMap.set(`puerta_${z.id}`, 'right');
-      } else if (z.kind === 'door_left') {
-        sideMap.set(`puerta_${z.id}`, 'right');
-      } else if (z.kind === 'door_right') {
-        sideMap.set(`puerta_${z.id}`, 'left');
-      } else if (z.kind === 'door_double') {
-        sideMap.set(`puerta_${z.id}_izq`, 'right');
-        sideMap.set(`puerta_${z.id}_der`, 'left');
-      }
-    }
-    return { glassDoorIds: glass, doorHandleSide: sideMap };
-  }, [topology.frontZones]);
+  const zoneMap = useMemo(
+    () => new Map((topology.frontZones ?? []).map((z) => [z.id, z])),
+    [topology.frontZones],
+  );
 
   const alertMap = useMemo(() => {
     const map = new Map<string, 'warning' | 'critical'>();
@@ -232,15 +254,24 @@ function FurnitureMeshGroup({
     let dx = px - cx0;
     let dy = py - cy0;
     let dz = pz - cz0;
-    const len = Math.hypot(dx, dy, dz);
     if (p.tipo === 'fondo') {
       dx = 0;
       dy = 0;
       dz = -1;
-    } else if (len > 1e-4) {
-      dx /= len;
-      dy /= len;
-      dz /= len;
+    } else if (p.tipo === 'zocalo') {
+      const xzLen = Math.hypot(dx, dz);
+      const nx = xzLen > 1e-4 ? (dx / xzLen) * 0.55 : 0;
+      const nz = xzLen > 1e-4 ? (dz / xzLen) * 0.55 : 0;
+      dx = nx;
+      dy = -0.8;
+      dz = nz;
+    } else {
+      const len = Math.hypot(dx, dy, dz);
+      if (len > 1e-4) {
+        dx /= len;
+        dy /= len;
+        dz /= len;
+      }
     }
     return [
       px / 1000 + dx * explodeDist,
@@ -273,6 +304,7 @@ function FurnitureMeshGroup({
   const basketVisuals = useMemo(() => {
     const list: Array<{
       key: string;
+      zoneId: string;
       cx: number;
       cy: number;
       cz: number;
@@ -304,6 +336,7 @@ function FurnitureMeshGroup({
         const cyMm = y0 + (k + 0.44) * slotH;
         list.push({
           key: `basket_${z.id}_${k}`,
+          zoneId: z.id,
           cx: (x0 + x1) / 2000,
           cy: cyMm / 1000,
           cz: (zf - 12 - (bd * 1000) / 2) / 1000 + explodeDist * 0.65,
@@ -317,6 +350,35 @@ function FurnitureMeshGroup({
     }
     return list;
   }, [topology.frontZones, e, xInt, yInt, zf, explodeDist]);
+
+  // Resalte 3D suave para zonas abiertas / hueco de piernas seleccionadas o hovered desde 2D
+  const activeOpenZoneHighlight = useMemo(() => {
+    const targetId = hoveredZoneId ?? selectedZoneId ?? null;
+    if (!targetId) return null;
+    const z = zoneMap.get(targetId);
+    if (!z || (z.kind !== 'open' && z.kind !== 'leg_void')) return null;
+    const u0 = Math.min(z.uStart, z.uEnd);
+    const u1 = Math.max(z.uStart, z.uEnd);
+    const v0 = Math.min(z.vStart, z.vEnd);
+    const v1 = Math.max(z.vStart, z.vEnd);
+    const x0 = e + u0 * xInt;
+    const x1 = e + u1 * xInt;
+    const y0 = e + v0 * yInt;
+    const y1 = e + v1 * yInt;
+    const w = (x1 - x0) / 1000;
+    const h = (y1 - y0) / 1000;
+    const d = Math.max(0.04, (zf - 10) / 1000);
+    if (w <= 0.02 || h <= 0.02) return null;
+    return {
+      cx: (x0 + x1) / 2000,
+      cy: (y0 + y1) / 2000,
+      cz: zf / 2000,
+      w,
+      h,
+      d,
+      isHover: hoveredZoneId === targetId,
+    };
+  }, [hoveredZoneId, selectedZoneId, zoneMap, e, xInt, yInt, zf]);
 
   const edgeLineColor = params.material === 'grafito' ? '#94a3b8' : '#334155';
   const renderDims = showDimensions && explodeFactor <= 0.1;
@@ -333,13 +395,15 @@ function FurnitureMeshGroup({
               const wheelW = Math.min(0.022, wheelR * 0.8);
               const swivelAngle = idx % 2 === 0 ? 0.25 : -0.2;
               return (
-                <group key={`ext_wheel_${idx}`} position={[lx, 0, lz]} rotation={[0, swivelAngle, 0]}>
-                  {/* Platina superior de montaje */}
+                <group
+                  key={`ext_wheel_${idx}`}
+                  position={[lx, 0, lz]}
+                  rotation={[0, swivelAngle, 0]}
+                >
                   <mesh position={[0, legOffsetY - plateH / 2, 0]}>
                     <boxGeometry args={[wheelR * 1.7, plateH, wheelR * 1.7]} />
                     <meshStandardMaterial color="#94a3b8" metalness={0.75} roughness={0.3} />
                   </mesh>
-                  {/* Horquilla metálica */}
                   <mesh position={[-(wheelW / 2 + 0.0025), legOffsetY - plateH - wheelR * 0.65, 0]}>
                     <boxGeometry args={[0.004, wheelR * 1.3, wheelR * 0.85]} />
                     <meshStandardMaterial color="#64748b" metalness={0.8} roughness={0.28} />
@@ -348,12 +412,10 @@ function FurnitureMeshGroup({
                     <boxGeometry args={[0.004, wheelR * 1.3, wheelR * 0.85]} />
                     <meshStandardMaterial color="#64748b" metalness={0.8} roughness={0.28} />
                   </mesh>
-                  {/* Rueda giratoria (apoya exactamente en y = 0.000) */}
                   <mesh position={[0, wheelR, 0]} rotation={[0, 0, Math.PI / 2]} castShadow>
                     <cylinderGeometry args={[wheelR, wheelR, wheelW, 20]} />
                     <meshStandardMaterial color="#f1f5f9" roughness={0.4} metalness={0.1} />
                   </mesh>
-                  {/* Banda de rodadura / eje */}
                   <mesh position={[0, wheelR, 0]} rotation={[0, 0, Math.PI / 2]}>
                     <cylinderGeometry args={[wheelR * 0.48, wheelR * 0.48, wheelW + 0.003, 14]} />
                     <meshStandardMaterial color="#334155" metalness={0.5} roughness={0.4} />
@@ -371,14 +433,15 @@ function FurnitureMeshGroup({
         </group>
       )}
 
-      {/* Cuerpo de Melamina + Puertas/Cajones + Fondo Durolac 3 mm (correspondencia física 1:1) */}
+      {/* Cuerpo de Melamina + Zócalo 4 lados + Puertas/Vidrio/Cajones + Fondo Durolac */}
       <group position={[0, bodyOffsetY, 0]}>
         {despiece.matrizDespiece.map((piece) => {
           const [dx, dy, dz] = piece.dimensiones3D;
           const pos = piecePosition(piece);
           const sev = alertMap.get(piece.id);
           const isBack = piece.tipo === 'fondo' || piece.tipo === 'fondo_cajon';
-          const isGlassDoor = glassDoorIds.has(piece.id);
+          const pieceZone = piece.zoneId ? zoneMap.get(piece.zoneId) : undefined;
+          const isGlassDoor = piece.isGlassDoor ?? pieceZone?.kind === 'door_glass';
           const isVertical =
             piece.tipo === 'lateral' ||
             piece.tipo === 'division_vertical' ||
@@ -396,18 +459,171 @@ function FurnitureMeshGroup({
               : textureBank[melMat].h;
 
           const isSelected = selectedPieceId === piece.id;
-          const pieceEdgeColor = melMat === 'grafito' ? '#94a3b8' : edgeLineColor;
+          const isZoneSelected = Boolean(selectedZoneId && piece.zoneId && piece.zoneId === selectedZoneId);
+          const isZoneHovered = Boolean(hoveredZoneId && piece.zoneId && piece.zoneId === hoveredZoneId);
+          const isHighlighted = isSelected || isZoneSelected || isZoneHovered;
+
+          const emissiveColor = isSelected
+            ? '#0284c7'
+            : isZoneSelected
+              ? '#0ea5e9'
+              : isZoneHovered
+                ? '#38bdf8'
+                : '#000000';
+          const emissiveIntensity = isSelected
+            ? 0.34
+            : isZoneSelected
+              ? 0.28
+              : isZoneHovered
+                ? 0.22
+                : 0;
+
+          const pieceEdgeColor = isHighlighted
+            ? '#0284c7'
+            : sev
+              ? '#7f1d1d'
+              : melMat === 'grafito'
+                ? '#94a3b8'
+                : edgeLineColor;
+
           const dxM = dx / 1000;
           const dyM = dy / 1000;
           const dzM = dz / 1000;
 
-          const handleSide = doorHandleSide.get(piece.id);
-          const showDoorHandle = piece.tipo === 'puerta' && dxM > 0.14 && dyM > 0.18;
-          const showDrawerHandle = piece.tipo === 'frente_cajon' && dxM > 0.14 && dyM > 0.06;
-          const doorHandleX =
-            handleSide === 'left'
-              ? -dxM / 2 + Math.min(0.042, dxM * 0.16)
-              : dxM / 2 - Math.min(0.042, dxM * 0.16);
+          const resolvedHandleSide =
+            piece.handleSide ??
+            (piece.tipo === 'frente_cajon'
+              ? 'top'
+              : piece.tipo === 'puerta'
+                ? 'right'
+                : 'none');
+
+          const showDoorHandle =
+            piece.tipo === 'puerta' &&
+            resolvedHandleSide !== 'none' &&
+            dxM > 0.12 &&
+            dyM > 0.16;
+          const showDrawerHandle =
+            piece.tipo === 'frente_cajon' &&
+            resolvedHandleSide !== 'none' &&
+            dxM > 0.12 &&
+            dyM > 0.055;
+
+          const doorHandlePos: [number, number, number] =
+            resolvedHandleSide === 'left'
+              ? [-dxM / 2 + Math.min(0.042, dxM * 0.16), 0, dzM / 2 + 0.008]
+              : resolvedHandleSide === 'top'
+                ? [0, dyM / 2 - Math.min(0.042, dyM * 0.16), dzM / 2 + 0.008]
+                : [dxM / 2 - Math.min(0.042, dxM * 0.16), 0, dzM / 2 + 0.008];
+
+          const doorHandleSize: [number, number, number] =
+            resolvedHandleSide === 'top'
+              ? [Math.min(0.13, dxM * 0.32), 0.01, 0.012]
+              : [0.01, Math.min(0.12, dyM * 0.24), 0.012];
+
+          const handleClickPiece = (e: { stopPropagation: () => void }) => {
+            e.stopPropagation();
+            onSelectPiece(isSelected ? null : piece.id);
+            if (piece.zoneId && onSelectZone) {
+              onSelectZone(piece.zoneId);
+            }
+          };
+
+          const handlePointerOver = (e: { stopPropagation: () => void }) => {
+            e.stopPropagation();
+            document.body.style.cursor = 'pointer';
+            if (piece.zoneId && onHoverZone) {
+              onHoverZone(piece.zoneId);
+            }
+          };
+
+          const handlePointerOut = () => {
+            document.body.style.cursor = 'auto';
+            if (piece.zoneId && onHoverZone) {
+              onHoverZone(null);
+            }
+          };
+
+          // Puerta vitrina con bastidor perimetral real de melamina + paño de vidrio translúcido
+          const frameW = Math.min(0.06, Math.min(dxM, dyM) * 0.24);
+          const innerGlassW = dxM - 2 * frameW;
+          const innerGlassH = dyM - 2 * frameW;
+          if (isGlassDoor && innerGlassW > 0.03 && innerGlassH > 0.03) {
+            return (
+              <group
+                key={piece.id}
+                position={pos}
+                rotation={piece.rotacion3D}
+                onClick={handleClickPiece}
+                onPointerOver={handlePointerOver}
+                onPointerOut={handlePointerOut}
+              >
+                {/* Larguero izquierdo */}
+                <mesh position={[-(dxM - frameW) / 2, 0, 0]} castShadow receiveShadow>
+                  <boxGeometry args={[frameW, dyM, dzM]} />
+                  <meshStandardMaterial
+                    map={tex}
+                    emissive={emissiveColor}
+                    emissiveIntensity={emissiveIntensity}
+                    roughness={0.55}
+                  />
+                  <Edges color={pieceEdgeColor} />
+                </mesh>
+                {/* Larguero derecho */}
+                <mesh position={[(dxM - frameW) / 2, 0, 0]} castShadow receiveShadow>
+                  <boxGeometry args={[frameW, dyM, dzM]} />
+                  <meshStandardMaterial
+                    map={tex}
+                    emissive={emissiveColor}
+                    emissiveIntensity={emissiveIntensity}
+                    roughness={0.55}
+                  />
+                  <Edges color={pieceEdgeColor} />
+                </mesh>
+                {/* Cabezal superior */}
+                <mesh position={[0, (dyM - frameW) / 2, 0]} castShadow receiveShadow>
+                  <boxGeometry args={[innerGlassW, frameW, dzM]} />
+                  <meshStandardMaterial
+                    map={textureBank[melMat].h}
+                    emissive={emissiveColor}
+                    emissiveIntensity={emissiveIntensity}
+                    roughness={0.55}
+                  />
+                  <Edges color={pieceEdgeColor} />
+                </mesh>
+                {/* Cabezal inferior */}
+                <mesh position={[0, -(dyM - frameW) / 2, 0]} castShadow receiveShadow>
+                  <boxGeometry args={[innerGlassW, frameW, dzM]} />
+                  <meshStandardMaterial
+                    map={textureBank[melMat].h}
+                    emissive={emissiveColor}
+                    emissiveIntensity={emissiveIntensity}
+                    roughness={0.55}
+                  />
+                  <Edges color={pieceEdgeColor} />
+                </mesh>
+                {/* Paño de vidrio 4 mm */}
+                <mesh position={[0, 0, 0]}>
+                  <boxGeometry args={[innerGlassW, innerGlassH, Math.min(0.005, dzM * 0.45)]} />
+                  <meshStandardMaterial
+                    color="#bae6fd"
+                    transparent
+                    opacity={0.42}
+                    emissive={emissiveColor}
+                    emissiveIntensity={emissiveIntensity * 0.8}
+                    roughness={0.12}
+                    metalness={0.18}
+                  />
+                </mesh>
+                {showDoorHandle && (
+                  <mesh position={doorHandlePos}>
+                    <boxGeometry args={doorHandleSize} />
+                    <meshStandardMaterial color="#1e293b" metalness={0.75} roughness={0.28} />
+                  </mesh>
+                )}
+              </group>
+            );
+          }
 
           return (
             <mesh
@@ -416,24 +632,16 @@ function FurnitureMeshGroup({
               rotation={piece.rotacion3D}
               castShadow={!isGlassDoor}
               receiveShadow
-              onClick={(e) => {
-                e.stopPropagation();
-                onSelectPiece(isSelected ? null : piece.id);
-              }}
-              onPointerOver={(e) => {
-                e.stopPropagation();
-                document.body.style.cursor = 'pointer';
-              }}
-              onPointerOut={() => {
-                document.body.style.cursor = 'auto';
-              }}
+              onClick={handleClickPiece}
+              onPointerOver={handlePointerOver}
+              onPointerOut={handlePointerOut}
             >
               <boxGeometry args={[dxM, dyM, dzM]} />
               {sev ? (
                 <meshStandardMaterial
                   color={sev === 'critical' ? '#ef4444' : '#f59e0b'}
-                  emissive={isSelected ? '#0284c7' : '#000000'}
-                  emissiveIntensity={isSelected ? 0.35 : 0}
+                  emissive={emissiveColor}
+                  emissiveIntensity={isHighlighted ? 0.35 : 0}
                   roughness={0.45}
                 />
               ) : isGlassDoor ? (
@@ -441,30 +649,36 @@ function FurnitureMeshGroup({
                   color="#bae6fd"
                   transparent
                   opacity={0.44}
-                  emissive={isSelected ? '#0284c7' : '#000000'}
-                  emissiveIntensity={isSelected ? 0.25 : 0}
+                  emissive={emissiveColor}
+                  emissiveIntensity={emissiveIntensity}
                   roughness={0.14}
                   metalness={0.15}
                 />
               ) : (
                 <meshStandardMaterial
                   map={tex}
-                  emissive={isSelected ? '#0284c7' : '#000000'}
-                  emissiveIntensity={isSelected ? 0.28 : 0}
+                  emissive={emissiveColor}
+                  emissiveIntensity={emissiveIntensity}
                   roughness={isBack ? 0.85 : 0.55}
                 />
               )}
-              <Edges color={isSelected ? '#0284c7' : sev ? '#7f1d1d' : pieceEdgeColor} />
+              <Edges color={pieceEdgeColor} />
 
               {showDoorHandle && (
-                <mesh position={[doorHandleX, 0, dzM / 2 + 0.008]}>
-                  <boxGeometry args={[0.01, Math.min(0.12, dyM * 0.24), 0.012]} />
+                <mesh position={doorHandlePos}>
+                  <boxGeometry args={doorHandleSize} />
                   <meshStandardMaterial color="#1e293b" metalness={0.75} roughness={0.28} />
                 </mesh>
               )}
 
               {showDrawerHandle && (
-                <mesh position={[0, 0, dzM / 2 + 0.008]}>
+                <mesh
+                  position={[
+                    0,
+                    resolvedHandleSide === 'top' ? Math.min(dyM * 0.16, 0.028) : 0,
+                    dzM / 2 + 0.008,
+                  ]}
+                >
                   <boxGeometry args={[Math.min(0.13, dxM * 0.32), 0.01, 0.012]} />
                   <meshStandardMaterial color="#1e293b" metalness={0.75} roughness={0.28} />
                 </mesh>
@@ -473,13 +687,58 @@ function FurnitureMeshGroup({
           );
         })}
 
+        {/* Resalte no obstructivo para zonas abiertas o hueco de piernas al pasar el mouse en 2D */}
+        {activeOpenZoneHighlight && (
+          <mesh
+            position={[
+              activeOpenZoneHighlight.cx,
+              activeOpenZoneHighlight.cy,
+              activeOpenZoneHighlight.cz,
+            ]}
+            raycast={() => null}
+          >
+            <boxGeometry
+              args={[
+                activeOpenZoneHighlight.w,
+                activeOpenZoneHighlight.h,
+                activeOpenZoneHighlight.d,
+              ]}
+            />
+            <meshStandardMaterial
+              color={activeOpenZoneHighlight.isHover ? '#38bdf8' : '#0ea5e9'}
+              transparent
+              opacity={activeOpenZoneHighlight.isHover ? 0.16 : 0.12}
+              depthWrite={false}
+            />
+            <Edges color="#0284c7" />
+          </mesh>
+        )}
+
         {/* Canastos metálicos cromados extraíbles (herraje externo no-melamina) */}
         {basketVisuals.map((bk) => {
           const rodR = 0.003;
           const wireOffsets = [-0.36, -0.18, 0, 0.18, 0.36];
+          const isBkHighlight =
+            selectedZoneId === bk.zoneId || hoveredZoneId === bk.zoneId;
+          const wireColor = isBkHighlight ? '#38bdf8' : '#cbd5e1';
+          const frontWireColor = isBkHighlight ? '#7dd3fc' : '#e2e8f0';
           return (
-            <group key={bk.key}>
-              {/* Rieles laterales */}
+            <group
+              key={bk.key}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectZone?.(bk.zoneId);
+              }}
+              onPointerOver={(e) => {
+                e.stopPropagation();
+                document.body.style.cursor = 'pointer';
+                onHoverZone?.(bk.zoneId);
+              }}
+              onPointerOut={() => {
+                document.body.style.cursor = 'auto';
+                onHoverZone?.(null);
+              }}
+            >
               <mesh position={[bk.xLeftRail, bk.cy + bk.h * 0.35, bk.cz]}>
                 <boxGeometry args={[0.008, 0.012, bk.d]} />
                 <meshStandardMaterial color="#64748b" metalness={0.75} roughness={0.3} />
@@ -489,45 +748,47 @@ function FurnitureMeshGroup({
                 <meshStandardMaterial color="#64748b" metalness={0.75} roughness={0.3} />
               </mesh>
               <group position={[bk.cx, bk.cy, bk.cz]}>
-                {/* Borde superior frontal/trasero/laterales */}
                 <mesh position={[0, bk.h / 2, bk.d / 2]}>
                   <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
-                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
                 <mesh position={[0, -bk.h / 2, bk.d / 2]}>
                   <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
-                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
                 <mesh position={[0, bk.h / 2, -bk.d / 2]}>
                   <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
-                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
                 <mesh position={[-bk.w / 2, bk.h / 2, 0]}>
                   <boxGeometry args={[rodR * 2, rodR * 2, bk.d]} />
-                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
                 <mesh position={[bk.w / 2, bk.h / 2, 0]}>
                   <boxGeometry args={[rodR * 2, rodR * 2, bk.d]} />
-                  <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
-                {/* Base metálica enrejada */}
                 <mesh position={[0, -bk.h / 2, 0]}>
                   <boxGeometry args={[bk.w, rodR * 1.4, bk.d]} />
-                  <meshStandardMaterial color="#94a3b8" metalness={0.7} roughness={0.32} transparent opacity={0.72} />
+                  <meshStandardMaterial
+                    color={isBkHighlight ? '#0ea5e9' : '#94a3b8'}
+                    metalness={0.7}
+                    roughness={0.32}
+                    transparent
+                    opacity={0.72}
+                  />
                 </mesh>
-                {/* Varillas verticales frontales */}
                 {wireOffsets.map((frac, wi) => (
                   <mesh key={wi} position={[bk.w * frac, 0, bk.d / 2]}>
                     <boxGeometry args={[rodR * 1.6, bk.h, rodR * 1.6]} />
-                    <meshStandardMaterial color="#e2e8f0" metalness={0.85} roughness={0.2} />
+                    <meshStandardMaterial color={frontWireColor} metalness={0.85} roughness={0.2} />
                   </mesh>
                 ))}
-                {/* 4 postes esquineros */}
                 {([-1, 1] as const).map((sx) =>
                   ([-1, 1] as const).map((sz) => (
                     <mesh key={`${sx}_${sz}`} position={[(sx * bk.w) / 2, 0, (sz * bk.d) / 2]}>
                       <boxGeometry args={[rodR * 2, bk.h, rodR * 2]} />
-                      <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.22} />
+                      <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                     </mesh>
                   )),
                 )}
@@ -536,7 +797,7 @@ function FurnitureMeshGroup({
           );
         })}
 
-        {/* Cotas 3D dinámicas (ocultas automáticamente al explotar para no chocar con placas) */}
+        {/* Cotas 3D dinámicas (pointer-events: none para nunca bloquear clics u órbita) */}
         {renderDims && (
           <>
             <Line
@@ -547,7 +808,12 @@ function FurnitureMeshGroup({
               color="#0284c7"
               lineWidth={2}
             />
-            <Html position={[xm / 2, -0.09, zm + 0.06]} center>
+            <Html
+              position={[xm / 2, -0.09, zm + 0.06]}
+              center
+              wrapperClass="dim-html-wrapper"
+              style={{ pointerEvents: 'none' }}
+            >
               <div className="dim-badge">X: {Math.round(xf)} mm</div>
             </Html>
 
@@ -559,14 +825,19 @@ function FurnitureMeshGroup({
               color="#059669"
               lineWidth={2}
             />
-            <Html position={[xm + 0.14, ym / 2, zm]} center>
+            <Html
+              position={[xm + 0.14, ym / 2, zm]}
+              center
+              wrapperClass="dim-html-wrapper"
+              style={{ pointerEvents: 'none' }}
+            >
               <div className="dim-badge dim-y">
                 Y: {Math.round(yf)} mm
                 {support.type === 'wheels'
                   ? ` (+${legHeightMm} ruedas)`
                   : support.type === 'legs'
                     ? ` (+${legHeightMm} patas)`
-                    : support.type === 'toe_kick'
+                    : support.type === 'toe_kick' && toeKickMm > 0
                       ? ` (+${toeKickMm} zócalo)`
                       : ''}
               </div>
@@ -580,7 +851,12 @@ function FurnitureMeshGroup({
               color="#7c3aed"
               lineWidth={2}
             />
-            <Html position={[-0.12, ym + 0.07, zm / 2]} center>
+            <Html
+              position={[-0.12, ym + 0.07, zm / 2]}
+              center
+              wrapperClass="dim-html-wrapper"
+              style={{ pointerEvents: 'none' }}
+            >
               <div className="dim-badge dim-z">Z: {Math.round(zf)} mm</div>
             </Html>
           </>
@@ -595,6 +871,12 @@ export function Viewer3D({
   topology,
   params,
   explodeFactor,
+  variant = 'default',
+  modelKey,
+  selectedZoneId,
+  hoveredZoneId,
+  onSelectZone,
+  onHoverZone,
   onAddCenterDivider,
 }: Viewer3DProps) {
   const [camPreset, setCamPreset] = useState<CameraPreset>('iso');
@@ -602,10 +884,23 @@ export function Viewer3D({
   const [showDimensions, setShowDimensions] = useState<boolean>(true);
   const [selectedPieceId, setSelectedPieceId] = useState<string | null>(null);
 
+  // Limpia automáticamente la pieza seleccionada si ya no existe al cambiar preset/catálogo
+  useEffect(() => {
+    if (selectedPieceId && !despiece.matrizDespiece.some((p) => p.id === selectedPieceId)) {
+      setSelectedPieceId(null);
+    }
+  }, [despiece.matrizDespiece, selectedPieceId]);
+
   const selectedPiece = useMemo(
     () => despiece.matrizDespiece.find((p) => p.id === selectedPieceId) ?? null,
     [despiece.matrizDespiece, selectedPieceId],
   );
+
+  const selectedPieceZoneLabel = useMemo(() => {
+    if (!selectedPiece?.zoneId) return null;
+    const z = (topology.frontZones ?? []).find((item) => item.id === selectedPiece.zoneId);
+    return z?.label ?? selectedPiece.zoneId;
+  }, [selectedPiece, topology.frontZones]);
 
   const selectedPieceDin = useMemo(() => {
     if (!selectedPiece || selectedPiece.tipo !== 'repisa') return null;
@@ -618,10 +913,22 @@ export function Viewer3D({
   }, [selectedPiece]);
 
   const supportSummary = resolveBaseSupport(topology);
-  const legExtraMm = supportSummary.heightMm;
+  const hasToeKickPieces = useMemo(
+    () => despiece.matrizDespiece.some((p) => p.tipo === 'zocalo'),
+    [despiece.matrizDespiece],
+  );
+  const legExtraMm =
+    supportSummary.type === 'toe_kick'
+      ? hasToeKickPieces
+        ? supportSummary.heightMm
+        : 0
+      : supportSummary.heightMm;
   const maxDim =
-    Math.max(params.targetDimensions.x, params.targetDimensions.y + legExtraMm, params.targetDimensions.z) /
-    1000;
+    Math.max(
+      params.targetDimensions.x,
+      params.targetDimensions.y + legExtraMm,
+      params.targetDimensions.z,
+    ) / 1000;
   const camDist = Math.max(1.8, maxDim * 1.65);
   const targetY = (params.targetDimensions.y + legExtraMm) / 2000;
 
@@ -633,8 +940,16 @@ export function Viewer3D({
     setCamTrigger((n) => n + 1);
   };
 
+  const wrapperClass = [
+    'viewer3d-wrapper',
+    variant === 'compact' ? 'viewer3d-compact' : '',
+    variant === 'solo' ? 'viewer3d-solo' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
   return (
-    <div className="viewer3d-wrapper">
+    <div className={wrapperClass}>
       <div className="viewer3d-overlay-top">
         <div className="viewer3d-badges">
           <span className="viewer3d-pill">
@@ -643,17 +958,22 @@ export function Viewer3D({
           </span>
           {(supportSummary.type === 'legs' || supportSummary.type === 'wheels') && (
             <span className="badge-legs">
-              {supportSummary.type === 'wheels' ? 'Ruedas' : 'Patas'} ({supportSummary.count} × {supportSummary.heightMm} mm) aparte
+              {supportSummary.type === 'wheels' ? 'Ruedas' : 'Patas'} ({supportSummary.count} ×{' '}
+              {supportSummary.heightMm} mm) aparte
             </span>
+          )}
+          {supportSummary.type === 'toe_kick' && hasToeKickPieces && (
+            <span className="badge-support">Zócalo 4 lados ({supportSummary.heightMm} mm)</span>
           )}
         </div>
 
-        <div className="viewer3d-cam-bar">
+        <div className="viewer3d-cam-bar" role="toolbar" aria-label="Controles de cámara 3D">
           <button
             type="button"
             className={camPreset === 'iso' ? 'cam-btn active' : 'cam-btn'}
             onClick={() => selectView('iso')}
             title="Vista isométrica 3/4"
+            aria-label="Vista isométrica 3/4"
           >
             Iso
           </button>
@@ -662,6 +982,7 @@ export function Viewer3D({
             className={camPreset === 'front' ? 'cam-btn active' : 'cam-btn'}
             onClick={() => selectView('front')}
             title="Vista frontal XY"
+            aria-label="Vista frontal XY"
           >
             Frente
           </button>
@@ -670,6 +991,7 @@ export function Viewer3D({
             className={camPreset === 'side' ? 'cam-btn active' : 'cam-btn'}
             onClick={() => selectView('side')}
             title="Vista lateral ZY"
+            aria-label="Vista lateral ZY"
           >
             Lateral
           </button>
@@ -678,6 +1000,7 @@ export function Viewer3D({
             className={showDimensions ? 'cam-btn active' : 'cam-btn'}
             onClick={() => setShowDimensions((v) => !v)}
             title="Mostrar u ocultar cotas 3D"
+            aria-label={showDimensions ? 'Ocultar cotas 3D' : 'Mostrar cotas 3D'}
           >
             {showDimensions ? <Eye size={13} /> : <EyeOff size={13} />} Cotas
           </button>
@@ -685,7 +1008,8 @@ export function Viewer3D({
             type="button"
             className="cam-btn"
             onClick={() => selectView(camPreset)}
-            title="Centrar cámara"
+            title="Centrar y restablecer cámara"
+            aria-label="Centrar y restablecer cámara"
           >
             <RotateCcw size={13} />
           </button>
@@ -700,26 +1024,28 @@ export function Viewer3D({
                 <div className="piece-hud-title">
                   <strong>{selectedPiece.nombre}</strong>
                   <span className="piece-hud-tag">{selectedPiece.tipo}</span>
+                  {selectedPieceZoneLabel && (
+                    <span className="piece-hud-tag zone-tag">Zona: {selectedPieceZoneLabel}</span>
+                  )}
                   <span className="mono">
-                    Corte: <strong>{selectedPiece.ancho.toFixed(1)} × {selectedPiece.alto.toFixed(1)} × {selectedPiece.espesor} mm</strong>
+                    Corte:{' '}
+                    <strong>
+                      {selectedPiece.ancho.toFixed(1)} × {selectedPiece.alto.toFixed(1)} ×{' '}
+                      {selectedPiece.espesor} mm
+                    </strong>
                   </span>
                 </div>
                 <div className="piece-hud-meta mono">
                   <span>
                     Centro ℝ³: ({selectedPiece.posicion3D.map((v) => Math.round(v)).join(', ')}) mm
                   </span>
-                  <span>
-                    Acabado: {selectedPiece.material}
-                  </span>
-                  <span>
-                    Veta: {selectedPiece.respectGrain ? 'Eje ancho' : 'Libre'}
-                  </span>
+                  <span>Acabado: {selectedPiece.material}</span>
+                  <span>Veta: {selectedPiece.respectGrain ? 'Eje ancho' : 'Libre'}</span>
+                  {selectedPiece.miterAngleDeg !== undefined && (
+                    <span>Inglete: {selectedPiece.miterAngleDeg.toFixed(1)}°</span>
+                  )}
                   {selectedPieceDin && (
-                    <span
-                      className={
-                        selectedPieceDin.passesDIN ? 'din-pill ok' : 'din-pill bad'
-                      }
-                    >
+                    <span className={selectedPieceDin.passesDIN ? 'din-pill ok' : 'din-pill bad'}>
                       DIN 68874-1: δ={selectedPieceDin.deflectionMm.toFixed(2)} mm /{' '}
                       {selectedPieceDin.allowableMm.toFixed(2)} mm (máx.{' '}
                       {selectedPieceDin.maxLoadKg.toFixed(1)} kg)
@@ -757,7 +1083,10 @@ export function Viewer3D({
 
       <Canvas
         shadows
-        camera={{ position: [camDist * 0.72, Math.max(targetY * 1.15, camDist * 0.58), camDist * 1.05], fov: 42 }}
+        camera={{
+          position: [camDist * 0.72, Math.max(targetY * 1.15, camDist * 0.58), camDist * 1.05],
+          fov: 42,
+        }}
         onPointerMissed={() => setSelectedPieceId(null)}
       >
         <color attach="background" args={['#eef2f6']} />
@@ -773,11 +1102,16 @@ export function Viewer3D({
           explodeFactor={explodeFactor}
           showDimensions={showDimensions}
           selectedPieceId={selectedPieceId}
+          selectedZoneId={selectedZoneId}
+          hoveredZoneId={hoveredZoneId}
           onSelectPiece={setSelectedPieceId}
+          onSelectZone={onSelectZone}
+          onHoverZone={onHoverZone}
         />
         <CameraRig
           preset={camPreset}
           presetTrigger={camTrigger}
+          modelKey={modelKey}
           camDist={camDist}
           targetY={targetY}
         />

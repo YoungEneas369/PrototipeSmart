@@ -385,4 +385,280 @@ describe('SmartFurniture Bloque 1 — Motor Matemático y Homografía (v3.0)', (
       expect(res.hardwareSummary.some((h) => /canasto/i.test(h.descripcion) && h.cantidad === 3)).toBe(true);
     }
   });
+
+  it('14. Laterales en `leg_void` + `topOverSides` bajan hasta y = 0 (0 flotación, 0 solapamiento 3D)', () => {
+    // Escritorio con hueco de piernas a la izquierda + pedestal con cajones a la derecha
+    const { topology, params } = clonePreset('estanteria');
+    params.targetDimensions = { x: 1400, y: 750, z: 600 };
+    params.referenceDimensions = { x: 1400, y: 750, z: 600 };
+    params.cornerJointType = 'topOverSides';
+    topology.shelfMode = 'custom';
+    topology.equalShelfCount = 0;
+    topology.hasBackPanel = true;
+    topology.vDividers = [{ id: 'ped_div', position: 0.65, start: 0, end: 1 }];
+    topology.hShelves = [];
+    topology.frontZones = [
+      { id: 'hueco_piernas', uStart: 0, uEnd: 0.65, vStart: 0, vEnd: 1, kind: 'leg_void' },
+      { id: 'ped_cajones', uStart: 0.65, uEnd: 1, vStart: 0, vEnd: 1, kind: 'drawers', drawerCount: 3 },
+    ];
+
+    const res = calculateDespiece(topology, params);
+    assertNo3DOverlap(res.matrizDespiece);
+
+    const latIzq = res.matrizDespiece.find((p) => p.id === 'lateral_izq')!;
+    const latDer = res.matrizDespiece.find((p) => p.id === 'lateral_der')!;
+    const pedDiv = res.matrizDespiece.find((p) => p.id === 'ped_div')!;
+    const faldon = res.matrizDespiece.find((p) => p.tipo === 'faldon')!;
+    const pedBase = res.matrizDespiece.find((p) => p.id === 'base_pedestal_1')!;
+
+    // Todos los apoyos verticales deben tocar el piso y = 0 (cero flotación)
+    expect(latIzq.posicion3D[1] - latIzq.dimensiones3D[1] / 2).toBeCloseTo(0, 4);
+    expect(latDer.posicion3D[1] - latDer.dimensiones3D[1] / 2).toBeCloseTo(0, 4);
+    expect(pedDiv.posicion3D[1] - pedDiv.dimensiones3D[1] / 2).toBeCloseTo(0, 4);
+    expect(latIzq.ancho).toBeCloseTo(750 - 18, 4);
+    expect(faldon).toBeDefined();
+    expect(pedBase).toBeDefined();
+    // No existe base bajo el hueco de piernas (x < pedDiv.cx)
+    expect(pedBase.posicion3D[0] - pedBase.dimensiones3D[0] / 2).toBeGreaterThan(pedDiv.posicion3D[0]);
+
+    // Escritorio puro con `leg_void` en [0, 1] (sin pedestal): ambos laterales tocan y = 0
+    const desk2 = clonePreset('estanteria');
+    desk2.params.targetDimensions = { x: 1200, y: 740, z: 600 };
+    desk2.params.cornerJointType = 'topOverSides';
+    desk2.topology.shelfMode = 'custom';
+    desk2.topology.vDividers = [];
+    desk2.topology.hShelves = [];
+    desk2.topology.frontZones = [
+      { id: 'full_leg', uStart: 0, uEnd: 1, vStart: 0, vEnd: 1, kind: 'leg_void' },
+    ];
+    const resDesk2 = calculateDespiece(desk2.topology, desk2.params);
+    assertNo3DOverlap(resDesk2.matrizDespiece);
+    const l2 = resDesk2.matrizDespiece.find((p) => p.id === 'lateral_izq')!;
+    const r2 = resDesk2.matrizDespiece.find((p) => p.id === 'lateral_der')!;
+    expect(l2.posicion3D[1] - l2.dimensiones3D[1] / 2).toBeCloseTo(0, 4);
+    expect(r2.posicion3D[1] - r2.dimensiones3D[1] / 2).toBeCloseTo(0, 4);
+  });
+
+  it('15. `division_diagonal` con inglete (`miterAngleDeg`) sin sobresalir de la carcasa ni divisores', () => {
+    const { topology, params } = clonePreset('estanteria');
+    const xf = 1000;
+    const yf = 1000;
+    const e = 18;
+    params.targetDimensions = { x: xf, y: yf, z: 320 };
+    params.referenceDimensions = { x: xf, y: yf, z: 320 };
+    topology.shelfMode = 'custom';
+    topology.vDividers = [{ id: 'div_c', position: 0.5, start: 0, end: 1 }];
+    topology.hShelves = [];
+    topology.diagonalDividers = [
+      { id: 'diag_izq', u1: 0, v1: 0, u2: 0.5, v2: 1 },
+      { id: 'diag_der', u1: 0.5, v1: 1, u2: 1, v2: 0 },
+    ];
+
+    const res = calculateDespiece(topology, params);
+    const diags = res.matrizDespiece.filter((p) => p.tipo === 'division_diagonal');
+    expect(diags).toHaveLength(2);
+
+    const divC = res.matrizDespiece.find((p) => p.id === 'div_c')!;
+    const divLeftFace = divC.posicion3D[0] - e / 2;
+    const divRightFace = divC.posicion3D[0] + e / 2;
+
+    for (const d of diags) {
+      expect(d.miterAngleDeg).toBeDefined();
+      expect(d.miterAngleDeg!).toBeGreaterThan(20);
+      expect(d.miterAngleDeg!).toBeLessThan(80);
+
+      const [cx, cy] = d.posicion3D;
+      const halfL = d.dimensiones3D[0] / 2;
+      const halfE = d.dimensiones3D[1] / 2;
+      const theta = d.rotacion3D[2];
+      const cosT = Math.cos(theta);
+      const sinT = Math.sin(theta);
+
+      // Verificar las 4 esquinas rotadas en XY: ninguna puede sobresalir hacia laterales, base, cubierta ni divisor central
+      const corners: Array<[number, number]> = [
+        [cx + halfL * cosT - halfE * sinT, cy + halfL * sinT + halfE * cosT],
+        [cx + halfL * cosT + halfE * sinT, cy + halfL * sinT - halfE * cosT],
+        [cx - halfL * cosT - halfE * sinT, cy - halfL * sinT + halfE * cosT],
+        [cx - halfL * cosT + halfE * sinT, cy - halfL * sinT - halfE * cosT],
+      ];
+
+      const minX = d.id === 'diag_izq' ? e : divRightFace;
+      const maxX = d.id === 'diag_izq' ? divLeftFace : xf - e;
+
+      for (const [px, py] of corners) {
+        expect(px).toBeGreaterThanOrEqual(minX - 0.05);
+        expect(px).toBeLessThanOrEqual(maxX + 0.05);
+        expect(py).toBeGreaterThanOrEqual(e - 0.05);
+        expect(py).toBeLessThanOrEqual(yf - e + 0.05);
+      }
+    }
+  });
+
+  it('16. `void_outside` multi-esquina sin solapamientos 3D ni borrado de repisas adyacentes', () => {
+    for (const joint of ['topOverSides', 'topBetweenSides'] as const) {
+      // Caso A: Dos esquinas superiores recortadas (`topLeft` + `topRight`, mueble escalonado en torre central)
+      const { topology, params } = clonePreset('estanteria');
+      params.targetDimensions = { x: 1200, y: 1200, z: 380 };
+      params.referenceDimensions = { x: 1200, y: 1200, z: 380 };
+      params.cornerJointType = joint;
+      topology.shelfMode = 'custom';
+      topology.hasBackPanel = true;
+      topology.vDividers = [];
+      topology.hShelves = [
+        { id: 'rep_nivel_escalon', position: 0.7, start: 0, end: 1 },
+        { id: 'rep_inferior', position: 0.35, start: 0, end: 1 },
+      ];
+      topology.frontZones = [
+        { id: 'void_tl', uStart: 0, uEnd: 0.3, vStart: 0.7, vEnd: 1, kind: 'void_outside' },
+        { id: 'void_tr', uStart: 0.7, uEnd: 1, vStart: 0.7, vEnd: 1, kind: 'void_outside' },
+      ];
+
+      const resA = calculateDespiece(topology, params);
+      assertNo3DOverlap(resA.matrizDespiece);
+
+      expect(resA.matrizDespiece.some((p) => p.id === 'cubierta_escalon_izq')).toBe(true);
+      expect(resA.matrizDespiece.some((p) => p.id === 'cubierta_escalon_der')).toBe(true);
+      // La repisa a la altura del escalón sobrevive recortada en la torre central (NO se borra)
+      const centralStepShelf = resA.matrizDespiece.find((p) => p.id.startsWith('rep_nivel_escalon'));
+      expect(centralStepShelf).toBeDefined();
+      expect(centralStepShelf!.ancho).toBeGreaterThan(350);
+      // La repisa inferior bajo ambos escalones sobrevive completa
+      const lowerShelf = resA.matrizDespiece.find((p) => p.id.startsWith('rep_inferior'));
+      expect(lowerShelf).toBeDefined();
+      expect(lowerShelf!.ancho).toBeCloseTo(1200 - 36, 2);
+
+      // Caso B: Esquinas opuestas (`topRight` + `bottomLeft`)
+      const caseB = clonePreset('estanteria');
+      caseB.params.targetDimensions = { x: 1100, y: 1000, z: 360 };
+      caseB.params.cornerJointType = joint;
+      caseB.topology.shelfMode = 'custom';
+      caseB.topology.hasBackPanel = true;
+      caseB.topology.vDividers = [];
+      caseB.topology.hShelves = [{ id: 'rep_media', position: 0.5, start: 0, end: 1 }];
+      caseB.topology.frontZones = [
+        { id: 'void_tr_b', uStart: 0.65, uEnd: 1, vStart: 0.72, vEnd: 1, kind: 'void_outside' },
+        { id: 'void_bl_b', uStart: 0, uEnd: 0.35, vStart: 0, vEnd: 0.28, kind: 'void_outside' },
+      ];
+
+      const resB = calculateDespiece(caseB.topology, caseB.params);
+      assertNo3DOverlap(resB.matrizDespiece);
+      expect(resB.matrizDespiece.some((p) => p.id === 'cubierta_escalon_der')).toBe(true);
+      expect(resB.matrizDespiece.some((p) => p.id === 'base_escalon_izq')).toBe(true);
+      expect(resB.matrizDespiece.some((p) => p.id === 'rep_media')).toBe(true);
+      expect(resB.matrizDespiece.filter((p) => p.tipo === 'fondo').length).toBeGreaterThanOrEqual(2);
+    }
+  });
+
+  it('17. Cajones sin colisión con repisas internas y con espesores `boardThickness = 15` y `25` mm', () => {
+    for (const thickness of [15, 18, 25]) {
+      const { topology, params } = clonePreset('estanteria');
+      params.targetDimensions = { x: 1100, y: 1100, z: 450 };
+      params.referenceDimensions = { x: 1100, y: 1100, z: 450 };
+      params.boardThickness = thickness;
+      topology.shelfMode = 'custom';
+      topology.hasBackPanel = true;
+      topology.vDividers = [{ id: 'div_mid', position: 0.5, start: 0, end: 1 }];
+      topology.hShelves = [
+        { id: 'rep_borde_inf', position: 0.25, start: 0, end: 1 },
+        // Esta repisa cruza el interior de la zona de cajones (izquierda) pero debe sobrevivir en la zona abierta (derecha)
+        { id: 'rep_cruzada', position: 0.5, start: 0, end: 1 },
+        { id: 'rep_borde_sup', position: 0.75, start: 0, end: 1 },
+      ];
+      topology.frontZones = [
+        {
+          id: 'zona_caj',
+          uStart: 0,
+          uEnd: 0.5,
+          vStart: 0.25,
+          vEnd: 0.75,
+          kind: 'drawers',
+          drawerCount: 3,
+          materialOverride: 'blanco',
+        },
+        {
+          id: 'zona_abierta',
+          uStart: 0.5,
+          uEnd: 1,
+          vStart: 0.25,
+          vEnd: 0.75,
+          kind: 'open',
+        },
+      ];
+
+      const res = calculateDespiece(topology, params);
+      assertNo3DOverlap(res.matrizDespiece);
+
+      // 3 cajones × (1 frente + 2 costados + 1 trasera + 1 fondo) = 15 piezas de cajón
+      const fronts = res.matrizDespiece.filter((p) => p.tipo === 'frente_cajon');
+      const sides = res.matrizDespiece.filter((p) => p.tipo === 'costado_cajon');
+      const backs = res.matrizDespiece.filter((p) => p.tipo === 'trasera_cajon');
+      const bottoms = res.matrizDespiece.filter((p) => p.tipo === 'fondo_cajon');
+      expect(fronts).toHaveLength(3);
+      expect(sides).toHaveLength(6);
+      expect(backs).toHaveLength(3);
+      expect(bottoms).toHaveLength(3);
+      expect(fronts.every((f) => f.espesor === thickness && f.handleSide === 'top' && f.zoneId === 'zona_caj')).toBe(true);
+
+      // La repisa en v = 0.5 se suprimió en el vano de cajones y sobrevivió únicamente en el vano abierto derecho
+      const crossedShelves = res.matrizDespiece.filter((p) => p.id.startsWith('rep_cruzada'));
+      expect(crossedShelves).toHaveLength(1);
+      expect(crossedShelves[0].posicion3D[0]).toBeGreaterThan(params.targetDimensions.x / 2);
+    }
+  });
+
+  it('18. Zócalo completo de 4 piezas (`toe_kick`) sin solapamiento 3D en ambos encuentros', () => {
+    for (const joint of ['topOverSides', 'topBetweenSides'] as const) {
+      const { topology, params } = clonePreset('closet');
+      params.cornerJointType = joint;
+      topology.baseSupportType = 'toe_kick';
+      topology.toeKickHeightMm = 100;
+
+      const res = calculateDespiece(topology, params);
+      assertNo3DOverlap(res.matrizDespiece);
+
+      const zocalos = res.matrizDespiece.filter((p) => p.tipo === 'zocalo');
+      expect(zocalos).toHaveLength(4);
+      const ids = zocalos.map((z) => z.id).sort();
+      expect(ids).toEqual(['zocalo_der', 'zocalo_frontal', 'zocalo_izq', 'zocalo_trasero']);
+      for (const z of zocalos) {
+        expect(z.alto).toBe(100);
+        // Ubicados exactamente bajo la carcasa: y ∈ [-100, 0]
+        expect(z.posicion3D[1]).toBeCloseTo(-50, 4);
+      }
+    }
+  });
+
+  it('19. Homografía 3×3: rechaza cuadrilátero no-convexo (corbatín y cóncavo) y mantiene precisión Hartley en 4K', () => {
+    // Corbatín (auto-intersectado) -> null
+    const bowtie: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 100, y: 100 },
+      { x: 700, y: 600 },
+      { x: 700, y: 100 },
+      { x: 100, y: 600 },
+    ];
+    expect(computeQuadToUnitHomography(bowtie)).toBeNull();
+
+    // Cuadrilátero cóncavo (punta de flecha) -> null
+    const concave: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 0, y: 0 },
+      { x: 500, y: 0 },
+      { x: 120, y: 120 },
+      { x: 0, y: 500 },
+    ];
+    expect(computeQuadToUnitHomography(concave)).toBeNull();
+
+    // Estabilidad numérica Hartley en foto de alta resolución (3000×4000 px) con perspectiva pronunciada
+    const quad4k: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 420, y: 380 },
+      { x: 2680, y: 510 },
+      { x: 2890, y: 3690 },
+      { x: 290, y: 3520 },
+    ];
+    const hom = computeQuadToUnitHomography(quad4k);
+    expect(hom).not.toBeNull();
+    const probe4k: Point2D = { x: 1640, y: 2150 };
+    const u = applyHomography(hom!.toUnit, probe4k)!;
+    const restored = applyHomography(hom!.toCanvas, u)!;
+    expect(Math.hypot(restored.x - probe4k.x, restored.y - probe4k.y)).toBeLessThan(1e-6);
+  });
 });

@@ -1,27 +1,27 @@
 /**
- * SMARTFURNITURE — VECTORIZACIÓN GUIADA POR EL USUARIO (RECALCAR MÁRGENES -> VECTORES -> 3D EXACTO) v6.0
+ * SMARTFURNITURE — VECTORIZACIÓN GUIADA POR EL USUARIO (RECALCAR MÁRGENES -> VECTORES -> 3D EXACTO) v8.0
  * 100% offline, TypeScript puro (cero DOM, cero React).
  *
- * Permite que el usuario recalque directamente sobre la foto:
- *   1) Contorno exterior (con imán opcional de bordes Sobel `snapPointToStrongEdge`).
- *   2) Líneas internas con 1 sola herramienta universal (`vectorizeUserStroke`): detecta automáticamente
- *      si el trazo es horizontal (repisa/junta) o vertical (divisor), lo endereza en espacio de homografía,
- *      hace snap a muros y vectores existentes (T-junctions) y calcula su medida exacta en mm.
- *   3) Partición planar exacta por BFS (`partitionCellsFromVectors`): convierte cualquier combinación de
- *      divisores y repisas (totales o parciales) en celdas rectangulares cerradas sin solapamiento.
- *   4) Auto-clasificación por píxeles dentro de cada celda recalcada (`classifyPartitionedZonesFromPhoto`):
- *      muestrea el color real, contraste marco-centro (vidrio), fondo exterior (hueco piernas) y
- *      acabado bicolor únicamente dentro de los márgenes exactos trazados por el usuario.
+ * Unificado sobre `imageOps`, `colorClassifier` y `zoneClassifier`:
+ *   1) Imán de bordes Sobel 3×3 (`snapPointToStrongEdge` vía `sobel3x3AtRgba`).
+ *   2) Herramienta universal (`vectorizeUserStroke`): ángulo diagonal unificado `18°–72°`,
+ *      `autoExtend` seguro (≤ 6%, sin estirar trazos cortos a la fuerza) e IDs deterministas.
+ *   3) Partición planar rectangular exacta (`partitionCellsFromVectors`) con tolerancia adaptativa
+ *      por tamaño de celda (evita contaminar bandas angostas con divisores parciales adyacentes).
+ *   4) Auto-clasificación por píxeles (`classifyPartitionedZonesFromPhoto`) delegada al clasificador
+ *      CIE-Lab unificado (`classifyZonesUnified` + `interiorToExteriorRect`).
  */
 import type {
   DiagonalSegment,
-  FrontModuleKind,
   FrontZone,
   MelamineMaterial,
   NormalizedSegment,
   Point2D,
 } from '../../types/contracts';
 import { applyHomography, exteriorToInterior } from '../mathEngine';
+import { MATERIAL_BASE_RGB } from './colorClassifier';
+import { clamp, sobel3x3AtRgba } from './imageOps';
+import { classifyZonesUnified } from './zoneClassifier';
 
 export type UserStrokeMode = 'auto' | 'ortho' | 'diagonal';
 
@@ -59,10 +59,6 @@ export interface PartitionRectCell {
   vEnd: number;
 }
 
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
-}
-
 function snapToAnchors(val: number, anchors: readonly number[], tol = 0.055): number {
   let best = val;
   let bestD = tol;
@@ -76,8 +72,17 @@ function snapToAnchors(val: number, anchors: readonly number[], tol = 0.055): nu
   return best;
 }
 
+function makeDeterministicId(base: string, existingIds: ReadonlySet<string>): string {
+  if (!existingIds.has(base)) return base;
+  let suffix = 2;
+  while (existingIds.has(`${base}_${suffix}`)) {
+    suffix++;
+  }
+  return `${base}_${suffix}`;
+}
+
 /**
- * Imán de bordes (Sobel local): ajusta un punto tocado por el usuario al borde de mayor
+ * Imán de bordes (Sobel 3×3 unificado): ajusta un punto tocado por el usuario al borde de mayor
  * contraste más cercano dentro de `radiusPx` (ideal para trazos en pantalla táctil o mouse).
  */
 export function snapPointToStrongEdge(
@@ -94,13 +99,7 @@ export function snapPointToStrongEdge(
 
   const cx = clamp(Math.round(pt.x), 1, imgW - 2);
   const cy = clamp(Math.round(pt.y), 1, imgH - 2);
-  const r = Math.max(2, Math.min(18, Math.round(radiusPx)));
-
-  const lumAt = (x: number, y: number): number => {
-    const i = (y * imgW + x) * 4;
-    if (rgba[i + 3] < 128) return 255;
-    return 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2];
-  };
+  const r = clamp(Math.round(radiusPx), 2, 18);
 
   let bestX = cx;
   let bestY = cy;
@@ -116,23 +115,9 @@ export function snapPointToStrongEdge(
     for (let x = x0; x <= x1; x++) {
       const dist = Math.hypot(x - cx, y - cy);
       if (dist > r) continue;
-      const gx =
-        -lumAt(x - 1, y - 1) +
-        lumAt(x + 1, y - 1) -
-        2 * lumAt(x - 1, y) +
-        2 * lumAt(x + 1, y) -
-        lumAt(x - 1, y + 1) +
-        lumAt(x + 1, y + 1);
-      const gy =
-        -lumAt(x - 1, y - 1) -
-        2 * lumAt(x, y - 1) -
-        lumAt(x + 1, y - 1) +
-        lumAt(x - 1, y + 1) +
-        2 * lumAt(x, y + 1) +
-        lumAt(x + 1, y + 1);
+      const [gx, gy] = sobel3x3AtRgba(rgba, imgW, imgH, x, y);
       const grad = Math.hypot(gx, gy);
       if (grad < minGradient) continue;
-      // Priorizar borde fuerte cercano al dedo/puntero
       const score = grad / (1 + dist * 0.14);
       if (score > bestScore) {
         bestScore = score;
@@ -156,11 +141,14 @@ export function snapPointToStrongEdge(
 /**
  * Convierte un trazo libre `p1 -> p2` del usuario sobre la foto en un vector estructural
  * exacto (`vDivider`, `hShelf` o `diagonal`) en el espacio interior normalizado `[0, 1]^2`:
- *  - Modo `'auto'` (default): si el ángulo está dentro de ±18° de H/V endereza a repisa/divisor
- *    (siguiendo la perspectiva del contorno 4 pts); si está entre 18° y 72° conserva una
+ *  - Modo `'auto'` (default): si el ángulo está dentro de `< 18°` de H o V endereza a repisa/divisor
+ *    (siguiendo la perspectiva del contorno 4 pts); si está entre **18° y 72°** conserva una
  *    **división diagonal real** con su ángulo y longitud física exacta en mm.
  *  - Modo `'diagonal'`: conserva SIEMPRE la línea libre/diagonal exacta sin forzar a recta.
  *  - Modo `'ortho'`: endereza siempre a horizontal o vertical con snap a muros y T-junctions.
+ *  - `autoExtend`: `true` extiende suavemente solo a ≤ 6% de un borde/divisor; `false` desactiva
+ *    extensión automática; número explícito fija la tolerancia en `[0..0.25]`. Jamás estira a la
+ *    fuerza trazos parciales cortos (`< 16%`) trazados intencionalmente por el usuario.
  */
 export function vectorizeUserStroke(
   p1: Point2D,
@@ -170,7 +158,7 @@ export function vectorizeUserStroke(
   existingHShelves: readonly NormalizedSegment[],
   boardThicknessMm: number,
   dimsMm: { x: number; y: number },
-  autoExtend = true,
+  autoExtend: boolean | number = true,
   strokeMode: UserStrokeMode = 'auto',
 ): TracedStrokeResult | null {
   const uA = applyHomography(toUnitHomography, p1);
@@ -190,16 +178,21 @@ export function vectorizeUserStroke(
   const xInt = Math.max(1, dimsMm.x - 2 * boardThicknessMm);
   const yInt = Math.max(1, dimsMm.y - 2 * boardThicknessMm);
 
-  // Comparar en escala física real (mm) para ángulo verdadero del mueble
   const dxMmSigned = du * xInt;
   const dyMmSigned = dv * yInt;
   const dxMm = Math.abs(dxMmSigned);
   const dyMm = Math.abs(dyMmSigned);
   const absAngleFromHorizDeg = (Math.atan2(dyMm, dxMm) * 180) / Math.PI; // 0° = horiz, 90° = vert
 
+  const existingIds = new Set<string>([
+    ...existingVDividers.map((d) => d.id),
+    ...existingHShelves.map((s) => s.id),
+  ]);
+
+  // Rango unificado 18°–72° (consistente con dEdge en vectorLines.ts y con la UI)
   const shouldBeDiagonal =
     strokeMode === 'diagonal' ||
-    (strokeMode === 'auto' && absAngleFromHorizDeg > 24 && absAngleFromHorizDeg < 66);
+    (strokeMode === 'auto' && absAngleFromHorizDeg >= 18 && absAngleFromHorizDeg <= 72);
 
   if (shouldBeDiagonal) {
     const allUAnchors = [0, ...existingVDividers.map((d) => d.position), 1];
@@ -215,10 +208,11 @@ export function vectorizeUserStroke(
     if (lenMm < Math.max(30, boardThicknessMm * 1.5)) return null;
 
     const angleDeg = Math.round((Math.atan2(fdy, fdx) * 180) / Math.PI);
+    const baseId = `usr_diag_${Math.round(su1 * 1000)}_${Math.round(sv1 * 1000)}_${Math.round(su2 * 1000)}_${Math.round(sv2 * 1000)}`;
     return {
       kind: 'diagonal',
       segment: {
-        id: `usr_diag_${Date.now()}_${Math.round(lenMm)}`,
+        id: makeDeterministicId(baseId, existingIds),
         u1: Number(su1.toFixed(4)),
         v1: Number(sv1.toFixed(4)),
         u2: Number(su2.toFixed(4)),
@@ -231,11 +225,18 @@ export function vectorizeUserStroke(
     };
   }
 
+  const extendTol =
+    typeof autoExtend === 'number'
+      ? clamp(autoExtend, 0, 0.25)
+      : autoExtend
+        ? 0.06
+        : 0;
+  const anchorSnapTol = extendTol > 0 ? Math.min(0.06, extendTol) : 0.035;
+
   const isHorizontal = dxMm >= dyMm;
 
   if (isHorizontal) {
     const vPos = clamp((y1 + y2) / 2, 0.04, 0.96);
-    // Anclas verticales (muros 0, 1 + divisores que crucen esta altura vPos)
     const activeVAnchors = [
       0,
       ...existingVDividers
@@ -247,23 +248,23 @@ export function vectorizeUserStroke(
     let uStart = clamp(Math.min(x1, x2), 0, 1);
     let uEnd = clamp(Math.max(x1, x2), 0, 1);
 
-    uStart = snapToAnchors(uStart, activeVAnchors, 0.065);
-    uEnd = snapToAnchors(uEnd, activeVAnchors, 0.065);
+    uStart = snapToAnchors(uStart, activeVAnchors, anchorSnapTol);
+    uEnd = snapToAnchors(uEnd, activeVAnchors, anchorSnapTol);
 
-    if (autoExtend) {
-      // Encajar extremos al muro/divisor envolvente si el trazo quedó casi llegando o fue corto dentro del vano
-      const leftWall = [...activeVAnchors].reverse().find((a) => a <= uStart + 0.02) ?? 0;
-      const rightWall = activeVAnchors.find((a) => a >= uEnd - 0.02) ?? 1;
-      if (uStart - leftWall <= 0.14 || uEnd - uStart < 0.16) uStart = leftWall;
-      if (rightWall - uEnd <= 0.14 || uEnd - uStart < 0.16) uEnd = rightWall;
+    if (extendTol > 0) {
+      const leftWall = [...activeVAnchors].reverse().find((a) => a <= uStart + 0.015) ?? 0;
+      const rightWall = activeVAnchors.find((a) => a >= uEnd - 0.015) ?? 1;
+      if (uStart - leftWall <= extendTol) uStart = leftWall;
+      if (rightWall - uEnd <= extendTol) uEnd = rightWall;
     }
 
     if (uEnd - uStart < 0.05) return null;
 
+    const baseId = `usr_rep_${Math.round(vPos * 1000)}_${Math.round(uStart * 1000)}_${Math.round(uEnd * 1000)}`;
     return {
       kind: 'hShelf',
       segment: {
-        id: `usr_rep_${Date.now()}_${Math.round(vPos * 1000)}`,
+        id: makeDeterministicId(baseId, existingIds),
         position: Number(vPos.toFixed(4)),
         start: Number(uStart.toFixed(4)),
         end: Number(uEnd.toFixed(4)),
@@ -288,22 +289,23 @@ export function vectorizeUserStroke(
   let vStart = clamp(Math.min(y1, y2), 0, 1);
   let vEnd = clamp(Math.max(y1, y2), 0, 1);
 
-  vStart = snapToAnchors(vStart, activeHAnchors, 0.065);
-  vEnd = snapToAnchors(vEnd, activeHAnchors, 0.065);
+  vStart = snapToAnchors(vStart, activeHAnchors, anchorSnapTol);
+  vEnd = snapToAnchors(vEnd, activeHAnchors, anchorSnapTol);
 
-  if (autoExtend) {
-    const botWall = [...activeHAnchors].reverse().find((a) => a <= vStart + 0.02) ?? 0;
-    const topWall = activeHAnchors.find((a) => a >= vEnd - 0.02) ?? 1;
-    if (vStart - botWall <= 0.14 || vEnd - vStart < 0.16) vStart = botWall;
-    if (topWall - vEnd <= 0.14 || vEnd - vStart < 0.16) vEnd = topWall;
+  if (extendTol > 0) {
+    const botWall = [...activeHAnchors].reverse().find((a) => a <= vStart + 0.015) ?? 0;
+    const topWall = activeHAnchors.find((a) => a >= vEnd - 0.015) ?? 1;
+    if (vStart - botWall <= extendTol) vStart = botWall;
+    if (topWall - vEnd <= extendTol) vEnd = topWall;
   }
 
   if (vEnd - vStart < 0.05) return null;
 
+  const baseId = `usr_div_${Math.round(uPos * 1000)}_${Math.round(vStart * 1000)}_${Math.round(vEnd * 1000)}`;
   return {
     kind: 'vDivider',
     segment: {
-      id: `usr_div_${Date.now()}_${Math.round(uPos * 1000)}`,
+      id: makeDeterministicId(baseId, existingIds),
       position: Number(uPos.toFixed(4)),
       start: Number(vStart.toFixed(4)),
       end: Number(vEnd.toFixed(4)),
@@ -317,14 +319,15 @@ export function vectorizeUserStroke(
 
 /**
  * Partición planar rectangular exacta de `[0, 1]^2` a partir de divisores verticales y repisas
- * horizontales (totales o parciales). Genera celdas estrictamente rectangulares, disjuntas
- * (cero solapamiento) cuya suma de áreas es exactamente 1.0 incluso en vacíos en forma de L.
+ * horizontales (totales o parciales). Emplea tolerancia adaptativa basada en el tamaño y
+ * solapamiento real de cada celda elemental para no contaminar celdas angostas con divisores
+ * parciales vecinos. Garantiza celdas disjuntas con suma de áreas = 1.0.
  */
 export function partitionCellsFromVectors(
   vDividers: readonly NormalizedSegment[],
   hShelves: readonly NormalizedSegment[],
 ): PartitionRectCell[] {
-  const dedupeSorted = (vals: number[], eps = 0.015): number[] => {
+  const dedupeSorted = (vals: number[], eps = 0.012): number[] => {
     const sorted = [...vals].sort((a, b) => a - b);
     const out: number[] = [];
     for (const v of sorted) {
@@ -348,23 +351,43 @@ export function partitionCellsFromVectors(
     return [{ id: 'traced_zone_1', uStart: 0, uEnd: 1, vStart: 0, vEnd: 1 }];
   }
 
-  const tol = 0.025;
-  // Verificar si existe una pared vertical bloqueando entre columna (colBorderIdx - 1) y (colBorderIdx) en fila (r)
+  // Tolerancia adaptativa en posición + solapamiento estricto >= 50% de la altura/ancho de la celda
   const hasVertWall = (colBorderIdx: number, r: number): boolean => {
     const uWall = us[colBorderIdx];
-    const vMid = (vs[r] + vs[r + 1]) / 2;
-    return vDividers.some(
-      (d) => Math.abs(d.position - uWall) <= tol && vMid >= d.start - tol && vMid <= d.end + tol,
+    const v0 = vs[r];
+    const v1 = vs[r + 1];
+    const cellH = v1 - v0;
+    const minColGap = Math.min(
+      colBorderIdx > 0 ? us[colBorderIdx] - us[colBorderIdx - 1] : 1,
+      colBorderIdx + 1 < us.length ? us[colBorderIdx + 1] - us[colBorderIdx] : 1,
     );
+    const posTol = Math.min(0.015, minColGap * 0.45);
+    return vDividers.some((d) => {
+      if (Math.abs(d.position - uWall) > posTol) return false;
+      const dStart = Math.min(d.start, d.end);
+      const dEnd = Math.max(d.start, d.end);
+      const overlap = Math.min(v1, dEnd) - Math.max(v0, dStart);
+      return overlap >= cellH * 0.5;
+    });
   };
 
-  // Verificar si existe una repisa horizontal bloqueando entre fila (rowBorderIdx - 1) y (rowBorderIdx) en columna (c)
   const hasHorizWall = (rowBorderIdx: number, c: number): boolean => {
     const vWall = vs[rowBorderIdx];
-    const uMid = (us[c] + us[c + 1]) / 2;
-    return hShelves.some(
-      (s) => Math.abs(s.position - vWall) <= tol && uMid >= s.start - tol && uMid <= s.end + tol,
+    const u0 = us[c];
+    const u1 = us[c + 1];
+    const cellW = u1 - u0;
+    const minRowGap = Math.min(
+      rowBorderIdx > 0 ? vs[rowBorderIdx] - vs[rowBorderIdx - 1] : 1,
+      rowBorderIdx + 1 < vs.length ? vs[rowBorderIdx + 1] - vs[rowBorderIdx] : 1,
     );
+    const posTol = Math.min(0.015, minRowGap * 0.45);
+    return hShelves.some((s) => {
+      if (Math.abs(s.position - vWall) > posTol) return false;
+      const sStart = Math.min(s.start, s.end);
+      const sEnd = Math.max(s.start, s.end);
+      const overlap = Math.min(u1, sEnd) - Math.max(u0, sStart);
+      return overlap >= cellW * 0.5;
+    });
   };
 
   const used = new Uint8Array(rows * cols);
@@ -477,29 +500,13 @@ export function partitionCellsFromVectors(
     }
   }
 
-  // Ordenar de izquierda a derecha y de arriba a abajo para lectura natural del cliente
   cells.sort((a, b) => a.uStart - b.uStart || b.vEnd - a.vEnd);
   return cells.map((cell, idx) => ({ ...cell, id: `traced_zone_${idx + 1}` }));
 }
 
-function inferMelamineSimple(r: number, g: number, b: number): MelamineMaterial {
-  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-  const warmth = r - b;
-  if (lum >= 175 && Math.abs(r - b) < 28) return 'blanco';
-  if (warmth >= 16 && r > g + 3 && lum >= 48) return 'roble';
-  if (lum <= 105) return 'grafito';
-  return lum >= 162 ? 'blanco' : 'roble';
-}
-
-const MAT_REF: Record<MelamineMaterial, [number, number, number]> = {
-  blanco: [238, 240, 244],
-  roble: [198, 154, 106],
-  grafito: [62, 74, 92],
-};
-
 /**
  * Clasifica automáticamente cada celda resultante de las líneas recalcadas por el usuario
- * muestreando los píxeles reales de la foto rectificada dentro de cada recuadro exacto.
+ * delegando al clasificador CIE-Lab unificado (`classifyZonesUnified` + `interiorToExteriorRect`).
  * Conserva selecciones manuales previas del usuario si la celda sigue en la misma posición.
  */
 export function classifyPartitionedZonesFromPhoto(
@@ -511,159 +518,20 @@ export function classifyPartitionedZonesFromPhoto(
   carcassMaterial: MelamineMaterial,
   exteriorBgRgb: [number, number, number] = [245, 245, 245],
   previousZones: readonly FrontZone[] = [],
+  boardThicknessMm = 18,
 ): FrontZone[] {
-  const refRgb = MAT_REF[carcassMaterial];
-  const refLum = 0.299 * refRgb[0] + 0.587 * refRgb[1] + 0.114 * refRgb[2];
-
-  return cells.map((cell, idx) => {
-    // Si el usuario ya había configurado esta celda casi idéntica, preservar su elección
-    const prevMatch = previousZones.find(
-      (pz) =>
-        Math.abs(pz.uStart - cell.uStart) <= 0.04 &&
-        Math.abs(pz.uEnd - cell.uEnd) <= 0.04 &&
-        Math.abs(pz.vStart - cell.vStart) <= 0.04 &&
-        Math.abs(pz.vEnd - cell.vEnd) <= 0.04,
-    );
-    if (prevMatch) {
-      return {
-        ...prevMatch,
-        id: cell.id,
-        uStart: cell.uStart,
-        uEnd: cell.uEnd,
-        vStart: cell.vStart,
-        vEnd: cell.vEnd,
-      };
-    }
-
-    if (!rectRgba || rectW < 20 || rectH < 20) {
-      return {
-        id: cell.id,
-        uStart: cell.uStart,
-        uEnd: cell.uEnd,
-        vStart: cell.vStart,
-        vEnd: cell.vEnd,
-        kind: 'open',
-        label: `Zona ${idx + 1}`,
-      };
-    }
-
-    const x0 = clamp(Math.round((cell.uStart + (cell.uEnd - cell.uStart) * 0.12) * rectW), 0, rectW - 1);
-    const x1 = clamp(Math.round((cell.uEnd - (cell.uEnd - cell.uStart) * 0.12) * rectW), 0, rectW - 1);
-    const y0 = clamp(Math.round((1 - cell.vEnd + (cell.vEnd - cell.vStart) * 0.12) * rectH), 0, rectH - 1);
-    const y1 = clamp(Math.round((1 - cell.vStart - (cell.vEnd - cell.vStart) * 0.12) * rectH), 0, rectH - 1);
-
-    let sumR = 0, sumG = 0, sumB = 0, sumL = 0, sumL2 = 0, bgHits = 0, cnt = 0;
-    let fSum = 0, fCnt = 0, cSum = 0, cCnt = 0;
-    const fx0 = x0 + Math.round((x1 - x0) * 0.16);
-    const fx1 = x1 - Math.round((x1 - x0) * 0.16);
-    const fy0 = y0 + Math.round((y1 - y0) * 0.16);
-    const fy1 = y1 - Math.round((y1 - y0) * 0.16);
-
-    for (let y = y0; y <= y1; y += 2) {
-      for (let x = x0; x <= x1; x += 2) {
-        const p = (y * rectW + x) * 4;
-        if (rectRgba[p + 3] < 128) {
-          bgHits++;
-          cnt++;
-          continue;
-        }
-        const r = rectRgba[p], g = rectRgba[p + 1], b = rectRgba[p + 2];
-        const l = 0.299 * r + 0.587 * g + 0.114 * b;
-        sumR += r;
-        sumG += g;
-        sumB += b;
-        sumL += l;
-        sumL2 += l * l;
-        if (Math.hypot(r - exteriorBgRgb[0], g - exteriorBgRgb[1], b - exteriorBgRgb[2]) <= 36) {
-          bgHits++;
-        }
-        if (x >= fx0 && x <= fx1 && y >= fy0 && y <= fy1) {
-          cSum += l;
-          cCnt++;
-        } else {
-          fSum += l;
-          fCnt++;
-        }
-        cnt++;
-      }
-    }
-
-    const nSafe = Math.max(1, cnt);
-    const meanR = sumR / nSafe;
-    const meanG = sumG / nSafe;
-    const meanB = sumB / nSafe;
-    const meanL = sumL / nSafe;
-    const stdL = Math.sqrt(Math.max(0, sumL2 / nSafe - meanL * meanL));
-    const bgRatio = bgHits / nSafe;
-    const fMean = fCnt > 0 ? fSum / fCnt : meanL;
-    const cMean = cCnt > 0 ? cSum / cCnt : meanL;
-
-    const cellWmm = (cell.uEnd - cell.uStart) * dimsMm.x;
-    const cellHmm = (cell.vEnd - cell.vStart) * dimsMm.y;
-    const cellMat = inferMelamineSimple(meanR, meanG, meanB);
-    const distCarcass = Math.hypot(meanR - refRgb[0], meanG - refRgb[1], meanB - refRgb[2]);
-    // Madera genuina (evitar falsos positivos en nichos con sombra marrón-grisácea heterogénea)
-    const isWarmWood =
-      meanR - meanB >= 18 &&
-      meanR > meanG + 3 &&
-      meanL >= 55 &&
-      (stdL <= 30 || meanR - meanB >= 30);
-    const matOverride =
-      (distCarcass > 38 || (isWarmWood && carcassMaterial !== 'roble')) && cellMat !== carcassMaterial
-        ? cellMat
-        : undefined;
-
-    let kind: FrontModuleKind;
-    if (cell.vStart <= 0.05 && bgRatio >= 0.48 && (cell.uEnd - cell.uStart < 0.94 || cell.vEnd - cell.vStart < 0.92)) {
-      kind = 'leg_void';
-    } else if (
-      // Vano pasante / mesón abierto mostrando pared de fondo (sin tocar el piso)
-      (cell.vStart > 0.05 && bgRatio >= 0.65) ||
-      // Cavidad oscura interior o nicho sombreado en mueble claro (p. ej. estante abierto con objetos)
-      (cMean < 56 && !isWarmWood) ||
-      (refLum >= 200 && meanL < refLum - 65 && stdL > 22) ||
-      (meanL < refLum - 26 && distCarcass > 32 && !isWarmWood) ||
-      (stdL > 35 && bgRatio < 0.45)
-    ) {
-      kind = 'open';
-    } else if (
-      !isWarmWood &&
-      Math.abs(meanR - meanB) < 22 &&
-      cellHmm >= 360 &&
-      cellHmm / Math.max(1, cellWmm) >= 1.1 &&
-      fMean - cMean >= 13 &&
-      stdL < 46
-    ) {
-      kind = 'door_glass';
-    } else if (cellHmm <= 310 && cellWmm > cellHmm * 1.15) {
-      kind = 'drawers';
-    } else if (cellWmm >= 540 && cellWmm / Math.max(1, cellHmm) >= 0.85) {
-      kind = 'door_double';
-    } else {
-      kind = cell.uStart < 0.48 ? 'door_left' : 'door_right';
-    }
-
-    return {
-      id: cell.id,
-      uStart: cell.uStart,
-      uEnd: cell.uEnd,
-      vStart: cell.vStart,
-      vEnd: cell.vEnd,
-      kind,
-      drawerCount: kind === 'drawers' ? 1 : undefined,
-      label:
-        kind === 'leg_void'
-          ? 'Hueco Piernas'
-          : kind === 'door_glass'
-            ? 'Vidrio'
-            : kind === 'open'
-              ? `Vano ${idx + 1}`
-              : kind === 'drawers'
-                ? 'Cajón'
-                : kind === 'door_double'
-                  ? '2 Puertas'
-                  : 'Puerta',
-      materialOverride: kind === 'open' || kind === 'leg_void' ? undefined : matOverride,
-    };
+  return classifyZonesUnified(cells, {
+    rectRgba,
+    rectW,
+    rectH,
+    dimsMm,
+    boardThicknessMm,
+    carcassMaterial,
+    refRgb: MATERIAL_BASE_RGB[carcassMaterial],
+    exteriorBgRgb,
+    previousZones,
+    mergeDrawers: false,
+    modeHint: 'traced',
+    idPrefix: 'traced_zone',
   });
 }

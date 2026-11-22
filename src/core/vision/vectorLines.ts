@@ -1,17 +1,19 @@
 /**
- * SMARTFURNITURE — EXTRACTOR DE LÍNEAS VECTORIALES 2D + EVALUADOR MÁRGENES/3D vs FOTO (v5.0)
+ * SMARTFURNITURE — EXTRACTOR DE LÍNEAS VECTORIALES 2D + EVALUADOR MÁRGENES/3D vs FOTO (v8.0)
  * 100% offline, TypeScript puro (cero DOM, cero React, cero dependencias externas).
  *
  * 1. `extractStructuralVectorLines`: Convierte los bordes reales de la foto en segmentos
- *    vectoriales explícitos (`VectorLine2D`: p1, p2, Δx, Δy, ||v||, vector unitario û, rol).
- * 2. `evaluateMarginsAgainstPhoto`: Evalúa qué tan bien calzan los márgenes y líneas vectoriales
- *    propuestos contra los bordes y la silueta real de la foto subida.
- * 3. `evaluate3DvsPhotoSimilarity`: Proyecta el modelo 3D real (`DespieceResult`) sobre el frente
- *    de la foto rectificada y mide similitud estructural, de silueta y de color zona por zona.
+ *    vectoriales explícitos (`VectorLine2D`: H, V y diagonales reales 18°–72° vía `dEdge`).
+ * 2. `evaluateMarginsAgainstPhoto`: Evalúa el cuadrilátero proyectivo real contra la foto usando
+ *    test punto-en-polígono (`pointInQuad`) y normales perpendiculares reales a cada arista.
+ * 3. `evaluate3DvsPhotoSimilarity`: Proyecta el modelo 3D real (`DespieceResult`), incluyendo
+ *    piezas rotadas (`division_diagonal`, `rotacion3D[2] !== 0`) y rejillas de `baskets`.
+ * 4. `reconstructStructureFromVectors` + `runIterativePhotoTo3D`: Reconstrucción integral
+ *    coherente en espacio INTERIOR `[0,1]^2` sin duplicación de `hShelves` dentro de `drawers`.
  */
 import type {
   DespieceResult,
-  FrontModuleKind,
+  DiagonalSegment,
   FrontZone,
   FurnitureTopology,
   MelamineMaterial,
@@ -30,6 +32,21 @@ import {
   type BandDetectionResult,
   type LowerGapHintResult,
 } from './bandDetector';
+import { MATERIAL_BASE_RGB } from './colorClassifier';
+import {
+  clamp,
+  edgeInwardUnitNormal,
+  extractLuminanceBuffer,
+  gaussianBlur3x3,
+  interiorToExteriorPoint,
+  interiorToExteriorRect,
+  pointInQuad,
+  quadArea,
+  rgbaLuminance,
+  sampleExteriorBgRgb,
+  sampleLumSafe,
+  sobel3x3At,
+} from './imageOps';
 import {
   autoDetectFurnitureQuad,
   computeRectifiedSize,
@@ -39,6 +56,12 @@ import {
   type AutoQuadResult,
   type CameraPoseEstimate,
 } from './rectify';
+import { runRecursiveXYCut, type XYCutCandidate } from './xyCut';
+import {
+  classifyZonesUnified,
+  detectHandlesLocalContrast,
+  suppressShelvesInsideDrawers,
+} from './zoneClassifier';
 
 export type VectorLineOrientation = 'horizontal' | 'vertical' | 'diagonal';
 export type VectorLineRole =
@@ -73,6 +96,8 @@ export interface VectorLineExtractionResult {
   horizontalCount: number;
   verticalCount: number;
   diagonalCount: number;
+  /** Segmentos diagonales reales (18°–72°) extraídos desde el mapa de gradiente oblicuo `dEdge`. */
+  diagonalSegments: VectorLine2D[];
   outerFrameLines: VectorLine2D[];
   interiorLines: VectorLine2D[];
   /** Caja ajustada usando vectores de contorno reales si fueron consistentes. */
@@ -101,10 +126,6 @@ export interface Visual3DSimilarityResult {
   overallScore: number; // 0..100
   verdict: 'alto_parecido' | 'parecido_medio' | 'bajo_parecido';
   mismatches: string[];
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
 }
 
 function makeVectorLine(
@@ -156,8 +177,9 @@ function makeVectorLine(
 }
 
 /**
- * Calcula mapas de gradiente cromático + luminancia con suavizado Gaussiano 3×3
- * y supresión direccional de no-máximos (NMS) para extraer segmentos vectoriales limpios.
+ * Calcula mapas de gradiente cromático + luminancia con suavizado Gaussiano 3×3 (`imageOps.ts`)
+ * y supresión direccional de no-máximos (NMS) para extraer segmentos vectoriales H, V y
+ * diagonales reales en rango `18°–72°` desde `dEdge`.
  */
 export function extractStructuralVectorLines(
   rgba: Uint8ClampedArray,
@@ -171,6 +193,7 @@ export function extractStructuralVectorLines(
       horizontalCount: 0,
       verticalCount: 0,
       diagonalCount: 0,
+      diagonalSegments: [],
       outerFrameLines: [],
       interiorLines: [],
     };
@@ -207,72 +230,27 @@ export function extractStructuralVectorLines(
     }
   }
 
-  // Suavizado Gaussiano 3×3 por canal (preserva bordes rectos de melamina, atenúa grano y ruido JPEG/WebP)
-  const smoothChannel = (src: Float32Array): Float32Array => {
-    const dst = new Float32Array(n);
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        if (y === 0 || y === H - 1 || x === 0 || x === W - 1) {
-          dst[y * W + x] = src[y * W + x];
-        } else {
-          const u = (y - 1) * W;
-          const m = y * W;
-          const d = (y + 1) * W;
-          dst[m + x] =
-            (src[u + x - 1] +
-              2 * src[u + x] +
-              src[u + x + 1] +
-              2 * src[m + x - 1] +
-              4 * src[m + x] +
-              2 * src[m + x + 1] +
-              src[d + x - 1] +
-              2 * src[d + x] +
-              src[d + x + 1]) /
-            16;
-        }
-      }
-    }
-    return dst;
-  };
+  // Suavizado Gaussiano 3×3 unificado por canal
+  const sR = gaussianBlur3x3(chR, W, H);
+  const sG = gaussianBlur3x3(chG, W, H);
+  const sB = gaussianBlur3x3(chB, W, H);
 
-  const sR = smoothChannel(chR);
-  const sG = smoothChannel(chG);
-  const sB = smoothChannel(chB);
-
-  // Gradiente vectorial máximo entre canales R, G, B (detecta cambios de color incluso a igual luminancia)
+  // Gradiente vectorial máximo entre canales R, G, B usando Sobel 3×3 unificado (`sobel3x3At`)
   const gxMap = new Float32Array(n);
   const gyMap = new Float32Array(n);
+  const magMap = new Float32Array(n);
   const hEdge = new Float32Array(n);
   const vEdge = new Float32Array(n);
-  const dEdge = new Float32Array(n);
-
-  const sobelAt = (arr: Float32Array, u: number, m: number, d: number, x: number): [number, number] => {
-    const gx =
-      -arr[u + x - 1] +
-      arr[u + x + 1] -
-      2 * arr[m + x - 1] +
-      2 * arr[m + x + 1] -
-      arr[d + x - 1] +
-      arr[d + x + 1];
-    const gy =
-      -arr[u + x - 1] -
-      2 * arr[u + x] -
-      arr[u + x + 1] +
-      arr[d + x - 1] +
-      2 * arr[d + x] +
-      arr[d + x + 1];
-    return [gx, gy];
-  };
+  const dEdgeSlash = new Float32Array(n); // bordes diagonales '/' (gx * gy > 0)
+  const dEdgeBackslash = new Float32Array(n); // bordes diagonales '\' (gx * gy < 0)
 
   const gradMags: number[] = [];
   for (let y = 1; y < H - 1; y++) {
-    const u = (y - 1) * W;
     const m = y * W;
-    const d = (y + 1) * W;
     for (let x = 1; x < W - 1; x++) {
-      const [rx, ry] = sobelAt(sR, u, m, d, x);
-      const [gx, gy] = sobelAt(sG, u, m, d, x);
-      const [bx, by] = sobelAt(sB, u, m, d, x);
+      const [rx, ry] = sobel3x3At(sR, W, x, y);
+      const [gx, gy] = sobel3x3At(sG, W, x, y);
+      const [bx, by] = sobel3x3At(sB, W, x, y);
       const rm = Math.hypot(rx, ry);
       const gm = Math.hypot(gx, gy);
       const bm = Math.hypot(bx, by);
@@ -292,6 +270,7 @@ export function extractStructuralVectorLines(
       const idx = m + x;
       gxMap[idx] = bestGx;
       gyMap[idx] = bestGy;
+      magMap[idx] = bestM;
       if (bestM > 18) gradMags.push(bestM);
     }
   }
@@ -301,24 +280,29 @@ export function extractStructuralVectorLines(
   const p70 = gradMags.length > 30 ? gradMags[Math.floor(gradMags.length * 0.7)] : 48;
   const edgeThresh = clamp(p70 * 0.52, 26, 82);
 
-  // Supresión direccional de no-máximos (NMS) separando bordes horizontales, verticales y diagonales
+  // Supresión direccional de no-máximos (NMS) separando H (< 18°), V (> 72°) y diagonales reales `dEdge` (18°–72°)
   for (let y = 2; y < H - 2; y++) {
     const m = y * W;
     for (let x = 2; x < W - 2; x++) {
       const idx = m + x;
-      const agx = Math.abs(gxMap[idx]);
-      const agy = Math.abs(gyMap[idx]);
-      const mag = Math.hypot(agx, agy);
+      const mag = magMap[idx];
       if (mag < edgeThresh) continue;
 
-      if (agy >= agx * 1.45) {
+      const gxVal = gxMap[idx];
+      const gyVal = gyMap[idx];
+      const agx = Math.abs(gxVal);
+      const agy = Math.abs(gyVal);
+      // Ángulo de la tangente del borde respecto a la horizontal: 0° = horiz, 90° = vert
+      const edgeAngleDeg = (Math.atan2(agx, agy) * 180) / Math.PI;
+
+      if (edgeAngleDeg < 18) {
         // Borde horizontal: máximo local a lo largo de Y
         const upM = Math.abs(gyMap[(y - 1) * W + x]);
         const dnM = Math.abs(gyMap[(y + 1) * W + x]);
         if (agy >= upM && agy >= dnM) {
           hEdge[idx] = mag;
         }
-      } else if (agx >= agy * 1.45) {
+      } else if (edgeAngleDeg > 72) {
         // Borde vertical: máximo local a lo largo de X
         const ltM = Math.abs(gxMap[m + x - 1]);
         const rtM = Math.abs(gxMap[m + x + 1]);
@@ -326,7 +310,18 @@ export function extractStructuralVectorLines(
           vEdge[idx] = mag;
         }
       } else {
-        dEdge[idx] = mag;
+        // Borde oblicuo genuino (18°–72°): NMS en dirección normal al gradiente
+        const rx = Math.round(gxVal / mag);
+        const ry = Math.round(gyVal / mag);
+        const mPlus = magMap[(y + ry) * W + (x + rx)];
+        const mMinus = magMap[(y - ry) * W + (x - rx)];
+        if (mag >= mPlus && mag >= mMinus) {
+          if (gxVal * gyVal > 0) {
+            dEdgeSlash[idx] = mag;
+          } else {
+            dEdgeBackslash[idx] = mag;
+          }
+        }
       }
     }
   }
@@ -347,7 +342,6 @@ export function extractStructuralVectorLines(
       x1: Math.max(...xs),
       y1: Math.max(...ys),
     };
-    // Buscar líneas dentro del marco + un margen de 8% alrededor para evaluar márgenes exteriores
     const padX = Math.max(8, Math.round(((frameBounds.x1 - frameBounds.x0) * 0.08) / invScaleX));
     const padY = Math.max(8, Math.round(((frameBounds.y1 - frameBounds.y0) * 0.08) / invScaleY));
     roiX0 = Math.max(2, Math.floor(frameBounds.x0 / invScaleX) - padX);
@@ -371,7 +365,7 @@ export function extractStructuralVectorLines(
   const minVertLen = Math.max(14, Math.round((roiY1 - roiY0) * 0.11));
   const gapTol = 4;
 
-  // Trazado de vectores horizontales con tolerancia de ±1 px en Y (captura líneas rectas con leve inclinación)
+  // Trazado de vectores horizontales con tolerancia de ±1 px en Y
   const visitedH = new Uint8Array(n);
   for (let y = roiY0; y <= roiY1; y++) {
     for (let x = roiX0; x <= roiX1; x++) {
@@ -423,7 +417,7 @@ export function extractStructuralVectorLines(
           x2: endX,
           y2: endY,
           strength: Math.min(1, sumS / hits / 220),
-          orientation: slopeDeg > 7 ? 'diagonal' : 'horizontal',
+          orientation: slopeDeg >= 18 ? 'diagonal' : 'horizontal',
         });
       }
     }
@@ -481,13 +475,139 @@ export function extractStructuralVectorLines(
           x2: endX,
           y2: endY,
           strength: Math.min(1, sumS / hits / 220),
-          orientation: tiltDeg > 7 ? 'diagonal' : 'vertical',
+          orientation: tiltDeg >= 18 ? 'diagonal' : 'vertical',
         });
       }
     }
   }
 
-  // Fusión de segmentos colineales cercanos (elimina fragmentos partidos por tiradores o brillo)
+  // Extracción de segmentos diagonales reales (18°–72°) desde `dEdgeSlash` ('/') y `dEdgeBackslash` ('\')
+  const minDiagLen = Math.max(18, Math.round(Math.min(roiX1 - roiX0, roiY1 - roiY0) * 0.14));
+  const extractDiagonalChains = (dMap: Float32Array, expectSlash: boolean): RawSeg[] => {
+    const visited = new Uint8Array(n);
+    const out: RawSeg[] = [];
+    const qX: number[] = [];
+    const qY: number[] = [];
+
+    for (let y = roiY0; y <= roiY1; y++) {
+      for (let x = roiX0; x <= roiX1; x++) {
+        const idx0 = y * W + x;
+        if (dMap[idx0] <= 0 || visited[idx0]) continue;
+
+        visited[idx0] = 1;
+        qX.length = 0;
+        qY.length = 0;
+        qX.push(x);
+        qY.push(y);
+
+        let head = 0;
+        let sumW = 0;
+        let sumX = 0;
+        let sumY = 0;
+
+        while (head < qX.length) {
+          const cx = qX[head];
+          const cy = qY[head];
+          head++;
+          const w = dMap[cy * W + cx];
+          sumW += w;
+          sumX += cx * w;
+          sumY += cy * w;
+
+          for (let dy = -2; dy <= 2; dy++) {
+            const ny = cy + dy;
+            if (ny < roiY0 || ny > roiY1) continue;
+            const nRow = ny * W;
+            for (let dx = -2; dx <= 2; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const nx = cx + dx;
+              if (nx < roiX0 || nx > roiX1) continue;
+              const nIdx = nRow + nx;
+              if (dMap[nIdx] > 0 && !visited[nIdx]) {
+                visited[nIdx] = 1;
+                qX.push(nx);
+                qY.push(ny);
+              }
+            }
+          }
+        }
+
+        const count = head;
+        if (count < Math.max(10, Math.round(minDiagLen * 0.6)) || sumW <= 1e-6) continue;
+
+        const mx = sumX / sumW;
+        const my = sumY / sumW;
+        let sxx = 0;
+        let syy = 0;
+        let sxy = 0;
+        for (let k = 0; k < count; k++) {
+          const px = qX[k] - mx;
+          const py = qY[k] - my;
+          const w = dMap[qY[k] * W + qX[k]];
+          sxx += px * px * w;
+          syy += py * py * w;
+          sxy += px * py * w;
+        }
+        sxx /= sumW;
+        syy /= sumW;
+        sxy /= sumW;
+
+        const theta = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+        let ux = Math.cos(theta);
+        let uy = Math.sin(theta);
+        if (ux < 0 || (Math.abs(ux) < 1e-6 && uy < 0)) {
+          ux = -ux;
+          uy = -uy;
+        }
+
+        const lambdaMin = 0.5 * (sxx + syy - Math.hypot(sxx - syy, 2 * sxy));
+        const rmsPerp = Math.sqrt(Math.max(0, lambdaMin));
+
+        let tMin = Infinity;
+        let tMax = -Infinity;
+        for (let k = 0; k < count; k++) {
+          const t = (qX[k] - mx) * ux + (qY[k] - my) * uy;
+          if (t < tMin) tMin = t;
+          if (t > tMax) tMax = t;
+        }
+
+        const len = tMax - tMin;
+        if (len < minDiagLen) continue;
+        if (rmsPerp > Math.max(2.8, len * 0.04)) continue;
+        if (count / len < 0.42) continue;
+
+        const x1 = mx + tMin * ux;
+        const y1 = my + tMin * uy;
+        const x2 = mx + tMax * ux;
+        const y2 = my + tMax * uy;
+        const ddx = (x2 - x1) * invScaleX;
+        const ddy = (y2 - y1) * invScaleY;
+        const rawDeg = Math.abs((Math.atan2(ddy, ddx) * 180) / Math.PI);
+        const effDeg = rawDeg > 90 ? 180 - rawDeg : rawDeg;
+        if (effDeg < 18 || effDeg > 72) continue;
+
+        // Verificar coherencia de signo de pendiente: '/' -> ddx*ddy < 0, '\' -> ddx*ddy > 0
+        if (expectSlash ? ddx * ddy >= 0 : ddx * ddy <= 0) continue;
+
+        out.push({
+          x1,
+          y1,
+          x2,
+          y2,
+          strength: clamp(sumW / count / 220, 0, 1),
+          orientation: 'diagonal',
+        });
+      }
+    }
+    return out;
+  };
+
+  const rawDiag = [
+    ...extractDiagonalChains(dEdgeSlash, true),
+    ...extractDiagonalChains(dEdgeBackslash, false),
+  ];
+
+  // Fusión de segmentos H/V colineales cercanos
   const mergeCollinear = (segs: RawSeg[], isHoriz: boolean): RawSeg[] => {
     const sorted = [...segs].sort((a, b) =>
       isHoriz
@@ -551,8 +671,86 @@ export function extractStructuralVectorLines(
     return out;
   };
 
+  // Fusión de flancos paralelos/colineales de un mismo tablero diagonal (centrado en eje físico)
+  const mergeDiagonalSegs = (segs: RawSeg[]): RawSeg[] => {
+    const sorted = [...segs].sort(
+      (a, b) => Math.hypot(b.x2 - b.x1, b.y2 - b.y1) - Math.hypot(a.x2 - a.x1, a.y2 - a.y1),
+    );
+    const out: RawSeg[] = [];
+    const perpTol = Math.max(10, Math.round(Math.min(W, H) * 0.045));
+    const endGapTol = 14;
+
+    for (const s of sorted) {
+      const sLen = Math.max(1, Math.hypot(s.x2 - s.x1, s.y2 - s.y1));
+      const sUx = (s.x2 - s.x1) / sLen;
+      const sUy = (s.y2 - s.y1) / sLen;
+      const sMidX = 0.5 * (s.x1 + s.x2);
+      const sMidY = 0.5 * (s.y1 + s.y2);
+      const sAngle = (Math.atan2(sUy, sUx) * 180) / Math.PI;
+
+      let merged = false;
+      for (const m of out) {
+        const mLen = Math.max(1, Math.hypot(m.x2 - m.x1, m.y2 - m.y1));
+        const mUx = (m.x2 - m.x1) / mLen;
+        const mUy = (m.y2 - m.y1) / mLen;
+        const mAngle = (Math.atan2(mUy, mUx) * 180) / Math.PI;
+        if (Math.abs(mAngle - sAngle) > 9) continue;
+
+        const mMidX = 0.5 * (m.x1 + m.x2);
+        const mMidY = 0.5 * (m.y1 + m.y2);
+        const perpDist = Math.abs((sMidX - mMidX) * -mUy + (sMidY - mMidY) * mUx);
+        if (perpDist > perpTol) continue;
+
+        const tM1 = (m.x1 - mMidX) * mUx + (m.y1 - mMidY) * mUy;
+        const tM2 = (m.x2 - mMidX) * mUx + (m.y2 - mMidY) * mUy;
+        const tS1 = (s.x1 - mMidX) * mUx + (s.y1 - mMidY) * mUy;
+        const tS2 = (s.x2 - mMidX) * mUx + (s.y2 - mMidY) * mUy;
+        const mMin = Math.min(tM1, tM2);
+        const mMax = Math.max(tM1, tM2);
+        const sMin = Math.min(tS1, tS2);
+        const sMax = Math.max(tS1, tS2);
+
+        if (sMin <= mMax + endGapTol && sMax >= mMin - endGapTol) {
+          const wM = mLen * (0.5 + m.strength);
+          const wS = sLen * (0.5 + s.strength);
+          const wTot = wM + wS;
+          const cx = (mMidX * wM + sMidX * wS) / wTot;
+          const cy = (mMidY * wM + sMidY * wS) / wTot;
+          let ux = (mUx * wM + sUx * wS) / wTot;
+          let uy = (mUy * wM + sUy * wS) / wTot;
+          const uNorm = Math.max(1e-6, Math.hypot(ux, uy));
+          ux /= uNorm;
+          uy /= uNorm;
+          if (ux < 0) {
+            ux = -ux;
+            uy = -uy;
+          }
+
+          const projs = [
+            (m.x1 - cx) * ux + (m.y1 - cy) * uy,
+            (m.x2 - cx) * ux + (m.y2 - cy) * uy,
+            (s.x1 - cx) * ux + (s.y1 - cy) * uy,
+            (s.x2 - cx) * ux + (s.y2 - cy) * uy,
+          ];
+          const pMin = Math.min(...projs);
+          const pMax = Math.max(...projs);
+          m.x1 = cx + pMin * ux;
+          m.y1 = cy + pMin * uy;
+          m.x2 = cx + pMax * ux;
+          m.y2 = cy + pMax * uy;
+          m.strength = Math.max(m.strength, s.strength);
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) out.push({ ...s });
+    }
+    return out;
+  };
+
   const mergedH = mergeCollinear(rawHoriz, true);
   const mergedV = mergeCollinear(rawVert, false);
+  const mergedD = mergeDiagonalSegs(rawDiag);
 
   // Clasificar cada vector según su posición respecto a los márgenes del mueble
   const classifyRole = (seg: RawSeg): VectorLineRole => {
@@ -599,19 +797,44 @@ export function extractStructuralVectorLines(
       return 'detail';
     }
 
+    // Diagonal estructural interior (18°–72°)
+    if (
+      midX >= frameBounds.x0 + borderTolX * 0.4 &&
+      midX <= frameBounds.x1 - borderTolX * 0.4 &&
+      midY >= frameBounds.y0 + borderTolY * 0.4 &&
+      midY <= frameBounds.y1 - borderTolY * 0.4 &&
+      Math.hypot(lenX, lenY) >= Math.min(fw, fh) * 0.16
+    ) {
+      return 'divider';
+    }
+
     return 'detail';
   };
 
-  // Mantener los vectores estructurales más significativos (top 60 por longitud × fuerza)
-  const allMerged = [...mergedH, ...mergedV]
+  // Mantener los vectores estructurales más significativos (top 64 H/V + hasta 12 diagonales)
+  const topHV = [...mergedH, ...mergedV]
     .map((seg) => ({
       seg,
-      score: Math.hypot((seg.x2 - seg.x1) * invScaleX, (seg.y2 - seg.y1) * invScaleY) * (0.4 + seg.strength),
+      score:
+        Math.hypot((seg.x2 - seg.x1) * invScaleX, (seg.y2 - seg.y1) * invScaleY) *
+        (0.4 + seg.strength),
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 64);
 
-  const lines: VectorLine2D[] = allMerged.map(({ seg }, idx) =>
+  const topD = mergedD
+    .map((seg) => ({
+      seg,
+      score:
+        Math.hypot((seg.x2 - seg.x1) * invScaleX, (seg.y2 - seg.y1) * invScaleY) *
+        (0.4 + seg.strength),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 12);
+
+  const allSelected = [...topHV, ...topD];
+
+  const lines: VectorLine2D[] = allSelected.map(({ seg }, idx) =>
     makeVectorLine(
       `vec_${idx + 1}`,
       { x: seg.x1 * invScaleX, y: seg.y1 * invScaleY },
@@ -623,7 +846,7 @@ export function extractStructuralVectorLines(
     ),
   );
 
-  // Refinar la caja exterior haciendo snap a vectores de contorno + recorte de costado 3/4 y objetos decorativos
+  // Refinar la caja exterior haciendo snap a vectores de contorno + recorte de costado 3/4
   let refinedBox: [Point2D, Point2D, Point2D, Point2D] | undefined;
   if (frameBounds) {
     const fw = Math.max(1, frameBounds.x1 - frameBounds.x0);
@@ -636,9 +859,6 @@ export function extractStructuralVectorLines(
     const horizLines = lines.filter((l) => l.orientation === 'horizontal');
     const vertLines = lines.filter((l) => l.orientation === 'vertical');
 
-    // 1) Snap TOP: buscar vector horizontal largo cerca del borde superior;
-    // si tocó el borde superior de la foto (ej. ladrillo + cuadro en #01), solo bajar hasta 42%
-    // cuando la franja superior difiera claramente en color del cuerpo inferior (evita cortar vitrinas ajustadas como #09)
     const touchedTop = frameBounds.y0 <= imgH * 0.03;
     let topCand = horizLines
       .filter((l) => {
@@ -664,12 +884,16 @@ export function extractStructuralVectorLines(
         .sort((a, b) => b.lengthPx * b.strength - a.lengthPx * a.strength)[0];
       if (deepCand) {
         const ym = (deepCand.p1.y + deepCand.p2.y) / 2;
-        const gyAbove = Math.max(0, Math.min(H - 1, Math.round((ym * 0.5) / invScaleY)));
-        const gyBelow = Math.max(0, Math.min(H - 1, Math.round(((ym + frameBounds.y1) * 0.5) / invScaleY)));
-        const gxMid = Math.max(0, Math.min(W - 1, Math.round(((frameBounds.x0 + frameBounds.x1) * 0.5) / invScaleX)));
+        const gyAbove = clamp(Math.round((ym * 0.5) / invScaleY), 0, H - 1);
+        const gyBelow = clamp(Math.round(((ym + frameBounds.y1) * 0.5) / invScaleY), 0, H - 1);
+        const gxMid = clamp(
+          Math.round(((frameBounds.x0 + frameBounds.x1) * 0.5) / invScaleX),
+          0,
+          W - 1,
+        );
         const iA = gyAbove * W + gxMid;
         const iB = gyBelow * W + gxMid;
-        const warmthDiff = Math.abs((chR[iB] - chB[iB]) - (chR[iA] - chB[iA]));
+        const warmthDiff = Math.abs(chR[iB] - chB[iB] - (chR[iA] - chB[iA]));
         const colDiff = Math.hypot(chR[iB] - chR[iA], chG[iB] - chG[iA], chB[iB] - chB[iA]);
         if (warmthDiff > 22 || colDiff > 48) {
           topCand = deepCand;
@@ -678,7 +902,6 @@ export function extractStructuralVectorLines(
     }
     if (topCand) ry0 = (topCand.p1.y + topCand.p2.y) / 2;
 
-    // 2) Snap BOTTOM: vector horizontal largo más cercano a la base (hasta 24% arriba para saltar alfombra/piso)
     const botCand = horizLines
       .filter((l) => {
         const ym = (l.p1.y + l.p2.y) / 2;
@@ -691,7 +914,6 @@ export function extractStructuralVectorLines(
       .sort((a, b) => (b.p1.y + b.p2.y) / 2 - (a.p1.y + a.p2.y) / 2)[0];
     if (botCand) ry1 = (botCand.p1.y + botCand.p2.y) / 2;
 
-    // 3) Snap LEFT / RIGHT a vectores verticales exteriores dominantes
     const leftCand = vertLines
       .filter((l) => {
         const xm = (l.p1.x + l.p2.x) / 2;
@@ -716,9 +938,6 @@ export function extractStructuralVectorLines(
       .sort((a, b) => b.lengthPx * b.strength - a.lengthPx * a.strength)[0];
     if (rightCand) rx1 = (rightCand.p1.x + rightCand.p2.x) / 2;
 
-    // 4) Recorte de costado 3/4 (fotos en ángulo): si existe un vector vertical de altura completa
-    // a 6%..22% del borde izquierdo o derecho y la franja externa NO tiene repisas/ranuras horizontales
-    // mientras la cara principal sí las tiene, recortar al plano frontal real.
     const curW = rx1 - rx0;
     const curH = ry1 - ry0;
     const interiorHoriz = horizLines.filter((l) => {
@@ -730,18 +949,18 @@ export function extractStructuralVectorLines(
       const leftCorner = vertLines
         .filter((l) => {
           const xm = (l.p1.x + l.p2.x) / 2;
-          return (
-            xm > rx0 + curW * 0.065 &&
-            xm < rx0 + curW * 0.22 &&
-            l.lengthPx >= curH * 0.58
-          );
+          return xm > rx0 + curW * 0.065 && xm < rx0 + curW * 0.22 && l.lengthPx >= curH * 0.58;
         })
         .sort((a, b) => b.lengthPx * b.strength - a.lengthPx * a.strength)[0];
 
       if (leftCorner) {
         const cx = (leftCorner.p1.x + leftCorner.p2.x) / 2;
-        const horizInStrip = interiorHoriz.some((h) => Math.min(h.p1.x, h.p2.x) < cx - curW * 0.04);
-        const horizInMain = interiorHoriz.some((h) => Math.min(h.p1.x, h.p2.x) >= cx - curW * 0.04);
+        const horizInStrip = interiorHoriz.some(
+          (h) => Math.min(h.p1.x, h.p2.x) < cx - curW * 0.04,
+        );
+        const horizInMain = interiorHoriz.some(
+          (h) => Math.min(h.p1.x, h.p2.x) >= cx - curW * 0.04,
+        );
         if (!horizInStrip && horizInMain) {
           rx0 = cx;
         }
@@ -750,18 +969,18 @@ export function extractStructuralVectorLines(
       const rightCorner = vertLines
         .filter((l) => {
           const xm = (l.p1.x + l.p2.x) / 2;
-          return (
-            xm < rx1 - curW * 0.065 &&
-            xm > rx1 - curW * 0.22 &&
-            l.lengthPx >= curH * 0.58
-          );
+          return xm < rx1 - curW * 0.065 && xm > rx1 - curW * 0.22 && l.lengthPx >= curH * 0.58;
         })
         .sort((a, b) => b.lengthPx * b.strength - a.lengthPx * a.strength)[0];
 
       if (rightCorner) {
         const cx = (rightCorner.p1.x + rightCorner.p2.x) / 2;
-        const horizInStrip = interiorHoriz.some((h) => Math.max(h.p1.x, h.p2.x) > cx + curW * 0.04);
-        const horizInMain = interiorHoriz.some((h) => Math.max(h.p1.x, h.p2.x) <= cx + curW * 0.04);
+        const horizInStrip = interiorHoriz.some(
+          (h) => Math.max(h.p1.x, h.p2.x) > cx + curW * 0.04,
+        );
+        const horizInMain = interiorHoriz.some(
+          (h) => Math.max(h.p1.x, h.p2.x) <= cx + curW * 0.04,
+        );
         if (!horizInStrip && horizInMain) {
           rx1 = cx;
         }
@@ -786,12 +1005,14 @@ export function extractStructuralVectorLines(
   ]);
   const outerFrameLines = lines.filter((l) => outerRoles.has(l.role));
   const interiorLines = lines.filter((l) => !outerRoles.has(l.role));
+  const diagonalSegments = lines.filter((l) => l.orientation === 'diagonal');
 
   return {
     lines,
     horizontalCount: lines.filter((l) => l.orientation === 'horizontal').length,
     verticalCount: lines.filter((l) => l.orientation === 'vertical').length,
-    diagonalCount: lines.filter((l) => l.orientation === 'diagonal').length,
+    diagonalCount: diagonalSegments.length,
+    diagonalSegments,
     outerFrameLines,
     interiorLines,
     refinedBox,
@@ -799,8 +1020,10 @@ export function extractStructuralVectorLines(
 }
 
 /**
- * Evalúa cuantitativamente qué tan bien coinciden los márgenes propuestos (quad)
- * y los segmentos vectoriales extraídos con la foto real subida.
+ * Evalúa cuantitativamente qué tan bien coinciden los márgenes propuestos (quad proyectivo real)
+ * y los segmentos vectoriales extraídos con la foto real subida, usando:
+ *  - Normales perpendiculares reales a cada arista del quad (`edgeInwardUnitNormal`).
+ *  - Test punto-en-polígono exacto (`pointInQuad`) en vez de AABB para `silhouetteIoU`.
  */
 export function evaluateMarginsAgainstPhoto(
   rgba: Uint8ClampedArray,
@@ -810,21 +1033,9 @@ export function evaluateMarginsAgainstPhoto(
   extracted: VectorLineExtractionResult,
   exteriorBgRgb?: [number, number, number],
 ): MarginEvaluationResult {
-  const xs = quad.map((p) => p.x);
-  const ys = quad.map((p) => p.y);
-  const qx0 = clamp(Math.min(...xs), 0, imgW - 1);
-  const qx1 = clamp(Math.max(...xs), 1, imgW - 1);
-  const qy0 = clamp(Math.min(...ys), 0, imgH - 1);
-  const qy1 = clamp(Math.max(...ys), 1, imgH - 1);
-  const qw = Math.max(1, qx1 - qx0);
-  const qh = Math.max(1, qy1 - qy0);
-
-  // 1. Medir soporte de gradiente real directamente sobre los 4 bordes del marco
-  const sampleLum = (x: number, y: number): number => {
-    const ix = clamp(Math.round(x), 0, imgW - 1);
-    const iy = clamp(Math.round(y), 0, imgH - 1);
-    const p = (iy * imgW + ix) * 4;
-    return 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
+  const centroid: Point2D = {
+    x: (quad[0].x + quad[1].x + quad[2].x + quad[3].x) * 0.25,
+    y: (quad[0].y + quad[1].y + quad[2].y + quad[3].y) * 0.25,
   };
 
   const sampleEdgeSupport = (
@@ -836,14 +1047,15 @@ export function evaluateMarginsAgainstPhoto(
   ): number => {
     let hits = 0;
     const band = Math.max(3, Math.round(Math.min(imgW, imgH) * 0.01));
+    const stepShift = Math.max(1, Math.floor(band / 2));
     for (let k = 2; k <= steps - 2; k++) {
       const t = k / steps;
       const bx = p1.x + (p2.x - p1.x) * t;
       const by = p1.y + (p2.y - p1.y) * t;
       let maxDiff = 0;
-      for (let shift = -band; shift <= band; shift += Math.max(1, Math.floor(band / 2))) {
-        const lA = sampleLum(bx + nx * (shift - 3), by + ny * (shift - 3));
-        const lB = sampleLum(bx + nx * (shift + 3), by + ny * (shift + 3));
+      for (let shift = -band; shift <= band; shift += stepShift) {
+        const lA = sampleLumSafe(rgba, imgW, imgH, bx + nx * (shift - 3), by + ny * (shift - 3));
+        const lB = sampleLumSafe(rgba, imgW, imgH, bx + nx * (shift + 3), by + ny * (shift + 3));
         const diff = Math.abs(lB - lA);
         if (diff > maxDiff) maxDiff = diff;
       }
@@ -852,22 +1064,20 @@ export function evaluateMarginsAgainstPhoto(
     return hits / Math.max(1, steps - 3);
   };
 
-  const topSup = sampleEdgeSupport(quad[0], quad[1], 0, 1);
-  const rightSup = sampleEdgeSupport(quad[1], quad[2], -1, 0);
-  const bottomSup = sampleEdgeSupport(quad[3], quad[2], 0, -1);
-  const leftSup = sampleEdgeSupport(quad[0], quad[3], 1, 0);
+  // Normales perpendiculares unitarias reales a cada arista del cuadrilátero en perspectiva
+  const [topNx, topNy] = edgeInwardUnitNormal(quad[0], quad[1], centroid);
+  const [rightNx, rightNy] = edgeInwardUnitNormal(quad[1], quad[2], centroid);
+  const [botNx, botNy] = edgeInwardUnitNormal(quad[2], quad[3], centroid);
+  const [leftNx, leftNy] = edgeInwardUnitNormal(quad[3], quad[0], centroid);
+
+  const topSup = sampleEdgeSupport(quad[0], quad[1], topNx, topNy);
+  const rightSup = sampleEdgeSupport(quad[1], quad[2], rightNx, rightNy);
+  const bottomSup = sampleEdgeSupport(quad[2], quad[3], botNx, botNy);
+  const leftSup = sampleEdgeSupport(quad[3], quad[0], leftNx, leftNy);
   const edgeAlignmentScore = (topSup + rightSup + bottomSup + leftSup) / 4;
 
-  // 2. Silueta IoU aproximada comparando píxeles distintos al fondo exterior
-  let bgR = exteriorBgRgb?.[0] ?? 240;
-  let bgG = exteriorBgRgb?.[1] ?? 240;
-  let bgB = exteriorBgRgb?.[2] ?? 240;
-  if (!exteriorBgRgb) {
-    const p0 = 0;
-    bgR = rgba[p0];
-    bgG = rgba[p0 + 1];
-    bgB = rgba[p0 + 2];
-  }
+  // 2. Silueta IoU exacta usando punto-en-polígono (`pointInQuad`) sobre el quad real
+  const [bgR, bgG, bgB] = exteriorBgRgb ?? sampleExteriorBgRgb(rgba, imgW, imgH);
 
   let inter = 0;
   let union = 0;
@@ -878,7 +1088,7 @@ export function evaluateMarginsAgainstPhoto(
       const p = (y * imgW + x) * 4;
       const dBg = Math.hypot(rgba[p] - bgR, rgba[p + 1] - bgG, rgba[p + 2] - bgB);
       const isFg = dBg > 24;
-      const inQuad = x >= qx0 && x <= qx1 && y >= qy0 && y <= qy1;
+      const inQuad = pointInQuad(x, y, quad);
       if (isFg && inQuad) inter++;
       if (isFg || inQuad) union++;
     }
@@ -890,12 +1100,13 @@ export function evaluateMarginsAgainstPhoto(
   const hasBot = extracted.outerFrameLines.some((l) => l.role === 'outer_bottom');
   const hasLeft = extracted.outerFrameLines.some((l) => l.role === 'outer_left');
   const hasRight = extracted.outerFrameLines.some((l) => l.role === 'outer_right');
-  const sidesWithVectors = (hasTop ? 1 : 0) + (hasBot ? 1 : 0) + (hasLeft ? 1 : 0) + (hasRight ? 1 : 0);
+  const sidesWithVectors =
+    (hasTop ? 1 : 0) + (hasBot ? 1 : 0) + (hasLeft ? 1 : 0) + (hasRight ? 1 : 0);
   const interiorSupport = Math.min(1, extracted.interiorLines.length / 6);
   const vectorCoverageScore = 0.65 * (sidesWithVectors / 4) + 0.35 * interiorSupport;
 
-  // Ponderación compuesta 0..100
-  const areaFrac = (qw * qh) / Math.max(1, imgW * imgH);
+  // Ponderación compuesta 0..100 con área exacta del cuadrilátero (`quadArea`)
+  const areaFrac = quadArea(quad) / Math.max(1, imgW * imgH);
   const areaPenalty = areaFrac < 0.08 || areaFrac > 0.94 ? 0.72 : 1;
   const overallScore = Math.round(
     clamp(
@@ -908,12 +1119,24 @@ export function evaluateMarginsAgainstPhoto(
   );
 
   const notes: string[] = [];
-  if (topSup < 0.45) notes.push('Margen superior débil: verifica si incluye fondo/pared o TV encima.');
-  if (bottomSup < 0.4) notes.push('Margen inferior abierto (posible escritorio sin base o patas).');
-  if (leftSup < 0.45) notes.push('Margen izquierdo poco alineado al borde real del mueble.');
-  if (rightSup < 0.45) notes.push('Margen derecho poco alineado (revisa si incluye costado en 3/4).');
-  if (silhouetteIoU < 0.52) notes.push('Silueta con exceso de fondo o recorte parcial del cuerpo.');
-  if (notes.length === 0) notes.push('Márgenes exteriores y vectores estructurales bien alineados con la foto.');
+  if (topSup < 0.45) {
+    notes.push('Margen superior débil: verifica si incluye fondo/pared o TV encima.');
+  }
+  if (bottomSup < 0.4) {
+    notes.push('Margen inferior abierto (posible escritorio sin base o patas).');
+  }
+  if (leftSup < 0.45) {
+    notes.push('Margen izquierdo poco alineado al borde real del mueble.');
+  }
+  if (rightSup < 0.45) {
+    notes.push('Margen derecho poco alineado (revisa si incluye costado en 3/4).');
+  }
+  if (silhouetteIoU < 0.52) {
+    notes.push('Silueta con exceso de fondo o recorte parcial del cuerpo.');
+  }
+  if (notes.length === 0) {
+    notes.push('Márgenes exteriores y vectores estructurales bien alineados con la foto.');
+  }
 
   const verdict: MarginEvaluationResult['verdict'] =
     overallScore >= 72 ? 'excelente' : overallScore >= 52 ? 'aceptable' : 'revisar';
@@ -934,16 +1157,10 @@ export function evaluateMarginsAgainstPhoto(
   };
 }
 
-const MATERIAL_BASE_RGB: Record<MelamineMaterial | 'durolac_3mm', [number, number, number]> = {
-  blanco: [238, 240, 244],
-  roble: [198, 154, 106],
-  grafito: [62, 74, 92],
-  durolac_3mm: [148, 114, 82],
-};
-
 /**
- * Proyecta el modelo 3D real (`DespieceResult`) sobre una rejilla frontal 2D (alzado XY)
- * y evalúa su similitud visual pixel-a-pixel contra la foto rectificada del mueble.
+ * Proyecta el modelo 3D real (`DespieceResult`) sobre una rejilla frontal 2D (alzado XY),
+ * rasterizando correctamente tableros rotados (`rotacion3D[2] !== 0`, ej. `division_diagonal`)
+ * y rejillas metálicas de zonas `baskets`, y evalúa su similitud visual contra la foto rectificada.
  */
 export function evaluate3DvsPhotoSimilarity(
   rectRgba: Uint8ClampedArray,
@@ -965,7 +1182,6 @@ export function evaluate3DvsPhotoSimilarity(
     };
   }
 
-  // Rejilla de comparación rápida (96×96 proporcional)
   const gW = 96;
   const gH = Math.max(36, Math.min(128, Math.round((gW * rectH) / rectW)));
   const n = gW * gH;
@@ -973,10 +1189,9 @@ export function evaluate3DvsPhotoSimilarity(
   const synR = new Float32Array(n);
   const synG = new Float32Array(n);
   const synB = new Float32Array(n);
-  const synOcc = new Uint8Array(n); // 0 = hueco pasante / fondo ext, 1 = vano abierto sombreado, 2 = tablero/puerta/cajón
+  const synOcc = new Uint8Array(n); // 0 = fondo ext, 1 = vano abierto sombreado, 2 = tablero/puerta/cajón/rejilla
   const synZ = new Float32Array(n).fill(-1e9);
 
-  // Fondo base: si tiene hueco de piernas abajo, rellenar esa zona con fondo exterior; si es vano interior, sombra interior
   const hasBack = topology.hasBackPanel;
   const cavityShade = hasBack ? 0.55 : 0.85;
   const baseCarcassRgb = MATERIAL_BASE_RGB[params.material];
@@ -989,50 +1204,129 @@ export function evaluate3DvsPhotoSimilarity(
 
   const xf = Math.max(1, params.targetDimensions.x);
   const yf = Math.max(1, params.targetDimensions.y);
+  const eMm = params.boardThickness;
   const glassIds = new Set(
-    (topology.frontZones ?? [])
-      .filter((z) => z.kind === 'door_glass')
-      .map((z) => `puerta_${z.id}`),
+    (topology.frontZones ?? []).filter((z) => z.kind === 'door_glass').map((z) => `puerta_${z.id}`),
   );
 
-  // Pintar las zonas explícitas `leg_void` y `void_outside` (recorte escalonado) como fondo exterior (sin tablero)
+  // Pintar zonas `leg_void`, `void_outside` y rejillas metálicas `baskets` usando mapeo exacto interior -> exterior
   for (const z of topology.frontZones ?? []) {
-    if (z.kind !== 'leg_void' && z.kind !== 'void_outside') continue;
-    const isOut = z.kind === 'void_outside';
-    const x0 = isOut && z.uStart <= 0.02 ? 0 : clamp(Math.floor(z.uStart * gW), 0, gW - 1);
-    const x1 = isOut && z.uEnd >= 0.98 ? gW - 1 : clamp(Math.ceil(z.uEnd * gW), 0, gW - 1);
-    const y0 = isOut && z.vEnd >= 0.98 ? 0 : clamp(Math.floor((1 - z.vEnd) * gH), 0, gH - 1);
-    const y1 = isOut && z.vStart <= 0.02 ? gH - 1 : clamp(Math.ceil((1 - z.vStart) * gH), 0, gH - 1);
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        const idx = y * gW + x;
-        synR[idx] = exteriorBgRgb[0];
-        synG[idx] = exteriorBgRgb[1];
-        synB[idx] = exteriorBgRgb[2];
-        synOcc[idx] = 0;
+    if (z.kind === 'leg_void' || z.kind === 'void_outside') {
+      const isOut = z.kind === 'void_outside';
+      const rect = interiorToExteriorRect(z, { x: xf, y: yf }, eMm, gW, gH, 0);
+      const x0 = isOut && z.uStart <= 0.02 ? 0 : rect.x0;
+      const x1 = isOut && z.uEnd >= 0.98 ? gW - 1 : rect.x1;
+      const y0 = isOut && z.vEnd >= 0.98 ? 0 : rect.y0;
+      const y1 = isOut && z.vStart <= 0.02 ? gH - 1 : rect.y1;
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const idx = y * gW + x;
+          synR[idx] = exteriorBgRgb[0];
+          synG[idx] = exteriorBgRgb[1];
+          synB[idx] = exteriorBgRgb[2];
+          synOcc[idx] = 0;
+        }
+      }
+    } else if (z.kind === 'baskets') {
+      const rect = interiorToExteriorRect(z, { x: xf, y: yf }, eMm, gW, gH, 0.03);
+      const bw = rect.x1 - rect.x0;
+      const bh = rect.y1 - rect.y0;
+      if (bw >= 4 && bh >= 6) {
+        const nb = Math.max(1, Math.min(6, Math.round(z.basketCount ?? 3)));
+        const slotH = bh / nb;
+        const wireRgb: [number, number, number] = [188, 194, 202];
+        const basketZ = params.targetDimensions.z * 0.9;
+        for (let k = 0; k < nb; k++) {
+          const by0 = clamp(Math.round(rect.y0 + k * slotH + slotH * 0.22), rect.y0, rect.y1);
+          const by1 = clamp(Math.round(rect.y0 + (k + 1) * slotH - slotH * 0.1), by0, rect.y1);
+          const byMid = Math.round((by0 + by1) * 0.5);
+          const wireCols = Math.max(3, Math.min(8, Math.floor(bw / 3)));
+          for (let x = rect.x0; x <= rect.x1; x++) {
+            for (const wy of [by0, byMid, by1]) {
+              const idx = wy * gW + x;
+              if (basketZ >= synZ[idx]) {
+                synZ[idx] = basketZ;
+                synR[idx] = wireRgb[0];
+                synG[idx] = wireRgb[1];
+                synB[idx] = wireRgb[2];
+                synOcc[idx] = 2;
+              }
+            }
+          }
+          for (let cIdx = 0; cIdx <= wireCols; cIdx++) {
+            const wx = clamp(Math.round(rect.x0 + (bw * cIdx) / wireCols), rect.x0, rect.x1);
+            for (let y = by0; y <= by1; y++) {
+              const idx = y * gW + wx;
+              if (basketZ >= synZ[idx]) {
+                synZ[idx] = basketZ;
+                synR[idx] = wireRgb[0];
+                synG[idx] = wireRgb[1];
+                synB[idx] = wireRgb[2];
+                synOcc[idx] = 2;
+              }
+            }
+          }
+        }
       }
     }
   }
 
-  // Z-buffer frontal de cada pieza física del 3D (`posicion3D` + `dimensiones3D`)
+  // Z-buffer frontal de cada pieza física del 3D (`posicion3D`, `dimensiones3D`, `rotacion3D`)
   for (const p of despiece.matrizDespiece) {
     if (p.tipo === 'zocalo' || p.tipo === 'fondo' || p.tipo === 'fondo_cajon') continue;
     const [cx, cy, cz] = p.posicion3D;
     const [dx, dy, dz] = p.dimensiones3D;
+    const rotZ = p.rotacion3D[2] ?? 0;
     const frontZ = cz + dz / 2;
+
+    const isGlass = p.isGlassDoor === true || glassIds.has(p.id);
+    const rgb = isGlass
+      ? ([186, 224, 245] as [number, number, number])
+      : MATERIAL_BASE_RGB[p.material] ?? baseCarcassRgb;
+    const isFrontPanel = p.tipo === 'puerta' || p.tipo === 'frente_cajon';
+
+    // Rasterización exacta de tableros rotados en Z (`division_diagonal`, etc.)
+    if (Math.abs(rotZ) > 1e-4) {
+      const cosT = Math.cos(rotZ);
+      const sinT = Math.sin(rotZ);
+      const hx = dx * 0.5;
+      const minHalfThicknessMm = Math.max(xf / gW, yf / gH) * 0.65;
+      const hy = Math.max(dy * 0.5, minHalfThicknessMm);
+      const bbHalfX = Math.abs(hx * cosT) + Math.abs(hy * sinT);
+      const bbHalfY = Math.abs(hx * sinT) + Math.abs(hy * cosT);
+
+      const px0 = clamp(Math.floor(((cx - bbHalfX) / xf) * gW), 0, gW - 1);
+      const px1 = clamp(Math.ceil(((cx + bbHalfX) / xf) * gW), 0, gW - 1);
+      const py0 = clamp(Math.floor((1 - (cy + bbHalfY) / yf) * gH), 0, gH - 1);
+      const py1 = clamp(Math.ceil((1 - (cy - bbHalfY) / yf) * gH), 0, gH - 1);
+
+      for (let y = py0; y <= py1; y++) {
+        const wy = (1 - (y + 0.5) / gH) * yf;
+        const relY = wy - cy;
+        for (let x = px0; x <= px1; x++) {
+          const wx = ((x + 0.5) / gW) * xf;
+          const relX = wx - cx;
+          // Rotación inversa por -rotZ al marco local de la pieza
+          const lx = relX * cosT + relY * sinT;
+          const ly = -relX * sinT + relY * cosT;
+          if (Math.abs(lx) <= hx && Math.abs(ly) <= hy) {
+            const idx = y * gW + x;
+            if (frontZ < synZ[idx]) continue;
+            synZ[idx] = frontZ;
+            synR[idx] = rgb[0];
+            synG[idx] = rgb[1];
+            synB[idx] = rgb[2];
+            synOcc[idx] = 2;
+          }
+        }
+      }
+      continue;
+    }
 
     const px0 = clamp(Math.floor(((cx - dx / 2) / xf) * gW), 0, gW - 1);
     const px1 = clamp(Math.ceil(((cx + dx / 2) / xf) * gW) - 1, 0, gW - 1);
     const py0 = clamp(Math.floor((1 - (cy + dy / 2) / yf) * gH), 0, gH - 1);
     const py1 = clamp(Math.ceil((1 - (cy - dy / 2) / yf) * gH) - 1, 0, gH - 1);
-
-    const isGlass = glassIds.has(p.id);
-    const rgb = isGlass
-      ? ([186, 224, 245] as [number, number, number])
-      : MATERIAL_BASE_RGB[p.material] ?? baseCarcassRgb;
-
-    // Oscurecer levemente juntas de puertas/cajones en su borde de 1 px
-    const isFrontPanel = p.tipo === 'puerta' || p.tipo === 'frente_cajon';
 
     for (let y = py0; y <= py1; y++) {
       for (let x = px0; x <= px1; x++) {
@@ -1068,14 +1362,13 @@ export function evaluate3DvsPhotoSimilarity(
       phoR[gi] = rectRgba[pi];
       phoG[gi] = rectRgba[pi + 1];
       phoB[gi] = rectRgba[pi + 2];
-      phoLum[gi] = 0.299 * phoR[gi] + 0.587 * phoG[gi] + 0.114 * phoB[gi];
-      synLum[gi] = 0.299 * synR[gi] + 0.587 * synG[gi] + 0.114 * synB[gi];
+      phoLum[gi] = rgbaLuminance(phoR[gi], phoG[gi], phoB[gi]);
+      synLum[gi] = rgbaLuminance(synR[gi], synG[gi], synB[gi]);
 
-      // Comparación de color normalizada (0..1)
-      const dCol = Math.hypot(phoR[gi] - synR[gi], phoG[gi] - synG[gi], phoB[gi] - synB[gi]) / 441.67;
+      const dCol =
+        Math.hypot(phoR[gi] - synR[gi], phoG[gi] - synG[gi], phoB[gi] - synB[gi]) / 441.67;
       colorDistSum += dCol;
 
-      // Ocupación: comparar si el píxel de la foto es fondo exterior vs cuerpo/tablero
       const dExt = Math.hypot(
         phoR[gi] - exteriorBgRgb[0],
         phoG[gi] - exteriorBgRgb[1],
@@ -1090,7 +1383,7 @@ export function evaluate3DvsPhotoSimilarity(
   const colorPaletteMatch = clamp(1 - colorDistSum / n / 0.55, 0, 1);
   const silhouetteMatch = silHits / n;
 
-  // Correlación de mapas de bordes estructurales (Sobel suave en gW×gH)
+  // Correlación de mapas de bordes estructurales
   const edgeMap = (lum: Float32Array): Float32Array => {
     const out = new Float32Array(n);
     for (let y = 1; y < gH - 1; y++) {
@@ -1108,7 +1401,6 @@ export function evaluate3DvsPhotoSimilarity(
 
   const phoE = edgeMap(phoLum);
   const synE = edgeMap(synLum);
-  // Tolerancia de ±2 celdas en la rejilla gW×gH para comparar alineación de aristas
   let synMatched = 0;
   let synTotal = 0;
   let phoMatched = 0;
@@ -1160,13 +1452,19 @@ export function evaluate3DvsPhotoSimilarity(
 
   const mismatches: string[] = [];
   if (silhouetteMatch < 0.72) {
-    mismatches.push('Diferencia de silueta/hueco inferior entre foto y 3D (revisa Hueco Piernas o encuadre).');
+    mismatches.push(
+      'Diferencia de silueta/hueco inferior entre foto y 3D (revisa Hueco Piernas o encuadre).',
+    );
   }
   if (edgeStructureMatch < 0.45) {
-    mismatches.push('Las divisiones internas del 3D no coinciden del todo con los bordes de la foto.');
+    mismatches.push(
+      'Las divisiones internas del 3D no coinciden del todo con los bordes de la foto.',
+    );
   }
   if (colorPaletteMatch < 0.62) {
-    mismatches.push('Acabado o contraste abierto/cerrado difiere de la foto (prueba alternar Zonas o color).');
+    mismatches.push(
+      'Acabado o contraste abierto/cerrado difiere de la foto (prueba alternar Zonas o color).',
+    );
   }
   if (mismatches.length === 0) {
     mismatches.push('Buen parecido global entre la foto subida y la geometría 3D reconstruida.');
@@ -1188,28 +1486,34 @@ export function evaluate3DvsPhotoSimilarity(
 export interface VectorStructureReconstruction {
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
+  /** Divisiones diagonales reales (18°–72°) convertidas a espacio interior `[0,1]^2`. */
+  diagonalDividers: DiagonalSegment[];
   inferredZones: FrontZone[];
   detectedMaterial: MelamineMaterial;
   vectorLinesUsed: number;
   furnitureMode: 'open' | 'closed_front' | 'hybrid';
 }
 
-function inferMaterialRgb(r: number, g: number, b: number): MelamineMaterial {
-  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-  const warmth = r - b;
-  if (lum >= 175 && Math.abs(r - b) < 28) return 'blanco';
-  if (lum <= 96) return 'grafito';
-  if (warmth > 20 && r > g - 6) return 'roble';
-  if (lum >= 165) return 'blanco';
-  return warmth > 12 ? 'roble' : 'grafito';
+function snapCoordToAnchors(val: number, anchors: readonly number[], tol = 0.05): number {
+  let best = val;
+  let bestD = tol;
+  for (const a of anchors) {
+    const d = Math.abs(val - a);
+    if (d <= bestD) {
+      bestD = d;
+      best = a;
+    }
+  }
+  return best;
 }
 
 /**
  * Reconstruye la topología del mueble DIRECTAMENTE a partir de los segmentos vectoriales 2D
  * (`VectorLine2D[]`) extraídos sobre la cara frontal rectificada:
+ *  - Convierte TODA coordenada exterior `[0,1]^2` a espacio INTERIOR `[0,1]^2` antes de particionar.
  *  - Filtra molduras decorativas flotantes mediante regla de soporte en extremos (T-junction).
- *  - Particiona el frente [0..1]^2 jerárquicamente (cortes totales y luego parciales por zona).
- *  - Clasifica cada celda resultante (hueco piernas, vidrio, abierto, cajones, puerta, bicolor).
+ *  - Particiona mediante `runRecursiveXYCut` (espacio interior puro) y clasifica vía `classifyZonesUnified`.
+ *  - Suprime repisas fantasma interiores a zonas `drawers` y conserva diagonales reales (18°–72°).
  */
 export function reconstructStructureFromVectors(
   rectRgba: Uint8ClampedArray,
@@ -1228,7 +1532,7 @@ export function reconstructStructureFromVectors(
   ];
   const ext = extractStructuralVectorLines(rectRgba, W, H, fullQuad);
 
-  // Recolectar segmentos vectoriales interiores normalizados [0..1] (u: izq->der, v: abajo->arriba)
+  // Recolectar segmentos vectoriales ya convertidos estrictamente a espacio INTERIOR [0..1]^2
   interface NormVecSeg {
     pos: number;
     start: number;
@@ -1237,33 +1541,54 @@ export function reconstructStructureFromVectors(
     strength: number;
   }
 
+  const toUInt = (uExt: number) => clamp(exteriorToInterior(uExt, boardThicknessMm, dimsMm.x), 0, 1);
+  const toVInt = (vExt: number) => clamp(exteriorToInterior(vExt, boardThicknessMm, dimsMm.y), 0, 1);
+
   const rawV: NormVecSeg[] = [];
   const rawH: NormVecSeg[] = [];
+  const rawDiags: Array<{ u1: number; v1: number; u2: number; v2: number; strength: number }> = [];
 
   for (const ln of ext.lines) {
     if (!ln.normStart || !ln.normEnd) continue;
-    const uA = Math.min(ln.normStart.x, ln.normEnd.x);
-    const uB = Math.max(ln.normStart.x, ln.normEnd.x);
-    const vA = Math.min(ln.normStart.y, ln.normEnd.y);
-    const vB = Math.max(ln.normStart.y, ln.normEnd.y);
+
+    if (ln.orientation === 'diagonal') {
+      const u1 = toUInt(ln.normStart.x);
+      const v1 = toVInt(ln.normStart.y);
+      const u2 = toUInt(ln.normEnd.x);
+      const v2 = toVInt(ln.normEnd.y);
+      const du = u2 - u1;
+      const dv = v2 - v1;
+      if (Math.hypot(du, dv) < 0.16) continue;
+      // Verificar ángulo físico real 18°–72° en espacio del mueble
+      const xInt = Math.max(1, dimsMm.x - 2 * boardThicknessMm);
+      const yInt = Math.max(1, dimsMm.y - 2 * boardThicknessMm);
+      const deg = (Math.atan2(Math.abs(dv * yInt), Math.abs(du * xInt)) * 180) / Math.PI;
+      if (deg >= 18 && deg <= 72) {
+        rawDiags.push({ u1, v1, u2, v2, strength: ln.strength });
+      }
+      continue;
+    }
+
+    const uA = toUInt(Math.min(ln.normStart.x, ln.normEnd.x));
+    const uB = toUInt(Math.max(ln.normStart.x, ln.normEnd.x));
+    const vA = toVInt(Math.min(ln.normStart.y, ln.normEnd.y));
+    const vB = toVInt(Math.max(ln.normStart.y, ln.normEnd.y));
 
     if (ln.orientation === 'vertical' || Math.abs(Math.abs(ln.angleDeg) - 90) <= 10) {
       const uMid = (uA + uB) / 2;
       const span = vB - vA;
-      // Descartar contornos exteriores / ecos laterales (< 12% o > 88%)
-      if (uMid < 0.12 || uMid > 0.88 || span < 0.22) continue;
+      if (uMid < 0.1 || uMid > 0.9 || span < 0.22) continue;
       rawV.push({ pos: uMid, start: vA, end: vB, span, strength: ln.strength });
     } else if (ln.orientation === 'horizontal' || Math.abs(ln.angleDeg) <= 10) {
       const vMid = (vA + vB) / 2;
       const span = uB - uA;
-      // Descartar cubierta, base y zócalo inferior (< 16% en muebles bajos como racks TV, < 13% en altos)
-      const minV = dimsMm.y <= 700 ? 0.16 : 0.13;
-      if (vMid < minV || vMid > 0.89 || span < 0.2) continue;
+      const minV = dimsMm.y <= 700 ? 0.14 : 0.11;
+      if (vMid < minV || vMid > 0.9 || span < 0.2) continue;
       rawH.push({ pos: vMid, start: uA, end: uB, span, strength: ln.strength });
     }
   }
 
-  // Fusionar vectores paralelos colineales o muy cercanos
+  // Fusionar vectores paralelos colineales o muy cercanos (ya en espacio interior consistente)
   const clusterSegs = (segs: NormVecSeg[], posTol: number): NormVecSeg[] => {
     const sorted = [...segs].sort((a, b) => a.pos - b.pos);
     const merged: NormVecSeg[] = [];
@@ -1292,8 +1617,7 @@ export function reconstructStructureFromVectors(
   const candH = clusterSegs(rawH, 0.045);
   const candVAll = clusterSegs(rawV, 0.055);
 
-  // Filtro T-Junction anti-molduras: todo vector vertical estructural debe apoyar al menos 1 extremo
-  // en la cubierta (>= 0.88), base (<= 0.12) o un vector horizontal detectado (±0.07)
+  // Filtro T-Junction anti-molduras en espacio interior [0..1]
   const candV = candVAll.filter((v) => {
     const touchesTop = v.end >= 0.88;
     const touchesBot = v.start <= 0.12;
@@ -1303,296 +1627,160 @@ export function reconstructStructureFromVectors(
         v.pos <= h.end + 0.07 &&
         (Math.abs(v.start - h.pos) <= 0.08 || Math.abs(v.end - h.pos) <= 0.08),
     );
-    return (touchesTop && touchesBot) || ((touchesTop || touchesBot) && (touchesH || v.span >= 0.34)) || (touchesH && v.span >= 0.28);
+    return (
+      (touchesTop && touchesBot) ||
+      ((touchesTop || touchesBot) && (touchesH || v.span >= 0.34)) ||
+      (touchesH && v.span >= 0.28)
+    );
   });
 
-  // Partición jerárquica XY guiada por los vectores reales
-  const vDividers: NormalizedSegment[] = [];
-  const hShelves: NormalizedSegment[] = [];
-  const leafCells: Array<{ u0: number; u1: number; v0: number; v1: number }> = [];
+  // Partición jerárquica XY-Cut unificada en espacio interior normalizado puro (`vTopDownPx: false`)
+  const xyRes = runRecursiveXYCut(
+    { rx0: 0, rx1: 1, ry0: 0, ry1: 1, u0: 0, u1: 1, v0: 0, v1: 1 },
+    {
+      maxDepth: 3,
+      minRegionW: 0.18,
+      minRegionH: 0.16,
+      minNormSpanU: 0.18,
+      minNormSpanV: 0.16,
+      minCutMarginNorm: 0.06,
+      vTopDownPx: false,
+      idPrefix: { v: 'vec_div', h: 'vec_rep' },
+      findVerticalCuts: (reg): XYCutCandidate[] => {
+        const spanU = reg.u1 - reg.u0;
+        const spanV = reg.v1 - reg.v0;
+        const vIn = candV
+          .filter((v) => {
+            if (
+              v.pos <= reg.u0 + Math.max(0.11, spanU * 0.14) ||
+              v.pos >= reg.u1 - Math.max(0.11, spanU * 0.14)
+            ) {
+              return false;
+            }
+            const ov = Math.min(v.end, reg.v1) - Math.max(v.start, reg.v0);
+            return ov / Math.max(1e-4, spanV) >= 0.62;
+          })
+          .sort((a, b) => b.span * b.strength - a.span * a.strength)
+          .slice(0, 4)
+          .sort((a, b) => a.pos - b.pos);
 
-  const splitRegion = (u0: number, u1: number, v0: number, v1: number, depth: number) => {
-    const spanU = u1 - u0;
-    const spanV = v1 - v0;
-    if (depth >= 3 || spanU < 0.18 || spanV < 0.16) {
-      leafCells.push({ u0, u1, v0, v1 });
-      return;
-    }
-
-    // Buscar cortes verticales que atraviesen al menos 65% de la altura actual (o anclados en el nivel raíz)
-    const vIn = candV
-      .filter((v) => {
-        if (v.pos <= u0 + Math.max(0.11, spanU * 0.14) || v.pos >= u1 - Math.max(0.11, spanU * 0.14)) {
-          return false;
+        const selected: XYCutCandidate[] = [];
+        for (const v of vIn) {
+          if (selected.every((prev) => Math.abs(prev.posNorm - v.pos) >= 0.14)) {
+            selected.push({
+              posNorm: clamp(v.pos, 0.05, 0.95),
+              posPx: clamp(v.pos, 0.05, 0.95),
+              score: (v.span / Math.max(1e-4, spanV)) * v.strength,
+            });
+          }
         }
-        const ov = Math.min(v.end, v1) - Math.max(v.start, v0);
-        return ov / Math.max(1e-4, spanV) >= 0.62;
-      })
-      .sort((a, b) => b.span * b.strength - a.span * a.strength)
-      .slice(0, 4)
-      .sort((a, b) => a.pos - b.pos);
+        return selected;
+      },
+      findHorizontalCuts: (reg): XYCutCandidate[] => {
+        const spanU = reg.u1 - reg.u0;
+        const spanV = reg.v1 - reg.v0;
+        const hIn = candH
+          .filter((h) => {
+            if (
+              h.pos <= reg.v0 + Math.max(0.11, spanV * 0.14) ||
+              h.pos >= reg.v1 - Math.max(0.11, spanV * 0.14)
+            ) {
+              return false;
+            }
+            const ov = Math.min(h.end, reg.u1) - Math.max(h.start, reg.u0);
+            return ov / Math.max(1e-4, spanU) >= 0.62;
+          })
+          .sort((a, b) => b.span * b.strength - a.span * a.strength)
+          .slice(0, 4)
+          .sort((a, b) => a.pos - b.pos);
 
-    // Filtrar separación mínima entre cortes verticales
-    const vSel: NormVecSeg[] = [];
-    for (const v of vIn) {
-      if (vSel.every((prev) => Math.abs(prev.pos - v.pos) >= 0.14)) {
-        vSel.push(v);
-      }
-    }
-
-    const hIn = candH
-      .filter((h) => {
-        if (h.pos <= v0 + Math.max(0.11, spanV * 0.14) || h.pos >= v1 - Math.max(0.11, spanV * 0.14)) {
-          return false;
+        const selected: XYCutCandidate[] = [];
+        for (const h of hIn) {
+          if (selected.every((prev) => Math.abs(prev.posNorm - h.pos) >= 0.12)) {
+            selected.push({
+              posNorm: clamp(h.pos, 0.05, 0.95),
+              posPx: clamp(h.pos, 0.05, 0.95),
+              score: (h.span / Math.max(1e-4, spanU)) * h.strength,
+            });
+          }
         }
-        const ov = Math.min(h.end, u1) - Math.max(h.start, u0);
-        return ov / Math.max(1e-4, spanU) >= 0.62;
-      })
-      .sort((a, b) => b.span * b.strength - a.span * a.strength)
-      .slice(0, 4)
-      .sort((a, b) => a.pos - b.pos);
+        return selected;
+      },
+      chooseAxis: (vCuts, hCuts) => {
+        const scoreV = vCuts.reduce((acc, s) => Math.max(acc, s.score), 0);
+        const scoreH = hCuts.reduce((acc, s) => Math.max(acc, s.score), 0);
+        if (vCuts.length === 0 && hCuts.length === 0) return 'none';
+        const preferHoriz = dimsMm.y > dimsMm.x * 1.12 && hCuts.length > 0 && scoreH >= scoreV * 0.82;
+        if (hCuts.length > 0 && (preferHoriz || scoreH > scoreV)) return 'horizontal';
+        return vCuts.length > 0 ? 'vertical' : 'horizontal';
+      },
+    },
+  );
 
-    const hSel: NormVecSeg[] = [];
-    for (const h of hIn) {
-      if (hSel.every((prev) => Math.abs(prev.pos - h.pos) >= 0.12)) {
-        hSel.push(h);
-      }
-    }
+  const lum = extractLuminanceBuffer(rectRgba, W, H, true);
+  const vSeamPxs = xyRes.vDividers.map(
+    (d) => interiorToExteriorPoint(d.position, 0.5, dimsMm, boardThicknessMm).uExt * W,
+  );
+  const hSeamPxs = xyRes.hShelves.map((s) => ({
+    y: (1 - interiorToExteriorPoint(0.5, s.position, dimsMm, boardThicknessMm).vExt) * H,
+    uStart: s.start,
+    uEnd: s.end,
+  }));
+  const detectedHandles =
+    xyRes.vDividers.length + xyRes.hShelves.length > 0
+      ? detectHandlesLocalContrast(lum, W, H, vSeamPxs, hSeamPxs, dimsMm, boardThicknessMm)
+      : [];
 
-    const scoreV = vSel.reduce((acc, s) => Math.max(acc, (s.span / spanV) * s.strength), 0);
-    const scoreH = hSel.reduce((acc, s) => Math.max(acc, (s.span / spanU) * s.strength), 0);
+  // Clasificación unificada CIE-Lab + interiorToExteriorRect + fusión verificada de cajones
+  const inferredZones = classifyZonesUnified(
+    xyRes.leaves.map((lf) => ({ uStart: lf.u0, uEnd: lf.u1, vStart: lf.v0, vEnd: lf.v1 })),
+    {
+      rectRgba,
+      rectW: W,
+      rectH: H,
+      dimsMm,
+      boardThicknessMm,
+      carcassMaterial: detectedMaterial,
+      refRgb: MATERIAL_BASE_RGB[detectedMaterial],
+      exteriorBgRgb,
+      lum,
+      detectedHandles,
+      mergeDrawers: true,
+      modeHint: 'hybrid',
+      idPrefix: 'vz',
+    },
+  );
 
-    // En muebles más altos que anchos (cocinas, vitrinas, armarios 2 niveles), priorizar divisiones horizontales completas
-    const preferHoriz = dimsMm.y > dimsMm.x * 1.12 && hSel.length > 0 && scoreH >= scoreV * 0.82;
+  // Eliminar repisas interiores duplicadas dentro de zonas clasificadas como `drawers`
+  const hShelves = suppressShelvesInsideDrawers(xyRes.hShelves, inferredZones);
 
-    if (hSel.length > 0 && (preferHoriz || scoreH > scoreV)) {
-      const vStops = [v0];
-      for (const hs of hSel) {
-        const vInt = clamp(exteriorToInterior(hs.pos, boardThicknessMm, dimsMm.y), 0.05, 0.95);
-        if (vInt <= v0 + 0.06 || vInt >= v1 - 0.06) continue;
-        hShelves.push({
-          id: `vec_rep_${hShelves.length + 1}`,
-          position: Number(vInt.toFixed(4)),
-          start: Number(u0.toFixed(4)),
-          end: Number(u1.toFixed(4)),
-        });
-        vStops.push(vInt);
-      }
-      vStops.push(v1);
-      if (vStops.length > 2) {
-        for (let k = 0; k < vStops.length - 1; k++) {
-          splitRegion(u0, u1, vStops[k], vStops[k + 1], depth + 1);
-        }
-        return;
-      }
-    }
+  // Anclar extremos de diagonales reales detectadas a muros/divisores/repisas en espacio interior
+  const uAnchors = [0, ...xyRes.vDividers.map((d) => d.position), 1];
+  const vAnchors = [0, ...hShelves.map((s) => s.position), 1];
+  const diagonalDividers: DiagonalSegment[] = rawDiags.map((d, idx) => ({
+    id: `vec_diag_${idx + 1}`,
+    u1: Number(snapCoordToAnchors(d.u1, uAnchors, 0.05).toFixed(4)),
+    v1: Number(snapCoordToAnchors(d.v1, vAnchors, 0.05).toFixed(4)),
+    u2: Number(snapCoordToAnchors(d.u2, uAnchors, 0.05).toFixed(4)),
+    v2: Number(snapCoordToAnchors(d.v2, vAnchors, 0.05).toFixed(4)),
+  }));
 
-    if (vSel.length > 0) {
-      const uStops = [u0];
-      for (const vs of vSel) {
-        const uInt = clamp(exteriorToInterior(vs.pos, boardThicknessMm, dimsMm.x), 0.05, 0.95);
-        if (uInt <= u0 + 0.06 || uInt >= u1 - 0.06) continue;
-        vDividers.push({
-          id: `vec_div_${vDividers.length + 1}`,
-          position: Number(uInt.toFixed(4)),
-          start: Number(v0.toFixed(4)),
-          end: Number(v1.toFixed(4)),
-        });
-        uStops.push(uInt);
-      }
-      uStops.push(u1);
-      if (uStops.length > 2) {
-        for (let k = 0; k < uStops.length - 1; k++) {
-          splitRegion(uStops[k], uStops[k + 1], v0, v1, depth + 1);
-        }
-        return;
-      }
-    }
-
-    leafCells.push({ u0, u1, v0, v1 });
-  };
-
-  splitRegion(0, 1, 0, 1, 0);
-
-  // Calcular luminancia y color de referencia del cuerpo (filtrando fondo exterior)
-  const nPx = W * H;
-  const lum = new Float32Array(nPx);
-  for (let i = 0; i < nPx; i++) {
-    const p = i * 4;
-    lum[i] = 0.299 * rectRgba[p] + 0.587 * rectRgba[p + 1] + 0.114 * rectRgba[p + 2];
-  }
-  const refRgb = MATERIAL_BASE_RGB[detectedMaterial];
-  const refLum = 0.299 * refRgb[0] + 0.587 * refRgb[1] + 0.114 * refRgb[2];
-
-  // Clasificar cada celda hoja usando estadísticas de color, contraste marco/centro (vidrio) y fondo exterior
-  interface CellStat {
-    c: { u0: number; u1: number; v0: number; v1: number };
-    kind: FrontModuleKind;
-    matOverride?: MelamineMaterial;
-  }
-
-  const colMap = new Map<string, CellStat[]>();
-  for (const c of leafCells) {
-    const x0 = clamp(Math.round((c.u0 + (c.u1 - c.u0) * 0.12) * W), 0, W - 1);
-    const x1 = clamp(Math.round((c.u1 - (c.u1 - c.u0) * 0.12) * W), 0, W - 1);
-    const y0 = clamp(Math.round((1 - c.v1 + (c.v1 - c.v0) * 0.12) * H), 0, H - 1);
-    const y1 = clamp(Math.round((1 - c.v0 - (c.v1 - c.v0) * 0.12) * H), 0, H - 1);
-
-    let sumR = 0, sumG = 0, sumB = 0, sumL = 0, sumL2 = 0, bgHits = 0, cnt = 0;
-    let fSum = 0, fCnt = 0, cSum = 0, cCnt = 0;
-    const fx0 = x0 + Math.round((x1 - x0) * 0.16);
-    const fx1 = x1 - Math.round((x1 - x0) * 0.16);
-    const fy0 = y0 + Math.round((y1 - y0) * 0.16);
-    const fy1 = y1 - Math.round((y1 - y0) * 0.16);
-
-    for (let y = y0; y <= y1; y += 2) {
-      for (let x = x0; x <= x1; x += 2) {
-        const idx = y * W + x;
-        const p = idx * 4;
-        if (rectRgba[p + 3] < 128) {
-          bgHits++;
-          cnt++;
-          continue;
-        }
-        const r = rectRgba[p], g = rectRgba[p + 1], b = rectRgba[p + 2];
-        const l = lum[idx];
-        sumR += r;
-        sumG += g;
-        sumB += b;
-        sumL += l;
-        sumL2 += l * l;
-        if (Math.hypot(r - exteriorBgRgb[0], g - exteriorBgRgb[1], b - exteriorBgRgb[2]) <= 36) {
-          bgHits++;
-        }
-        if (x >= fx0 && x <= fx1 && y >= fy0 && y <= fy1) {
-          cSum += l;
-          cCnt++;
-        } else {
-          fSum += l;
-          fCnt++;
-        }
-        cnt++;
-      }
-    }
-
-    const nSafe = Math.max(1, cnt);
-    const meanR = sumR / nSafe;
-    const meanG = sumG / nSafe;
-    const meanB = sumB / nSafe;
-    const meanL = sumL / nSafe;
-    const stdL = Math.sqrt(Math.max(0, sumL2 / nSafe - meanL * meanL));
-    const bgRatio = bgHits / nSafe;
-    const cellWmm = (c.u1 - c.u0) * dimsMm.x;
-    const cellHmm = (c.v1 - c.v0) * dimsMm.y;
-    const fMean = fCnt > 0 ? fSum / fCnt : meanL;
-    const cMean = cCnt > 0 ? cSum / cCnt : meanL;
-
-    const warmth = meanR - meanB;
-    const isDarkWalnut = warmth >= 15 && meanR > meanG + 4 && meanL >= 48;
-    const cellMat: MelamineMaterial = isDarkWalnut
-      ? 'roble'
-      : inferMaterialRgb(meanR, meanG, meanB);
-    const distCarcass = Math.hypot(meanR - refRgb[0], meanG - refRgb[1], meanB - refRgb[2]);
-    const matOverride =
-      (distCarcass > 38 || (isDarkWalnut && detectedMaterial !== 'roble')) &&
-      cellMat !== detectedMaterial
-        ? cellMat
-        : undefined;
-
-    let kind: FrontModuleKind;
-    if (c.v0 <= 0.05 && bgRatio >= 0.48 && (c.u1 - c.u0 < 0.94 || c.v1 - c.v0 < 0.92)) {
-      kind = 'leg_void';
-    } else if (
-      (cMean < 56 && !isDarkWalnut) ||
-      (meanL < refLum - 26 && distCarcass > 32 && !isDarkWalnut) ||
-      (stdL > 34 && bgRatio < 0.45) ||
-      (bgRatio >= 0.55 && c.v0 > 0.08 && detectedMaterial !== 'blanco')
-    ) {
-      kind = 'open';
-    } else if (
-      cellHmm >= 360 &&
-      cellHmm / Math.max(1, cellWmm) >= 1.15 &&
-      fMean - cMean >= 14 &&
-      stdL < 46
-    ) {
-      kind = 'door_glass';
-    } else if (cellHmm <= 310 && cellWmm > cellHmm * 1.15) {
-      kind = 'drawers';
-    } else if (cellWmm >= 540 && cellWmm / Math.max(1, cellHmm) >= 0.85) {
-      kind = 'door_double';
-    } else {
-      kind = c.u0 < 0.48 ? 'door_left' : 'door_right';
-    }
-
-    const key = `${c.u0.toFixed(2)}_${c.u1.toFixed(2)}`;
-    const list = colMap.get(key) ?? [];
-    list.push({ c, kind, matOverride: kind === 'open' || kind === 'leg_void' ? undefined : matOverride });
-    colMap.set(key, list);
-  }
-
-  // Consolidar pilas verticales contiguas de cajones en la misma columna
-  const inferredZones: FrontZone[] = [];
-  for (const list of colMap.values()) {
-    const sorted = [...list].sort((a, b) => a.c.v0 - b.c.v0);
-    let i = 0;
-    while (i < sorted.length) {
-      if (sorted[i].kind === 'drawers') {
-        let j = i;
-        while (j + 1 < sorted.length && sorted[j + 1].kind === 'drawers') j++;
-        const count = j - i + 1;
-        const u0 = sorted[i].c.u0;
-        const u1 = sorted[i].c.u1;
-        const v0 = sorted[i].c.v0;
-        const v1 = sorted[j].c.v1;
-        inferredZones.push({
-          id: `vz_drw_${inferredZones.length + 1}`,
-          uStart: Number(u0.toFixed(4)),
-          uEnd: Number(u1.toFixed(4)),
-          vStart: Number(v0.toFixed(4)),
-          vEnd: Number(v1.toFixed(4)),
-          kind: 'drawers',
-          drawerCount: count,
-          label: count > 1 ? `${count} Cajones` : 'Cajón',
-          materialOverride: sorted[i].matOverride,
-        });
-        i = j + 1;
-      } else {
-        const it = sorted[i];
-        inferredZones.push({
-          id: `vz_${it.kind}_${inferredZones.length + 1}`,
-          uStart: Number(it.c.u0.toFixed(4)),
-          uEnd: Number(it.c.u1.toFixed(4)),
-          vStart: Number(it.c.v0.toFixed(4)),
-          vEnd: Number(it.c.v1.toFixed(4)),
-          kind: it.kind,
-          label:
-            it.kind === 'leg_void'
-              ? 'Hueco Piernas'
-              : it.kind === 'door_glass'
-                ? 'Vitrina'
-                : it.kind === 'open'
-                  ? 'Nicho'
-                  : it.kind === 'door_double'
-                    ? 'Puerta Doble'
-                    : 'Puerta',
-          materialOverride: it.matOverride,
-        });
-        i++;
-      }
-    }
-  }
-
-  const hasOpen = inferredZones.some((z) => z.kind === 'open' || z.kind === 'leg_void');
-  const hasClosed = inferredZones.some((z) => z.kind !== 'open' && z.kind !== 'leg_void');
+  const hasOpen = inferredZones.some(
+    (z) => z.kind === 'open' || z.kind === 'leg_void' || z.kind === 'void_outside',
+  );
+  const hasClosed = inferredZones.some(
+    (z) => z.kind !== 'open' && z.kind !== 'leg_void' && z.kind !== 'void_outside',
+  );
   const furnitureMode: 'open' | 'closed_front' | 'hybrid' =
     hasOpen && hasClosed ? 'hybrid' : hasClosed ? 'closed_front' : 'open';
 
   return {
-    vDividers,
+    vDividers: xyRes.vDividers,
     hShelves,
+    diagonalDividers,
     inferredZones,
     detectedMaterial,
-    vectorLinesUsed: candV.length + candH.length,
+    vectorLinesUsed: candV.length + candH.length + diagonalDividers.length,
     furnitureMode,
   };
 }
@@ -1605,6 +1793,8 @@ export interface IterativePhoto3DOptions {
   currentDepthMm?: number;
   preferredDimsMm?: { x: number; y: number };
   existingBackPanel?: boolean;
+  /** Inyección opcional de `calculateDespiece` para desacoplamiento y pruebas unitarias. */
+  calculateDespieceFn?: typeof calculateDespiece;
 }
 
 export interface IterativePhoto3DResult {
@@ -1624,11 +1814,12 @@ export interface IterativePhoto3DResult {
 }
 
 /**
- * Orquestador v5.0 100% offline:
- *   1) Extrae líneas vectoriales 2D (`VectorLine2D[]`) de la foto.
- *   2) Evalúa márgenes (`rawQuad` vs `refinedBox`) contra la foto y selecciona el mejor encuadre.
- *   3) Rectifica la cara frontal y compara Candidato A (Band/Híbrido) vs Candidato B (Vector-First 2D)
- *      + iteración de acabado evaluando el modelo 3D real contra la foto (`evaluate3DvsPhotoSimilarity`).
+ * Orquestador v8.0 100% offline:
+ *   1) Cuando `opts.overrideQuad` es provisto, omite `autoDetectFurnitureQuad` completo y solo
+ *      muestrea el fondo exterior (`sampleExteriorBgRgb`) para minimizar latencia.
+ *   2) Extrae líneas vectoriales 2D (H, V y diagonales reales 18°–72°) y evalúa márgenes reales.
+ *   3) Rectifica la cara frontal y compara Candidato A (Band/Híbrido) vs Candidato B (Vector-First)
+ *      evaluando el modelo 3D real contra la foto (`evaluate3DvsPhotoSimilarity`).
  */
 export function runIterativePhotoTo3D(
   rgba: Uint8ClampedArray,
@@ -1638,9 +1829,29 @@ export function runIterativePhotoTo3D(
 ): IterativePhoto3DResult | null {
   const focal = opts.focal35mm ?? 26;
   const e = opts.boardThicknessMm ?? 18;
-  const depthZ = Math.max(250, Math.min(750, opts.currentDepthMm ?? 420));
+  const depthZ = clamp(opts.currentDepthMm ?? 420, 250, 750);
+  const despieceFn = opts.calculateDespieceFn ?? calculateDespiece;
 
-  const autoQuad = autoDetectFurnitureQuad(rgba, imgW, imgH);
+  // Evitar re-ejecutar `autoDetectFurnitureQuad` completo cuando el usuario ya proveyó `overrideQuad`
+  let autoQuad: AutoQuadResult;
+  if (opts.overrideQuad) {
+    const [tl, tr, br, bl] = opts.overrideQuad;
+    const avgW =
+      0.5 * (Math.hypot(tr.x - tl.x, tr.y - tl.y) + Math.hypot(br.x - bl.x, br.y - bl.y));
+    const avgH =
+      0.5 * (Math.hypot(bl.x - tl.x, bl.y - tl.y) + Math.hypot(br.x - tr.x, br.y - tr.y));
+    autoQuad = {
+      quadCorners: opts.overrideQuad,
+      confidence: 1,
+      usedFallback: false,
+      aspectRatioEst: avgH > 1 ? avgW / avgH : imgW / Math.max(1, imgH),
+      backgroundCoverage: 0,
+      exteriorBgRgb: sampleExteriorBgRgb(rgba, imgW, imgH),
+    };
+  } else {
+    autoQuad = autoDetectFurnitureQuad(rgba, imgW, imgH);
+  }
+
   const rawQuad = opts.overrideQuad ?? autoQuad.quadCorners;
   const extractedRaw = extractStructuralVectorLines(rgba, imgW, imgH, rawQuad);
   const evalRaw = evaluateMarginsAgainstPhoto(
@@ -1657,7 +1868,6 @@ export function runIterativePhotoTo3D(
   let marginEval = evalRaw;
   let iterationsRun = 1;
 
-  // Solo auto-refinar márgenes cuando el usuario no forzó un encuadre manual exacto
   if (!opts.overrideQuad && extractedRaw.refinedBox) {
     iterationsRun++;
     const extRef = extractStructuralVectorLines(rgba, imgW, imgH, extractedRaw.refinedBox);
@@ -1681,21 +1891,19 @@ export function runIterativePhotoTo3D(
 
   const estRatio = estimateAspectRatioFixedFocal(usedQuad, imgW, imgH, focal);
   const safeRatio = clamp(Number.isFinite(estRatio) ? estRatio : 1, 0.3, 3.2);
-  const round10 = (v: number) => Math.max(450, Math.min(2200, Math.round(v / 10) * 10));
+  const round10 = (v: number) => clamp(Math.round(v / 10) * 10, 450, 2200);
 
   const effX =
-    opts.preferredDimsMm?.x ??
-    (safeRatio >= 1.15 ? 1400 : round10(1800 * safeRatio));
+    opts.preferredDimsMm?.x ?? (safeRatio >= 1.15 ? 1400 : round10(1800 * safeRatio));
   const effY =
-    opts.preferredDimsMm?.y ??
-    (safeRatio >= 1.15 ? round10(1400 / safeRatio) : 1800);
+    opts.preferredDimsMm?.y ?? (safeRatio >= 1.15 ? round10(1400 / safeRatio) : 1800);
 
   const cameraPose = estimateCameraPoseMeters(usedQuad, imgW, imgH, 'x', effX, focal);
   const { width: dstW, height: dstH } = computeRectifiedSize(effX, effY, e);
   const rectRgba = rectifyImageRGBA(rgba, imgW, imgH, hom.toCanvas, dstW, dstH);
-  const legsHint = detectLowerGapHint(rgba, imgW, imgH, usedQuad);
+  const legsHint = detectLowerGapHint(rgba, imgW, imgH, usedQuad, autoQuad.exteriorBgRgb);
 
-  // Candidato A: Detector Dual/Híbrido clásico
+  // Candidato A: Detector Dual/Híbrido unificado
   const detA = analyzeRectifiedFurniture(rectRgba, dstW, dstH, { x: effX, y: effY }, e, {
     seedPoint: opts.seedPoint,
     parallaxAware: true,
@@ -1715,9 +1923,13 @@ export function runIterativePhotoTo3D(
       homographyMatrix: hom.toUnit.map((r) => [...r]),
       vDividers: detObj.vDividers,
       hShelves: detObj.hShelves,
+      diagonalDividers: detObj.diagonalDividers,
       shelfMode: 'custom',
       equalShelfCount: 0,
       hasBackPanel: hasLegVoid ? false : (opts.existingBackPanel ?? true),
+      baseSupportType: hasLegVoid
+        ? 'none'
+        : (legsHint.supportType ?? (legsHint.possibleExternalLegs ? 'legs' : 'none')),
       hasExternalLegs: !hasLegVoid && legsHint.possibleExternalLegs,
       externalLegHeightMm: 140,
       externalLegCount: 4,
@@ -1740,7 +1952,7 @@ export function runIterativePhotoTo3D(
       edgeBandingMode: 'visibleEdgesOnly',
       material: mat,
     };
-    const desp = calculateDespiece(topo, prm);
+    const desp = despieceFn(topo, prm);
     return evaluate3DvsPhotoSimilarity(
       rectRgba,
       dstW,
@@ -1756,7 +1968,7 @@ export function runIterativePhotoTo3D(
   let bestSim = scoreCandidate(detA, detA.detectedMaterial);
   let selectedStrategy: 'band_hybrid' | 'vector_first' = 'band_hybrid';
 
-  // Candidato B: Reconstrucción Vector-First directa desde los segmentos VectorLine2D[]
+  // Candidato B: Reconstrucción Vector-First directa desde los segmentos VectorLine2D[] (incluyendo diagonales)
   if (!opts.seedPoint) {
     iterationsRun++;
     const vecRec = reconstructStructureFromVectors(
@@ -1768,12 +1980,14 @@ export function runIterativePhotoTo3D(
       detA.detectedMaterial,
       autoQuad.exteriorBgRgb,
     );
-    if (vecRec.inferredZones.length > 0) {
+    if (vecRec.inferredZones.length > 0 || vecRec.diagonalDividers.length > 0) {
       const detB: BandDetectionResult = {
         ...detA,
         furnitureMode: vecRec.furnitureMode,
         vDividers: vecRec.vDividers,
         hShelves: vecRec.hShelves,
+        diagonalDividers:
+          vecRec.diagonalDividers.length > 0 ? vecRec.diagonalDividers : undefined,
         inferredZones: vecRec.inferredZones,
         confidence: Math.max(detA.confidence, 0.72),
       };
@@ -1782,6 +1996,17 @@ export function runIterativePhotoTo3D(
         bestDet = detB;
         bestSim = simB;
         selectedStrategy = 'vector_first';
+      } else if (vecRec.diagonalDividers.length > 0) {
+        // Evaluar también añadir diagonales detectadas al Candidato A si mejora el parecido 3D
+        const detAWithDiag: BandDetectionResult = {
+          ...detA,
+          diagonalDividers: vecRec.diagonalDividers,
+        };
+        const simADiag = scoreCandidate(detAWithDiag, detA.detectedMaterial);
+        if (simADiag.overallScore >= bestSim.overallScore) {
+          bestDet = detAWithDiag;
+          bestSim = simADiag;
+        }
       }
     }
 
@@ -1817,5 +2042,3 @@ export function runIterativePhotoTo3D(
     iterationsRun,
   };
 }
-
-

@@ -4,6 +4,8 @@ import { calculateDespiece, computeQuadToUnitHomography, interiorToExterior } fr
 import {
   analyzeRectifiedFurniture,
   autoDetectFurnitureQuad,
+  classifyMelamineMaterialFromRgb,
+  classifyPartitionedZonesFromPhoto,
   computeRectifiedSize,
   computeSobelEdgeOverlayRGBA,
   estimateAspectRatioFixedFocal,
@@ -12,7 +14,10 @@ import {
   evaluateMarginsAgainstPhoto,
   extractStructuralVectorLines,
   extrapolateDimensionsFromSingleMeasure,
+  interiorToExteriorPoint,
+  interiorToExteriorRect,
   partitionCellsFromVectors,
+  reconstructStructureFromVectors,
   rectifyImageRGBA,
   runIterativePhotoTo3D,
   snapPointToStrongEdge,
@@ -490,12 +495,14 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     expect(res.furnitureMode).toBe('closed_front');
     expect(res.confidence).toBeGreaterThanOrEqual(0.7);
     expect(res.vDividers).toHaveLength(3);
-    expect(res.hShelves).toHaveLength(2);
-    // Ambas repisas/divisiones horizontales están en el vano derecho [~0.75..1]
-    for (const sh of res.hShelves) {
-      expect(sh.start).toBeGreaterThan(0.7);
-      expect(sh.end).toBeCloseTo(1, 2);
-    }
+    // v8.0: cero hShelves duplicadas dentro de la zona clasificada como `drawers`
+    expect(res.hShelves).toHaveLength(0);
+    const drawerZone = res.inferredZones.find((z) => z.kind === 'drawers');
+    expect(drawerZone).toBeDefined();
+    expect(drawerZone!.drawerCount).toBe(3);
+    expect(drawerZone!.uStart).toBeGreaterThan(0.7);
+    expect(drawerZone!.uEnd).toBeCloseTo(1, 2);
+    expect(res.inferredZones.filter((z) => z.kind === 'door_left' || z.kind === 'door_right')).toHaveLength(3);
     expect(res.detectedHandles).toHaveLength(6);
   });
 
@@ -1214,5 +1221,399 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     assertDisjointFullCover(cells11);
     expect(cells11.some((c) => c.uStart >= 0.6 && c.vStart >= 0.5)).toBe(true);
     expect(cells11.some((c) => c.uStart === 0 && c.uEnd <= 0.65 && c.vStart === 0 && c.vEnd === 1)).toBe(true);
+  });
+
+  it('Escenario 24 (Perspectiva real v8.0): autoDetectFurnitureQuad recupera trapezoide no-AABB y evaluateMarginsAgainstPhoto premia quad real sobre AABB', () => {
+    const W = 480;
+    const H = 360;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const bg: [number, number, number] = [242, 244, 248];
+    const wood: [number, number, number] = [184, 134, 82];
+
+    // Trapezoide proyectivo inclinado (borde superior más angosto que la base)
+    const trueQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 128, y: 60 }, // TL
+      { x: 352, y: 60 }, // TR (ancho sup = 224)
+      { x: 408, y: 300 }, // BR
+      { x: 72, y: 300 }, // BL (ancho inf = 336)
+    ];
+
+    for (let y = 0; y < H; y++) {
+      const t = (y - 60) / (300 - 60);
+      const xLeft = 128 + (72 - 128) * t;
+      const xRight = 352 + (408 - 352) * t;
+      for (let x = 0; x < W; x++) {
+        const inside = y >= 60 && y <= 300 && x >= xLeft && x <= xRight;
+        const rgb = inside ? wood : bg;
+        const i = (y * W + x) * 4;
+        rgba[i] = rgb[0];
+        rgba[i + 1] = rgb[1];
+        rgba[i + 2] = rgb[2];
+        rgba[i + 3] = 255;
+      }
+    }
+
+    const res = autoDetectFurnitureQuad(rgba, W, H);
+    expect(res.usedFallback).toBe(false);
+    const [tl, tr, br, bl] = res.quadCorners;
+    // Debe recuperar las 4 esquinas inclinadas (NO colapsar a un AABB rectangular)
+    expect(Math.abs(tl.x - trueQuad[0].x)).toBeLessThan(W * 0.06);
+    expect(Math.abs(tr.x - trueQuad[1].x)).toBeLessThan(W * 0.06);
+    expect(Math.abs(br.x - trueQuad[2].x)).toBeLessThan(W * 0.06);
+    expect(Math.abs(bl.x - trueQuad[3].x)).toBeLessThan(W * 0.06);
+    const topW = tr.x - tl.x;
+    const botW = br.x - bl.x;
+    expect(botW - topW).toBeGreaterThan(50);
+
+    // evaluateMarginsAgainstPhoto con pointInQuad + normales reales puntúa mejor el trapezoide exacto que el AABB
+    const aabbQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 72, y: 60 },
+      { x: 408, y: 60 },
+      { x: 408, y: 300 },
+      { x: 72, y: 300 },
+    ];
+    const extTrue = extractStructuralVectorLines(rgba, W, H, trueQuad);
+    const evalTrue = evaluateMarginsAgainstPhoto(rgba, W, H, trueQuad, extTrue, bg);
+    const extAabb = extractStructuralVectorLines(rgba, W, H, aabbQuad);
+    const evalAabb = evaluateMarginsAgainstPhoto(rgba, W, H, aabbQuad, extAabb, bg);
+
+    expect(evalTrue.silhouetteIoU).toBeGreaterThan(0.9);
+    expect(evalTrue.silhouetteIoU).toBeGreaterThan(evalAabb.silhouetteIoU + 0.12);
+    expect(evalTrue.edgeAlignmentScore).toBeGreaterThan(evalAabb.edgeAlignmentScore + 0.15);
+  });
+
+  it('Escenario 25 (Diagonales reales 18°–72° vía dEdge + rasterización rotada 3D + vectorizeUserStroke/partitionCells v8.0)', () => {
+    const W = 360;
+    const H = 360;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const cavity: [number, number, number] = [42, 46, 54];
+    const oak: [number, number, number] = [208, 162, 108];
+
+    // Carcasa roble + tablero diagonal real de ~45° desde (14, 346) a (346, 14)
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const isBorder = x < 10 || x >= W - 10 || y < 10 || y >= H - 10;
+        const distDiag = Math.abs(x + y - (W - 1)) / Math.SQRT2;
+        const isDiag = !isBorder && distDiag <= 5.5;
+        const rgb = isBorder || isDiag ? oak : cavity;
+        const i = (y * W + x) * 4;
+        rgba[i] = rgb[0];
+        rgba[i + 1] = rgb[1];
+        rgba[i + 2] = rgb[2];
+        rgba[i + 3] = 255;
+      }
+    }
+
+    const fullQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 0, y: 0 },
+      { x: W, y: 0 },
+      { x: W, y: H },
+      { x: 0, y: H },
+    ];
+    const ext = extractStructuralVectorLines(rgba, W, H, fullQuad);
+    expect(ext.diagonalCount).toBeGreaterThanOrEqual(1);
+    expect(ext.diagonalSegments.length).toBeGreaterThanOrEqual(1);
+    const diagLine = ext.diagonalSegments[0];
+    const absAngle = Math.abs(diagLine.angleDeg);
+    const effAngle = absAngle > 90 ? 180 - absAngle : absAngle;
+    expect(effAngle).toBeGreaterThanOrEqual(18);
+    expect(effAngle).toBeLessThanOrEqual(72);
+
+    // Reconstrucción vectorial convierte la diagonal a espacio INTERIOR [0, 1]^2
+    const rec = reconstructStructureFromVectors(rgba, W, H, { x: 1000, y: 1000 }, 18, 'roble');
+    expect(rec.diagonalDividers.length).toBeGreaterThanOrEqual(1);
+    const d0 = rec.diagonalDividers[0];
+    expect(d0.u1).toBeGreaterThanOrEqual(0);
+    expect(d0.u2).toBeLessThanOrEqual(1);
+    expect(d0.v1).toBeGreaterThanOrEqual(0);
+    expect(d0.v2).toBeLessThanOrEqual(1);
+
+    // evaluate3DvsPhotoSimilarity rasteriza rotacion3D[2] !== 0 y supera al modelo sin diagonal
+    const params: ScaleAndBoardParams = {
+      targetDimensions: { x: 1000, y: 1000, z: 360 },
+      referenceDimensions: { x: 1000, y: 1000, z: 360 },
+      boardThickness: 18,
+      backPanelThickness: 3,
+      sheetDimensions: { width: 2440, height: 1220 },
+      trimMm: 0,
+      kerf: 4,
+      respectGrain: true,
+      packingStrategy: 'guillotine',
+      cornerJointType: 'topOverSides',
+      edgeBandingMode: 'visibleEdgesOnly',
+      material: 'roble',
+    };
+    const topoWithDiag: FurnitureTopology = {
+      viewsMode: 1,
+      aspectRatioXY: 1,
+      vDividers: [],
+      hShelves: [],
+      diagonalDividers: rec.diagonalDividers,
+      shelfMode: 'custom',
+      equalShelfCount: 0,
+      hasBackPanel: true,
+    };
+    const topoNoDiag: FurnitureTopology = { ...topoWithDiag, diagonalDividers: [] };
+    const simWith = evaluate3DvsPhotoSimilarity(
+      rgba,
+      W,
+      H,
+      calculateDespiece(topoWithDiag, params),
+      topoWithDiag,
+      params,
+    );
+    const simWithout = evaluate3DvsPhotoSimilarity(
+      rgba,
+      W,
+      H,
+      calculateDespiece(topoNoDiag, params),
+      topoNoDiag,
+      params,
+    );
+    expect(simWith.edgeStructureMatch).toBeGreaterThan(simWithout.edgeStructureMatch + 0.12);
+    expect(simWith.overallScore).toBeGreaterThan(simWithout.overallScore);
+
+    // vectorizeUserStroke: rango unificado 18°–72° (21° y 69°), autoExtend seguro e IDs deterministas
+    const hom = computeQuadToUnitHomography(fullQuad)!;
+    const stroke21 = vectorizeUserStroke(
+      { x: 60, y: 260 },
+      { x: 260, y: 183 }, // tan^-1(77/200) ≈ 21.1°
+      hom.toUnit,
+      [],
+      [],
+      18,
+      { x: 1000, y: 1000 },
+      true,
+      'auto',
+    );
+    const stroke69 = vectorizeUserStroke(
+      { x: 140, y: 280 },
+      { x: 217, y: 80 }, // tan^-1(200/77) ≈ 68.9°
+      hom.toUnit,
+      [],
+      [],
+      18,
+      { x: 1000, y: 1000 },
+      true,
+      'auto',
+    );
+    expect(stroke21?.kind).toBe('diagonal');
+    expect(stroke69?.kind).toBe('diagonal');
+
+    // Trazo parcial corto (< 16%) lejos de muros NO debe estirarse a la fuerza con autoExtend=true
+    const shortPartial = vectorizeUserStroke(
+      { x: 145, y: 180 },
+      { x: 190, y: 180 }, // ~12.5% del ancho, centrado
+      hom.toUnit,
+      [],
+      [],
+      18,
+      { x: 1000, y: 1000 },
+      true,
+      'ortho',
+    );
+    expect(shortPartial?.kind).toBe('hShelf');
+    if (shortPartial?.kind === 'hShelf') {
+      expect(shortPartial.segment.start).toBeGreaterThan(0.32);
+      expect(shortPartial.segment.end).toBeLessThan(0.62);
+    }
+
+    // IDs deterministas idénticos ante mismos parámetros (sin Date.now())
+    const shortRepeat = vectorizeUserStroke(
+      { x: 145, y: 180 },
+      { x: 190, y: 180 },
+      hom.toUnit,
+      [],
+      [],
+      18,
+      { x: 1000, y: 1000 },
+      true,
+      'ortho',
+    );
+    expect(shortRepeat?.segment.id).toBe(shortPartial?.segment.id);
+
+    // partitionCellsFromVectors: tolerancia adaptativa protege banda angosta [0.70..0.74] de divisor inferior [0..0.70]
+    const narrowCells = partitionCellsFromVectors(
+      [{ id: 'd_low', position: 0.5, start: 0, end: 0.7 }],
+      [
+        { id: 'r1', position: 0.7, start: 0, end: 1 },
+        { id: 'r2', position: 0.74, start: 0, end: 1 },
+      ],
+    );
+    const narrowBand = narrowCells.filter(
+      (c) => Math.abs(c.vStart - 0.7) < 0.005 && Math.abs(c.vEnd - 0.74) < 0.005,
+    );
+    expect(narrowBand).toHaveLength(1);
+    expect(narrowBand[0].uStart).toBe(0);
+    expect(narrowBand[0].uEnd).toBe(1);
+  });
+
+  it('Escenario 26 (Interior/Exterior exacto + Manillas claras/cromadas sobre grafito + CIE-Lab v8.0)', () => {
+    // Verificar mapeo exacto interior -> exterior
+    const pt0 = interiorToExteriorPoint(0, 0, { x: 1000, y: 1000 }, 18);
+    expect(pt0.uExt).toBeCloseTo(0.018, 4);
+    expect(pt0.vExt).toBeCloseTo(0.018, 4);
+    const rect0 = interiorToExteriorRect(
+      { uStart: 0, uEnd: 1, vStart: 0, vEnd: 1 },
+      { x: 1000, y: 1000 },
+      18,
+      500,
+      500,
+      0,
+    );
+    expect(rect0.x0).toBe(9);
+    expect(rect0.x1).toBe(491);
+
+    // Mueble grafito oscuro con 2 puertas y tiradores cromados CLAROS (contraste positivo)
+    const W = 480;
+    const H = 300;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const graphite: [number, number, number] = [56, 64, 78];
+    const seam: [number, number, number] = [14, 16, 20];
+    const chrome: [number, number, number] = [226, 230, 238];
+
+    const fill = (x0: number, y0: number, x1: number, y1: number, rgb: [number, number, number]) => {
+      for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) {
+        for (let x = Math.max(0, x0); x < Math.min(W, x1); x++) {
+          const i = (y * W + x) * 4;
+          rgba[i] = rgb[0];
+          rgba[i + 1] = rgb[1];
+          rgba[i + 2] = rgb[2];
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+
+    fill(0, 0, W, H, graphite);
+    fill(239, 0, 242, H, seam); // Junta central vertical
+    fill(208, 124, 216, 176, chrome); // Tirador cromado en borde derecho de puerta izq -> door_left
+    fill(264, 124, 272, 176, chrome); // Tirador cromado en borde izquierdo de puerta der -> door_right
+
+    const res = analyzeRectifiedFurniture(rgba, W, H, { x: 1000, y: 750 }, 18);
+    expect(res.detectedMaterial).toBe('grafito');
+    expect(res.vDividers).toHaveLength(1);
+    expect(res.detectedHandles).toHaveLength(2);
+    expect(res.detectedHandles.every((h) => h.polarity === 'bright')).toBe(true);
+    const leftDoor = res.inferredZones.find((z) => z.uEnd <= 0.55);
+    const rightDoor = res.inferredZones.find((z) => z.uStart >= 0.45);
+    expect(leftDoor?.kind).toBe('door_left');
+    expect(rightDoor?.kind).toBe('door_right');
+
+    // Clasificador CIE-Lab unificado invariante a luz cálida/fría
+    expect(classifyMelamineMaterialFromRgb(242, 232, 212, [246, 236, 218])).toBe('blanco');
+    expect(classifyMelamineMaterialFromRgb(126, 78, 46)).toBe('roble'); // nogal oscuro
+    expect(classifyMelamineMaterialFromRgb(56, 64, 78)).toBe('grafito');
+  });
+
+  it('Escenario 27 (Cero hShelves duplicadas dentro de drawers en bandDetector y reconstructStructureFromVectors)', () => {
+    const W = 520;
+    const H = 260;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const oak: [number, number, number] = [194, 146, 94];
+    const seam: [number, number, number] = [36, 24, 14];
+
+    const fill = (x0: number, y0: number, x1: number, y1: number, rgb: [number, number, number]) => {
+      for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) {
+        for (let x = Math.max(0, x0); x < Math.min(W, x1); x++) {
+          const i = (y * W + x) * 4;
+          rgba[i] = rgb[0];
+          rgba[i + 1] = rgb[1];
+          rgba[i + 2] = rgb[2];
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+
+    fill(0, 0, W, H, oak);
+    fill(259, 0, 262, H, seam); // Divisor central
+    fill(262, 85, W, 88, seam); // Junta cajón 1-2
+    fill(262, 172, W, 175, seam); // Junta cajón 2-3
+
+    const assertNoShelvesInsideDrawers = (
+      hShelves: ReadonlyArray<{ position: number; start: number; end: number }>,
+      zones: ReadonlyArray<{ kind: string; uStart: number; uEnd: number; vStart: number; vEnd: number }>,
+    ) => {
+      const drawerZones = zones.filter((z) => z.kind === 'drawers');
+      expect(drawerZones.length).toBeGreaterThanOrEqual(1);
+      for (const z of drawerZones) {
+        for (const sh of hShelves) {
+          const strictlyInsideV = sh.position > z.vStart + 0.025 && sh.position < z.vEnd - 0.025;
+          const overlapsU = Math.min(sh.end, z.uEnd) - Math.max(sh.start, z.uStart) > 0.05;
+          expect(strictlyInsideV && overlapsU).toBe(false);
+        }
+      }
+    };
+
+    const detBand = analyzeRectifiedFurniture(rgba, W, H, { x: 1400, y: 760 }, 18);
+    assertNoShelvesInsideDrawers(detBand.hShelves, detBand.inferredZones);
+
+    const detVec = reconstructStructureFromVectors(rgba, W, H, { x: 1400, y: 760 }, 18, 'roble');
+    assertNoShelvesInsideDrawers(detVec.hShelves, detVec.inferredZones);
+  });
+
+  it('Escenario 28 (computeRectifiedSize preserva aspecto en rack bajo 2200×400 y despensero 600×2200 + inyección calculateDespieceFn)', () => {
+    const rack = computeRectifiedSize(2200, 400, 18);
+    const rackRatio = rack.width / rack.height;
+    const expectedRack = 2200 / 400;
+    expect(rack.width).toBeLessThanOrEqual(960);
+    expect(rack.height).toBeLessThanOrEqual(1200);
+    expect(Math.abs(rackRatio - expectedRack) / expectedRack).toBeLessThan(0.02);
+
+    const pantry = computeRectifiedSize(600, 2200, 18);
+    const pantryRatio = pantry.width / pantry.height;
+    const expectedPantry = 600 / 2200;
+    expect(pantry.width).toBeLessThanOrEqual(960);
+    expect(pantry.height).toBeLessThanOrEqual(1200);
+    expect(Math.abs(pantryRatio - expectedPantry) / expectedPantry).toBeLessThan(0.02);
+
+    // Desacoplamiento calculateDespieceFn y ruta rápida overrideQuad en runIterativePhotoTo3D
+    const W = 280;
+    const H = 220;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const inside = x >= 40 && x <= 240 && y >= 30 && y <= 190;
+        const i = (y * W + x) * 4;
+        rgba[i] = inside ? 195 : 244;
+        rgba[i + 1] = inside ? 148 : 246;
+        rgba[i + 2] = inside ? 98 : 250;
+        rgba[i + 3] = 255;
+      }
+    }
+    let despieceCalls = 0;
+    const overrideQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 40, y: 30 },
+      { x: 240, y: 30 },
+      { x: 240, y: 190 },
+      { x: 40, y: 190 },
+    ];
+    const iter = runIterativePhotoTo3D(rgba, W, H, {
+      overrideQuad,
+      boardThicknessMm: 18,
+      calculateDespieceFn: (topo, prm) => {
+        despieceCalls++;
+        return calculateDespiece(topo, prm);
+      },
+    });
+    expect(iter).not.toBeNull();
+    expect(despieceCalls).toBeGreaterThanOrEqual(1);
+    expect(iter!.usedQuad).toEqual(overrideQuad);
+
+    // classifyPartitionedZonesFromPhoto preserva elecciones previas y detecta bicolor vía CIE-Lab
+    const zonesTraced = classifyPartitionedZonesFromPhoto(
+      [
+        { id: 'c1', uStart: 0, uEnd: 0.5, vStart: 0, vEnd: 1 },
+        { id: 'c2', uStart: 0.5, uEnd: 1, vStart: 0, vEnd: 1 },
+      ],
+      rgba,
+      W,
+      H,
+      { x: 1000, y: 800 },
+      'blanco',
+      [244, 246, 250],
+      [],
+      18,
+    );
+    expect(zonesTraced).toHaveLength(2);
   });
 });

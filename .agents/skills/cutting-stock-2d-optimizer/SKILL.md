@@ -1,55 +1,61 @@
 ---
 name: cutting-stock-2d-optimizer
 description: >-
-  Use this skill when implementing, debugging, or optimizing src/core/cuttingStock/
-  (Bloque 2). Enforces strict thickness separation (18mm vs 3mm), exact virtual-pad
-  kerf handling, grain-direction locking along 2440mm with real 90-degree rotation
-  gains when unlocked, 2-stage guillotine + optional MaxRects, and offline SVG.
+  Governs src/core/cuttingStock/ in SmartFurniture v8.0, covering strict sheet
+  separation by (thickness + material) for bicolor furniture, virtual-pad kerf
+  and trimMm handling, 2-stage guillotine and MaxRects packing with real
+  rotation gains, offline XML-safe SVG rendering, editable CLP BOM/cost
+  estimation, and 3-sheet Excel .xls / safe CSV export. Activate when editing
+  optimizer.ts, svgGenerator.ts, costEstimator.ts, or exporters.ts.
 ---
 
-# 2D Cutting Stock Optimizer & Offline SVG Generator (v2.1 Rev. 2)
+# 2D Cutting Stock Optimizer, CLP Cost Estimator & Exporters (v8.0)
 
-## 1. Non-Negotiable Packing Invariants
-1. **Strict Material/Thickness Separation:**
-   - Group pieces by `espesor` (`18 mm` Melamina vs. `3 mm` Fondo Durolac/MDF) BEFORE packing. Never mix thicknesses on the same sheet.
-   - Use `params.sheetDimensions` for 18 mm and `params.backPanelSheetDimensions ?? params.sheetDimensions` for 3 mm.
-   - Populate `sheet.espesorMm`, `sheet.materialLabel`, `melamineSheetsCount`, and `backPanelSheetsCount`.
-2. **Squaring Trim (`trimMm`) + Exact Kerf Handling:**
-   - `trim = params.trimMm ?? 0`; usable dimensions `usableW = W - 2 * trim`, `usableH = H - 2 * trim`.
-   - Let `s = params.kerf` (e.g., `4.0 mm`).
-   - Virtual-pad capacity `(usableW + s) × (usableH + s)`; placing `(pw, ph)` reserves `(pw + s) × (ph + s)`, while recording exact coordinates `{ x: trim + ..., y: trim + ..., ancho: pw, alto: ph }`.
-   - Guarantees:
-     - `trim <= x` and `x + ancho <= sheetWidth - trim`
-     - `trim <= y` and `y + alto <= sheetHeight - trim`
-     - Pairwise separation `>= s` on X or Y
-     - Exact edge cases (`trim = 0, s = 4`): `2440 × 1220` fits on 1 sheet; two `1218 × 600` fit side-by-side; two `1220 × 600` require 2 strips.
-3. **Grain Direction Lock + Real Rotation Benefit When Unlocked (v2.1 Rev. 2):**
-   - Sheet `width` (`2440 mm` default) is the grain axis; `height` (`1220 mm`) is cross-grain.
-   - A piece may rotate 90° **only** when `!(params.respectGrain && piece.respectGrain)`.
-   - When `respectGrain = true` and `piece.respectGrain = true`, rotation is strictly forbidden (`rotado: false`).
-   - **CRITICAL FIX (Rev. 2):** In standard cabinets, most pieces have `ancho > alto` (`alto = z_f`). When rotation IS allowed (`respectGrain = false`), the guillotine packer MUST evaluate multi-orientation policies (`default`, `preferRotated`, `mixed` — see [guillotine_sim.ts](../../../docs/evidencia/guillotine_sim.ts)) and pick the layout with fewest unplaced pieces, fewest sheets, and fewest strips. This guarantees that toggling `respectGrain` OFF visibly rotates pieces and saves sheets (e.g., `900×1150×410` module drops from **2 sheets / 33.7%** to **1 sheet / 67.4%** with 5 rotated pieces).
-4. **Algorithm Choice:**
-   - Default `packingStrategy = 'guillotine'` (2-stage strip packing: rip strips along grain, fill by FFD with `<= 25%` height tolerance, stack strips into sheets). Fully cuttable on real panel saws (Sodimac/Imperial) and explainable with sumatorias.
-   - Optional `packingStrategy = 'maxrects'`: MaxRects BSSF with free-rectangle pruning (CNC-style), obeying identical thickness, grain, kerf, and trim invariants.
-   - Reference prototype + verified outputs: [guillotine_sim.ts](../../../docs/evidencia/guillotine_sim.ts).
-5. **Oversized Pieces Guard:**
-   - If a piece cannot fit an empty usable sheet (under its rotation rules), push immediately to `unplacedPieces` — never infinite-loop.
-6. **Exact Metrics:**
-   - Sheet: `usoPorcentaje = (sumPieceAreas / (anchoSheet * altoSheet)) * 100`, `desperdicioPorcentaje = 100 - usoPorcentaje`.
-   - Global: `usagePercentage`, `wastePercentage = 100 - usagePercentage` (`usage + waste === 100` within `1e-6`).
-   - Chilean market formats supported via selector (`2500 × 1830 mm` Melamina, `2440 × 1520 mm` Durolac), while keeping `2440 × 1220 mm` as default for pauta compliance.
+## 1. Non-Negotiable Packing Invariants (`optimizer.ts`)
+1. **Strict Separation by `(espesorMm, material)` (Bicolor Ready):**
+   - Partition expanded pieces by composite key `${espesor}::${material}` BEFORE packing.
+   - NEVER mix thicknesses (`18 mm` melamine vs `3 mm` Durolac) AND NEVER mix melamine finishes (`blanco` vs `roble` vs `grafito`) on the same sheet.
+   - Select `params.sheetDimensions` for structural melamine (`> backPanelThickness`) and `params.backPanelSheetDimensions ?? params.sheetDimensions` for `3 mm` panels (`durolac_3mm`).
+   - Populate `SheetLayout.espesorMm`, `SheetLayout.material`, `SheetLayout.materialLabel`, `melamineSheetsCount`, and `backPanelSheetsCount`.
+   - Propagate typed metadata onto every `PlacedRectangle`: `material`, `tipo`, and optional `miterAngleDeg` (for oblique `division_diagonal` cuts).
+2. **Squaring Trim (`trimMm`) + Exact Virtual-Pad Kerf:**
+   - `trim = Math.max(0, params.trimMm ?? 0)`; usable sheet is `(W - 2*trim) × (H - 2*trim)`.
+   - With blade kerf `s = Math.max(0, params.kerf)`, pack inside `(usableW + s) × (usableH + s)` reserving `(pw + s) × (ph + s)` while recording real piece bounds `{ x: trim + ..., y: trim + ..., ancho: pw, alto: ph }`.
+   - Guarantee: all pieces stay inside `[trim, W - trim] × [trim, H - trim]`, pairwise gap `>= s` on X or Y, `2440×1220` fits on 1 sheet (`trim = 0`), two `1218×600` share 1 strip (`s = 4`), and two `1220×600` split into 2 strips.
+3. **Grain Lock & Real Rotation Gains:**
+   - Sheet `width` (`2440 mm` pauta / `2500 mm` Chile) is the grain axis. A piece rotates 90° ONLY when `!(params.respectGrain && piece.respectGrain)`.
+   - When rotation is permitted, evaluate multi-orientation guillotine policies (`default`, `preferRotated`, `mixed`) and select the best layout by `(fewest unplaced, fewest sheets, fewest strips)` so disabling `respectGrain` visibly rotates panels and saves sheets (e.g. `900×1150×410` module drops `2 -> 1` sheet).
+4. **Packing Strategies & Oversized Guard:**
+   - Default `packingStrategy = 'guillotine'` (2-stage panel-saw strip packing, Sodimac/Imperial compatible).
+   - Optional `packingStrategy = 'maxrects'` (CNC-style BSSF with free-rectangle pruning).
+   - Pieces that cannot fit an empty usable sheet under their rotation rule go directly to `unplacedPieces` (never loop).
+5. **Area-Weighted Global Metrics:**
+   - Compute `usagePercentage` weighted by total real area across all sheets (essential when mixing `2500×1830` melamine and `2440×1520` Durolac sheets) with `wastePercentage = 100 - usagePercentage` (`usage + waste === 100` within `1e-6`, zero `NaN` on empty input).
 
-## 2. Offline Vector SVG (`src/core/cuttingStock/svgGenerator.ts`)
+## 2. Offline Vector SVG (`svgGenerator.ts`)
 - Export `renderCuttingPlanSvg(sheets: SheetLayout[], kerf: number, trimMm?: number): string`.
-- **100% Offline:** `font-family="system-ui, -apple-system, sans-serif"`, zero external URLs or stylesheets.
-- **XML Escaping:** Escape `&`, `<`, `>`, `"`, `'` in all labels and piece names.
-- **Visual Clarity:** Explicit `viewBox`, stacked sheets with headers (`Plancha #N · Material · Uso XX.X% / Desperdicio YY.Y%`), grain arrow (`→ Veta`), optional trim border when `trimMm > 0`, subtle waste grid, color-coded piece types, `ancho × alto mm`, and `(R)` badge when `rotado === true`.
+- **100 % Offline & XML-Safe:** Use shared `escapeXml` from `src/core/utils/xml.ts`, `font-family="system-ui, -apple-system, sans-serif"`, zero external URLs.
+- Render explicit `viewBox`, stacked sheets showing `Plancha #N · Material · Espesor · Uso/Desperdicio`, grain arrow (`→ Veta`), trim border when `trimMm > 0`, color-coded `PlacedRectangle.tipo`, `(R)` rotation badge, and miter angle badge when `miterAngleDeg` is present.
 
-## Verification Checklist
-Run Vitest and confirm:
-- [ ] Pairwise overlap & minimum `>= kerf` gap + `trimMm` bounds check passes on all sheets for both `'guillotine'` and `'maxrects'`.
-- [ ] `2440 × 1220`, `2 × (1218 × 600)`, and `2 × (1220 × 600)` kerf edge tests pass.
-- [ ] `respectGrain = true` yields zero `rotado: true` melamine pieces, and `respectGrain = false` reduces sheets from 2 -> 1 on `900×1150×410`.
-- [ ] Preset 3 (`closet`) separates 18 mm and 3 mm sheets, works on both `2440×1220` and Chile (`2500×1830` / `2440×1520`), `unplacedPieces.length === 0`, `usage + waste === 100`.
-- [ ] `2600 × 1500 mm` piece lands cleanly in `unplacedPieces`.
-- [ ] `svgMarkup` is valid XML containing `<svg`, `</svg>`, sheet labels, and dimensions.
+## 3. Editable CLP BOM & Cost Estimator (`costEstimator.ts`)
+- Export `DEFAULT_COST_CONFIG` (or default rates), `estimateProjectBomAndCost(despiece, cuttingPlan, params)`, and `formatClp(amount)`.
+- Merge user overrides from `params.costConfig?: Partial<CostEstimatorConfig>` cleanly over CLP defaults for standard/large melamine sheets, 3 mm sheets, edge banding per meter (`+10 %` allowance), fasteners (`screwClp`, `dowelClp`, `glideClp`, `nailClp`), and hardware (`legClp`, `wheelClp`, `handleClp`, `hingeClp`, `slideClp`, `basketClp`, `glassPanelClp`, `countertopClp`, `metalFrameClp`, `otherClp`).
+- Guarantee reconciled accounting: `totalClp === melamineSheetsClp + backPanelSheetsClp + edgeBandingClp + fastenersClp + externalHardwareClp`.
+
+## 4. Offline Exporters (`exporters.ts`)
+- **Excel `.xls` (3 Sheets, Zero Libraries):** `generateExcelSpreadsheetML()` outputs valid SpreadsheetML XML 2003 using shared `escapeXml` with 3 tabs:
+  1. `Despiece_Melamina` (all physical boards, grain axis, edges, material, miter angle)
+  2. `Herrajes_y_Patas` (non-melamine hardware + auto fasteners BOM + edge banding with `+10%` allowance)
+  3. `Resumen_U3_y_Planchas` (`V0`, `Vf`, `û_V`, `kx/ky/kz`, areas, sheet counts by material, weighted usage %, DIN 68874-1 max deflection, reconciled CLP budget, structural alerts)
+- **CSV Chile Safe (`generateDespieceCsv`):** UTF-8 BOM `\uFEFF`, `;` delimiter default for Spanish Excel, full RFC-4180 quoting, and formula-injection neutralization (prefix cells starting with `=`, `+`, `-`, `@` safely when exporting text labels).
+
+## 5. Verification Checklist (Windows PowerShell 5.1)
+```powershell
+npx vitest run src/core/cuttingStock/cuttingStock.test.ts
+if ($LASTEXITCODE -ne 0) { throw "cuttingStock tests failed" }
+```
+Confirm:
+- [ ] Bicolor furniture splits `blanco` and `roble` 18 mm boards onto separate sheets (`SheetLayout.material` homogeneous per sheet).
+- [ ] Zero overlaps, pairwise gap `>= kerf`, `trimMm` bounds, kerf edge cases, and `respectGrain` rotation gain (`2 -> 1` sheet).
+- [ ] `params.costConfig` overrides recalculate `ProjectCostEstimate` and match `totalClp` sum exactly.
+- [ ] Excel `.xls` has 3 XML-escaped worksheets and CSV starts with `\uFEFF` using `;`.

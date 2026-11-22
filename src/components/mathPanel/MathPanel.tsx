@@ -1,28 +1,37 @@
 /**
- * SMARTFURNITURE — PANEL MATEMÁTICO (UNIDAD 3), HERRAJES Y PLANO DE CORTE 2D (v3.1 UX)
- * - Tipografía matemática con subíndices reales para grabación de video.
- * - Badge visual destacado en pestaña Alertas, toast de confirmación en descargas/acciones
- *   y zoom + leyenda de colores en plano de corte SVG.
+ * SMARTFURNITURE — PANEL DE TALLER: UNIDAD 3, ALERTAS DIN, MATRICES, BOM CLP EDITABLE Y CORTE 2D (v8.0)
+ * - 100 % memoizado con `useMemo` para cambios instantáneos de pestaña sin recálculos redundantes.
+ * - Tabla BOM CLP 100 % cuadrada al peso exacto (`planchas + tapacanto + fijaciones + herrajes === totalClp`).
+ * - Tarifas unitarias CLP editables en vivo (`params.costConfig`) con botón "Restaurar precios Chile".
+ * - Edición in-place de herrajes manuales (categoría, descripción y cantidad).
+ * - Espesores dinámicos (`boardThickness`, `backPanelThickness`), formato real de plancha y accesibilidad ARIA.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
   Download,
   FileSpreadsheet,
   Grid,
   Layers,
+  Pencil,
+  RotateCcw,
   Sigma,
+  SlidersHorizontal,
   Wrench,
+  X,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
 import type {
+  CostEstimatorConfig,
   CuttingPlanResult,
   DespieceResult,
   FurnitureTopology,
   HardwareCategory,
   HardwareItem,
+  MelamineMaterial,
   ScaleAndBoardParams,
 } from '../../types/contracts';
 import {
@@ -31,8 +40,11 @@ import {
   compareShapeAspect,
   computeUnitDirectionVector,
   scaleBaseMatrix,
+  type ShapeComparisonResult,
+  type UnitDirectionVectorResult,
 } from '../../core/mathEngine';
 import {
+  DEFAULT_COST_CONFIG,
   estimateProjectBomAndCost,
   formatClp,
   generateDespieceCsv,
@@ -40,18 +52,57 @@ import {
 } from '../../core/cuttingStock';
 import { NumericInput } from '../NumericInput';
 
-interface MathPanelProps {
+export type MathPanelTab = 'unidad3' | 'alertas' | 'matrices' | 'herrajes' | 'corte';
+
+export interface MathPanelProps {
   despiece: DespieceResult;
   cuttingPlan: CuttingPlanResult;
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
+  unitVec?: UnitDirectionVectorResult;
+  shapeComp?: ShapeComparisonResult | null;
+  requestedTab?: { tab: MathPanelTab; seq: number } | null;
   onFixReferenceV0: () => void;
   onAddCenterDivider: () => void;
   onAddHardwareItem: (item: HardwareItem) => void;
+  onUpdateHardwareItem?: (item: HardwareItem) => void;
   onRemoveHardwareItem: (id: string) => void;
+  onUpdateCostConfig?: (next: Partial<CostEstimatorConfig> | undefined) => void;
 }
 
-type PanelTab = 'unidad3' | 'alertas' | 'matrices' | 'herrajes' | 'corte';
+const MATERIAL_NAMES: Record<MelamineMaterial, string> = {
+  blanco: 'Blanco',
+  roble: 'Roble',
+  grafito: 'Grafito',
+};
+
+const COST_FIELDS: Array<{
+  key: keyof CostEstimatorConfig;
+  label: string;
+  step: number;
+  max: number;
+  group: 'tableros' | 'herrajes' | 'fijaciones';
+}> = [
+  { key: 'melamineSheetStdClp', label: 'Plancha Melamina Estándar (≤3.6 m²)', step: 500, max: 250000, group: 'tableros' },
+  { key: 'melamineSheetLargeClp', label: 'Plancha Melamina Grande (>3.6 m²)', step: 500, max: 300000, group: 'tableros' },
+  { key: 'backPanelSheetStdClp', label: 'Plancha Fondo Estándar (≤3.3 m²)', step: 500, max: 120000, group: 'tableros' },
+  { key: 'backPanelSheetLargeClp', label: 'Plancha Fondo Grande (>3.3 m²)', step: 500, max: 150000, group: 'tableros' },
+  { key: 'edgeBandingPerMeterClp', label: 'Tapacanto PVC (por metro)', step: 20, max: 10000, group: 'tableros' },
+  { key: 'hingeClp', label: 'Bisagra cazoleta 35 mm', step: 100, max: 30000, group: 'herrajes' },
+  { key: 'slideClp', label: 'Par correderas telescópicas', step: 200, max: 50000, group: 'herrajes' },
+  { key: 'handleClp', label: 'Tirador / pomo', step: 100, max: 30000, group: 'herrajes' },
+  { key: 'legClp', label: 'Pata externa (c/u)', step: 200, max: 50000, group: 'herrajes' },
+  { key: 'wheelClp', label: 'Rueda giratoria (c/u)', step: 200, max: 50000, group: 'herrajes' },
+  { key: 'basketClp', label: 'Canasto metálico extraíble', step: 500, max: 120000, group: 'herrajes' },
+  { key: 'glassPanelClp', label: 'Panel vidrio 4 mm vitrina', step: 500, max: 150000, group: 'herrajes' },
+  { key: 'countertopClp', label: 'Mesón / cubierta especial', step: 1000, max: 600000, group: 'herrajes' },
+  { key: 'metalFrameClp', label: 'Estructura metálica / fierro', step: 1000, max: 400000, group: 'herrajes' },
+  { key: 'otherClp', label: 'Otro herraje (ref.)', step: 100, max: 100000, group: 'herrajes' },
+  { key: 'screwClp', label: 'Tornillo soberbio 4×50', step: 5, max: 2000, group: 'fijaciones' },
+  { key: 'dowelClp', label: 'Tarugo madera 8×35', step: 5, max: 2000, group: 'fijaciones' },
+  { key: 'nailClp', label: 'Clavo / grapa fondo', step: 5, max: 1000, group: 'fijaciones' },
+  { key: 'glideClp', label: 'Patín deslizador a piso', step: 50, max: 5000, group: 'fijaciones' },
+];
 
 function triggerDownload(filename: string, content: string, mimeType: string): void {
   const blob = new Blob([content], { type: mimeType });
@@ -70,49 +121,179 @@ export function MathPanel({
   cuttingPlan,
   topology,
   params,
+  unitVec: unitVecProp,
+  shapeComp: shapeCompProp,
+  requestedTab,
   onFixReferenceV0,
   onAddCenterDivider,
   onAddHardwareItem,
+  onUpdateHardwareItem,
   onRemoveHardwareItem,
+  onUpdateCostConfig,
 }: MathPanelProps) {
-  const [tab, setTab] = useState<PanelTab>('unidad3');
+  const [tab, setTab] = useState<MathPanelTab>(() => requestedTab?.tab ?? 'unidad3');
   const [matrixOverride, setMatrixOverride] = useState<'auto' | 'nx3' | 'nx5'>('auto');
   const [svgZoom, setSvgZoom] = useState<number>(100);
   const [toast, setToast] = useState<string | null>(null);
+
+  // Formulario para agregar herraje manual
   const [hwCategory, setHwCategory] = useState<HardwareCategory>('tiradores');
   const [hwDesc, setHwDesc] = useState('Tirador metálico 128 mm');
   const [hwQty, setHwQty] = useState(2);
 
+  // Estado de edición in-place para herrajes manuales
+  const [editingHwId, setEditingHwId] = useState<string | null>(null);
+  const [editHwCategory, setEditHwCategory] = useState<HardwareCategory>('tiradores');
+  const [editHwDesc, setEditHwDesc] = useState('');
+  const [editHwQty, setEditHwQty] = useState(1);
+
+  useEffect(() => {
+    if (requestedTab) {
+      setTab(requestedTab.tab);
+    }
+  }, [requestedTab]);
+
   useEffect(() => {
     if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 2600);
+    const timer = window.setTimeout(() => setToast(null), 2800);
     return () => window.clearTimeout(timer);
   }, [toast]);
 
   const showToast = (msg: string) => setToast(msg);
 
-  const etapa2Demo = scaleBaseMatrix(ETAPA2_BASE_MATRIX_M0, 1.2, 1.2);
+  // Todos los cálculos memoizados para evitar recomputación al cambiar pestañas o mostrar toasts
+  const etapa2Demo = useMemo(() => scaleBaseMatrix(ETAPA2_BASE_MATRIX_M0, 1.2, 1.2), []);
+
+  const unitVec = useMemo(
+    () => unitVecProp ?? computeUnitDirectionVector(params.targetDimensions),
+    [unitVecProp, params.targetDimensions],
+  );
+
+  const shapeComp = useMemo(
+    () =>
+      shapeCompProp !== undefined
+        ? shapeCompProp
+        : compareShapeAspect(
+            topology.aspectRatioXY,
+            params.targetDimensions.x,
+            params.targetDimensions.y,
+          ),
+    [shapeCompProp, topology.aspectRatioXY, params.targetDimensions.x, params.targetDimensions.y],
+  );
+
+  const dinReports = useMemo(
+    () => analyzeShelvesDeflectionDIN(despiece.matrizDespiece, 25),
+    [despiece.matrizDespiece],
+  );
+
+  const bomCost = useMemo(
+    () => estimateProjectBomAndCost(despiece, cuttingPlan, params),
+    [despiece, cuttingPlan, params],
+  );
+
+  const resolvedCost = useMemo<CostEstimatorConfig>(
+    () => ({ ...DEFAULT_COST_CONFIG, ...(params.costConfig ?? {}) }),
+    [params.costConfig],
+  );
+
+  const hasCustomCostOverrides = useMemo(() => {
+    if (!params.costConfig) return false;
+    return (Object.keys(DEFAULT_COST_CONFIG) as Array<keyof CostEstimatorConfig>).some(
+      (k) => params.costConfig?.[k] !== undefined && params.costConfig[k] !== DEFAULT_COST_CONFIG[k],
+    );
+  }, [params.costConfig]);
+
+  const manualHardwareIds = useMemo(
+    () => new Set((topology.hardwareItems ?? []).map((item) => item.id)),
+    [topology.hardwareItems],
+  );
+
   const { kx, ky, kz } = despiece.scaleFactors;
   const prog = despiece.shelfProgression;
-  const unitVec = computeUnitDirectionVector(params.targetDimensions);
-  const shapeComp = compareShapeAspect(
-    topology.aspectRatioXY,
-    params.targetDimensions.x,
-    params.targetDimensions.y,
-  );
-  const dinReports = analyzeShelvesDeflectionDIN(despiece.matrizDespiece, 25);
-  const bomCost = estimateProjectBomAndCost(despiece, cuttingPlan, params);
-  const melamineAreaM2 = Math.max(0, despiece.totalNetAreaM2 - despiece.backPanelAreaM2);
+  const melamineAreaM2 =
+    despiece.melamineNetAreaM2 ?? Math.max(0, despiece.totalNetAreaM2 - despiece.backPanelAreaM2);
   const hasThinPanels =
-    topology.hasBackPanel || despiece.matrizDespiece.some((p) => p.espesor < 10);
+    topology.hasBackPanel ||
+    despiece.matrizDespiece.some(
+      (p) =>
+        p.tipo === 'fondo' ||
+        p.tipo === 'fondo_cajon' ||
+        p.espesor !== params.boardThickness,
+    );
   const activeMatrixView: 'nx3' | 'nx5' =
     matrixOverride === 'auto' ? (hasThinPanels ? 'nx5' : 'nx3') : matrixOverride;
   const hasCriticalAlert = despiece.alerts.some((a) => a.severidad === 'critical');
 
+  const sheetWcm = Math.round(params.sheetDimensions.width / 10);
+  const sheetHcm = Math.round(params.sheetDimensions.height / 10);
+  const sheetLabel = `${sheetWcm}×${sheetHcm} cm`;
+  const sheetAreaM2 = (params.sheetDimensions.width * params.sheetDimensions.height) / 1_000_000;
+  const isLargeMelamineSheet = sheetAreaM2 > 3.6;
+
+  const backSheetDim = params.backPanelSheetDimensions ?? params.sheetDimensions;
+  const backSheetWcm = Math.round(backSheetDim.width / 10);
+  const backSheetHcm = Math.round(backSheetDim.height / 10);
+  const backSheetLabel = `${backSheetWcm}×${backSheetHcm} cm`;
+  const backSheetAreaM2 = (backSheetDim.width * backSheetDim.height) / 1_000_000;
+  const isLargeBackSheet = backSheetAreaM2 > 3.3;
+
+  // Filas de planchas de melamina por color (cuadradas exactamente con `bomCost.melamineSheetsClp`)
+  const melamineSheetRows = useMemo(() => {
+    const entries = Object.entries(bomCost.melamineByMaterialClp ?? {}) as Array<
+      [MelamineMaterial, { sheets: number; clp: number } | undefined]
+    >;
+    const valid = entries.filter(
+      (entry): entry is [MelamineMaterial, { sheets: number; clp: number }] =>
+        Boolean(entry[1] && entry[1].sheets > 0),
+    );
+    if (valid.length > 0) {
+      return valid.map(([matKey, info]) => ({
+        id: `bom_mel_${matKey}`,
+        nombre: `Plancha Melamina ${MATERIAL_NAMES[matKey]} (${params.boardThickness} mm · ${sheetLabel})`,
+        cantidad: info.sheets,
+        unidad: 'pl.',
+        costoUnitarioClp: Math.round(info.clp / info.sheets),
+        subtotalClp: info.clp,
+      }));
+    }
+    if (cuttingPlan.melamineSheetsCount > 0) {
+      return [
+        {
+          id: 'bom_mel_total',
+          nombre: `Plancha Melamina ${MATERIAL_NAMES[params.material]} (${params.boardThickness} mm · ${sheetLabel})`,
+          cantidad: cuttingPlan.melamineSheetsCount,
+          unidad: 'pl.',
+          costoUnitarioClp: Math.round(
+            bomCost.melamineSheetsClp / cuttingPlan.melamineSheetsCount,
+          ),
+          subtotalClp: bomCost.melamineSheetsClp,
+        },
+      ];
+    }
+    return [];
+  }, [
+    bomCost.melamineByMaterialClp,
+    bomCost.melamineSheetsClp,
+    cuttingPlan.melamineSheetsCount,
+    params.boardThickness,
+    params.material,
+    sheetLabel,
+  ]);
+
+  const edgeBandingColorSummary = useMemo(() => {
+    const entries = Object.entries(bomCost.edgeBandingByMaterialMeters ?? {}) as Array<
+      [MelamineMaterial, number | undefined]
+    >;
+    const parts = entries
+      .filter((entry): entry is [MelamineMaterial, number] => typeof entry[1] === 'number' && entry[1] > 0)
+      .map(([matKey, m]) => `${MATERIAL_NAMES[matKey]} ${m.toFixed(1)} m`);
+    return parts.join(' · ');
+  }, [bomCost.edgeBandingByMaterialMeters]);
+
   const handleFixV0 = () => {
     onFixReferenceV0();
     showToast(
-      `V₀ fijado en (${params.targetDimensions.x}, ${params.targetDimensions.y}, ${params.targetDimensions.z}) mm — mueve X/Y/Z para ver k.`,
+      `V₀ fijado en (${params.targetDimensions.x}, ${params.targetDimensions.y}, ${params.targetDimensions.z}) mm — ajusta X/Y/Z para ver k.`,
     );
   };
 
@@ -137,17 +318,56 @@ export function MathPanel({
   };
 
   const handleAddHw = () => {
-    if (!hwDesc.trim()) return;
+    const trimmed = hwDesc.trim();
+    if (!trimmed) return;
     onAddHardwareItem({
       id: `hw_manual_${Date.now()}`,
       categoria: hwCategory,
-      descripcion: hwDesc.trim(),
+      descripcion: trimmed,
       cantidad: Math.max(1, hwQty),
       notaCompra: 'Accesorio ajeno a melamina — adquirir en ferretería aparte.',
       origen: 'manual',
     });
-    showToast(`Herraje agregado: ${hwDesc.trim()} × ${hwQty}`);
+    showToast(`Herraje agregado: ${trimmed} × ${hwQty}`);
     setHwDesc('');
+  };
+
+  const startEditHw = (hw: HardwareItem) => {
+    setEditingHwId(hw.id);
+    setEditHwCategory(hw.categoria);
+    setEditHwDesc(hw.descripcion);
+    setEditHwQty(hw.cantidad);
+  };
+
+  const cancelEditHw = () => {
+    setEditingHwId(null);
+  };
+
+  const saveEditHw = (original: HardwareItem) => {
+    const trimmed = editHwDesc.trim();
+    if (!trimmed || !onUpdateHardwareItem) return;
+    onUpdateHardwareItem({
+      ...original,
+      categoria: editHwCategory,
+      descripcion: trimmed,
+      cantidad: Math.max(1, editHwQty),
+    });
+    setEditingHwId(null);
+    showToast(`Herraje actualizado: ${trimmed} × ${Math.max(1, editHwQty)}`);
+  };
+
+  const handleUpdateCostField = (key: keyof CostEstimatorConfig, nextVal: number) => {
+    if (!onUpdateCostConfig) return;
+    onUpdateCostConfig({
+      ...(params.costConfig ?? {}),
+      [key]: Math.max(0, Math.round(nextVal)),
+    });
+  };
+
+  const handleResetCostDefaults = () => {
+    if (!onUpdateCostConfig) return;
+    onUpdateCostConfig(undefined);
+    showToast('Precios unitarios CLP restaurados a referencia mercado chileno.');
   };
 
   return (
@@ -158,16 +378,24 @@ export function MathPanel({
         </div>
       )}
 
-      <div className="panel-tabs">
+      <div className="panel-tabs" role="tablist" aria-label="Secciones de taller y cálculos">
         <button
+          id="tab-unidad3"
           type="button"
+          role="tab"
+          aria-selected={tab === 'unidad3'}
+          aria-controls="panel-unidad3"
           className={tab === 'unidad3' ? 'tab-btn active' : 'tab-btn'}
           onClick={() => setTab('unidad3')}
         >
           <Sigma size={15} /> Unidad 3
         </button>
         <button
+          id="tab-alertas"
           type="button"
+          role="tab"
+          aria-selected={tab === 'alertas'}
+          aria-controls="panel-alertas"
           className={[
             'tab-btn',
             tab === 'alertas' ? 'active' : '',
@@ -181,27 +409,39 @@ export function MathPanel({
             .join(' ')}
           onClick={() => setTab('alertas')}
         >
-          <AlertTriangle size={15} /> Alertas
+          <AlertTriangle size={15} /> Alertas &amp; DIN
           {despiece.alerts.length > 0 && (
             <span className="tab-count-pill">{despiece.alerts.length}</span>
           )}
         </button>
         <button
+          id="tab-matrices"
           type="button"
+          role="tab"
+          aria-selected={tab === 'matrices'}
+          aria-controls="panel-matrices"
           className={tab === 'matrices' ? 'tab-btn active' : 'tab-btn'}
           onClick={() => setTab('matrices')}
         >
           <Grid size={15} /> Matrices n×3/n×5
         </button>
         <button
+          id="tab-herrajes"
           type="button"
+          role="tab"
+          aria-selected={tab === 'herrajes'}
+          aria-controls="panel-herrajes"
           className={tab === 'herrajes' ? 'tab-btn active' : 'tab-btn'}
           onClick={() => setTab('herrajes')}
         >
-          <Wrench size={15} /> Herrajes ({despiece.hardwareSummary.length})
+          <Wrench size={15} /> Herrajes &amp; CLP ({despiece.hardwareSummary.length})
         </button>
         <button
+          id="tab-corte"
           type="button"
+          role="tab"
+          aria-selected={tab === 'corte'}
+          aria-controls="panel-corte"
           className={tab === 'corte' ? 'tab-btn active' : 'tab-btn'}
           onClick={() => setTab('corte')}
         >
@@ -209,7 +449,7 @@ export function MathPanel({
         </button>
       </div>
 
-      <div className="panel-body">
+      <div className="panel-body" role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`}>
         {tab === 'unidad3' && (
           <div className="tab-section">
             <div className="metric-card">
@@ -269,7 +509,8 @@ export function MathPanel({
                 </>
               ) : (
                 <p className="muted small-note">
-                  Modo personalizado (<code>custom</code>): {topology.hShelves.length} repisas definidas en espacio interior [0, 1]².
+                  Modo personalizado (<code>custom</code>): {topology.hShelves.length} repisa(s)
+                  definida(s) en espacio interior [0, 1]².
                 </p>
               )}
             </div>
@@ -278,11 +519,11 @@ export function MathPanel({
               <h4>3. Sumatorias de Materiales y Validación Etapa 2</h4>
               <div className="kpi-grid">
                 <div>
-                  <span className="kpi-label">Melamina 18 mm</span>
+                  <span className="kpi-label">Melamina {params.boardThickness} mm</span>
                   <strong>{melamineAreaM2.toFixed(4)} m²</strong>
                 </div>
                 <div>
-                  <span className="kpi-label">Fondo 3 mm</span>
+                  <span className="kpi-label">Fondo {params.backPanelThickness} mm</span>
                   <strong>{despiece.backPanelAreaM2.toFixed(4)} m²</strong>
                 </div>
                 <div>
@@ -298,8 +539,8 @@ export function MathPanel({
               </div>
               <p className="muted small-note">
                 Validación matricial Etapa 2 (M = M<sub>0</sub> · diag(1.2, 1.2, 1)):{' '}
-                {etapa2Demo.originalAreaM2.toFixed(4)} → {etapa2Demo.scaledAreaM2.toFixed(4)} m² · Tapacanto{' '}
-                {etapa2Demo.originalEdgeBandingMeters.toFixed(2)} →{' '}
+                {etapa2Demo.originalAreaM2.toFixed(4)} → {etapa2Demo.scaledAreaM2.toFixed(4)} m² ·
+                Tapacanto {etapa2Demo.originalEdgeBandingMeters.toFixed(2)} →{' '}
                 {etapa2Demo.scaledEdgeBandingMeters.toFixed(2)} m.
               </p>
             </div>
@@ -321,14 +562,17 @@ export function MathPanel({
           <div className="tab-section">
             {despiece.alerts.length === 0 ? (
               <div className="ok-box">
-                Todas las piezas cumplen luz libre estructural (≤ 850 mm) y dimensiones válidas.
+                Todas las piezas cumplen luz libre estructural (≤ 850 mm), rigidez DIN 68874-1 y
+                dimensiones válidas para e = {params.boardThickness} mm.
               </div>
             ) : (
               <>
                 {despiece.alerts.map((al) => (
                   <div
                     key={al.id}
-                    className={al.severidad === 'critical' ? 'alert-box critical' : 'alert-box warning'}
+                    className={
+                      al.severidad === 'critical' ? 'alert-box critical' : 'alert-box warning'
+                    }
                   >
                     <strong>
                       [{al.severidad.toUpperCase()}] {al.tipo}
@@ -345,12 +589,17 @@ export function MathPanel({
             )}
 
             <div className="metric-card">
-              <h4>Rigidez Estructural de Repisas — Norma DIN 68874-1 (Euler-Bernoulli, 25 kg)</h4>
+              <h4>
+                Rigidez Estructural de Repisas — Norma DIN 68874-1 (Euler-Bernoulli, 25 kg · e ={' '}
+                {params.boardThickness} mm)
+              </h4>
               <p className="math-eq small-note">
                 δ = (5 · P · L³) / (384 · E · I) · E = 2700 N/mm² (MDP) · Límite admisible L / 200
               </p>
               {dinReports.length === 0 ? (
-                <p className="muted small-note">Este mueble no tiene repisas horizontales suspendidas.</p>
+                <p className="muted small-note">
+                  Este mueble no tiene repisas horizontales suspendidas.
+                </p>
               ) : (
                 <div className="table-scroll">
                   <table className="data-table">
@@ -410,8 +659,8 @@ export function MathPanel({
                 Matriz activa:{' '}
                 <strong>
                   {activeMatrixView === 'nx5'
-                    ? `Extendida n × 5 (${despiece.consolidatedRows.length} × 5 · incluye Cantidad y Material)`
-                    : `Base n × 3 (${despiece.matrixNx3.length} × 3 · Melamina 18 mm)`}
+                    ? `Extendida n × 5 (${despiece.consolidatedRows.length} × 5 · incluye Cantidad, Espesor y Material)`
+                    : `Base n × 3 (${despiece.matrixNx3.length} × 3 · Melamina ${params.boardThickness} mm)`}
                 </strong>
               </p>
               <div className="chip-row">
@@ -420,7 +669,7 @@ export function MathPanel({
                   className={matrixOverride === 'auto' ? 'chip-btn active' : 'chip-btn'}
                   onClick={() => setMatrixOverride('auto')}
                 >
-                  Auto ({topology.hasBackPanel ? 'n×5' : 'n×3'})
+                  Auto ({hasThinPanels ? 'n×5' : 'n×3'})
                 </button>
                 <button
                   type="button"
@@ -443,7 +692,7 @@ export function MathPanel({
                 <table className="data-table">
                   <thead>
                     <tr>
-                      <th>Placa física (18 mm)</th>
+                      <th>Placa física ({params.boardThickness} mm)</th>
                       <th>Ancho Veta (mm)</th>
                       <th>Alto / Prof (mm)</th>
                       <th>Espesor (mm)</th>
@@ -469,7 +718,7 @@ export function MathPanel({
                       <th>Pieza consolidada</th>
                       <th>Ancho Veta (mm)</th>
                       <th>Alto / Prof (mm)</th>
-                      <th>Esp.</th>
+                      <th>Esp. (mm)</th>
                       <th>Cant.</th>
                       <th>Material</th>
                     </tr>
@@ -495,38 +744,115 @@ export function MathPanel({
         {tab === 'herrajes' && (
           <div className="tab-section">
             <p className="muted small-note">
-              Elementos distintos a la melamina (patas independientes, tiradores, bisagras). Se aíslan del cálculo estructural del cuerpo y se exportan en su propia hoja de Excel.
+              Elementos externos a la melamina (patas, ruedas, tiradores, bisagras, correderas,
+              canastos, vidrios). Se aíslan del cuerpo estructural y se cuadran en el presupuesto CLP.
             </p>
             {despiece.hardwareSummary.length === 0 ? (
-              <div className="empty-box">No hay patas externas ni tiradores registrados para este mueble.</div>
+              <div className="empty-box">
+                No hay patas externas ni herrajes registrados para este mueble.
+              </div>
             ) : (
               <div className="hw-list">
-                {despiece.hardwareSummary.map((hw) => (
-                  <div key={hw.id} className="hw-card">
-                    <div>
-                      <strong>
-                        [{hw.categoria.toUpperCase()}] {hw.descripcion} × {hw.cantidad}
-                      </strong>
-                      <p className="muted small-note">{hw.notaCompra}</p>
+                {despiece.hardwareSummary.map((hw) => {
+                  const isManualEditable =
+                    hw.id !== 'hw_patas_externas' &&
+                    hw.id !== 'hw_ruedas_externas' &&
+                    !hw.id.endsWith('_calc') &&
+                    manualHardwareIds.has(hw.id);
+                  const isEditing = editingHwId === hw.id;
+
+                  if (isEditing) {
+                    return (
+                      <div key={hw.id} className="hw-card hw-card-editing">
+                        <div className="hw-edit-row">
+                          <select
+                            aria-label="Categoría del herraje"
+                            value={editHwCategory}
+                            onChange={(e) => setEditHwCategory(e.target.value as HardwareCategory)}
+                          >
+                            <option value="tiradores">Tiradores</option>
+                            <option value="patas">Patas</option>
+                            <option value="bisagras">Bisagras</option>
+                            <option value="correderas">Correderas</option>
+                            <option value="otro">Otro</option>
+                          </select>
+                          <input
+                            type="text"
+                            aria-label="Descripción del herraje"
+                            value={editHwDesc}
+                            onChange={(e) => setEditHwDesc(e.target.value)}
+                            style={{ flex: 1, minWidth: 140 }}
+                          />
+                          <NumericInput
+                            min={1}
+                            max={100}
+                            value={editHwQty}
+                            onCommit={setEditHwQty}
+                            style={{ width: 64 }}
+                            ariaLabel="Cantidad de herraje"
+                          />
+                          <button
+                            type="button"
+                            className="btn-primary"
+                            onClick={() => saveEditHw(hw)}
+                            disabled={!editHwDesc.trim()}
+                            aria-label="Guardar cambios del herraje"
+                          >
+                            <Check size={14} /> Guardar
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-small"
+                            onClick={cancelEditHw}
+                            aria-label="Cancelar edición del herraje"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div key={hw.id} className="hw-card">
+                      <div>
+                        <strong>
+                          [{hw.categoria.toUpperCase()}] {hw.descripcion} × {hw.cantidad}
+                        </strong>
+                        <p className="muted small-note">{hw.notaCompra}</p>
+                      </div>
+                      {isManualEditable && (
+                        <div className="hw-card-actions">
+                          {onUpdateHardwareItem && (
+                            <button
+                              type="button"
+                              className="btn-small"
+                              onClick={() => startEditHw(hw)}
+                              aria-label={`Editar ${hw.descripcion}`}
+                              title="Editar herraje manual"
+                            >
+                              <Pencil size={13} /> Editar
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="btn-danger-sm"
+                            onClick={() => onRemoveHardwareItem(hw.id)}
+                            aria-label={`Quitar ${hw.descripcion}`}
+                          >
+                            Quitar
+                          </button>
+                        </div>
+                      )}
                     </div>
-                    {hw.id !== 'hw_patas_externas' &&
-                      hw.id !== 'hw_ruedas_externas' &&
-                      !hw.id.endsWith('_calc') && (
-                      <button
-                        type="button"
-                        className="btn-danger-sm"
-                        onClick={() => onRemoveHardwareItem(hw.id)}
-                      >
-                        Quitar
-                      </button>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
             <div className="hw-form">
               <select
+                aria-label="Categoría de nuevo herraje"
                 value={hwCategory}
                 onChange={(e) => setHwCategory(e.target.value as HardwareCategory)}
               >
@@ -538,39 +864,64 @@ export function MathPanel({
               </select>
               <input
                 type="text"
+                aria-label="Descripción de nuevo herraje"
                 value={hwDesc}
                 onChange={(e) => setHwDesc(e.target.value)}
                 placeholder="Ej. Tirador metálico 128 mm"
               />
               <NumericInput
                 min={1}
-                max={50}
+                max={100}
                 value={hwQty}
                 onCommit={setHwQty}
                 style={{ width: 64 }}
-                ariaLabel="Cantidad de herraje"
+                ariaLabel="Cantidad de nuevo herraje"
               />
-              <button type="button" className="btn-small" onClick={handleAddHw} disabled={!hwDesc.trim()}>
+              <button
+                type="button"
+                className="btn-small"
+                onClick={handleAddHw}
+                disabled={!hwDesc.trim()}
+              >
                 + Agregar
               </button>
             </div>
 
             <div className="metric-card">
               <div className="card-header-row">
-                <h4>Quincallería Automática (BOM) &amp; Presupuesto Referencial CLP</h4>
+                <h4>Presupuesto Detallado y Quincallería (BOM Cuadrado CLP)</h4>
                 <span className="bom-total-pill">{formatClp(bomCost.totalClp)}</span>
               </div>
+
+              {bomCost.unplacedPiecesCount > 0 && (
+                <div className="alert-box critical">
+                  <strong>
+                    Atención: {bomCost.unplacedPiecesCount} pieza(s) fuera de plancha ({sheetLabel}).
+                  </strong>{' '}
+                  El presupuesto de planchas no cubre esas piezas sobredimensionadas; reduce sus
+                  medidas o cambia al formato Chile (250×183 cm).
+                </div>
+              )}
+
               <div className="kpi-grid">
                 <div>
-                  <span className="kpi-label">Melamina ({cuttingPlan.melamineSheetsCount} pl.)</span>
+                  <span className="kpi-label">
+                    Melamina {params.boardThickness} mm ({cuttingPlan.melamineSheetsCount} pl.{' '}
+                    {sheetLabel})
+                  </span>
                   <strong>{formatClp(bomCost.melamineSheetsClp)}</strong>
                 </div>
                 <div>
-                  <span className="kpi-label">Fondo 3 mm ({cuttingPlan.backPanelSheetsCount} pl.)</span>
+                  <span className="kpi-label">
+                    Fondo {params.backPanelThickness} mm ({cuttingPlan.backPanelSheetsCount} pl.{' '}
+                    {backSheetLabel})
+                  </span>
                   <strong>{formatClp(bomCost.backPanelSheetsClp)}</strong>
                 </div>
                 <div>
-                  <span className="kpi-label">Tapacanto ({bomCost.edgeBandingMetersWithAllowance} m)</span>
+                  <span className="kpi-label">
+                    Tapacanto ({bomCost.edgeBandingMetersWithAllowance} m +10%)
+                  </span>
                   <strong>{formatClp(bomCost.edgeBandingClp)}</strong>
                 </div>
                 <div>
@@ -578,32 +929,172 @@ export function MathPanel({
                   <strong>{formatClp(bomCost.fastenersClp + bomCost.externalHardwareClp)}</strong>
                 </div>
               </div>
+
+              {/* Editor en vivo de tarifas unitarias CLP */}
+              {onUpdateCostConfig && (
+                <details className="cost-editor-drawer">
+                  <summary>
+                    <span className="inline-summary-label">
+                      <SlidersHorizontal size={14} /> Editar precios unitarios CLP
+                      {hasCustomCostOverrides && (
+                        <span className="custom-price-badge">Personalizado</span>
+                      )}
+                    </span>
+                  </summary>
+                  <div className="cost-editor-body">
+                    <div className="card-header-row">
+                      <span className="small-note muted">
+                        Ajusta tus costos reales de ferretería/proveedor; la tabla y el total se
+                        recalculan al instante.
+                      </span>
+                      <button
+                        type="button"
+                        className="btn-small"
+                        onClick={handleResetCostDefaults}
+                        disabled={!hasCustomCostOverrides}
+                      >
+                        <RotateCcw size={13} /> Restaurar precios Chile
+                      </button>
+                    </div>
+                    <div className="cost-editor-grid">
+                      {COST_FIELDS.map((field) => {
+                        const isActiveSheet =
+                          (field.key === 'melamineSheetStdClp' && !isLargeMelamineSheet) ||
+                          (field.key === 'melamineSheetLargeClp' && isLargeMelamineSheet) ||
+                          (field.key === 'backPanelSheetStdClp' && !isLargeBackSheet) ||
+                          (field.key === 'backPanelSheetLargeClp' && isLargeBackSheet);
+                        return (
+                          <label
+                            key={field.key}
+                            className={isActiveSheet ? 'cost-field is-active-rate' : 'cost-field'}
+                          >
+                            <span className="cost-field-label">
+                              {field.label}
+                              {isActiveSheet && <em className="active-rate-tag">Activa</em>}
+                            </span>
+                            <NumericInput
+                              min={0}
+                              max={field.max}
+                              step={field.step}
+                              unitSuffix="CLP"
+                              value={resolvedCost[field.key]}
+                              onCommit={(v) => handleUpdateCostField(field.key, v)}
+                              ariaLabel={field.label}
+                            />
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </details>
+              )}
+
+              {/* Tabla BOM reconciliada 100% al peso exacto con bomCost.totalClp */}
               <div className="table-scroll">
                 <table className="data-table">
                   <thead>
                     <tr>
-                      <th>Insumo calculado (BOM)</th>
+                      <th>Concepto / Insumo BOM</th>
                       <th>Cant.</th>
-                      <th>Precio Ref.</th>
+                      <th>Precio Unit.</th>
                       <th>Subtotal</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {bomCost.fasteners.map((it) => (
-                      <tr key={it.id}>
-                        <td>{it.nombre}</td>
+                    <tr className="bom-group-row">
+                      <td colSpan={4}>1. Tableros y Tapacanto</td>
+                    </tr>
+                    {melamineSheetRows.map((row) => (
+                      <tr key={row.id}>
+                        <td>{row.nombre}</td>
                         <td className="num">
-                          {it.cantidad} {it.unidad}
+                          {row.cantidad} {row.unidad}
                         </td>
-                        <td className="num">{formatClp(it.costoUnitarioClp)}</td>
-                        <td className="num">{formatClp(it.subtotalClp)}</td>
+                        <td className="num">{formatClp(row.costoUnitarioClp)}</td>
+                        <td className="num">{formatClp(row.subtotalClp)}</td>
                       </tr>
                     ))}
+                    {cuttingPlan.backPanelSheetsCount > 0 && (
+                      <tr>
+                        <td>
+                          Plancha Fondo Durolac {params.backPanelThickness} mm ({backSheetLabel})
+                        </td>
+                        <td className="num">{cuttingPlan.backPanelSheetsCount} pl.</td>
+                        <td className="num">
+                          {formatClp(
+                            Math.round(
+                              bomCost.backPanelSheetsClp / cuttingPlan.backPanelSheetsCount,
+                            ),
+                          )}
+                        </td>
+                        <td className="num">{formatClp(bomCost.backPanelSheetsClp)}</td>
+                      </tr>
+                    )}
+                    {bomCost.edgeBandingMetersWithAllowance > 0 && (
+                      <tr>
+                        <td>
+                          Tapacanto PVC (+10% holgura)
+                          {edgeBandingColorSummary && (
+                            <div className="bom-bicolor-sub">{edgeBandingColorSummary}</div>
+                          )}
+                        </td>
+                        <td className="num">{bomCost.edgeBandingMetersWithAllowance} m</td>
+                        <td className="num">{formatClp(resolvedCost.edgeBandingPerMeterClp)}</td>
+                        <td className="num">{formatClp(bomCost.edgeBandingClp)}</td>
+                      </tr>
+                    )}
+
+                    {bomCost.fasteners.length > 0 && (
+                      <>
+                        <tr className="bom-group-row">
+                          <td colSpan={4}>2. Fijaciones Automáticas</td>
+                        </tr>
+                        {bomCost.fasteners.map((it) => (
+                          <tr key={it.id}>
+                            <td>{it.nombre}</td>
+                            <td className="num">
+                              {it.cantidad} {it.unidad}
+                            </td>
+                            <td className="num">{formatClp(it.costoUnitarioClp)}</td>
+                            <td className="num">{formatClp(it.subtotalClp)}</td>
+                          </tr>
+                        ))}
+                      </>
+                    )}
+
+                    {bomCost.externalHardware.length > 0 && (
+                      <>
+                        <tr className="bom-group-row">
+                          <td colSpan={4}>3. Herrajes y Accesorios Externos</td>
+                        </tr>
+                        {bomCost.externalHardware.map((it) => (
+                          <tr key={it.id}>
+                            <td>{it.nombre}</td>
+                            <td className="num">
+                              {it.cantidad} {it.unidad}
+                            </td>
+                            <td className="num">{formatClp(it.costoUnitarioClp)}</td>
+                            <td className="num">{formatClp(it.subtotalClp)}</td>
+                          </tr>
+                        ))}
+                      </>
+                    )}
                   </tbody>
+                  <tfoot>
+                    <tr className="bom-total-row">
+                      <td colSpan={3}>
+                        <strong>TOTAL PRESUPUESTO ESTIMADO (cuadrado al peso)</strong>
+                      </td>
+                      <td className="num">
+                        <strong>{formatClp(bomCost.totalClp)}</strong>
+                      </td>
+                    </tr>
+                  </tfoot>
                 </table>
               </div>
               <p className="muted small-note">
-                Estimación 100 % offline basada en precios referenciales de mercado chileno (plancha, tapacanto +10 % holgura y fijaciones).
+                Estimación 100 % offline con precios editables en Pesos Chilenos (planchas separadas
+                por color/espesor, tapacanto +10 % holgura, fijaciones y herrajes externos).
               </p>
             </div>
           </div>
@@ -613,11 +1104,15 @@ export function MathPanel({
           <div className="tab-section">
             <div className="kpi-grid">
               <div>
-                <span className="kpi-label">Melamina 18 mm</span>
+                <span className="kpi-label">
+                  Melamina {params.boardThickness} mm ({sheetLabel})
+                </span>
                 <strong>{cuttingPlan.melamineSheetsCount} plancha(s)</strong>
               </div>
               <div>
-                <span className="kpi-label">Fondo 3 mm</span>
+                <span className="kpi-label">
+                  Fondo {params.backPanelThickness} mm ({backSheetLabel})
+                </span>
                 <strong>{cuttingPlan.backPanelSheetsCount} plancha(s)</strong>
               </div>
               <div>
@@ -633,7 +1128,9 @@ export function MathPanel({
             {cuttingPlan.unplacedPieces.length > 0 && (
               <div className="alert-box critical">
                 <strong>Piezas sobredimensionadas ({cuttingPlan.unplacedPieces.length}):</strong>{' '}
-                {cuttingPlan.unplacedPieces.map((p) => `${p.nombre} (${p.ancho}×${p.alto})`).join(', ')}
+                {cuttingPlan.unplacedPieces
+                  .map((p) => `${p.nombre} (${p.ancho.toFixed(0)}×${p.alto.toFixed(0)} mm)`)
+                  .join(', ')}
               </div>
             )}
 
@@ -651,7 +1148,8 @@ export function MathPanel({
                   type="button"
                   className="chip-btn"
                   onClick={() => setSvgZoom((z) => Math.max(60, z - 20))}
-                  title="Alejar plano"
+                  title="Alejar plano de corte"
+                  aria-label="Alejar plano de corte"
                 >
                   <ZoomOut size={13} />
                 </button>
@@ -659,7 +1157,8 @@ export function MathPanel({
                   type="button"
                   className="chip-btn"
                   onClick={() => setSvgZoom(100)}
-                  title="Restablecer zoom"
+                  title="Restablecer zoom al 100%"
+                  aria-label="Restablecer zoom al 100%"
                 >
                   {svgZoom}%
                 </button>
@@ -667,7 +1166,8 @@ export function MathPanel({
                   type="button"
                   className="chip-btn"
                   onClick={() => setSvgZoom((z) => Math.min(200, z + 20))}
-                  title="Acercar plano"
+                  title="Acercar plano de corte"
+                  aria-label="Acercar plano de corte"
                 >
                   <ZoomIn size={13} />
                 </button>
@@ -675,13 +1175,28 @@ export function MathPanel({
             </div>
 
             <div className="svg-legend">
-              <span><i style={{ background: '#dcfce7', borderColor: '#15803d' }} /> Cubierta / Base</span>
-              <span><i style={{ background: '#dbeafe', borderColor: '#1d4ed8' }} /> Laterales</span>
-              <span><i style={{ background: '#ede9fe', borderColor: '#6d28d9' }} /> Divisores</span>
-              <span><i style={{ background: '#e0f2fe', borderColor: '#0369a1' }} /> Repisas</span>
-              <span><i style={{ background: '#fce7f3', borderColor: '#be185d' }} /> Puertas</span>
-              <span><i style={{ background: '#ffedd5', borderColor: '#c2410c' }} /> Cajones</span>
-              <span><i style={{ background: '#fef3c7', borderColor: '#b45309' }} /> Fondo 3 mm</span>
+              <span>
+                <i style={{ background: '#dcfce7', borderColor: '#15803d' }} /> Cubierta / Base
+              </span>
+              <span>
+                <i style={{ background: '#dbeafe', borderColor: '#1d4ed8' }} /> Laterales
+              </span>
+              <span>
+                <i style={{ background: '#ede9fe', borderColor: '#6d28d9' }} /> Divisores
+              </span>
+              <span>
+                <i style={{ background: '#e0f2fe', borderColor: '#0369a1' }} /> Repisas
+              </span>
+              <span>
+                <i style={{ background: '#fce7f3', borderColor: '#be185d' }} /> Puertas
+              </span>
+              <span>
+                <i style={{ background: '#ffedd5', borderColor: '#c2410c' }} /> Cajones
+              </span>
+              <span>
+                <i style={{ background: '#fef3c7', borderColor: '#b45309' }} /> Fondo{' '}
+                {params.backPanelThickness} mm
+              </span>
             </div>
 
             <div className="svg-preview">

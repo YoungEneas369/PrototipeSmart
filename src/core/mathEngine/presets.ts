@@ -1,5 +1,5 @@
 /**
- * Presets oficiales de demostración y validación SmartFurniture v3.0.
+ * Presets oficiales de demostración y validación SmartFurniture v8.0.
  * Incluye valores exactos 1/3 y 2/3 en Rack TV + patas externas excluidas de melamina.
  */
 import type { FurnitureTopology, ScaleAndBoardParams } from '../../types/contracts';
@@ -142,8 +142,22 @@ export function clonePreset(key: PresetKey): {
   return {
     topology: {
       ...preset.topology,
+      quadCorners: preset.topology.quadCorners
+        ? [
+            { ...preset.topology.quadCorners[0] },
+            { ...preset.topology.quadCorners[1] },
+            { ...preset.topology.quadCorners[2] },
+            { ...preset.topology.quadCorners[3] },
+          ]
+        : undefined,
       vDividers: preset.topology.vDividers.map((d) => ({ ...d })),
       hShelves: preset.topology.hShelves.map((s) => ({ ...s })),
+      diagonalDividers: preset.topology.diagonalDividers
+        ? preset.topology.diagonalDividers.map((d) => ({ ...d }))
+        : undefined,
+      frontZones: preset.topology.frontZones
+        ? preset.topology.frontZones.map((z) => ({ ...z }))
+        : undefined,
       hardwareItems: (preset.topology.hardwareItems ?? []).map((h) => ({ ...h })),
     },
     params: {
@@ -154,6 +168,7 @@ export function clonePreset(key: PresetKey): {
       backPanelSheetDimensions: preset.params.backPanelSheetDimensions
         ? { ...preset.params.backPanelSheetDimensions }
         : undefined,
+      costConfig: preset.params.costConfig ? { ...preset.params.costConfig } : undefined,
     },
   };
 }

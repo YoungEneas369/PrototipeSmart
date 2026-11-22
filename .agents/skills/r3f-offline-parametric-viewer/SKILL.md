@@ -1,71 +1,58 @@
 ---
 name: r3f-offline-parametric-viewer
 description: >-
-  Use this skill when installing Three.js / React Three Fiber dependencies or
-  building src/components/viewer3d/Viewer3D.tsx and MathPanel.tsx (Bloque 3).
-  Prevents Three.js r170+ version conflicts with R3F v8/Drei v9, blocks hidden
-  CDN network calls, and guides procedural textures, exploded view, and CSV export.
+  Guides maintenance and enhancement of src/components/viewer3d/Viewer3D.tsx
+  and src/components/mathPanel/MathPanel.tsx in SmartFurniture v8.0. Enforces
+  pinned Three.js 0.162 / R3F 8.18 / Drei 9.122 dependencies, zero CDN assets,
+  typed BoardPiece metadata rendering, bicolor procedural textures, stable
+  camera controls, 2D-to-3D hover sync, and memoized MathPanel with editable
+  CLP pricing and reconciled BOM totals.
 ---
 
-# Offline React Three Fiber Parametric 3D Viewer (v2.1 Rev. 2)
+# Offline R3F Parametric 3D Viewer & MathPanel (v8.0)
 
-## 1. Safe Pinned Dependency Matrix (Critical Anti-Breakage Rule)
-Running unpinned `npm install three` installs `three@0.17x–0.18x+`, which **breaks `@react-three/fiber@^8` and `@react-three/drei@^9`** (JSX `ThreeElements` type mismatches and removed legacy Three.js APIs).
+## 1. Pinned Dependency Matrix (Never Upgrade Unpinned)
+Installing `three@0.17x+` breaks `@react-three/fiber@8` and `@react-three/drei@9` (`ThreeElements` JSX types and removed APIs). Keep versions pinned in [`package.json`](../../../package.json):
+- Runtime: `react: "18.3.1"`, `react-dom: "18.3.1"`, `three: "0.162.0"`, `@react-three/fiber: "8.18.0"`, `@react-three/drei: "9.122.0"`, `lucide-react: "^0.454.0"`.
+- Dev: `@types/three: "0.162.0"`, `typescript: "~5.8.3"`, `vite: "^6.3.5"`, `vitest: "^3.2.4"`.
 
-Always pin compatible versions together:
-```json
-{
-  "react": "18.3.1",
-  "react-dom": "18.3.1",
-  "three": "0.162.0",
-  "@react-three/fiber": "8.18.0",
-  "@react-three/drei": "9.122.0",
-  "lucide-react": "^0.454.0"
-}
+## 2. Strict Offline WebGL Guardrails
+- **FORBIDDEN:** `<Environment preset="..." />` (remote HDRI), `<Text />` / `<Text3D />` without local font (remote Troika CDN), Google Fonts, external image URLs.
+- **APPROVED:** Native lights (`<ambientLight />`, `<hemisphereLight />`, `<directionalLight />`), procedural `THREE.CanvasTexture`, `<OrbitControls />`, `<Edges />`, `<Line />`, `<Html />` (system-ui font), `<gridHelper />`.
+
+## 3. `Viewer3D.tsx` Architecture & v8.0 Requirements
+1. **Typed Metadata Only (Zero ID String Parsing):**
+   - Read `piece.isGlassDoor`, `piece.handleSide`, `piece.zoneId`, `piece.miterAngleDeg`, `piece.tipo`, and `piece.material` directly from `BoardPiece`. Never inspect `piece.id.includes(...)` to decide glass, handles, or highlights.
+2. **Multi-Texture Bicolor Procedural Bank (Memory-Safe):**
+   - Pre-generate all 8 combinations (`blanco`, `roble`, `grafito`, `durolac_3mm` × horizontal/vertical grain) inside a single `useMemo`, and dispose every `THREE.CanvasTexture` in `useEffect(() => () => ..., [textures])`.
+   - Each `BoardPiece` selects its own texture from `piece.material` and orientation (`lateral`/`division_vertical` use vertical grain) so two-tone carcasses, `cubiertaMaterialOverride`, and `FrontZone.materialOverride` render seamlessly together.
+3. **Full Module & Support 3D Rendering:**
+   - **Doors & Glass (`puerta`):** Standard melamine doors + translucent framed glass (`isGlassDoor === true`) + metallic handles placed strictly by `handleSide` (`left` / `right` / `top`).
+   - **Drawers (`frente_cajon`, `costado_cajon`, `trasera_cajon`, `fondo_cajon`):** Full 5-piece drawer assembly visible in exploded view.
+   - **Wire Baskets (`baskets`):** Procedural metallic mesh baskets rendered inside their `FrontZone` cavity.
+   - **Supports:** External tapered legs (`legs`), caster wheels (`wheels`), and 4-sided recessed melamine plinth (`zocalo` when `toe_kick`).
+   - **Oblique Diagonals (`division_diagonal`) & Rear Apron (`faldon`):** Positioned using `posicion3D`, `dimensiones3D`, and `rotacion3D` (Z rotation for diagonals).
+4. **Camera Stability (NO Reset on Dimension Scaling):**
+   - `CameraRig` MUST ONLY reposition the camera when the user explicitly clicks a camera preset button (`Iso` / `Frontal` / `Lateral` / `Reset`) or switches to a different preset/catalog model.
+   - Dragging `X / Y / Z` sliders or editing thickness/shelves MUST NOT hijack or snap back the user's current orbit angle/zoom!
+5. **Bidirectional 2D <-> 3D Hover Sync & Exploded View:**
+   - Accept optional `hoveredZoneId` / `onHoverZone` props: highlight boards where `piece.zoneId === hoveredZoneId` with an accent outline/emissive tint without mutating geometry.
+   - Keep `explodeFactor` (`0..1`) pushing boards radially from furniture center (and `fondo` along `-Z`), plus amber/red highlight for `despiece.alerts` (`pandeo` > 850 mm).
+
+## 4. `MathPanel.tsx` Architecture & v8.0 Requirements
+- **Strict Memoization:** Wrap `scaleBaseMatrix`, `computeUnitDirectionVector`, `compareShapeAspect`, `analyzeShelvesDeflectionDIN`, and `estimateProjectBomAndCost` in `useMemo` keyed on their exact inputs so tab switches and UI toasts never trigger redundant recalculations.
+- **Unidad 3 Clarity:** Display `V0`, `Vf`, `û_V`, `(kx, ky, kz)`, `e = 18 mm` invariance, arithmetic progression (`H_int, s_libre, a1, d, terms`), homography matrix `H (3×3)`, `n × 3` vs `n × 5` matrices, and DIN 68874-1 deflection table.
+- **Editable CLP Prices & Reconciled BOM:** Expose editable unit rate inputs wired to `params.costConfig` (melamine sheets, 3 mm sheets, edge banding/m, fasteners, hardware) and render a reconciled breakdown where `planchas + tapacanto + fijaciones + herrajes === totalClp`.
+- **Offline Exports:** Trigger local `Blob` downloads for `.xls` (3-sheet SpreadsheetML), `.csv` (UTF-8 BOM `\uFEFF`, `;` delimiter), and `.svg` (bicolor cutting plan).
+
+## 5. Verification Checklist (Windows PowerShell 5.1)
+```powershell
+npm run typecheck
+if ($LASTEXITCODE -ne 0) { throw "TypeScript check failed" }
+npm run build
+if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+Select-String -Path src\components\viewer3d\Viewer3D.tsx,src\components\mathPanel\MathPanel.tsx -Pattern "<Environment|<Text\b|https?://|fonts\.googleapis"
 ```
-And devDependencies:
-```json
-{
-  "@types/react": "^18.3.12",
-  "@types/react-dom": "^18.3.1",
-  "@types/three": "0.162.0",
-  "@vitejs/plugin-react": "^4.3.4",
-  "typescript": "~5.8.3",
-  "vite": "^6.3.5",
-  "vitest": "^3.2.4"
-}
-```
-VERIFIED on 2026-11-20 (`vitest` ✅, `tsc -b` strict ✅, `vite build` ✅, bundle free of network requests) in [toolchain-spike](../../../docs/evidencia/toolchain-spike/). Run the offline URL grep on `src/` and `index.html` (never on `dist/`, which always contains XML namespace strings like `w3.org` and React/Three error doc URLs).
-
-## 2. Strict Offline Guardrails (Zero Hidden CDN Requests)
-- **FORBIDDEN:**
-  - `<Environment preset="..." />` (fetches HDRI from remote CDN).
-  - `<Text />` / `<Text3D />` without a bundled local font file (fetches Troika default font from CDN).
-  - External Google Fonts `<link>`, `@import url("https://...")`, or remote image URLs.
-- **APPROVED (100% Offline):**
-  - Native Three.js lights: `<ambientLight />`, `<hemisphereLight />`, `<directionalLight />`.
-  - Procedural `THREE.CanvasTexture` generated in-memory via `<canvas>`.
-  - `@react-three/drei`: `<OrbitControls />`, `<Edges />`, `<Line />`, `<Html />` (styled with `font-family: system-ui, -apple-system, sans-serif`).
-  - Native `<gridHelper />`.
-
-## 3. Viewer3D Implementation Pattern (`src/components/viewer3d/Viewer3D.tsx`)
-1. **Units & Centering:** Convert mm to meters (`* 0.001`) and wrap boards in `<group position={[-x_f / 2000, 0, -z_f / 2000]}>` so the furniture sits centered on `y = 0`.
-2. **Board Rendering:** Render each `piece` in `despiece.matrizDespiece` as `<mesh position={...}>` with `<boxGeometry args={[dx / 1000, dy / 1000, dz / 1000]} />` + `<Edges color={isAlerted ? '#ef4444' : '#334155'} />`.
-3. **Procedural CanvasTextures (Memory-Safe):** Generate inside `useMemo` and dispose in `useEffect(() => () => tex.dispose(), [tex])`:
-   - `blanco`: warm satin matte white (`#f5f5f4`) with subtle micro-grain.
-   - `roble`: warm oak base (`#d4a973`) with procedural wood fibers aligned along the panel's `ancho` axis.
-   - `grafito`: matte dark slate (`#374151`) with fine satin texture.
-   - `durolac_3mm`: smooth rear kraft/off-white backing (`#d6c7b2`).
-4. **Pandeo Alert Highlighting:** Check `alertedIds = new Set(despiece.alerts.map(a => a.piezaId))` and tint alerted shelves amber/red (`#f59e0b` / `#ef4444`).
-5. **Exploded View (`explodeFactor` in `0..1`):** Offset each piece from furniture center `C = [x_f/2, y_f/2, z_f/2]` along normalized `(P - C)` scaled by `explodeFactor * 180 mm`; for `tipo === 'fondo'`, push `-Z` (`-explodeFactor * 220 mm`).
-6. **3D Dimension Annotations:** Draw X (`x_f mm`), Y (`y_f mm`), and Z (`z_f mm`) lines outside the bounding box with `<Line />` + `<Html center>`.
-
-## 4. MathPanel & Export Rules (`src/components/mathPanel/MathPanel.tsx`)
-- Display live `V_f`, `V_0` (with **"Fijar V₀ actual"** button), `kx/ky/kz`, `e = 18 mm` invariance note, arithmetic progression (`H_int, s_libre, a1, d, terms`), homography matrix `H (3×3)` when available, `n × 3` vs `n × 5` matrix transition, mechanical alerts, sheet format selector (`2440×1220` default vs Chile `2500×1830` + `2440×1520`), strategy (`guillotine` / `maxrects`), and interactive SVG preview.
-- **CSV Export:** Prefix with UTF-8 BOM `\uFEFF` (`new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })`).
-- **SVG Export:** Export `cuttingPlan.svgMarkup` as `image/svg+xml;charset=utf-8`.
-
-## Verification Checklist
-- [ ] `tsc -b && vite build` succeeds with zero TypeScript errors (especially JSX `ThreeElements`).
-- [ ] Zero `http://` or `https://` URLs inside `src/` or `index.html`.
-- [ ] Moving sliders updates 3D meshes, exploded view, math formulas, alerts, and SVG synchronously in desktop browser offline mode.
+Confirm:
+- [ ] Zero TypeScript JSX/`ThreeElements` errors and zero external URL/CDN matches.
+- [ ] Scaling `X / Y / Z` sliders keeps camera orbit steady while updating meshes, alerts, DIN table, SVG sheets, and CLP BOM totals synchronously.

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { BoardPiece, ScaleAndBoardParams, SheetLayout } from '../../types/contracts';
+import type {
+  BoardPiece,
+  PieceMaterial,
+  PieceType,
+  ScaleAndBoardParams,
+  SheetLayout,
+} from '../../types/contracts';
 import {
   CHILE_DUROLAC_SHEET,
   CHILE_MELAMINE_SHEET,
@@ -7,10 +13,12 @@ import {
   clonePreset,
 } from '../mathEngine';
 import {
+  DEFAULT_COST_CONFIG,
   estimateProjectBomAndCost,
   generateCuttingPlan,
   generateDespieceCsv,
   generateExcelSpreadsheetML,
+  renderCuttingPlanSvg,
 } from './index';
 
 /**
@@ -45,21 +53,34 @@ function assertSheetInvariants(sheets: readonly SheetLayout[], kerf: number, tri
   }
 }
 
-function makePiece(id: string, ancho: number, alto: number, espesor = 18, respectGrain = true): BoardPiece {
+function makePiece(
+  id: string,
+  ancho: number,
+  alto: number,
+  espesor = 18,
+  respectGrain = true,
+  material?: PieceMaterial,
+  tipo?: PieceType,
+  nombre?: string,
+  miterAngleDeg?: number,
+): BoardPiece {
+  const resolvedMat: PieceMaterial = material ?? (espesor === 3 ? 'durolac_3mm' : 'roble');
+  const resolvedTipo: PieceType = tipo ?? (espesor === 3 ? 'fondo' : 'repisa');
   return {
     id,
-    nombre: id,
-    tipo: espesor === 3 ? 'fondo' : 'repisa',
+    nombre: nombre ?? id,
+    tipo: resolvedTipo,
     ancho,
     alto,
     espesor,
     cantidad: 1,
     respectGrain,
-    edges: { top: true, bottom: false, left: false, right: false },
+    edges: { top: resolvedTipo !== 'fondo', bottom: false, left: false, right: false },
     posicion3D: [0, 0, 0],
     dimensiones3D: [ancho, espesor, alto],
     rotacion3D: [0, 0, 0],
-    material: espesor === 3 ? 'durolac_3mm' : 'roble',
+    material: resolvedMat,
+    ...(miterAngleDeg !== undefined ? { miterAngleDeg } : {}),
   };
 }
 
@@ -223,5 +244,259 @@ describe('SmartFurniture Bloque 2 — Cutting Stock 2D, SVG y Exportadores Excel
         bom.fastenersClp +
         bom.externalHardwareClp,
     );
+  });
+
+  it('6. Separación bicolor estricta (espesor + material) en guillotine/maxrects y aprovechamiento de restos de franja', () => {
+    const pieces: BoardPiece[] = [
+      makePiece('lat_izq', 800, 400, 18, true, 'roble', 'lateral', 'Lateral Izquierdo'),
+      makePiece('lat_der', 800, 400, 18, true, 'roble', 'lateral', 'Lateral Derecho'),
+      makePiece('puerta_1', 760, 380, 18, true, 'blanco', 'puerta', 'Puerta Izquierda'),
+      makePiece('puerta_2', 760, 380, 18, true, 'blanco', 'puerta', 'Puerta Derecha'),
+      makePiece('cubierta_g', 820, 420, 18, true, 'grafito', 'cubierta', 'Cubierta'),
+      makePiece('fondo_1', 800, 800, 3, false, 'durolac_3mm', 'fondo', 'Fondo 3mm'),
+    ];
+
+    for (const strategy of ['guillotine', 'maxrects'] as const) {
+      const plan = generateCuttingPlan(pieces, baseParams({ material: 'roble', packingStrategy: strategy }));
+      expect(plan.unplacedPieces).toHaveLength(0);
+      // 3 acabados de melamina separados (roble, blanco, grafito) + 1 plancha fondo 3 mm
+      expect(plan.melamineSheetsCount).toBe(3);
+      expect(plan.backPanelSheetsCount).toBe(1);
+      expect(plan.totalSheetsCount).toBe(4);
+      assertSheetInvariants(plan.sheetsUsed, 4, 0);
+
+      const sheetMaterials = new Set(plan.sheetsUsed.map((s) => s.material));
+      expect(sheetMaterials).toEqual(new Set(['roble', 'blanco', 'grafito', 'durolac_3mm']));
+
+      for (const sh of plan.sheetsUsed) {
+        expect(sh.material).toBeDefined();
+        expect(sh.piezasColocadas.length).toBeGreaterThan(0);
+        // Cero mezcla de materiales dentro de la misma plancha y metadata tipada presente
+        for (const r of sh.piezasColocadas) {
+          expect(r.material).toBe(sh.material);
+          expect(r.tipo).toBeDefined();
+        }
+        if (sh.material === 'durolac_3mm') {
+          expect(sh.materialLabel).toBe('Fondo Durolac 3 mm');
+        } else {
+          expect(sh.materialLabel).toBe(`Melamina ${sh.material!.toUpperCase()} 18 mm`);
+        }
+      }
+    }
+
+    // Aprovechamiento de restos de franja para piezas angostas (costados de cajón / zócalos) con respectGrain ON
+    const stripReusePieces: BoardPiece[] = [
+      makePiece('panel_1', 1700, 400, 18, true, 'roble', 'cubierta', 'Cubierta'),
+      makePiece('panel_2', 1700, 400, 18, true, 'roble', 'base', 'Base'),
+      makePiece('panel_3', 1700, 400, 18, true, 'roble', 'repisa', 'Repisa 1'),
+      makePiece('caj_1', 500, 100, 18, true, 'roble', 'costado_cajon', 'Costado Cajón 1'),
+      makePiece('caj_2', 500, 100, 18, true, 'roble', 'costado_cajon', 'Costado Cajón 2'),
+      makePiece('zoc_1', 600, 80, 18, true, 'roble', 'zocalo', 'Zócalo Frontal'),
+    ];
+    const reusePlan = generateCuttingPlan(
+      stripReusePieces,
+      baseParams({ respectGrain: true, packingStrategy: 'guillotine' }),
+    );
+    expect(reusePlan.unplacedPieces).toHaveLength(0);
+    // 3 franjas de 400 mm ocupan 3×404 = 1212 <= 1224 -> 1 sola plancha si reutiliza los 740 mm restantes en cada franja
+    expect(reusePlan.melamineSheetsCount).toBe(1);
+    expect(reusePlan.sheetsUsed[0].piezasColocadas.every((r) => !r.rotado)).toBe(true);
+    assertSheetInvariants(reusePlan.sheetsUsed, 4, 0);
+  });
+
+  it('7. SVG offline: coloreado por tipo/material (sin substring), sin veta en Durolac, indicador inglete y aviso unplaced', () => {
+    const pieces: BoardPiece[] = [
+      makePiece('rep_p', 700, 350, 18, true, 'blanco', 'repisa', 'Repisa Interior Puerta'),
+      makePiece('diag_1', 600, 350, 18, true, 'blanco', 'division_diagonal', 'Divisor Diagonal 1 (45°)', 45),
+      makePiece('fondo_1', 900, 800, 3, false, 'durolac_3mm', 'fondo', 'Fondo 3mm'),
+      makePiece('gigante', 2800, 1400, 18, true, 'blanco', 'cubierta', 'Cubierta Sobredimensionada'),
+    ];
+    const plan = generateCuttingPlan(pieces, baseParams({ material: 'blanco' }));
+    expect(plan.unplacedPieces).toHaveLength(1);
+
+    // 1) "Repisa Interior Puerta" coloreada como repisa (#e0f2fe), NO como puerta (#fce7f3)
+    expect(plan.svgMarkup).toContain('fill="#e0f2fe" stroke="#0369a1" stroke-width="1.2" data-piece-type="repisa"');
+    expect(plan.svgMarkup).not.toContain('fill="#fce7f3"');
+
+    // 2) Inglete renderizado en SVG con ∡45° y data-miter-deg
+    expect(plan.svgMarkup).toContain('data-miter-deg="45"');
+    expect(plan.svgMarkup).toContain('∡45°');
+
+    // 3) Aviso visual claro de unplacedPieces en SVG
+    expect(plan.svgMarkup).toContain('data-unplaced-warning="true"');
+    expect(plan.svgMarkup).toContain('Cubierta Sobredimensionada');
+
+    // 4) Plancha Durolac 3 mm NO dibuja '→ Sentido de veta' (melamina 18 mm sí lo dibuja)
+    const backOnlySvg = renderCuttingPlanSvg(
+      plan.sheetsUsed.filter((s) => s.material === 'durolac_3mm'),
+      4,
+      0,
+    );
+    expect(backOnlySvg).not.toContain('→ Sentido de veta');
+
+    const melOnlySvg = renderCuttingPlanSvg(
+      plan.sheetsUsed.filter((s) => s.material === 'blanco'),
+      4,
+      0,
+    );
+    expect(melOnlySvg).toContain('→ Sentido de veta');
+  });
+
+  it('8. `costEstimator.ts`: `costConfig` editable, vidrio/granito/fierro/canastos/ruedas, tornillos sin puertas, clavos por perímetro y suma exacta `totalClp`', () => {
+    expect(DEFAULT_COST_CONFIG.melamineSheetStdClp).toBeGreaterThan(0);
+
+    const { topology, params } = clonePreset('estanteria');
+    params.targetDimensions = { x: 1000, y: 1200, z: 400 };
+    params.referenceDimensions = { x: 1000, y: 1200, z: 400 };
+    params.material = 'roble';
+    params.backPanelSheetDimensions = { ...CHILE_DUROLAC_SHEET }; // 2440×1520 -> large Durolac
+    topology.shelfMode = 'custom';
+    topology.hasBackPanel = true;
+    topology.vDividers = [{ id: 'd1', position: 0.5, start: 0, end: 1 }];
+    topology.hShelves = [{ id: 's1', position: 0.5, start: 0, end: 1 }];
+
+    // Comparación carcasa pura vs carcasa + puertas/cajones -> puertas y frentes NO suman tornillos/tarugos
+    const despieceCarcass = calculateDespiece(topology, params);
+    const planCarcass = generateCuttingPlan(despieceCarcass.matrizDespiece, params);
+    const bomCarcass = estimateProjectBomAndCost(despieceCarcass, planCarcass, params);
+    const screwsCarcass = bomCarcass.fasteners.find((f) => f.id === 'bom_tornillos')!.cantidad;
+    const dowelsCarcass = bomCarcass.fasteners.find((f) => f.id === 'bom_tarugos')!.cantidad;
+
+    topology.frontZones = [
+      { id: 'z_glass', uStart: 0, uEnd: 0.5, vStart: 0.5, vEnd: 1, kind: 'door_glass', materialOverride: 'blanco' },
+      { id: 'z_door', uStart: 0.5, uEnd: 1, vStart: 0.5, vEnd: 1, kind: 'door_right', materialOverride: 'blanco' },
+      { id: 'z_bask', uStart: 0, uEnd: 0.5, vStart: 0, vEnd: 0.5, kind: 'baskets', basketCount: 2 },
+    ];
+    topology.hardwareItems = [
+      {
+        id: 'hw_meson',
+        categoria: 'otro',
+        descripcion: 'Mesón de granito negro 1000×400',
+        cantidad: 1,
+        notaCompra: 'Mesón piedra',
+        origen: 'manual',
+      },
+      {
+        id: 'hw_fierro',
+        categoria: 'otro',
+        descripcion: 'Estructura de fierro electrostático',
+        cantidad: 1,
+        notaCompra: 'Perfil metálico',
+        origen: 'manual',
+      },
+      {
+        id: 'hw_ruedas',
+        categoria: 'patas',
+        descripcion: 'Ruedas giratorias industriales',
+        cantidad: 4,
+        notaCompra: '4 ruedas con freno',
+        origen: 'manual',
+      },
+    ];
+
+    const customCfg = {
+      melamineSheetStdClp: 35000,
+      backPanelSheetLargeClp: 17500,
+      backPanelSheetStdClp: 11000,
+      edgeBandingPerMeterClp: 500,
+      glassPanelClp: 22000,
+      countertopClp: 95000,
+      metalFrameClp: 52000,
+      basketClp: 16500,
+      wheelClp: 5500,
+      screwClp: 60,
+      dowelClp: 40,
+      nailClp: 20,
+    };
+    params.costConfig = customCfg;
+
+    const despieceFull = calculateDespiece(topology, params);
+    const planFull = generateCuttingPlan(despieceFull.matrizDespiece, params);
+    const bomFull = estimateProjectBomAndCost(despieceFull, planFull, params);
+
+    // 1) Puertas NO inflan conteo de tornillos soberbio ni tarugos
+    expect(bomFull.fasteners.find((f) => f.id === 'bom_tornillos')!.cantidad).toBe(screwsCarcass);
+    expect(bomFull.fasteners.find((f) => f.id === 'bom_tarugos')!.cantidad).toBe(dowelsCarcass);
+
+    // 2) Clavos de fondo por perímetro real: 1000×1200 -> perímetro 4400 mm -> ceil(4400/120) = 37 clavos
+    const nailsItem = bomFull.fasteners.find((f) => f.id === 'bom_clavos')!;
+    expect(nailsItem.cantidad).toBe(Math.ceil((2 * (1000 + 1200)) / 120));
+    expect(nailsItem.costoUnitarioClp).toBe(20);
+
+    // 3) Tarifas editables aplicadas a vidrio, granito, fierro, canastos (no confundido con metal) y ruedas
+    expect(bomFull.externalHardware.find((h) => /vidrio/i.test(h.nombre))?.costoUnitarioClp).toBe(22000);
+    expect(bomFull.externalHardware.find((h) => /granito/i.test(h.nombre))?.costoUnitarioClp).toBe(95000);
+    expect(bomFull.externalHardware.find((h) => /fierro/i.test(h.nombre))?.costoUnitarioClp).toBe(52000);
+    expect(bomFull.externalHardware.find((h) => /canasto/i.test(h.nombre))?.costoUnitarioClp).toBe(16500);
+    expect(bomFull.externalHardware.find((h) => /rueda/i.test(h.nombre))?.costoUnitarioClp).toBe(5500);
+
+    // 4) Durolac grande (2440×1520) vs estándar (2440×1220)
+    expect(bomFull.backPanelSheetsClp).toBe(planFull.backPanelSheetsCount * 17500);
+    const paramsStdBack = { ...params, backPanelSheetDimensions: { width: 2440, height: 1220 } };
+    const bomStdBack = estimateProjectBomAndCost(despieceFull, planFull, paramsStdBack);
+    expect(bomStdBack.backPanelSheetsClp).toBe(planFull.backPanelSheetsCount * 11000);
+
+    // 5) Desglose bicolor, unplacedPiecesCount y reconciliación exacta de totalClp
+    expect(bomFull.unplacedPiecesCount).toBe(0);
+    expect(bomFull.melamineByMaterialClp?.roble?.sheets).toBeGreaterThanOrEqual(1);
+    expect(bomFull.melamineByMaterialClp?.blanco?.sheets).toBeGreaterThanOrEqual(1);
+    expect(
+      (bomFull.melamineByMaterialClp?.roble?.clp ?? 0) +
+        (bomFull.melamineByMaterialClp?.blanco?.clp ?? 0),
+    ).toBe(bomFull.melamineSheetsClp);
+    expect(bomFull.edgeBandingByMaterialMeters?.roble).toBeGreaterThan(0);
+    expect(bomFull.edgeBandingByMaterialMeters?.blanco).toBeGreaterThan(0);
+    expect(bomFull.totalClp).toBe(
+      bomFull.melamineSheetsClp +
+        bomFull.backPanelSheetsClp +
+        bomFull.edgeBandingClp +
+        bomFull.fastenersClp +
+        bomFull.externalHardwareClp,
+    );
+  });
+
+  it('9. `exporters.ts`: Excel Hoja 2 incluye precios CLP de herrajes, espesores dinámicos y CSV neutraliza formula-injection y \\r', () => {
+    const { topology, params } = clonePreset('rack_tv');
+    params.boardThickness = 15;
+    params.backPanelThickness = 5;
+    params.costConfig = { legClp: 4750 };
+    topology.hasBackPanel = true;
+
+    const despiece = calculateDespiece(topology, params);
+    const plan = generateCuttingPlan(despiece.matrizDespiece, params);
+    const xls = generateExcelSpreadsheetML(despiece, plan, params);
+
+    // Espesores dinámicos en Hoja 3 (sin '18 mm' / '3 mm' hardcodeados)
+    expect(xls).toContain('Planchas Melamina 15 mm');
+    expect(xls).toContain('Planchas Fondo 5 mm');
+    expect(xls).not.toContain('Planchas Melamina 18 mm');
+    expect(xls).not.toContain('Planchas Fondo 3 mm');
+
+    // Hoja 2 incluye columnas de precio unitario y subtotal CLP de herrajes externos (4 patas × $4.750 = $19.000)
+    const sheet2Start = xls.indexOf('<Worksheet ss:Name="Herrajes_y_Patas">');
+    const sheet3Start = xls.indexOf('<Worksheet ss:Name="Resumen_U3_y_Planchas">');
+    const sheet2Xml = xls.slice(sheet2Start, sheet3Start);
+    expect(sheet2Xml).toContain('Precio Unit. (CLP)');
+    expect(sheet2Xml).toContain('Subtotal (CLP)');
+    expect(sheet2Xml).toContain('<Data ss:Type="Number">4750</Data>');
+    expect(sheet2Xml).toContain('<Data ss:Type="Number">19000</Data>');
+
+    // CSV formula-injection neutralization (=, +, -, @) + escape de retorno de carro \r
+    const hostileDespiece = {
+      ...despiece,
+      matrizDespiece: [
+        { ...despiece.matrizDespiece[0], nombre: '=CMD|\' /C calc\'!A0' },
+        { ...despiece.matrizDespiece[1], nombre: '+SUM(A1:A5)' },
+        { ...despiece.matrizDespiece[2], nombre: '-2+3' },
+        { ...despiece.matrizDespiece[3], nombre: '@IMPORT("evil")' },
+        { ...despiece.matrizDespiece[4], nombre: 'Repisa\rConRetorno' },
+      ],
+    };
+    const csv = generateDespieceCsv(hostileDespiece, ';');
+    expect(csv).toContain(";'=CMD|' /C calc'!A0;");
+    expect(csv).toContain(";'+SUM(A1:A5);");
+    expect(csv).toContain(";\'-2+3;");
+    expect(csv).toContain(';"\'@IMPORT(""evil"")";');
+    expect(csv).toContain(';"Repisa\rConRetorno";');
   });
 });

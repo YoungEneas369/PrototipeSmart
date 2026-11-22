@@ -1,21 +1,48 @@
 /**
- * SMARTFURNITURE — DETECTOR DUAL DE ESTRUCTURA DE MELAMINA (v3.1)
- * Soporta DOS familias reales de muebles 100% offline:
+ * SMARTFURNITURE — DETECTOR DUAL/HÍBRIDO DE ESTRUCTURA DE MELAMINA (v8.0)
+ * 100% offline, TypeScript puro + TypedArrays, unificado sobre `imageOps`, `colorClassifier`,
+ * `xyCut` y `zoneClassifier`.
+ *
+ * Soporta todas las familias reales de muebles:
  *   A) MUEBLE ABIERTO (`open`): cantos de melamina sobre huecos oscuros — usa luminancia flat-field
- *      + crominancia normalizada RGBA + sembrado en 4 bordes/gotero + anclaje unilateral de paralaje.
- *   B) MUEBLE CERRADO (`closed_front` — puertas y cajones): superficie frontal uniforme de madera/melamina
- *      con ranuras/juntas lineales oscuras — usa detector de valles de luminancia con CONTINUIDAD EN EXTREMOS
- *      (inmune a molduras decorativas internas de puertas) + detector de tiradores metálicos por BFS.
- *   C) BAJA CONFIANZA (`uncertain`, ej. blanco sobre blanco sin ranuras): retorna confidence < 0.5
- *      para activar trazado manual asistido (Principio 07 OFG: Honestidad de Confianza).
+ *      + crominancia normalizada RGBA + sembrado en 4 bordes/gotero + anclaje unilateral de paralaje
+ *      + partición recursiva XY-Cut (`xyCut.ts`).
+ *   B) MUEBLE CERRADO (`closed_front` — puertas y cajones): superficie frontal uniforme con
+ *      ranuras/juntas lineales continuas en extremos (inmune a molduras decorativas) + detector de
+ *      manillas por contraste local bidireccional (oscuras y claras/cromadas sobre grafito).
+ *   C) MUEBLE HÍBRIDO / BICOLOR / ESCRITORIO (`hybrid`): transiciones RGB + clasificación CIE-Lab
+ *      unificada (`zoneClassifier.ts`) sin emisión duplicada de `hShelves` dentro de `drawers`.
+ *   D) BAJA CONFIANZA (`uncertain`, ej. blanco sobre blanco sin ranuras): retorna `confidence < 0.5`
+ *      para guiar el trazado manual en 3 pasos.
  */
 import type {
+  BaseSupportType,
+  DiagonalSegment,
   FrontZone,
   MelamineMaterial,
   NormalizedSegment,
   Point2D,
 } from '../../types/contracts';
 import { exteriorToInterior } from '../mathEngine';
+import { classifyMelamineMaterial } from './colorClassifier';
+import {
+  boxBlur2D,
+  clamp,
+  interiorToExteriorPoint,
+  mad,
+  median,
+  rgbaLuminance,
+} from './imageOps';
+import { findLocalPeaks1D, runRecursiveXYCut, type XYCutCandidate } from './xyCut';
+import {
+  classifyZonesUnified,
+  detectBaseSupportHint,
+  detectHandlesLocalContrast,
+  suppressShelvesInsideDrawers,
+  type DetectedHandlePoint,
+} from './zoneClassifier';
+
+export type { DetectedHandlePoint } from './zoneClassifier';
 
 export interface BandDetectorOptions {
   /** Gotero de 1 clic en coordenadas unitarias exteriores { u: 0..1, v: 0..1 (0=base, 1=cubierta) }. */
@@ -26,11 +53,6 @@ export interface BandDetectorOptions {
   horizonV?: number;
   /** RGB mediano del fondo exterior (permite reconocer huecos de piernas / pasantes en escritorios). */
   exteriorBgRgb?: [number, number, number];
-}
-
-export interface DetectedHandlePoint {
-  u: number;
-  v: number;
 }
 
 export interface DetectedCavity {
@@ -46,12 +68,14 @@ export interface BandDetectionResult {
   furnitureMode: 'open' | 'closed_front' | 'hybrid' | 'uncertain';
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
+  /** Divisiones diagonales opcionales detectadas (espacio interior [0,1]^2). */
+  diagonalDividers?: DiagonalSegment[];
   detectedHandles: DetectedHandlePoint[];
   /** Espacios vacíos / recuadros detectados en espacio interior [0,1]^2. */
   cavities: DetectedCavity[];
-  /** Zonas frontales clasificadas por celda (abierto, puerta, cajones, hueco piernas, bicolor). */
+  /** Zonas frontales clasificadas por celda (abierto, puerta, cajones, canastos, hueco piernas, bicolor). */
   inferredZones: FrontZone[];
-  /** Acabado de melamina estimado desde la carcasa principal. */
+  /** Acabado de melamina estimado desde la carcasa principal en espacio CIE-Lab. */
   detectedMaterial: MelamineMaterial;
   confidence: number;
   interiorMatch: number;
@@ -61,135 +85,33 @@ export interface BandDetectionResult {
 export interface LowerGapHintResult {
   possibleExternalLegs: boolean;
   estimatedLegRatio?: number;
-}
-
-function median(values: number[]): number {
-  if (values.length === 0) return 0;
-  const s = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(s.length / 2);
-  return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid];
-}
-
-function mad(values: number[], med: number): number {
-  if (values.length === 0) return 0;
-  const devs = values.map((v) => Math.abs(v - med));
-  return median(devs) * 1.4826;
-}
-
-/**
- * Box blur separable O(W·H) mediante sumas de prefijos para normalización flat-field.
- */
-function boxBlur2D(src: Float32Array, W: number, H: number, radius: number): Float32Array {
-  const r = Math.max(1, Math.floor(radius));
-  const tmp = new Float32Array(W * H);
-  const dst = new Float32Array(W * H);
-  const pref = new Float32Array(Math.max(W, H) + 1);
-
-  for (let y = 0; y < H; y++) {
-    const rowOff = y * W;
-    pref[0] = 0;
-    for (let x = 0; x < W; x++) {
-      pref[x + 1] = pref[x] + src[rowOff + x];
-    }
-    for (let x = 0; x < W; x++) {
-      const x0 = Math.max(0, x - r);
-      const x1 = Math.min(W - 1, x + r);
-      tmp[rowOff + x] = (pref[x1 + 1] - pref[x0]) / (x1 - x0 + 1);
-    }
-  }
-
-  for (let x = 0; x < W; x++) {
-    pref[0] = 0;
-    for (let y = 0; y < H; y++) {
-      pref[y + 1] = pref[y] + tmp[y * W + x];
-    }
-    for (let y = 0; y < H; y++) {
-      const y0 = Math.max(0, y - r);
-      const y1 = Math.min(H - 1, y + r);
-      dst[y * W + x] = (pref[y1 + 1] - pref[y0]) / (y1 - y0 + 1);
-    }
-  }
-
-  return dst;
-}
-
-function inferMelamineFromRgb(r: number, g: number, b: number): MelamineMaterial {
-  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-  const warmth = r - b;
-  if (lum >= 175 && Math.abs(r - b) < 28) return 'blanco';
-  if (lum <= 96) return 'grafito';
-  if (warmth > 20 && r > g - 6) return 'roble';
-  if (lum >= 165) return 'blanco';
-  return warmth > 12 ? 'roble' : 'grafito';
-}
-
-/**
- * Detecta si una celda cerrada corresponde a una PUERTA VIDRIADA (`door_glass`):
- * marco exterior de melamina relativamente uniforme + interior rectangular notablemente más oscuro.
- */
-function isGlassDoorCell(
-  lum: Float32Array,
-  W: number,
-  H: number,
-  u0: number,
-  u1: number,
-  v0: number,
-  v1: number,
-  cellHmm: number,
-): boolean {
-  if (cellHmm < 360) return false;
-  const x0 = Math.max(0, Math.round(u0 * W));
-  const x1 = Math.min(W - 1, Math.round(u1 * W));
-  const y0 = Math.max(0, Math.round((1 - v1) * H));
-  const y1 = Math.min(H - 1, Math.round((1 - v0) * H));
-  const cw = x1 - x0;
-  const ch = y1 - y0;
-  if (cw < 24 || ch < 32) return false;
-
-  const bx = Math.max(3, Math.round(cw * 0.14));
-  const by = Math.max(3, Math.round(ch * 0.12));
-  const ix0 = x0 + Math.round(cw * 0.22);
-  const ix1 = x1 - Math.round(cw * 0.22);
-  const iy0 = y0 + Math.round(ch * 0.18);
-  const iy1 = y1 - Math.round(ch * 0.18);
-
-  let fSum = 0, fSum2 = 0, fCnt = 0;
-  let cSum = 0, cCnt = 0;
-
-  for (let y = y0 + 2; y <= y1 - 2; y += 2) {
-    for (let x = x0 + 2; x <= x1 - 2; x += 2) {
-      const l = lum[y * W + x];
-      if (x >= ix0 && x <= ix1 && y >= iy0 && y <= iy1) {
-        cSum += l;
-        cCnt++;
-      } else if (x <= x0 + bx || x >= x1 - bx || y <= y0 + by || y >= y1 - by) {
-        fSum += l;
-        fSum2 += l * l;
-        fCnt++;
-      }
-    }
-  }
-  if (fCnt < 16 || cCnt < 16) return false;
-  const fMean = fSum / fCnt;
-  const fStd = Math.sqrt(Math.max(0, fSum2 / fCnt - fMean * fMean));
-  const cMean = cSum / cCnt;
-  return fStd < 38 && cMean < fMean - 11;
+  supportType?: BaseSupportType;
+  estimatedHeightRatio?: number;
 }
 
 interface HybridStructureResult {
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
+  detectedHandles: DetectedHandlePoint[];
   cavities: DetectedCavity[];
   inferredZones: FrontZone[];
   strength: number;
 }
 
+function rangeMean(arr: Float32Array, start: number, end: number): number {
+  const s = Math.max(0, Math.floor(start));
+  const e = Math.min(arr.length, Math.ceil(end));
+  if (e <= s) return 0;
+  let sum = 0;
+  for (let i = s; i < e; i++) {
+    sum += arr[i];
+  }
+  return sum / (e - s);
+}
+
 /**
- * Detector híbrido por transiciones de borde RGB (|∇x RGB|, |∇y RGB|) + clasificación
- * celda por celda (100% offline). Resuelve muebles reales que fallaban con el modo binario:
- *   - Muebles bicolores e híbridos (ej. Armario oficina gris abierto arriba + puertas nogal abajo)
- *   - Racks mixtos (cajones cerrados + nicho abierto con repisa + puertas)
- *   - Escritorios con hueco de piernas pasante al fondo (sin base inferior en el centro)
+ * Detector híbrido por transiciones de borde RGB (|∇x RGB|, |∇y RGB|) + XY-Cut recursivo
+ * + clasificación CIE-Lab unificada (`zoneClassifier.ts`).
  */
 function detectHybridEdgeTransitions(
   rgba: Uint8ClampedArray,
@@ -207,7 +129,6 @@ function detectHybridEdgeTransitions(
   const tPy = Math.max(3, Math.round((boardThicknessMm / Math.max(100, dimsMm.y)) * H));
   const stepPad = Math.max(5, Math.min(11, Math.round(Math.min(W, H) * 0.015)));
 
-  // Medir salto de color RGB izquierda vs derecha (o valle oscuro) a lo largo de columna x
   const evalVertStep = (x: number, y0: number, y1: number): { ratio: number; meanDiff: number } => {
     const count = Math.max(1, y1 - y0);
     let hits = 0;
@@ -275,7 +196,7 @@ function detectHybridEdgeTransitions(
     ry0: number,
     ry1: number,
     allowPartialAnchor = false,
-  ): Array<{ x: number; score: number }> => {
+  ): XYCutCandidate[] => {
     const regW = rx1 - rx0;
     const regH = ry1 - ry0;
     if (regW < 40 || regH < 30) return [];
@@ -285,8 +206,9 @@ function detectHybridEdgeTransitions(
     const yBot0 = ry1 - Math.round(regH * 0.18);
     const minX = Math.max(rx0 + stepPad + 2, Math.round(rx0 + regW * 0.14));
     const maxX = Math.min(rx1 - stepPad - 3, Math.round(rx1 - regW * 0.14));
-    const scores = new Float32Array(W);
+    if (maxX <= minX) return [];
 
+    const scores = new Float32Array(W);
     for (let x = minX; x <= maxX; x++) {
       const all = evalVertStep(x, yA, yB);
       const top = evalVertStep(x, yA, yTop1);
@@ -296,8 +218,6 @@ function detectHybridEdgeTransitions(
         if (top.ratio < 0.62 || bot.ratio < 0.62) continue;
         scores[x] = all.ratio * all.meanDiff;
       } else {
-        // Permite módulos suspendidos en esquina (ej. cajonera derecha de escritorio):
-        // exige que el borde arranque limpio en techo o base y tenga al menos 35% de corrida fuerte.
         const anchoredTop = top.ratio >= 0.72;
         const anchoredBot = bot.ratio >= 0.72;
         if (!anchoredTop && !anchoredBot) continue;
@@ -307,27 +227,14 @@ function detectHybridEdgeTransitions(
     }
 
     const nms = Math.max(28, Math.round(regW * 0.14));
-    const peaks: Array<{ x: number; score: number }> = [];
-    for (let x = minX; x <= maxX; x++) {
-      const s = scores[x];
-      if (s <= (allowPartialAnchor ? 17 : 32)) continue;
-      let isPeak = true;
-      for (let dx = -nms; dx <= nms; dx++) {
-        if (dx === 0) continue;
-        const nx = x + dx;
-        if (nx >= minX && nx <= maxX) {
-          if (dx < 0 ? scores[nx] >= s : scores[nx] > s) {
-            isPeak = false;
-            break;
-          }
-        }
-      }
-      if (isPeak) peaks.push({ x, score: s });
-    }
-    return peaks
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 4)
-      .sort((a, b) => a.x - b.x);
+    const peaks = findLocalPeaks1D(scores, minX, maxX, nms, allowPartialAnchor ? 17 : 32, {
+      maxPeaks: 4,
+    });
+    return peaks.map((pk) => ({
+      posPx: pk.pos,
+      posNorm: exteriorToInterior(pk.pos / W, boardThicknessMm, dimsMm.x),
+      score: pk.score,
+    }));
   };
 
   const findFullHorizSteps = (
@@ -336,7 +243,7 @@ function detectHybridEdgeTransitions(
     ry0: number,
     ry1: number,
     isRoot = false,
-  ): Array<{ y: number; score: number }> => {
+  ): XYCutCandidate[] => {
     const regW = rx1 - rx0;
     const regH = ry1 - ry0;
     if (regW < 36 || regH < 30) return [];
@@ -345,10 +252,10 @@ function detectHybridEdgeTransitions(
     const xL1 = rx0 + Math.round(regW * 0.18);
     const xR0 = rx1 - Math.round(regW * 0.18);
     const minY = Math.max(ry0 + stepPad + 2, Math.round(ry0 + regH * 0.12));
-    // En la raíz evitar tomar el zócalo inferior (< 15% altura) como división principal antes de dividir columnas
     const maxY = Math.min(ry1 - stepPad - 3, Math.round(ry1 - regH * (isRoot ? 0.16 : 0.11)));
-    const scores = new Float32Array(H);
+    if (maxY <= minY) return [];
 
+    const scores = new Float32Array(H);
     for (let y = minY; y <= maxY; y++) {
       const all = evalHorizStep(y, xA, xB);
       if (all.ratio < 0.65 || all.meanDiff < 29) continue;
@@ -360,374 +267,108 @@ function detectHybridEdgeTransitions(
     }
 
     const nms = Math.max(18, Math.round(regH * 0.11));
-    const peaks: Array<{ y: number; score: number }> = [];
-    for (let y = minY; y <= maxY; y++) {
-      const s = scores[y];
-      if (s <= 24) continue;
-      let isPeak = true;
-      for (let dy = -nms; dy <= nms; dy++) {
-        if (dy === 0) continue;
-        const ny = y + dy;
-        if (ny >= minY && ny <= maxY) {
-          if (dy < 0 ? scores[ny] >= s : scores[ny] > s) {
-            isPeak = false;
-            break;
-          }
-        }
-      }
-      if (isPeak) peaks.push({ y, score: s });
-    }
-    return peaks
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 4)
-      .sort((a, b) => a.y - b.y);
+    const peaks = findLocalPeaks1D(scores, minY, maxY, nms, 24, { maxPeaks: 4 });
+    return peaks.map((pk) => ({
+      posPx: pk.pos,
+      posNorm: exteriorToInterior(1 - pk.pos / H, boardThicknessMm, dimsMm.y),
+      score: pk.score,
+    }));
   };
 
-  // Recursive XY-Cut sobre transiciones de bordes/colores/juntas
-  const vDividers: NormalizedSegment[] = [];
-  const hShelves: NormalizedSegment[] = [];
-  const leafCells: Array<{
-    x0: number;
-    x1: number;
-    y0: number;
-    y1: number;
-    u0: number;
-    u1: number;
-    v0: number;
-    v1: number;
-  }> = [];
-  let sumStrength = 0;
-  let cutCount = 0;
+  // Partición recursiva XY-Cut unificada sobre transiciones RGB
+  const xyRes = runRecursiveXYCut(
+    { rx0: tPx, rx1: W - tPx, ry0: tPy, ry1: H - tPy, u0: 0, u1: 1, v0: 0, v1: 1 },
+    {
+      maxDepth: 3,
+      minRegionW: 36,
+      minRegionH: 30,
+      minNormSpanU: 0.12,
+      minNormSpanV: 0.1,
+      minCutMarginNorm: 0.06,
+      padX: Math.round(tPx * 0.5),
+      padY: Math.round(tPy * 0.5),
+      vTopDownPx: true,
+      idPrefix: { v: 'auto_div', h: 'auto_rep' },
+      findVerticalCuts: (reg) => {
+        const strict = findFullVertSteps(reg.rx0, reg.rx1, reg.ry0, reg.ry1, false);
+        if (strict.length > 0 || reg.depth > 0) return strict;
+        // En raíz sin cortes de punta a punta, habilitar anclaje a techo/piso (ej. cajonera suspendida #11)
+        const hRoot = findFullHorizSteps(reg.rx0, reg.rx1, reg.ry0, reg.ry1, true);
+        if (hRoot.length > 0) return strict;
+        return findFullVertSteps(reg.rx0, reg.rx1, reg.ry0, reg.ry1, true);
+      },
+      findHorizontalCuts: (reg) =>
+        findFullHorizSteps(reg.rx0, reg.rx1, reg.ry0, reg.ry1, reg.depth === 0),
+      chooseAxis: (vCuts, hCuts) => {
+        const bestV = vCuts.reduce((m, p) => Math.max(m, p.score), 0);
+        const bestH = hCuts.reduce((m, p) => Math.max(m, p.score), 0);
+        if (bestV === 0 && bestH === 0) return 'none';
+        return bestV >= bestH ? 'vertical' : 'horizontal';
+      },
+    },
+  );
 
-  const recurseHybrid = (
-    rx0: number,
-    rx1: number,
-    ry0: number,
-    ry1: number,
-    u0: number,
-    u1: number,
-    v0: number,
-    v1: number,
-    depth: number,
-  ) => {
-    if (depth >= 2) {
-      leafCells.push({ x0: rx0, x1: rx1, y0: ry0, y1: ry1, u0, u1, v0, v1 });
-      return;
-    }
+  // Detectar manillas por contraste local respetando conversión interior -> exterior en las juntas
+  const vSeamPxs = xyRes.vDividers.map(
+    (d) => interiorToExteriorPoint(d.position, 0.5, dimsMm, boardThicknessMm).uExt * W,
+  );
+  const hSeamPxs = xyRes.hShelves.map((s) => ({
+    y: (1 - interiorToExteriorPoint(0.5, s.position, dimsMm, boardThicknessMm).vExt) * H,
+    uStart: s.start,
+    uEnd: s.end,
+  }));
+  const detectedHandles =
+    xyRes.vDividers.length + xyRes.hShelves.length > 0
+      ? detectHandlesLocalContrast(lum, W, H, vSeamPxs, hSeamPxs, dimsMm, boardThicknessMm)
+      : [];
 
-    let vPks = findFullVertSteps(rx0, rx1, ry0, ry1, false);
-    const hPks = findFullHorizSteps(rx0, rx1, ry0, ry1, depth === 0);
+  // Clasificación unificada CIE-Lab + interiorToExteriorRect + fusión verificada de cajones
+  const inferredZones = classifyZonesUnified(
+    xyRes.leaves.map((lf) => ({ uStart: lf.u0, uEnd: lf.u1, vStart: lf.v0, vEnd: lf.v1 })),
+    {
+      rectRgba: rgba,
+      rectW: W,
+      rectH: H,
+      dimsMm,
+      boardThicknessMm,
+      carcassMaterial,
+      refRgb,
+      exteriorBgRgb,
+      lum,
+      matchMap,
+      detectedHandles,
+      mergeDrawers: true,
+      modeHint: 'hybrid',
+      idPrefix: 'zone',
+    },
+  );
 
-    // Si en el nivel raíz no hay cortes de punta a punta (ej. escritorio con cajonera suspendida
-    // arriba-derecha sobre hueco blanco), habilitar detección anclada al techo/piso.
-    if (depth === 0 && vPks.length === 0 && hPks.length === 0) {
-      vPks = findFullVertSteps(rx0, rx1, ry0, ry1, true);
-    }
+  const cavities: DetectedCavity[] = inferredZones.map((z, idx) => ({
+    id: `cav_hyb_${idx + 1}`,
+    u0: z.uStart,
+    u1: z.uEnd,
+    v0: z.vStart,
+    v1: z.vEnd,
+    kind: z.kind === 'leg_void' ? 'knee_space' : 'open_bay',
+  }));
 
-    const bestV = vPks.reduce((m, p) => Math.max(m, p.score), 0);
-    const bestH = hPks.reduce((m, p) => Math.max(m, p.score), 0);
-
-    if (bestV === 0 && bestH === 0) {
-      leafCells.push({ x0: rx0, x1: rx1, y0: ry0, y1: ry1, u0, u1, v0, v1 });
-      return;
-    }
-
-    if (bestV >= bestH) {
-      const uStops = [u0];
-      const xStops = [rx0];
-      for (const vp of vPks) {
-        const uInt = exteriorToInterior(vp.x / W, boardThicknessMm, dimsMm.x);
-        if (uInt <= u0 + 0.06 || uInt >= u1 - 0.06) continue;
-        vDividers.push({
-          id: `auto_div_${vDividers.length + 1}`,
-          position: Number(uInt.toFixed(4)),
-          start: Number(v0.toFixed(4)),
-          end: Number(v1.toFixed(4)),
-        });
-        uStops.push(uInt);
-        xStops.push(vp.x);
-        sumStrength += vp.score;
-        cutCount++;
-      }
-      uStops.push(u1);
-      xStops.push(rx1);
-      if (xStops.length > 2) {
-        for (let b = 0; b < xStops.length - 1; b++) {
-          recurseHybrid(
-            xStops[b] + Math.round(tPx * 0.5),
-            xStops[b + 1] - Math.round(tPx * 0.5),
-            ry0,
-            ry1,
-            uStops[b],
-            uStops[b + 1],
-            v0,
-            v1,
-            depth + 1,
-          );
-        }
-        return;
-      }
-    }
-
-    if (bestH > 0) {
-      const vStopsTopDown = [v1];
-      const yStops = [ry0];
-      for (const hp of hPks) {
-        const vInt = exteriorToInterior(1 - hp.y / H, boardThicknessMm, dimsMm.y);
-        if (vInt <= v0 + 0.06 || vInt >= v1 - 0.06) continue;
-        hShelves.push({
-          id: `auto_rep_${hShelves.length + 1}`,
-          position: Number(vInt.toFixed(4)),
-          start: Number(u0.toFixed(4)),
-          end: Number(u1.toFixed(4)),
-        });
-        vStopsTopDown.push(vInt);
-        yStops.push(hp.y);
-        sumStrength += hp.score;
-        cutCount++;
-      }
-      vStopsTopDown.push(v0);
-      yStops.push(ry1);
-      if (yStops.length > 2) {
-        for (let t = 0; t < yStops.length - 1; t++) {
-          recurseHybrid(
-            rx0,
-            rx1,
-            yStops[t] + Math.round(tPy * 0.5),
-            yStops[t + 1] - Math.round(tPy * 0.5),
-            u0,
-            u1,
-            vStopsTopDown[t + 1],
-            vStopsTopDown[t],
-            depth + 1,
-          );
-        }
-        return;
-      }
-    }
-
-    leafCells.push({ x0: rx0, x1: rx1, y0: ry0, y1: ry1, u0, u1, v0, v1 });
-  };
-
-  recurseHybrid(tPx, W - tPx, tPy, H - tPy, 0, 1, 0, 1, 0);
-
-  // Clasificar cada celda individual pixel a pixel (leg_void / open / drawers / door / materialOverride)
-  const cavities: DetectedCavity[] = [];
-  const inferredZones: FrontZone[] = [];
-  const refLum = 0.299 * refRgb[0] + 0.587 * refRgb[1] + 0.114 * refRgb[2];
-
-  // Agrupar celdas adyacentes verticalmente en la misma columna si son cajones apilados
-  const colGroups = new Map<string, typeof leafCells>();
-  for (const c of leafCells) {
-    const key = `${c.u0.toFixed(2)}_${c.u1.toFixed(2)}`;
-    const list = colGroups.get(key) ?? [];
-    list.push(c);
-    colGroups.set(key, list);
-  }
-
-  for (const cells of colGroups.values()) {
-    // Analizar estadísticas de color/luminancia/fondo de cada celda en la columna
-    const stats = cells.map((c) => {
-      const ix0 = Math.max(0, Math.round(c.x0 + (c.x1 - c.x0) * 0.12));
-      const ix1 = Math.min(W - 1, Math.round(c.x1 - (c.x1 - c.x0) * 0.12));
-      const iy0 = Math.max(0, Math.round(c.y0 + (c.y1 - c.y0) * 0.12));
-      const iy1 = Math.min(H - 1, Math.round(c.y1 - (c.y1 - c.y0) * 0.12));
-      let sumR = 0, sumG = 0, sumB = 0, sumL = 0, sumL2 = 0, cnt = 0;
-      let bgHits = 0, matchHits = 0;
-
-      for (let y = iy0; y <= iy1; y += 2) {
-        for (let x = ix0; x <= ix1; x += 2) {
-          const i = y * W + x;
-          const p = i * 4;
-          const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
-          sumR += r;
-          sumG += g;
-          sumB += b;
-          const l = lum[i];
-          sumL += l;
-          sumL2 += l * l;
-          if (matchMap[i] > 0.52) matchHits++;
-          if (exteriorBgRgb) {
-            const dBg = Math.hypot(r - exteriorBgRgb[0], g - exteriorBgRgb[1], b - exteriorBgRgb[2]);
-            if (dBg <= 38) bgHits++;
-          }
-          cnt++;
-        }
-      }
-      const nSafe = Math.max(1, cnt);
-      const meanR = sumR / nSafe;
-      const meanG = sumG / nSafe;
-      const meanB = sumB / nSafe;
-      const meanL = sumL / nSafe;
-      const stdL = Math.sqrt(Math.max(0, sumL2 / nSafe - meanL * meanL));
-      const distCarcass = Math.hypot(meanR - refRgb[0], meanG - refRgb[1], meanB - refRgb[2]);
-      const bgRatio = bgHits / nSafe;
-      const matchRatio = matchHits / nSafe;
-      const isLegVoid =
-        c.v0 <= 0.05 &&
-        bgRatio >= 0.48 &&
-        matchRatio < 0.42 &&
-        (c.u1 - c.u0 < 0.94 || c.v1 - c.v0 < 0.92);
-      const isDarkOpen =
-        !isLegVoid &&
-        ((meanL < refLum - 28 && distCarcass > 32 && matchRatio < 0.42) || stdL > 34);
-      const cellHmm = (c.v1 - c.v0) * dimsMm.y;
-      const isGlass =
-        !isLegVoid && !isDarkOpen && isGlassDoorCell(lum, W, H, c.u0, c.u1, c.v0, c.v1, cellHmm);
-      const isClosedPanel = !isLegVoid && !isDarkOpen && !isGlass && stdL <= 34;
-      const cellMat = inferMelamineFromRgb(meanR, meanG, meanB);
-      const matOverride = distCarcass > 45 && cellMat !== carcassMaterial ? cellMat : undefined;
-
-      return { c, isLegVoid, isDarkOpen, isGlass, isClosedPanel, matOverride };
-    });
-
-    // Consolidar corridas contiguas de ≥2 celdas cerradas con proporción de cajón en 1 zona de Cajones
-    // (soporta cajonera suspendida sobre hueco de piernas como Escritorio #11 y cajoneras sobre puertas)
-    const sortedStats = [...stats].sort((a, b) => a.c.v0 - b.c.v0);
-    const isDrawerShaped = (st: (typeof sortedStats)[number]): boolean => {
-      if (!st.isClosedPanel) return false;
-      const wMm = (st.c.u1 - st.c.u0) * dimsMm.x;
-      const hMm = (st.c.v1 - st.c.v0) * dimsMm.y;
-      return hMm <= 360 && wMm > hMm * 0.85;
-    };
-
-    const emittedIndices = new Set<number>();
-    let runStart = 0;
-    while (runStart < sortedStats.length) {
-      if (!isDrawerShaped(sortedStats[runStart])) {
-        runStart++;
-        continue;
-      }
-      let runEnd = runStart;
-      while (runEnd + 1 < sortedStats.length && isDrawerShaped(sortedStats[runEnd + 1])) {
-        runEnd++;
-      }
-      const runLen = runEnd - runStart + 1;
-      if (runLen >= 2) {
-        const runItems = sortedStats.slice(runStart, runEnd + 1);
-        const u0 = runItems[0].c.u0;
-        const u1 = runItems[0].c.u1;
-        const v0 = Math.min(...runItems.map((r) => r.c.v0));
-        const v1 = Math.max(...runItems.map((r) => r.c.v1));
-        inferredZones.push({
-          id: `zone_drawers_${inferredZones.length + 1}`,
-          uStart: Number(u0.toFixed(4)),
-          uEnd: Number(u1.toFixed(4)),
-          vStart: Number(v0.toFixed(4)),
-          vEnd: Number(v1.toFixed(4)),
-          kind: 'drawers',
-          drawerCount: runLen,
-          label: `${runLen} Cajones`,
-          materialOverride: runItems[0].matOverride,
-        });
-        cavities.push({
-          id: `cav_hyb_${cavities.length + 1}`,
-          u0: Number(u0.toFixed(4)),
-          u1: Number(u1.toFixed(4)),
-          v0: Number(v0.toFixed(4)),
-          v1: Number(v1.toFixed(4)),
-          kind: 'open_bay',
-        });
-        for (let k = runStart; k <= runEnd; k++) emittedIndices.add(k);
-      }
-      runStart = runEnd + 1;
-    }
-
-    for (let idxSt = 0; idxSt < sortedStats.length; idxSt++) {
-      if (emittedIndices.has(idxSt)) continue;
-      const st = sortedStats[idxSt];
-      const { c } = st;
-      cavities.push({
-        id: `cav_hyb_${cavities.length + 1}`,
-        u0: Number(c.u0.toFixed(4)),
-        u1: Number(c.u1.toFixed(4)),
-        v0: Number(c.v0.toFixed(4)),
-        v1: Number(c.v1.toFixed(4)),
-        kind: st.isLegVoid ? 'knee_space' : 'open_bay',
-      });
-
-      if (st.isLegVoid) {
-        inferredZones.push({
-          id: `zone_void_${inferredZones.length + 1}`,
-          uStart: Number(c.u0.toFixed(4)),
-          uEnd: Number(c.u1.toFixed(4)),
-          vStart: Number(c.v0.toFixed(4)),
-          vEnd: Number(c.v1.toFixed(4)),
-          kind: 'leg_void',
-          label: 'Hueco Piernas',
-        });
-      } else if (st.isDarkOpen) {
-        inferredZones.push({
-          id: `zone_open_${inferredZones.length + 1}`,
-          uStart: Number(c.u0.toFixed(4)),
-          uEnd: Number(c.u1.toFixed(4)),
-          vStart: Number(c.v0.toFixed(4)),
-          vEnd: Number(c.v1.toFixed(4)),
-          kind: 'open',
-          label: `Nicho ${inferredZones.length + 1}`,
-        });
-      } else if (st.isGlass) {
-        inferredZones.push({
-          id: `zone_glass_${inferredZones.length + 1}`,
-          uStart: Number(c.u0.toFixed(4)),
-          uEnd: Number(c.u1.toFixed(4)),
-          vStart: Number(c.v0.toFixed(4)),
-          vEnd: Number(c.v1.toFixed(4)),
-          kind: 'door_glass',
-          label: 'Vitrina',
-          materialOverride: st.matOverride,
-        });
-      } else {
-        const cellWmm = (c.u1 - c.u0) * dimsMm.x;
-        const cellHmm = (c.v1 - c.v0) * dimsMm.y;
-        const aspectCell = cellWmm / Math.max(1, cellHmm);
-        const kind =
-          aspectCell > 1.45 && cellHmm <= 340
-            ? 'drawers'
-            : aspectCell > 0.95 && cellWmm >= 520
-              ? 'door_double'
-              : c.u0 < 0.5
-                ? 'door_left'
-                : 'door_right';
-        inferredZones.push({
-          id: `zone_front_${inferredZones.length + 1}`,
-          uStart: Number(c.u0.toFixed(4)),
-          uEnd: Number(c.u1.toFixed(4)),
-          vStart: Number(c.v0.toFixed(4)),
-          vEnd: Number(c.v1.toFixed(4)),
-          kind,
-          drawerCount: kind === 'drawers' ? 1 : undefined,
-          label: kind === 'drawers' ? 'Cajón' : kind === 'door_double' ? 'Puerta Doble' : 'Puerta',
-          materialOverride: st.matOverride,
-        });
-      }
-    }
-  }
+  // Eliminar repisas fantasma estrictamente interiores a zonas clasificadas como `drawers`
+  const hShelves = suppressShelvesInsideDrawers(xyRes.hShelves, inferredZones);
 
   return {
-    vDividers,
+    vDividers: xyRes.vDividers,
     hShelves,
+    detectedHandles,
     cavities,
     inferredZones,
-    strength: cutCount > 0 ? sumStrength / cutCount : 0,
+    strength: xyRes.cutCount > 0 ? xyRes.cutStrengthSum / xyRes.cutCount : 0,
   };
-}
-
-function rangeMean(arr: Float32Array, start: number, end: number): number {
-  const s = Math.max(0, Math.floor(start));
-  const e = Math.min(arr.length, Math.ceil(end));
-  if (e <= s) return 0;
-  let sum = 0;
-  for (let i = s; i < e; i++) {
-    sum += arr[i];
-  }
-  return sum / (e - s);
 }
 
 /**
  * Detector para muebles CERRADOS (puertas y cajones del mismo material que la carcasa).
- * Exige continuidad de ranura oscura en AMBOS extremos del vano para eliminar al 100%
- * falsos positivos producidos por molduras decorativas internas de las puertas.
+ * Exige continuidad de ranura oscura en AMBOS extremos del vano (inmune a molduras decorativas)
+ * y utiliza `findLocalPeaks1D` (sin duplicados en mesetas) + `detectHandlesLocalContrast`.
  */
 function detectClosedFrontSeams(
   lum: Float32Array,
@@ -743,7 +384,7 @@ function detectClosedFrontSeams(
   seamStrength: number;
 } {
   const pad = Math.max(8, Math.min(14, Math.round(W * 0.017)));
-  const minDiff = 18;
+  const minDiff = clamp(refLum * 0.25, 11, 18);
 
   // 1. RANURAS VERTICALES CONTINUAS (juntas entre puertas / columna de cajones)
   const vScore = new Float32Array(W);
@@ -756,17 +397,17 @@ function detectClosedFrontSeams(
     const count = Math.max(1, y1 - y0);
     let darkHits = 0;
     let sumPos = 0;
+    const flankN = pad - 2;
     for (let y = y0; y < y1; y++) {
       const rowOff = y * W;
       const cMin = Math.min(lum[rowOff + x - 1], lum[rowOff + x], lum[rowOff + x + 1]);
       let lSum = 0;
       let rSum = 0;
-      const flankN = pad - 2;
       for (let k = 3; k <= pad; k++) {
         lSum += lum[rowOff + x - k];
         rSum += lum[rowOff + x + k];
       }
-      const flankMean = 0.5 * (lSum + rSum) / flankN;
+      const flankMean = (0.5 * (lSum + rSum)) / flankN;
       const diff = flankMean - cMin;
       if (diff > minDiff) darkHits++;
       if (diff > 0) sumPos += diff;
@@ -788,38 +429,22 @@ function detectClosedFrontSeams(
   }
 
   const nmsVx = Math.max(24, Math.round(W * 0.06));
-  const vPeaks: Array<{ x: number; score: number }> = [];
-  for (let x = minVx; x <= maxVx; x++) {
-    const s = vScore[x];
-    if (s <= 18) continue;
-    let isPeak = true;
-    for (let dx = -nmsVx; dx <= nmsVx; dx++) {
-      if (dx === 0) continue;
-      const nx = x + dx;
-      if (nx >= minVx && nx <= maxVx && vScore[nx] > s) {
-        isPeak = false;
-        break;
-      }
-    }
-    if (isPeak) {
-      vPeaks.push({ x, score: s });
-    }
-  }
-  vPeaks.sort((a, b) => a.x - b.x);
+  const minPeakScore = refLum < 80 ? 12 : 18;
+  const vPeaks = findLocalPeaks1D(vScore, minVx, maxVx, nmsVx, minPeakScore);
 
   const vDividers: NormalizedSegment[] = vPeaks.map((p, idx) => ({
     id: `auto_div_${idx + 1}`,
-    position: Number(exteriorToInterior(p.x / W, boardThicknessMm, dimsMm.x).toFixed(4)),
+    position: Number(exteriorToInterior(p.pos / W, boardThicknessMm, dimsMm.x).toFixed(4)),
     start: 0,
     end: 1,
   }));
 
   // 2. RANURAS HORIZONTALES VANO POR VANO (juntas entre cajones, inmunes a molduras de puertas)
-  const pxStops = [0, ...vPeaks.map((p) => p.x), W];
+  const pxStops = [0, ...vPeaks.map((p) => p.pos), W];
   const uStops = [0, ...vDividers.map((d) => d.position), 1];
   const hRaw: Array<{ y: number; vInt: number; uStart: number; uEnd: number; score: number }> = [];
-  const yMinH = Math.max(pad + 2, Math.round(H * 0.10));
-  const yMaxH = Math.min(H - pad - 3, Math.round(H * 0.90));
+  const yMinH = Math.max(pad + 2, Math.round(H * 0.1));
+  const yMaxH = Math.min(H - pad - 3, Math.round(H * 0.9));
   const nmsHy = Math.max(18, Math.round(H * 0.09));
 
   for (let b = 0; b < pxStops.length - 1; b++) {
@@ -828,12 +453,16 @@ function detectClosedFrontSeams(
     const bw = bx1 - bx0;
     if (bw < 36) continue;
 
-    const xAll0 = bx0 + Math.max(4, Math.round(bw * 0.04));
-    const xAll1 = bx1 - Math.max(4, Math.round(bw * 0.04));
-    const xLeft1 = bx0 + Math.max(8, Math.round(bw * 0.16));
-    const xRight0 = bx1 - Math.max(8, Math.round(bw * 0.16));
+    const xAll0 = Math.round(bx0 + Math.max(4, bw * 0.04));
+    const xAll1 = Math.round(bx1 - Math.max(4, bw * 0.04));
+    const xLeft1 = Math.round(bx0 + Math.max(8, bw * 0.16));
+    const xRight0 = Math.round(bx1 - Math.max(8, bw * 0.16));
 
-    const evalHorizRange = (y: number, x0: number, x1: number): { ratio: number; meanPos: number } => {
+    const evalHorizRange = (
+      y: number,
+      x0: number,
+      x1: number,
+    ): { ratio: number; meanPos: number } => {
       const count = Math.max(1, x1 - x0);
       let darkHits = 0;
       let sumPos = 0;
@@ -846,7 +475,7 @@ function detectClosedFrontSeams(
           uSum += lum[(y - k) * W + x];
           dSum += lum[(y + k) * W + x];
         }
-        const flankMean = 0.5 * (uSum + dSum) / flankN;
+        const flankMean = (0.5 * (uSum + dSum)) / flankN;
         const diff = flankMean - cMin;
         if (diff > minDiff) darkHits++;
         if (diff > 0) sumPos += diff;
@@ -865,34 +494,23 @@ function detectClosedFrontSeams(
       hScore[y] = all.ratio * all.meanPos;
     }
 
-    for (let y = yMinH; y <= yMaxH; y++) {
-      const s = hScore[y];
-      if (s <= 18) continue;
-      let isPeak = true;
-      for (let dy = -nmsHy; dy <= nmsHy; dy++) {
-        if (dy === 0) continue;
-        const ny = y + dy;
-        if (ny >= yMinH && ny <= yMaxH && hScore[ny] > s) {
-          isPeak = false;
-          break;
-        }
-      }
-      if (isPeak) {
-        const vExt = 1 - y / H;
-        hRaw.push({
-          y,
-          vInt: exteriorToInterior(vExt, boardThicknessMm, dimsMm.y),
-          uStart: uStops[b],
-          uEnd: uStops[b + 1],
-          score: s,
-        });
-      }
+    const hPeaks = findLocalPeaks1D(hScore, yMinH, yMaxH, nmsHy, minPeakScore);
+    for (const pk of hPeaks) {
+      const vExt = 1 - pk.pos / H;
+      hRaw.push({
+        y: pk.pos,
+        vInt: exteriorToInterior(vExt, boardThicknessMm, dimsMm.y),
+        uStart: uStops[b],
+        uEnd: uStops[b + 1],
+        score: pk.score,
+      });
     }
   }
 
   // Fusión de ranuras horizontales colineales en vanos adyacentes
   hRaw.sort((a, b) => a.vInt - b.vInt || a.uStart - b.uStart);
-  const hMerged: Array<{ vInt: number; uStart: number; uEnd: number; count: number; score: number }> = [];
+  const hMerged: Array<{ vInt: number; uStart: number; uEnd: number; count: number; score: number }> =
+    [];
   for (const rs of hRaw) {
     const existing = hMerged.find(
       (m) => Math.abs(m.vInt - rs.vInt) <= 0.025 && Math.abs(m.uEnd - rs.uStart) <= 0.025,
@@ -914,151 +532,30 @@ function detectClosedFrontSeams(
     end: Number(m.uEnd.toFixed(4)),
   }));
 
-  // 3. DETECCIÓN DE TIRADORES METÁLICOS / MANILLAS OSCURAS SOBRE EL FRENTE CERRADO
-  const detectedHandles: DetectedHandlePoint[] = [];
-  if (vPeaks.length > 0 || hRaw.length > 0) {
-    const mask = new Uint8Array(W * H);
-    const darkThresh = Math.min(refLum * 0.42, refLum - 62);
-    const coreMetalThresh = Math.min(refLum * 0.32, refLum - 78);
-    const borderX = Math.max(10, Math.round(W * 0.025));
-    const borderY = Math.max(10, Math.round(H * 0.055));
-
-    for (let y = borderY; y < H - borderY; y++) {
-      const rowOff = y * W;
-      for (let x = borderX; x < W - borderX; x++) {
-        if (lum[rowOff + x] < darkThresh) {
-          mask[rowOff + x] = 1;
-        }
-      }
-    }
-
-    // Enmascarar una banda de ±7 px alrededor de las juntas detectadas
-    const seamClear = 7;
-    for (const vp of vPeaks) {
-      const x0 = Math.max(0, vp.x - seamClear);
-      const x1 = Math.min(W - 1, vp.x + seamClear);
-      for (let y = 0; y < H; y++) {
-        const rowOff = y * W;
-        for (let x = x0; x <= x1; x++) mask[rowOff + x] = 0;
-      }
-    }
-    for (const hr of hRaw) {
-      const y0 = Math.max(0, hr.y - seamClear);
-      const y1 = Math.min(H - 1, hr.y + seamClear);
-      const x0 = Math.max(0, Math.floor(hr.uStart * W));
-      const x1 = Math.min(W - 1, Math.ceil(hr.uEnd * W));
-      for (let y = y0; y <= y1; y++) {
-        const rowOff = y * W;
-        for (let x = x0; x <= x1; x++) mask[rowOff + x] = 0;
-      }
-    }
-
-    // BFS componentes conexas (con salto de 4 px para unir manillas curvas con reflejo central)
-    const visited = new Uint8Array(W * H);
-    const rawBlobs: Array<{ cx: number; cy: number; area: number }> = [];
-    const queueX: number[] = [];
-    const queueY: number[] = [];
-
-    for (let y = borderY; y < H - borderY; y++) {
-      for (let x = borderX; x < W - borderX; x++) {
-        const idx0 = y * W + x;
-        if (mask[idx0] === 0 || visited[idx0] === 1) continue;
-
-        visited[idx0] = 1;
-        queueX.length = 0;
-        queueY.length = 0;
-        queueX.push(x);
-        queueY.push(y);
-
-        let head = 0;
-        let minX = x, maxX = x, minY = y, maxY = y;
-        let sumX = 0, sumY = 0;
-        let deepCoreCount = 0;
-
-        while (head < queueX.length) {
-          const cx = queueX[head];
-          const cy = queueY[head];
-          head++;
-          sumX += cx;
-          sumY += cy;
-          if (lum[cy * W + cx] < coreMetalThresh) deepCoreCount++;
-          if (cx < minX) minX = cx;
-          if (cx > maxX) maxX = cx;
-          if (cy < minY) minY = cy;
-          if (cy > maxY) maxY = cy;
-
-          for (let dy = -4; dy <= 4; dy++) {
-            const ny = cy + dy;
-            if (ny < borderY || ny >= H - borderY) continue;
-            const nRow = ny * W;
-            for (let dx = -4; dx <= 4; dx++) {
-              const nx = cx + dx;
-              if (nx < borderX || nx >= W - borderX) continue;
-              const nIdx = nRow + nx;
-              if (mask[nIdx] === 1 && visited[nIdx] === 0) {
-                visited[nIdx] = 1;
-                queueX.push(nx);
-                queueY.push(ny);
-              }
-            }
-          }
-        }
-
-        const area = head;
-        const bw = maxX - minX + 1;
-        const bh = maxY - minY + 1;
-        // Exigir núcleo muy oscuro (descarta nudos de madera cálida y mantiene herrajes metálicos)
-        if (area >= 28 && deepCoreCount >= 12 && area <= W * H * 0.018 && bw <= W * 0.16 && bh <= H * 0.35) {
-          rawBlobs.push({ cx: sumX / area, cy: sumY / area, area });
-        }
-      }
-    }
-
-    // Fusionar fragmentos del mismo tirador (ej. parte superior e inferior de un asa vertical)
-    const mergeDistX = Math.max(12, W * 0.022);
-    const mergeDistY = Math.max(24, H * 0.15);
-    const used = new Array<boolean>(rawBlobs.length).fill(false);
-
-    for (let i = 0; i < rawBlobs.length; i++) {
-      if (used[i]) continue;
-      used[i] = true;
-      let sx = rawBlobs[i].cx * rawBlobs[i].area;
-      let sy = rawBlobs[i].cy * rawBlobs[i].area;
-      let totalA = rawBlobs[i].area;
-
-      for (let j = i + 1; j < rawBlobs.length; j++) {
-        if (used[j]) continue;
-        const dx = Math.abs(rawBlobs[j].cx - sx / totalA);
-        const dy = Math.abs(rawBlobs[j].cy - sy / totalA);
-        if (dx <= mergeDistX && dy <= mergeDistY) {
-          used[j] = true;
-          sx += rawBlobs[j].cx * rawBlobs[j].area;
-          sy += rawBlobs[j].cy * rawBlobs[j].area;
-          totalA += rawBlobs[j].area;
-        }
-      }
-
-      if (totalA >= 42) {
-        detectedHandles.push({
-          u: Number((sx / totalA / W).toFixed(4)),
-          v: Number((1 - sy / totalA / H).toFixed(4)),
-        });
-      }
-    }
-  }
+  // 3. DETECCIÓN DE TIRADORES / MANILLAS POR CONTRASTE LOCAL BIDIRECCIONAL (OSCUROS Y CROMADOS/CLAROS)
+  const detectedHandles: DetectedHandlePoint[] =
+    vPeaks.length > 0 || hRaw.length > 0
+      ? detectHandlesLocalContrast(
+          lum,
+          W,
+          H,
+          vPeaks.map((p) => p.pos),
+          hRaw.map((hr) => ({ y: hr.y, uStart: hr.uStart, uEnd: hr.uEnd })),
+          dimsMm,
+          boardThicknessMm,
+        )
+      : [];
 
   const allScores = [...vPeaks.map((p) => p.score), ...hMerged.map((m) => m.score)];
   const seamStrength =
-    allScores.length > 0
-      ? allScores.reduce((acc, s) => acc + s, 0) / allScores.length
-      : 0;
+    allScores.length > 0 ? allScores.reduce((acc, s) => acc + s, 0) / allScores.length : 0;
 
   return { vDividers, hShelves, detectedHandles, seamStrength };
 }
 
 /**
- * Detecta automáticamente la estructura interna de un mueble rectificado (modo dual:
- * mueble abierto con huecos vs mueble cerrado con puertas/cajones + tiradores).
+ * Detecta automáticamente la estructura interna de un mueble rectificado (modo dual/híbrido:
+ * mueble abierto con huecos vs mueble cerrado con puertas/cajones + tiradores vs híbrido/bicolor).
  */
 export function analyzeRectifiedFurniture(
   rgba: Uint8ClampedArray,
@@ -1081,7 +578,7 @@ export function analyzeRectifiedFurniture(
     const r = rgba[p];
     const g = rgba[p + 1];
     const b = rgba[p + 2];
-    lum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    lum[i] = rgbaLuminance(r, g, b);
     const denom = r + g + b + 15;
     c1[i] = (r - g) / denom;
     c2[i] = (b - 0.5 * (r + g)) / denom;
@@ -1106,8 +603,8 @@ export function analyzeRectifiedFurniture(
   const sampleB: number[] = [];
 
   const pushPixel = (x: number, y: number, filterBg = false): void => {
-    const cx = Math.max(0, Math.min(W - 1, Math.round(x)));
-    const cy = Math.max(0, Math.min(H - 1, Math.round(y)));
+    const cx = clamp(Math.round(x), 0, W - 1);
+    const cy = clamp(Math.round(y), 0, H - 1);
     const idx = cy * W + cx;
     const p = idx * 4;
     if (rgba[p + 3] < 128) return;
@@ -1162,9 +659,7 @@ export function analyzeRectifiedFurniture(
       }
     };
 
-    // Primer intento filtrando píxeles del fondo exterior (evita contaminar escritorios/muebles en 3/4 con pared blanca)
     collectBorder(true);
-    // Fallback si el mueble en sí es del mismo color que el fondo (ej. mueble blanco sobre pared blanca)
     if (sampleLum.length < 24) {
       collectBorder(false);
     }
@@ -1174,12 +669,13 @@ export function analyzeRectifiedFurniture(
   const refFlat = median(sampleFlat);
   const refC1 = median(sampleC1);
   const refC2 = median(sampleC2);
-  const refRgb: [number, number, number] = [
-    median(sampleR),
-    median(sampleG),
-    median(sampleB),
-  ];
-  const detectedMaterial = inferMelamineFromRgb(refRgb[0], refRgb[1], refRgb[2]);
+  const refRgb: [number, number, number] = [median(sampleR), median(sampleG), median(sampleB)];
+  const detectedMaterial = classifyMelamineMaterial(
+    refRgb[0],
+    refRgb[1],
+    refRgb[2],
+    opts.exteriorBgRgb,
+  );
 
   const sigmaLum = Math.max(22, mad(sampleLum, refLum) * 2.5);
   const sigmaFlat = Math.max(0.11, mad(sampleFlat, refFlat) * 2.5);
@@ -1222,136 +718,71 @@ export function analyzeRectifiedFurniture(
   if (interiorMatch > 0.5) {
     const closed = detectClosedFrontSeams(lum, W, H, dimsMm, boardThicknessMm, refLum);
     const totalSeams = closed.vDividers.length + closed.hShelves.length;
-    if (totalSeams > 0 && closed.seamStrength >= 30) {
-      const closedConf = Math.max(0.62, Math.min(0.95, 0.55 + closed.seamStrength / 240));
+    const minStrength = refLum < 80 ? 18 : 30;
+    if (totalSeams > 0 && closed.seamStrength >= minStrength) {
+      const closedConf = clamp(0.55 + closed.seamStrength / 240, 0.62, 0.95);
       const uEdges = [0, ...closed.vDividers.map((d) => d.position), 1];
       const closedCavities: DetectedCavity[] = [];
-      const closedZones: FrontZone[] = [];
-      let hasOpenBayInside = false;
+      const closedCells: Array<{ uStart: number; uEnd: number; vStart: number; vEnd: number }> = [];
 
       for (let b = 0; b < uEdges.length - 1; b++) {
         const u0 = uEdges[b];
         const u1 = uEdges[b + 1];
-        const uMid = (u0 + u1) / 2;
         const bayShelves = closed.hShelves
           .filter((s) => s.start <= u0 + 0.03 && s.end >= u1 - 0.03)
           .map((s) => s.position)
           .sort((a, c) => a - c);
         const vEdges = [0, ...bayShelves, 1];
         for (let r = 0; r < vEdges.length - 1; r++) {
+          const cell = {
+            uStart: Number(u0.toFixed(4)),
+            uEnd: Number(u1.toFixed(4)),
+            vStart: Number(vEdges[r].toFixed(4)),
+            vEnd: Number(vEdges[r + 1].toFixed(4)),
+          };
+          closedCells.push(cell);
           closedCavities.push({
             id: `cav_closed_${closedCavities.length + 1}`,
-            u0: Number(u0.toFixed(4)),
-            u1: Number(u1.toFixed(4)),
-            v0: Number(vEdges[r].toFixed(4)),
-            v1: Number(vEdges[r + 1].toFixed(4)),
+            u0: cell.uStart,
+            u1: cell.uEnd,
+            v0: cell.vStart,
+            v1: cell.vEnd,
             kind: 'open_bay',
           });
         }
-
-        // Inspeccionar píxeles interiores de la columna para detectar nichos abiertos dentro de racks mixtos (#07)
-        const ix0 = Math.max(0, Math.round((u0 + (u1 - u0) * 0.14) * W));
-        const ix1 = Math.min(W - 1, Math.round((u1 - (u1 - u0) * 0.14) * W));
-        const iy0 = Math.max(0, Math.round(H * 0.12));
-        const iy1 = Math.min(H - 1, Math.round(H * 0.88));
-        let sumL = 0;
-        let mHits = 0;
-        let cnt = 0;
-        for (let y = iy0; y <= iy1; y += 2) {
-          for (let x = ix0; x <= ix1; x += 2) {
-            const idx = y * W + x;
-            sumL += lum[idx];
-            if (matchMap[idx] > 0.52) mHits++;
-            cnt++;
-          }
-        }
-        const colMeanLum = sumL / Math.max(1, cnt);
-        const colMatch = mHits / Math.max(1, cnt);
-        const isDarkOpenCol = colMatch < 0.4 && colMeanLum < refLum - 35;
-
-        if (isDarkOpenCol) {
-          hasOpenBayInside = true;
-          closedZones.push({
-            id: `zone_open_${b + 1}`,
-            uStart: Number(u0.toFixed(4)),
-            uEnd: Number(u1.toFixed(4)),
-            vStart: 0,
-            vEnd: 1,
-            kind: 'open',
-            label: `Nicho ${b + 1}`,
-          });
-        } else if (bayShelves.length >= 1) {
-          // Distinguir cajones apilados (franjas anchas y bajas <= 360 mm) de puertas/vitrinas apiladas en niveles (ej. Vitrina #06)
-          const cellWmm = (u1 - u0) * dimsMm.x;
-          const allDrawerShaped = vEdges.slice(0, -1).every((vLow, idxR) => {
-            const hMm = (vEdges[idxR + 1] - vLow) * dimsMm.y;
-            return hMm <= 360 && cellWmm > hMm * 0.82;
-          });
-          if (allDrawerShaped) {
-            closedZones.push({
-              id: `zone_drawers_${b + 1}`,
-              uStart: Number(u0.toFixed(4)),
-              uEnd: Number(u1.toFixed(4)),
-              vStart: 0,
-              vEnd: 1,
-              kind: 'drawers',
-              drawerCount: bayShelves.length + 1,
-              label: `${bayShelves.length + 1} Cajones`,
-            });
-          } else {
-            // Clasificar cada nivel vertical independientemente (puerta vidrio / nicho abierto / puerta ciega)
-            for (let r = 0; r < vEdges.length - 1; r++) {
-              const vLow = vEdges[r];
-              const vHigh = vEdges[r + 1];
-              const hMm = (vHigh - vLow) * dimsMm.y;
-              const glass = isGlassDoorCell(lum, W, H, u0, u1, vLow, vHigh, hMm);
-              if (glass) {
-                hasOpenBayInside = true;
-                closedZones.push({
-                  id: `zone_glass_${b + 1}_${r + 1}`,
-                  uStart: Number(u0.toFixed(4)),
-                  uEnd: Number(u1.toFixed(4)),
-                  vStart: Number(vLow.toFixed(4)),
-                  vEnd: Number(vHigh.toFixed(4)),
-                  kind: 'door_glass',
-                  label: `Vitrina ${b + 1}`,
-                });
-              } else {
-                const colHandle = closed.detectedHandles.find(
-                  (h) => h.u >= u0 - 0.02 && h.u <= u1 + 0.02 && h.v >= vLow && h.v <= vHigh,
-                );
-                const opensLeft = colHandle ? colHandle.u >= uMid : b % 2 === 0;
-                closedZones.push({
-                  id: `zone_door_${b + 1}_${r + 1}`,
-                  uStart: Number(u0.toFixed(4)),
-                  uEnd: Number(u1.toFixed(4)),
-                  vStart: Number(vLow.toFixed(4)),
-                  vEnd: Number(vHigh.toFixed(4)),
-                  kind: opensLeft ? 'door_left' : 'door_right',
-                  label: `Puerta ${b + 1}`,
-                });
-              }
-            }
-          }
-        } else {
-          const glass = isGlassDoorCell(lum, W, H, u0, u1, 0, 1, dimsMm.y);
-          const colHandle = closed.detectedHandles.find((h) => h.u >= u0 - 0.02 && h.u <= u1 + 0.02);
-          const opensLeft = colHandle ? colHandle.u >= uMid : b % 2 === 0;
-          closedZones.push({
-            id: `zone_door_${b + 1}`,
-            uStart: Number(u0.toFixed(4)),
-            uEnd: Number(u1.toFixed(4)),
-            vStart: 0,
-            vEnd: 1,
-            kind: glass ? 'door_glass' : opensLeft ? 'door_left' : 'door_right',
-            label: glass ? `Vitrina ${b + 1}` : `Puerta ${b + 1}`,
-          });
-        }
       }
+
+      const closedZones = classifyZonesUnified(closedCells, {
+        rectRgba: rgba,
+        rectW: W,
+        rectH: H,
+        dimsMm,
+        boardThicknessMm,
+        carcassMaterial: detectedMaterial,
+        refRgb,
+        exteriorBgRgb: opts.exteriorBgRgb,
+        lum,
+        matchMap,
+        detectedHandles: closed.detectedHandles,
+        mergeDrawers: true,
+        modeHint: 'closed',
+        idPrefix: 'zone',
+      });
+
+      const filteredHShelves = suppressShelvesInsideDrawers(closed.hShelves, closedZones);
+      const hasOpenOrSpecial = closedZones.some(
+        (z) =>
+          z.kind === 'open' ||
+          z.kind === 'door_glass' ||
+          z.kind === 'leg_void' ||
+          z.kind === 'void_outside' ||
+          z.kind === 'baskets',
+      );
+
       return {
-        furnitureMode: hasOpenBayInside ? 'hybrid' : 'closed_front',
+        furnitureMode: hasOpenOrSpecial ? 'hybrid' : 'closed_front',
         vDividers: closed.vDividers,
-        hShelves: closed.hShelves,
+        hShelves: filteredHShelves,
         detectedHandles: closed.detectedHandles,
         cavities: closedCavities,
         inferredZones: closedZones,
@@ -1376,12 +807,13 @@ export function analyzeRectifiedFurniture(
       opts.exteriorBgRgb,
     );
     if (hybrid.vDividers.length + hybrid.hShelves.length > 0 && hybrid.strength >= 20) {
-      const hybConf = Math.max(0.6, Math.min(0.92, 0.55 + hybrid.strength / 200));
+      const hybConf = clamp(0.55 + hybrid.strength / 200, 0.6, 0.92);
       return {
         furnitureMode: 'hybrid',
         vDividers: hybrid.vDividers,
         hShelves: hybrid.hShelves,
-        detectedHandles: closed.detectedHandles,
+        detectedHandles:
+          hybrid.detectedHandles.length > 0 ? hybrid.detectedHandles : closed.detectedHandles,
         cavities: hybrid.cavities,
         inferredZones: hybrid.inferredZones,
         detectedMaterial,
@@ -1392,7 +824,7 @@ export function analyzeRectifiedFurniture(
     }
 
     // Sin ranuras ni transiciones claras (ej. blanco sobre blanco sin contraste) -> NO CONFIABLE
-    const rawConf = Math.max(0, Math.min(0.45, 1 - interiorMatch * 1.05));
+    const rawConf = clamp(1 - interiorMatch * 1.05, 0, 0.45);
     return {
       furnitureMode: 'uncertain',
       vDividers: [],
@@ -1409,10 +841,8 @@ export function analyzeRectifiedFurniture(
 
   // =========================================================================
   // RAMA A: MUEBLE ABIERTO / MULTI-RECUADRO (RECURSIVE XY-CUT + CAVIDADES)
-  // Soporta estanterías, racks, clósets, escritorios con vano de piernas y
-  // muebles con recuadros asimétricos (divisores verticales continuos y parciales).
   // =========================================================================
-  const confidence = Math.max(0.52, Math.min(1, 1 - interiorMatch * 1.05));
+  const confidence = clamp(1 - interiorMatch * 1.05, 0.52, 1);
 
   const xStartInt = tPx;
   const xEndInt = W - tPx;
@@ -1421,25 +851,10 @@ export function analyzeRectifiedFurniture(
   const fwX = Math.max(tPx + 2, Math.round(tPx * 1.6));
   const fhY = Math.max(tPy + 2, Math.round(tPy * 1.6));
 
-  interface RawVDiv {
-    uInt: number;
-    vStart: number;
-    vEnd: number;
-    pxCenter: number;
-    score: number;
-  }
-  interface RawHShelf {
-    vInt: number;
-    uStart: number;
-    uEnd: number;
-    pyCenter: number;
-    score: number;
-  }
-
   const colAvgAt = (x0: number, x1: number, y: number): number => {
     const cx0 = Math.max(0, x0);
     const cx1 = Math.min(W - 1, x1);
-    const cy = Math.max(0, Math.min(H - 1, y));
+    const cy = clamp(y, 0, H - 1);
     let sum = 0;
     const rowOff = cy * W;
     for (let cx = cx0; cx <= cx1; cx++) sum += matchMap[rowOff + cx];
@@ -1463,7 +878,7 @@ export function analyzeRectifiedFurniture(
 
     let bestSupport = 0;
     for (let dy = -bandHalf; dy <= bandHalf; dy++) {
-      const yy = Math.max(0, Math.min(H - 1, Math.round(yEdge + dy)));
+      const yy = clamp(Math.round(yEdge + dy), 0, H - 1);
       const leftM = l1 > l0 ? colAvgAt(l0, l1, yy) : 0;
       const rightM = r1 > r0 ? colAvgAt(r0, r1, yy) : 0;
       bestSupport = Math.max(bestSupport, Math.max(leftM, rightM));
@@ -1477,7 +892,7 @@ export function analyzeRectifiedFurniture(
     ry0: number,
     ry1: number,
     isPartialTier: boolean,
-  ): Array<{ x: number; score: number }> => {
+  ): XYCutCandidate[] => {
     const regW = rx1 - rx0;
     const regH = ry1 - ry0;
     if (regW < Math.max(28, tPx * 4) || regH < Math.max(24, tPy * 4)) return [];
@@ -1517,24 +932,13 @@ export function analyzeRectifiedFurniture(
     }
 
     const nmsRadX = Math.max(tPx * 3, Math.round(regW * 0.07));
-    const cands: Array<{ x: number; score: number }> = [];
-    for (let x = minX; x <= maxX; x++) {
-      const s = divScores[x];
-      if (s <= 0) continue;
-      let isPeak = true;
-      for (let dx = -nmsRadX; dx <= nmsRadX; dx++) {
-        if (dx === 0) continue;
-        const nx = x + dx;
-        if (nx >= minX && nx <= maxX && divScores[nx] > s) {
-          isPeak = false;
-          break;
-        }
-      }
-      if (!isPeak) continue;
+    const peaks = findLocalPeaks1D(divScores, minX, maxX, nmsRadX, 0, { subpixelRefine: true });
+    const cands: XYCutCandidate[] = [];
 
-      // Verificar continuidad de extremo a extremo dentro de la región [ry0..ry1]
-      const cx0 = Math.max(0, x);
-      const cx1 = Math.min(W - 1, x + tPx - 1);
+    for (const pk of peaks) {
+      const xInt = Math.round(pk.pos);
+      const cx0 = Math.max(0, xInt);
+      const cx1 = Math.min(W - 1, xInt + tPx - 1);
       let bestStart = ry0;
       let bestEnd = ry0;
       let runStart = -1;
@@ -1564,8 +968,6 @@ export function analyzeRectifiedFurniture(
         continue;
       }
 
-      // Si es divisor parcial (en un subnivel), trazar su corrida completa global para
-      // descartar pilas de libros que sobresalen y terminan flotando en el aire.
       if (isPartialTier) {
         let fullTop = ry0;
         let miss = 0;
@@ -1589,21 +991,20 @@ export function analyzeRectifiedFurniture(
             if (miss > gapTol) break;
           }
         }
-        const xMid = x + tPx / 2;
+        const xMid = pk.pos + tPx / 2;
         if (!hasHorizontalSupportAt(xMid, fullTop) || !hasHorizontalSupportAt(xMid, fullBot)) {
           continue;
         }
       }
 
-      const sL = divScores[x - 1] ?? 0;
-      const sR = divScores[x + 1] ?? 0;
-      const denom = sL - 2 * s + sR;
-      const subShift =
-        Math.abs(denom) > 1e-6 ? Math.max(-0.5, Math.min(0.5, (0.5 * (sL - sR)) / denom)) : 0;
-      cands.push({ x: x + subShift, score: s });
+      const pxCenter = pk.pos + tPx / 2;
+      cands.push({
+        posPx: pxCenter,
+        posNorm: exteriorToInterior(pxCenter / W, boardThicknessMm, dimsMm.x),
+        score: pk.score,
+      });
     }
 
-    cands.sort((a, b) => a.x - b.x);
     return cands;
   };
 
@@ -1613,7 +1014,7 @@ export function analyzeRectifiedFurniture(
     ry0: number,
     ry1: number,
     requireFullSpanEnds: boolean,
-  ): Array<{ y: number; score: number }> => {
+  ): XYCutCandidate[] => {
     const regW = rx1 - rx0;
     const regH = ry1 - ry0;
     if (regW < Math.max(12, tPx * 2) || regH < Math.max(24, tPy * 4)) return [];
@@ -1654,26 +1055,14 @@ export function analyzeRectifiedFurniture(
     }
 
     const nmsRadY = Math.max(tPy * 3, Math.round(regH * 0.06));
-    const cands: Array<{ y: number; score: number }> = [];
+    const peaks = findLocalPeaks1D(rowScores, minY, maxY, nmsRadY, 0, { subpixelRefine: true });
+    const cands: XYCutCandidate[] = [];
 
-    for (let y = minY; y <= maxY; y++) {
-      const s = rowScores[y];
-      if (s <= 0) continue;
-      let isPeak = true;
-      for (let dy = -nmsRadY; dy <= nmsRadY; dy++) {
-        if (dy === 0) continue;
-        const ny = y + dy;
-        if (ny >= minY && ny <= maxY && rowScores[ny] > s) {
-          isPeak = false;
-          break;
-        }
-      }
-      if (!isPeak) continue;
-
+    for (const pk of peaks) {
+      const yInt = Math.round(pk.pos);
       if (requireFullSpanEnds) {
-        // Exigir continuidad horizontal de extremo a extremo (evita tomar repisa parcial como corte total)
-        const cy0 = Math.max(0, y);
-        const cy1 = Math.min(H - 1, y + tPy - 1);
+        const cy0 = Math.max(0, yInt);
+        const cy1 = Math.min(H - 1, yInt + tPy - 1);
         let bestStart = rx0;
         let bestEnd = rx0;
         let runStart = -1;
@@ -1704,162 +1093,71 @@ export function analyzeRectifiedFurniture(
         }
       }
 
-      const sU = rowScores[y - 1] ?? 0;
-      const sD = rowScores[y + 1] ?? 0;
-      const denom = sU - 2 * s + sD;
-      const subShift =
-        Math.abs(denom) > 1e-6 ? Math.max(-0.5, Math.min(0.5, (0.5 * (sU - sD)) / denom)) : 0;
-      cands.push({ y: y + subShift, score: s });
+      const pyCenter = pk.pos + tPy / 2;
+      cands.push({
+        posPx: pyCenter,
+        posNorm: exteriorToInterior(1 - pyCenter / H, boardThicknessMm, dimsMm.y),
+        score: pk.score,
+      });
     }
 
-    cands.sort((a, b) => a.y - b.y);
     return cands;
   };
 
-  const rawVDivs: RawVDiv[] = [];
-  const rawShelves: RawHShelf[] = [];
-  const cavities: DetectedCavity[] = [];
   const bayPadX = Math.max(tPx + 2, Math.round(tPx * 1.4));
   const tierPadY = Math.max(tPy + 2, Math.round(tPy * 1.3));
 
-  const recurseXYCut = (
-    rx0: number,
-    rx1: number,
-    ry0: number,
-    ry1: number,
-    u0: number,
-    u1: number,
-    v0: number,
-    v1: number,
-    depth: number,
-  ): void => {
-    if (depth >= 3 || rx1 - rx0 < Math.max(18, tPx * 2.5) || ry1 - ry0 < Math.max(18, tPy * 2.5)) {
-      const spanU = u1 - u0;
-      const spanV = v1 - v0;
-      const isKneeSpace = v0 <= 0.02 && spanU >= 0.34 && spanV >= 0.32 && spanU < 0.92;
-      cavities.push({
-        id: `cav_${cavities.length + 1}`,
-        u0: Number(u0.toFixed(4)),
-        u1: Number(u1.toFixed(4)),
-        v0: Number(v0.toFixed(4)),
-        v1: Number(v1.toFixed(4)),
-        kind: isKneeSpace ? 'knee_space' : 'open_bay',
-      });
-      return;
-    }
+  const xyOpen = runRecursiveXYCut(
+    { rx0: xStartInt, rx1: xEndInt, ry0: yStartInt, ry1: yEndInt, u0: 0, u1: 1, v0: 0, v1: 1 },
+    {
+      maxDepth: 3,
+      minRegionW: Math.max(18, tPx * 2.5),
+      minRegionH: Math.max(18, tPy * 2.5),
+      minNormSpanU: 0.06,
+      minNormSpanV: 0.06,
+      minCutMarginNorm: 0.04,
+      padX: (isOuter) => (isOuter ? 3 : bayPadX),
+      padY: (isOuter) => (isOuter ? 2 : tierPadY),
+      vTopDownPx: true,
+      idPrefix: { v: 'auto_div', h: 'auto_rep' },
+      findVerticalCuts: (reg) =>
+        findVerticalCutsInRegion(
+          reg.rx0,
+          reg.rx1,
+          reg.ry0,
+          reg.ry1,
+          reg.depth > 0 && (reg.v0 > 0.02 || reg.v1 < 0.98),
+        ),
+      findHorizontalCuts: (reg) =>
+        findHorizontalCutsInRegion(reg.rx0, reg.rx1, reg.ry0, reg.ry1, reg.depth === 0),
+      chooseAxis: (vCuts, hCuts) => {
+        if (vCuts.length > 0) return 'vertical';
+        if (hCuts.length > 0) return 'horizontal';
+        return 'none';
+      },
+    },
+  );
 
-    const isPartialTier = depth > 0 && (v0 > 0.02 || v1 < 0.98);
-    const vCuts = findVerticalCutsInRegion(rx0, rx1, ry0, ry1, isPartialTier);
-    const hCuts = findHorizontalCutsInRegion(rx0, rx1, ry0, ry1, depth === 0);
-
-    // Priorizar cortes verticales cuando existen a altura completa de la región
-    // (mantiene 100% compatibilidad con Rack TV, Clóset y grillas completas;
-    // cuando solo hay cortes horizontales, particiona por niveles y detecta divisores parciales).
-    if (vCuts.length > 0) {
-      const divUs: number[] = [];
-      const divPxs: number[] = [];
-
-      for (const vc of vCuts) {
-        const pxCenter = vc.x + tPx / 2;
-        const uExt = pxCenter / W;
-        const uInt = exteriorToInterior(uExt, boardThicknessMm, dimsMm.x);
-        if (uInt <= u0 + 0.04 || uInt >= u1 - 0.04) continue;
-        divUs.push(uInt);
-        divPxs.push(pxCenter);
-        rawVDivs.push({
-          uInt,
-          vStart: v0,
-          vEnd: v1,
-          pxCenter,
-          score: vc.score,
-        });
-      }
-
-      if (divUs.length > 0) {
-        const pxStops = [rx0, ...divPxs, rx1];
-        const uStops = [u0, ...divUs, u1];
-        for (let b = 0; b < pxStops.length - 1; b++) {
-          const bx0 = Math.round(pxStops[b] + (b === 0 ? 3 : bayPadX));
-          const bx1 = Math.round(pxStops[b + 1] - (b === pxStops.length - 2 ? 3 : bayPadX));
-          recurseXYCut(bx0, bx1, ry0, ry1, uStops[b], uStops[b + 1], v0, v1, depth + 1);
-        }
-        return;
-      }
-    }
-
-    if (hCuts.length > 0) {
-      // hCuts están ordenados de arriba (y pequeño -> v alto) hacia abajo (y grande -> v bajo)
-      const shelfVs: number[] = [];
-      const shelfPys: number[] = [];
-
-      for (const hc of hCuts) {
-        const pyCenter = hc.y + tPy / 2;
-        const vExt = 1 - pyCenter / H;
-        const vInt = exteriorToInterior(vExt, boardThicknessMm, dimsMm.y);
-        if (vInt <= v0 + 0.04 || vInt >= v1 - 0.04) continue;
-        shelfVs.push(vInt);
-        shelfPys.push(pyCenter);
-        rawShelves.push({
-          vInt,
-          uStart: u0,
-          uEnd: u1,
-          pyCenter,
-          score: hc.score,
-        });
-      }
-
-      if (shelfVs.length > 0) {
-        const pyStops = [ry0, ...shelfPys, ry1];
-        const vTopToBotStops = [v1, ...shelfVs, v0];
-        for (let t = 0; t < pyStops.length - 1; t++) {
-          const ty0 = Math.round(pyStops[t] + (t === 0 ? 2 : tierPadY));
-          const ty1 = Math.round(pyStops[t + 1] - (t === pyStops.length - 2 ? 2 : tierPadY));
-          const tierVHigh = vTopToBotStops[t];
-          const tierVLow = vTopToBotStops[t + 1];
-          recurseXYCut(rx0, rx1, ty0, ty1, u0, u1, tierVLow, tierVHigh, depth + 1);
-        }
-        return;
-      }
-    }
-
-    // Hoja sin más subdivisiones -> registrar cavidad/espacio vacío
-    const spanU = u1 - u0;
-    const spanV = v1 - v0;
-    const isKneeSpace = v0 <= 0.02 && spanU >= 0.34 && spanV >= 0.32 && spanU < 0.92;
-    cavities.push({
-      id: `cav_${cavities.length + 1}`,
-      u0: Number(u0.toFixed(4)),
-      u1: Number(u1.toFixed(4)),
-      v0: Number(v0.toFixed(4)),
-      v1: Number(v1.toFixed(4)),
-      kind: isKneeSpace ? 'knee_space' : 'open_bay',
-    });
-  };
-
-  recurseXYCut(xStartInt, xEndInt, yStartInt, yEndInt, 0, 1, 0, 1, 0);
-
-  // Consolidar divisores verticales (ordenados por u, luego vStart)
-  rawVDivs.sort((a, b) => a.uInt - b.uInt || a.vStart - b.vStart);
-  const vDividers: NormalizedSegment[] = rawVDivs.map((d, idx) => ({
-    id: `auto_div_${idx + 1}`,
-    position: Number(d.uInt.toFixed(4)),
-    start: Number(d.vStart.toFixed(4)),
-    end: Number(d.vEnd.toFixed(4)),
-  }));
+  // Consolidar divisores verticales ordenados por u, luego vStart
+  const vDividers: NormalizedSegment[] = [...xyOpen.vDividers]
+    .sort((a, b) => a.position - b.position || a.start - b.start)
+    .map((d, idx) => ({ ...d, id: `auto_div_${idx + 1}` }));
 
   // Fusión de repisas horizontales colineales entre vanos adyacentes
-  rawShelves.sort((a, b) => a.vInt - b.vInt || a.uStart - b.uStart);
+  const sortedShelves = [...xyOpen.hShelves].sort(
+    (a, b) => a.position - b.position || a.start - b.start,
+  );
   const merged: Array<{ vInt: number; uStart: number; uEnd: number; count: number }> = [];
-  for (const rs of rawShelves) {
+  for (const rs of sortedShelves) {
     const matchMerge = merged.find(
-      (m) => Math.abs(m.vInt - rs.vInt) <= 0.02 && Math.abs(m.uEnd - rs.uStart) <= 0.02,
+      (m) => Math.abs(m.vInt - rs.position) <= 0.02 && Math.abs(m.uEnd - rs.start) <= 0.02,
     );
     if (matchMerge) {
-      matchMerge.vInt = (matchMerge.vInt * matchMerge.count + rs.vInt) / (matchMerge.count + 1);
-      matchMerge.uEnd = rs.uEnd;
+      matchMerge.vInt = (matchMerge.vInt * matchMerge.count + rs.position) / (matchMerge.count + 1);
+      matchMerge.uEnd = rs.end;
       matchMerge.count++;
     } else {
-      merged.push({ vInt: rs.vInt, uStart: rs.uStart, uEnd: rs.uEnd, count: 1 });
+      merged.push({ vInt: rs.position, uStart: rs.start, uEnd: rs.end, count: 1 });
     }
   }
 
@@ -1870,8 +1168,21 @@ export function analyzeRectifiedFurniture(
     end: Number(m.uEnd.toFixed(4)),
   }));
 
-  // Si Rama A no encontró divisiones (ej. mueble bicolor con puertas oscuras/claras y carcasa distinta,
-  // o escritorio sobre fondo blanco), intentar detector híbrido por transiciones de bordes/colores.
+  const cavities: DetectedCavity[] = xyOpen.leaves.map((lf, idx) => {
+    const spanU = lf.u1 - lf.u0;
+    const spanV = lf.v1 - lf.v0;
+    const isKneeSpace = lf.v0 <= 0.02 && spanU >= 0.34 && spanV >= 0.32 && spanU < 0.92;
+    return {
+      id: `cav_${idx + 1}`,
+      u0: Number(lf.u0.toFixed(4)),
+      u1: Number(lf.u1.toFixed(4)),
+      v0: Number(lf.v0.toFixed(4)),
+      v1: Number(lf.v1.toFixed(4)),
+      kind: isKneeSpace ? 'knee_space' : 'open_bay',
+    };
+  });
+
+  // Fallback híbrido cuando Rama A no detectó divisiones (ej. bicolor o escritorio sobre pared blanca)
   if (vDividers.length === 0 && hShelves.length === 0) {
     const hybrid = detectHybridEdgeTransitions(
       rgba,
@@ -1886,12 +1197,12 @@ export function analyzeRectifiedFurniture(
       opts.exteriorBgRgb,
     );
     if (hybrid.vDividers.length + hybrid.hShelves.length > 0 && hybrid.strength >= 20) {
-      const hybConf = Math.max(0.6, Math.min(0.92, 0.55 + hybrid.strength / 200));
+      const hybConf = clamp(0.55 + hybrid.strength / 200, 0.6, 0.92);
       return {
         furnitureMode: 'hybrid',
         vDividers: hybrid.vDividers,
         hShelves: hybrid.hShelves,
-        detectedHandles: [],
+        detectedHandles: hybrid.detectedHandles,
         cavities: hybrid.cavities,
         inferredZones: hybrid.inferredZones,
         detectedMaterial,
@@ -1902,103 +1213,34 @@ export function analyzeRectifiedFurniture(
     }
   }
 
-  // Clasificar cada cavidad detectada en Rama A (abierto, hueco de piernas, o puerta bicolor cerrada #04)
-  let hasClosedFrontPanel = false;
-  const openZones: FrontZone[] = cavities.map((cav, idx) => {
-    const ix0 = Math.max(0, Math.round(cav.u0 * W + W * 0.04));
-    const ix1 = Math.min(W - 1, Math.round(cav.u1 * W - W * 0.04));
-    const iy0 = Math.max(0, Math.round((1 - cav.v1) * H + H * 0.04));
-    const iy1 = Math.min(H - 1, Math.round((1 - cav.v0) * H - H * 0.04));
-    let sumR = 0, sumG = 0, sumB = 0, sumL = 0, sumL2 = 0, bgHits = 0, cnt = 0;
-
-    for (let y = iy0; y <= iy1; y += 2) {
-      for (let x = ix0; x <= ix1; x += 2) {
-        const i = y * W + x;
-        const p = i * 4;
-        const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
-        sumR += r;
-        sumG += g;
-        sumB += b;
-        const l = lum[i];
-        sumL += l;
-        sumL2 += l * l;
-        if (opts.exteriorBgRgb) {
-          const d = Math.hypot(
-            r - opts.exteriorBgRgb[0],
-            g - opts.exteriorBgRgb[1],
-            b - opts.exteriorBgRgb[2],
-          );
-          if (d <= 38) bgHits++;
-        }
-        cnt++;
-      }
-    }
-
-    const nSafe = Math.max(1, cnt);
-    const meanR = sumR / nSafe;
-    const meanG = sumG / nSafe;
-    const meanB = sumB / nSafe;
-    const meanL = sumL / nSafe;
-    const stdL = Math.sqrt(Math.max(0, sumL2 / nSafe - meanL * meanL));
-    const bgRatio = bgHits / nSafe;
-
-    const isBgVoid =
-      cav.v0 <= 0.04 &&
-      bgRatio >= 0.55 &&
-      (cav.u1 - cav.u0 < 0.94 || cav.v1 - cav.v0 < 0.92);
-
-    if (isBgVoid) {
-      return {
-        id: `zone_leg_void_${idx + 1}`,
-        uStart: cav.u0,
-        uEnd: cav.u1,
-        vStart: cav.v0,
-        vEnd: cav.v1,
-        kind: 'leg_void',
-        label: 'Hueco Piernas',
-      };
-    }
-
-    // Panel cerrado bicolor de madera cálida (ej. puertas nogal/roble en mueble gris/blanco #04, #14)
-    const warmth = meanR - meanB;
-    const distCarcass = Math.hypot(meanR - refRgb[0], meanG - refRgb[1], meanB - refRgb[2]);
-    const isContrastingWoodDoor =
-      cavities.length >= 2 &&
-      stdL < 38 &&
-      warmth > 18 &&
-      detectedMaterial !== 'roble' &&
-      distCarcass > 36;
-
-    if (isContrastingWoodDoor) {
-      hasClosedFrontPanel = true;
-      const wideCell = (cav.u1 - cav.u0) * dimsMm.x > 620;
-      return {
-        id: `zone_door_bicolor_${idx + 1}`,
-        uStart: cav.u0,
-        uEnd: cav.u1,
-        vStart: cav.v0,
-        vEnd: cav.v1,
-        kind: wideCell ? 'door_double' : 'door_left',
-        label: wideCell ? 'Puertas Roble' : 'Puerta Roble',
-        materialOverride: 'roble',
-      };
-    }
-
-    return {
-      id: `zone_open_${idx + 1}`,
-      uStart: cav.u0,
-      uEnd: cav.u1,
-      vStart: cav.v0,
-      vEnd: cav.v1,
-      kind: 'open',
-      label: `Vano ${idx + 1}`,
-    };
-  });
+  // Clasificar cada cavidad detectada en Rama A usando el clasificador CIE-Lab unificado (`interiorToExteriorRect`)
+  const openZones = classifyZonesUnified(
+    cavities.map((c) => ({ uStart: c.u0, uEnd: c.u1, vStart: c.v0, vEnd: c.v1 })),
+    {
+      rectRgba: rgba,
+      rectW: W,
+      rectH: H,
+      dimsMm,
+      boardThicknessMm,
+      carcassMaterial: detectedMaterial,
+      refRgb,
+      exteriorBgRgb: opts.exteriorBgRgb,
+      lum,
+      matchMap,
+      mergeDrawers: false,
+      modeHint: 'open',
+      idPrefix: 'zone',
+    },
+  );
+  const finalHShelves = suppressShelvesInsideDrawers(hShelves, openZones);
+  const hasClosedFrontPanel = openZones.some(
+    (z) => z.kind !== 'open' && z.kind !== 'leg_void' && z.kind !== 'void_outside',
+  );
 
   return {
     furnitureMode: hasClosedFrontPanel ? 'hybrid' : 'open',
     vDividers,
-    hShelves,
+    hShelves: finalHShelves,
     detectedHandles: [],
     cavities,
     inferredZones: openZones,
@@ -2011,58 +1253,14 @@ export function analyzeRectifiedFurniture(
 
 /**
  * Analiza la franja inclinada paralela a la base [BL -> BR] debajo del cuerpo de melamina
- * para detectar patas independientes en los extremos + espacio sombreado bajo el mueble.
+ * para detectar patas externas, ruedas giratorias o zócalo continuo (`toe_kick`).
  */
 export function detectLowerGapHint(
   srcRgba: Uint8ClampedArray,
   srcW: number,
   srcH: number,
   quadCorners: readonly [Point2D, Point2D, Point2D, Point2D],
+  exteriorBgRgb?: readonly [number, number, number],
 ): LowerGapHintResult {
-  const [tl, tr, br, bl] = quadCorners;
-  const bodyH = 0.5 * (Math.hypot(bl.x - tl.x, bl.y - tl.y) + Math.hypot(br.x - tr.x, br.y - tr.y));
-  const dropOffset = Math.round(bodyH * 0.14);
-
-  if (bodyH < 40 || dropOffset < 10) {
-    return { possibleExternalLegs: false };
-  }
-
-  const lumAt = (x: number, y: number): number => {
-    const ix = Math.max(0, Math.min(srcW - 1, Math.round(x)));
-    const iy = Math.max(0, Math.min(srcH - 1, Math.round(y)));
-    const i = (iy * srcW + ix) * 4;
-    return 0.299 * srcRgba[i] + 0.587 * srcRgba[i + 1] + 0.114 * srcRgba[i + 2];
-  };
-
-  // Muestrear a lo largo de la línea inclinada BL -> BR desplazada `dropOffset` px hacia abajo
-  const samples = 60;
-  const edgeLums: number[] = [];
-  const midLums: number[] = [];
-
-  for (let k = 0; k <= samples; k++) {
-    const t = k / samples;
-    const px = bl.x + (br.x - bl.x) * t;
-    const py = bl.y + (br.y - bl.y) * t + dropOffset;
-    if (py >= srcH - 2) continue;
-    const l = lumAt(px, py);
-    if (t <= 0.12 || t >= 0.88) {
-      edgeLums.push(l);
-    } else if (t >= 0.22 && t <= 0.78) {
-      midLums.push(l);
-    }
-  }
-
-  if (edgeLums.length < 4 || midLums.length < 10) {
-    return { possibleExternalLegs: false };
-  }
-
-  const midMed = median(midLums);
-  const contrastHits = edgeLums.filter((l) => Math.abs(l - midMed) > 20).length;
-  const ratio = contrastHits / edgeLums.length;
-  const possibleExternalLegs = ratio >= 0.16;
-
-  return {
-    possibleExternalLegs,
-    estimatedLegRatio: possibleExternalLegs ? Number((dropOffset * 1.4 / bodyH).toFixed(3)) : undefined,
-  };
+  return detectBaseSupportHint(srcRgba, srcW, srcH, quadCorners, exteriorBgRgb);
 }

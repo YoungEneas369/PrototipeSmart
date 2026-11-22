@@ -1,13 +1,16 @@
 {
   "name": "smartfurniture",
   "private": true,
-  "version": "3.0.0",
+  "version": "8.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "audit:offline": "node scripts/audit-offline.mjs"
   },
   "dependencies": {
     "@react-three/drei": "9.122.0",

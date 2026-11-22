@@ -3,6 +3,8 @@ name: Deploy SmartFurniture to GitHub Pages
 on:
   push:
     branches: ["main"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -27,18 +29,25 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Run test suite
+      - name: Typecheck (strict tsc -b)
+        run: npm run typecheck
+      - name: Run unit and UI regression tests
         run: npm test
       - name: Build production bundle
         run: npm run build
+      - name: Run 100% offline & PWA precache audit
+        run: npm run audit:offline
       - name: Setup Pages
+        if: github.event_name != 'pull_request'
         uses: actions/configure-pages@v5
       - name: Upload artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist
 
   deploy:
+    if: github.event_name != 'pull_request'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

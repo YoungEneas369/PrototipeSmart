@@ -1,94 +1,21 @@
 /**
- * SMARTFURNITURE — GENERADOR DE PLANOS VECTORIALES 2D TÉCNICOS (v3.2)
- * 100% offline, SVG XML-safe, con alzado frontal acotado, perfil lateral ZY,
- * simbología real de puertas, vidrios, cajones (5 piezas), patas externas, zócalos y cartela técnica.
+ * SMARTFURNITURE — GENERADOR DE PLANOS VECTORIALES 2D TÉCNICOS (v8.0)
+ * 100% offline, SVG XML-safe (`escapeXml` compartido), con alzado frontal acotado,
+ * perfil lateral ZY con zócalo y frentes de altura parcial `[vStart, vEnd]`, escalones
+ * `void_outside` (incluso sin fondo trasero), simbología real de puertas/vidrios/cajones/canastos
+ * y cartela técnica con formato dinámico de plancha (`250×183 cm` Chile, `244×122 cm`, etc.).
  */
 import type {
   CuttingPlanResult,
   DespieceResult,
-  FrontZone,
   FurnitureTopology,
   ScaleAndBoardParams,
-  NormalizedSegment,
 } from '../../types/contracts';
 import { resolveBaseSupport } from '../mathEngine';
-import type { DetectedHandlePoint } from '../vision';
+import { escapeXml } from '../utils/xml';
 
-function escapeXml(str: string): string {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
-/**
- * Traduce la detección automática de visión (`vDividers`, `hShelves`, `furnitureMode`, `detectedHandles`)
- * en zonas funcionales `FrontZone[]` para que el Plano Vectorial 2D y el motor de despiece
- * construyan puertas y cajones completos (5 piezas/cajón) de forma automática.
- */
-export function inferFrontZonesFromDetection(
-  vDividers: readonly NormalizedSegment[],
-  hShelves: readonly NormalizedSegment[],
-  furnitureMode: 'open' | 'closed_front' | 'hybrid' | 'uncertain',
-  detectedHandles: readonly DetectedHandlePoint[] = [],
-): FrontZone[] {
-  const uStops = [0, ...[...vDividers].sort((a, b) => a.position - b.position).map((d) => d.position), 1];
-  const zones: FrontZone[] = [];
-
-  for (let i = 0; i < uStops.length - 1; i++) {
-    const u0 = uStops[i];
-    const u1 = uStops[i + 1];
-    const uMid = (u0 + u1) / 2;
-
-    if (furnitureMode !== 'closed_front') {
-      zones.push({
-        id: `zone_open_${i + 1}`,
-        uStart: Number(u0.toFixed(4)),
-        uEnd: Number(u1.toFixed(4)),
-        vStart: 0,
-        vEnd: 1,
-        kind: 'open',
-        label: `Vano ${i + 1}`,
-      });
-      continue;
-    }
-
-    // Buscar ranuras horizontales dentro de esta columna (cajones)
-    const colShelves = hShelves.filter(
-      (s) => s.start <= u0 + 0.04 && s.end >= u1 - 0.04,
-    );
-
-    if (colShelves.length >= 1) {
-      zones.push({
-        id: `zone_drawers_${i + 1}`,
-        uStart: Number(u0.toFixed(4)),
-        uEnd: Number(u1.toFixed(4)),
-        vStart: 0,
-        vEnd: 1,
-        kind: 'drawers',
-        drawerCount: colShelves.length + 1,
-        label: `Cajonera (${colShelves.length + 1})`,
-      });
-    } else {
-      // Determinar sentido de apertura según ubicación del tirador en esta columna
-      const colHandle = detectedHandles.find((h) => h.u >= u0 - 0.02 && h.u <= u1 + 0.02);
-      const opensLeft = colHandle ? colHandle.u >= uMid : i % 2 === 0;
-      zones.push({
-        id: `zone_door_${i + 1}`,
-        uStart: Number(u0.toFixed(4)),
-        uEnd: Number(u1.toFixed(4)),
-        vStart: 0,
-        vEnd: 1,
-        kind: opensLeft ? 'door_left' : 'door_right',
-        label: `Puerta ${i + 1}`,
-      });
-    }
-  }
-
-  return zones;
-}
+export { CATALOG_14_MUEBLES, cloneCatalogFurniture } from './catalog14';
+export type { CatalogFurnitureSpec } from './catalog14';
 
 export interface BlueprintRenderOptions {
   title?: string;
@@ -156,10 +83,10 @@ export function renderFurnitureVectorBlueprintSvg(
     `<text x="18" y="20" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="700" fill="#ffffff">${escapeXml(title)}</text>`,
   );
   lines.push(
-    `<text x="18" y="36" font-family="Consolas, monospace" font-size="10.5" fill="#7dd3fc">${escapeXml(stage)} · Cuerpo Melamina ${Math.round(xf)}×${Math.round(yf)}×${Math.round(zf)} mm (e=${e} mm)</text>`,
+    `<text x="18" y="36" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" fill="#7dd3fc">${escapeXml(stage)} · Cuerpo Melamina ${Math.round(xf)}×${Math.round(yf)}×${Math.round(zf)} mm (e=${e} mm)</text>`,
   );
   lines.push(
-    `<text x="${svgW - 18}" y="27" text-anchor="end" font-family="Consolas, monospace" font-size="11" font-weight="700" fill="#38bdf8">ESCALA 1:${Math.max(1, Math.round(1 / sc))}</text>`,
+    `<text x="${svgW - 18}" y="27" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#38bdf8">ESCALA 1:${Math.max(1, Math.round(1 / sc))}</text>`,
   );
 
   // Grilla técnica suave de fondo
@@ -169,29 +96,48 @@ export function renderFurnitureVectorBlueprintSvg(
   // 1. ALZADO FRONTAL (XY)
   // =========================================================================
   lines.push(
-    `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">ALZADO FRONTAL (PLANO XY)</text>`,
+    `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">ALZADO FRONTAL (PLANO XY)</text>`,
   );
 
-  // Fondo interior general (trazado por paños reales de fondo o carcasa, respetando recortes `void_outside`)
+  // Fondo interior general respetando recortes `void_outside` incluso cuando `hasBackPanel === false`
   const zones = topology.frontZones ?? [];
-  const hasStepVoid = zones.some((z) => z.kind === 'void_outside');
+  const stepVoidZones = zones.filter((z) => z.kind === 'void_outside');
+  const hasStepVoid = stepVoidZones.length > 0;
+
   if (!hasStepVoid) {
     lines.push(
       `<rect x="${frontX.toFixed(2)}" y="${frontY.toFixed(2)}" width="${fw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#0f172a" stroke-width="1.8" />`,
     );
   } else {
-    for (const bp of despiece.matrizDespiece.filter((p) => p.tipo === 'fondo')) {
-      const bx0 = frontX + (bp.posicion3D[0] - bp.dimensiones3D[0] / 2) * sc;
-      const by0 = frontY + fh - (bp.posicion3D[1] + bp.dimensiones3D[1] / 2) * sc;
-      const bw = bp.dimensiones3D[0] * sc;
-      const bh = bp.dimensiones3D[1] * sc;
+    const backPieces = despiece.matrizDespiece.filter((p) => p.tipo === 'fondo');
+    if (backPieces.length > 0) {
+      for (const bp of backPieces) {
+        const bx0 = frontX + (bp.posicion3D[0] - bp.dimensiones3D[0] / 2) * sc;
+        const by0 = frontY + fh - (bp.posicion3D[1] + bp.dimensiones3D[1] / 2) * sc;
+        const bw = bp.dimensiones3D[0] * sc;
+        const bh = bp.dimensiones3D[1] * sc;
+        lines.push(
+          `<rect x="${bx0.toFixed(2)}" y="${by0.toFixed(2)}" width="${bw.toFixed(2)}" height="${bh.toFixed(2)}" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" />`,
+        );
+      }
+    } else {
+      // Mueble escalonado SIN fondo trasero: silueta base + recorte limpio de cada esquina `void_outside`
       lines.push(
-        `<rect x="${bx0.toFixed(2)}" y="${by0.toFixed(2)}" width="${bw.toFixed(2)}" height="${bh.toFixed(2)}" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" />`,
+        `<rect x="${frontX.toFixed(2)}" y="${frontY.toFixed(2)}" width="${fw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" />`,
       );
+      for (const vz of stepVoidZones) {
+        const vx0 = vz.uStart <= 0.02 ? frontX : mapU(vz.uStart);
+        const vx1 = vz.uEnd >= 0.98 ? frontX + fw : mapU(vz.uEnd);
+        const vy0 = vz.vEnd >= 0.98 ? frontY : mapV(vz.vEnd);
+        const vy1 = vz.vStart <= 0.02 ? frontY + fh : mapV(vz.vStart);
+        lines.push(
+          `<rect class="step-void-cutout" x="${vx0.toFixed(2)}" y="${vy0.toFixed(2)}" width="${Math.max(1, vx1 - vx0).toFixed(2)}" height="${Math.max(1, vy1 - vy0).toFixed(2)}" fill="url(#bpGrid)" stroke="none" />`,
+        );
+      }
     }
   }
 
-  // Patas externas / Ruedas giratorias / Zócalo inferior
+  // Patas externas / Ruedas giratorias / Zócalo inferior (Alzado Frontal)
   if (legH > 0) {
     const legW = Math.max(5, Math.min(12, fw * 0.032));
     const nLegs = Math.max(2, Math.min(6, support.count || 4));
@@ -211,7 +157,7 @@ export function renderFurnitureVectorBlueprintSvg(
         );
       }
       lines.push(
-        `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY + fh + liftPx * 0.72).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="9" fill="#92400e">RUEDAS GIRATORIAS (${nLegs} × ${legH} mm · NO MELAMINA)</text>`,
+        `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY + fh + liftPx * 0.72).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#92400e">RUEDAS GIRATORIAS (${nLegs} × ${legH} mm · NO MELAMINA)</text>`,
       );
     } else {
       for (const lx of legXs) {
@@ -220,12 +166,16 @@ export function renderFurnitureVectorBlueprintSvg(
         );
       }
       lines.push(
-        `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY + fh + liftPx * 0.65).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="9" fill="#92400e">PATAS EXTERNAS (${legH} mm · NO MELAMINA)</text>`,
+        `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY + fh + liftPx * 0.65).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#92400e">PATAS EXTERNAS (${legH} mm · NO MELAMINA)</text>`,
       );
     }
   } else if (toeH > 0) {
     lines.push(
-      `<rect x="${(frontX + ep).toFixed(2)}" y="${(frontY + fh).toFixed(2)}" width="${(fw - 2 * ep).toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#334155" stroke-width="1.2" />`,
+      `<rect class="front-toe-kick" x="${(frontX + ep).toFixed(2)}" y="${(frontY + fh).toFixed(2)}" width="${Math.max(4, fw - 2 * ep).toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#334155" stroke-width="1.2" />`,
+    );
+    const labelY = liftPx >= 11 ? frontY + fh + liftPx * 0.72 : frontY + fh + liftPx + 10;
+    lines.push(
+      `<text x="${(frontX + fw / 2).toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8.5" font-weight="600" fill="#334155">ZÓCALO (${toeH} mm)</text>`,
     );
   }
 
@@ -244,7 +194,7 @@ export function renderFurnitureVectorBlueprintSvg(
       );
       if (zw > 38 && zh > 22) {
         lines.push(
-          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh / 2 + 3).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="8.5" fill="#94a3b8">SIN MUEBLE</text>`,
+          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh / 2 + 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8.5" fill="#94a3b8">SIN MUEBLE</text>`,
         );
       }
       continue;
@@ -272,7 +222,7 @@ export function renderFurnitureVectorBlueprintSvg(
         }
         if (zw > 44 && bh > 16) {
           lines.push(
-            `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(by0 + bh - 3).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="7.5" fill="#334155">Canasto ${k + 1}/${nb}</text>`,
+            `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(by0 + bh - 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="7.5" fill="#334155">Canasto ${k + 1}/${nb}</text>`,
           );
         }
       }
@@ -283,13 +233,12 @@ export function renderFurnitureVectorBlueprintSvg(
       lines.push(
         `<rect x="${zx0.toFixed(2)}" y="${zy0.toFixed(2)}" width="${zw.toFixed(2)}" height="${zh.toFixed(2)}" fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4,3" />`,
       );
-      // Faldón trasero en mitad superior del hueco
       const fhPx = zh * 0.42;
       lines.push(
         `<rect x="${zx0.toFixed(2)}" y="${zy0.toFixed(2)}" width="${zw.toFixed(2)}" height="${fhPx.toFixed(2)}" fill="#f1f5f9" stroke="#64748b" stroke-width="1" />`,
       );
       lines.push(
-        `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh * 0.72).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="9" fill="#64748b">HUECO PIERNAS</text>`,
+        `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh * 0.72).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#64748b">HUECO PIERNAS</text>`,
       );
     } else if (z.kind === 'open') {
       lines.push(
@@ -297,7 +246,7 @@ export function renderFurnitureVectorBlueprintSvg(
       );
       if (z.label && zw > 34 && zh > 24) {
         lines.push(
-          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh / 2 + 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="9" fill="#64748b">${escapeXml(z.label)}</text>`,
+          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh / 2 + 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#64748b">${escapeXml(z.label)}</text>`,
         );
       }
     } else if (z.kind === 'door_left' || z.kind === 'door_right' || z.kind === 'door_glass') {
@@ -306,7 +255,6 @@ export function renderFurnitureVectorBlueprintSvg(
         `<rect x="${(zx0 + 2).toFixed(2)}" y="${(zy0 + 2).toFixed(2)}" width="${Math.max(1, zw - 4).toFixed(2)}" height="${Math.max(1, zh - 4).toFixed(2)}" fill="${fillCol}" stroke="#0284c7" stroke-width="1.3" />`,
       );
       if (z.kind === 'door_glass' && zw > 18 && zh > 18) {
-        // Marco interior de vidrio + rayas diagonales
         const ins = Math.max(5, Math.min(12, zw * 0.16));
         lines.push(
           `<rect x="${(zx0 + ins).toFixed(2)}" y="${(zy0 + ins).toFixed(2)}" width="${Math.max(2, zw - 2 * ins).toFixed(2)}" height="${Math.max(2, zh - 2 * ins).toFixed(2)}" fill="#bae6fd" stroke="#0369a1" stroke-width="0.9" />`,
@@ -315,21 +263,20 @@ export function renderFurnitureVectorBlueprintSvg(
           `<line x1="${(zx0 + ins + 4).toFixed(1)}" y1="${(zy0 + ins + 14).toFixed(1)}" x2="${(zx0 + ins + 14).toFixed(1)}" y2="${(zy0 + ins + 4).toFixed(1)}" stroke="#0284c7" stroke-width="1" />`,
         );
       }
-      // Triángulo punteado de apertura hacia bisagras
       const hingeX = z.kind === 'door_right' ? zx1 - 2 : zx0 + 2;
       const handleX = z.kind === 'door_right' ? zx0 + 2 : zx1 - 2;
       const midY = zy0 + zh / 2;
       lines.push(
         `<polyline points="${hingeX.toFixed(1)},${(zy0 + 2).toFixed(1)} ${handleX.toFixed(1)},${midY.toFixed(1)} ${hingeX.toFixed(1)},${(zy1 - 2).toFixed(1)}" fill="none" stroke="#0369a1" stroke-width="0.8" stroke-dasharray="4,3" />`,
       );
-      // Símbolo de tirador
-      const tx = z.kind === 'door_right' ? zx0 + Math.min(10, zw * 0.2) : zx1 - Math.min(10, zw * 0.2);
+      const tx =
+        z.kind === 'door_right' ? zx0 + Math.min(10, zw * 0.2) : zx1 - Math.min(10, zw * 0.2);
       lines.push(
         `<line x1="${tx.toFixed(1)}" y1="${(midY - 8).toFixed(1)}" x2="${tx.toFixed(1)}" y2="${(midY + 8).toFixed(1)}" stroke="#0f172a" stroke-width="2.2" stroke-linecap="round" />`,
       );
       if (zw > 34 && zh > 24) {
         lines.push(
-          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy1 - 8).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="8.5" fill="#0f2b4c">${escapeXml(z.label ?? 'Puerta')}</text>`,
+          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy1 - 8).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8.5" fill="#0f2b4c">${escapeXml(z.label ?? 'Puerta')}</text>`,
         );
       }
     } else if (z.kind === 'door_double') {
@@ -361,7 +308,6 @@ export function renderFurnitureVectorBlueprintSvg(
         lines.push(
           `<rect x="${(zx0 + 2).toFixed(2)}" y="${(dy + 2).toFixed(2)}" width="${Math.max(1, zw - 4).toFixed(2)}" height="${Math.max(1, dh - 4).toFixed(2)}" fill="#ffedd5" stroke="#c2410c" stroke-width="1.2" />`,
         );
-        // Tirador horizontal centrado
         const cx = zx0 + zw / 2;
         const cy = dy + dh / 2;
         const hw = Math.min(18, zw * 0.28);
@@ -370,14 +316,14 @@ export function renderFurnitureVectorBlueprintSvg(
         );
         if (zw > 42 && dh > 22) {
           lines.push(
-            `<text x="${cx.toFixed(1)}" y="${(dy + dh - 5).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="8" fill="#9a3412">Cajón ${k + 1} (5 pzas)</text>`,
+            `<text x="${cx.toFixed(1)}" y="${(dy + dh - 5).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8" fill="#9a3412">Cajón ${k + 1} (5 pzas)</text>`,
           );
         }
       }
     }
   }
 
-  // Tableros estructurales directamente desde `despiece.matrizDespiece` (paridad 100% con 3D, incluye escalones `void_outside` y repisas interiores)
+  // Tableros estructurales directamente desde `despiece.matrizDespiece` (paridad 100% con 3D)
   for (const p of despiece.matrizDespiece) {
     if (
       p.tipo !== 'cubierta' &&
@@ -412,20 +358,26 @@ export function renderFurnitureVectorBlueprintSvg(
 
   // Cotas exteriores Alzado Frontal
   const dimTopY = frontY - 12;
-  lines.push(`<line x1="${frontX.toFixed(1)}" y1="${dimTopY.toFixed(1)}" x2="${(frontX + fw).toFixed(1)}" y2="${dimTopY.toFixed(1)}" stroke="#0284c7" stroke-width="1.3" />`);
-  lines.push(`<text x="${(frontX + fw / 2).toFixed(1)}" y="${(dimTopY - 3).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="10.5" font-weight="700" fill="#0284c7">Ancho X = ${Math.round(xf)} mm</text>`);
+  lines.push(
+    `<line x1="${frontX.toFixed(1)}" y1="${dimTopY.toFixed(1)}" x2="${(frontX + fw).toFixed(1)}" y2="${dimTopY.toFixed(1)}" stroke="#0284c7" stroke-width="1.3" />`,
+  );
+  lines.push(
+    `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(dimTopY - 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" font-weight="700" fill="#0284c7">Ancho X = ${Math.round(xf)} mm</text>`,
+  );
 
   const dimLeftX = frontX - 18;
-  lines.push(`<line x1="${dimLeftX.toFixed(1)}" y1="${frontY.toFixed(1)}" x2="${dimLeftX.toFixed(1)}" y2="${(frontY + fh).toFixed(1)}" stroke="#059669" stroke-width="1.3" />`);
   lines.push(
-    `<text x="${(dimLeftX - 5).toFixed(1)}" y="${(frontY + fh / 2).toFixed(1)}" text-anchor="middle" transform="rotate(-90 ${(dimLeftX - 5).toFixed(1)} ${(frontY + fh / 2).toFixed(1)})" font-family="Consolas, monospace" font-size="10.5" font-weight="700" fill="#059669">Alto Y = ${Math.round(yf)} mm</text>`,
+    `<line x1="${dimLeftX.toFixed(1)}" y1="${frontY.toFixed(1)}" x2="${dimLeftX.toFixed(1)}" y2="${(frontY + fh).toFixed(1)}" stroke="#059669" stroke-width="1.3" />`,
+  );
+  lines.push(
+    `<text x="${(dimLeftX - 5).toFixed(1)}" y="${(frontY + fh / 2).toFixed(1)}" text-anchor="middle" transform="rotate(-90 ${(dimLeftX - 5).toFixed(1)} ${(frontY + fh / 2).toFixed(1)})" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" font-weight="700" fill="#059669">Alto Y = ${Math.round(yf)} mm</text>`,
   );
 
   // =========================================================================
   // 2. PERFIL LATERAL (PLANO ZY)
   // =========================================================================
   lines.push(
-    `<text x="${(sideX + sw / 2).toFixed(1)}" y="${(sideY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">PERFIL LATERAL (ZY)</text>`,
+    `<text x="${(sideX + sw / 2).toFixed(1)}" y="${(sideY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">PERFIL LATERAL (ZY)</text>`,
   );
   lines.push(
     `<rect x="${sideX.toFixed(2)}" y="${sideY.toFixed(2)}" width="${sw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#0f172a" stroke-width="1.8" />`,
@@ -435,6 +387,17 @@ export function renderFurnitureVectorBlueprintSvg(
       `<rect x="${(sideX - 3).toFixed(2)}" y="${sideY.toFixed(2)}" width="3" height="${fh.toFixed(2)}" fill="#b45309" />`,
     );
   }
+  // Línea de nivel escalonado en perfil lateral cuando existe recorte `void_outside`
+  for (const vz of stepVoidZones) {
+    const stepV = vz.vEnd >= 0.98 ? vz.vStart : vz.vEnd;
+    if (stepV > 0.04 && stepV < 0.96) {
+      const syStep = mapV(stepV);
+      lines.push(
+        `<line class="side-step-line" x1="${sideX.toFixed(2)}" y1="${syStep.toFixed(2)}" x2="${(sideX + sw).toFixed(2)}" y2="${syStep.toFixed(2)}" stroke="#64748b" stroke-width="1" stroke-dasharray="4,3" />`,
+      );
+    }
+  }
+  // Apoyo inferior en perfil lateral ZY: ruedas, patas externas o zócalo retranqueado (`toe_kick`)
   if (legH > 0) {
     if (isWheels) {
       const rW = Math.max(4, Math.min(10, liftPx * 0.4));
@@ -454,51 +417,88 @@ export function renderFurnitureVectorBlueprintSvg(
         `<rect x="${(sideX + sw * 0.88 - legW).toFixed(2)}" y="${(sideY + fh).toFixed(2)}" width="${legW.toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#475569" stroke-dasharray="3,2" />`,
       );
     }
-  }
-  // Frente sobrepuesto si hay puertas o cajones
-  if (
-    zones.some(
-      (z) =>
-        z.kind !== 'open' &&
-        z.kind !== 'leg_void' &&
-        z.kind !== 'void_outside' &&
-        z.kind !== 'baskets',
-    )
-  ) {
+  } else if (toeH > 0) {
+    const recessPx = Math.min(sw * 0.16, Math.max(3, 35 * sc));
     lines.push(
-      `<rect x="${(sideX + sw + 1).toFixed(2)}" y="${(sideY + 2).toFixed(2)}" width="${ep.toFixed(2)}" height="${(fh - 4).toFixed(2)}" fill="#fef9c3" stroke="#0284c7" stroke-width="1" />`,
+      `<rect class="side-toe-kick" x="${sideX.toFixed(2)}" y="${(sideY + fh).toFixed(2)}" width="${Math.max(4, sw - recessPx).toFixed(2)}" height="${liftPx.toFixed(2)}" fill="#e2e8f0" stroke="#334155" stroke-width="1.2" />`,
     );
   }
-  lines.push(`<line x1="${sideX.toFixed(1)}" y1="${dimTopY.toFixed(1)}" x2="${(sideX + sw).toFixed(1)}" y2="${dimTopY.toFixed(1)}" stroke="#7c3aed" stroke-width="1.3" />`);
-  lines.push(`<text x="${(sideX + sw / 2).toFixed(1)}" y="${(dimTopY - 3).toFixed(1)}" text-anchor="middle" font-family="Consolas, monospace" font-size="10.5" font-weight="700" fill="#7c3aed">Z = ${Math.round(zf)} mm</text>`);
+
+  // Frentes sobrepuestos en perfil lateral ZY respetando la altura parcial exacta `[vStart, vEnd]`
+  const sideFrontBands: Array<{
+    v0: number;
+    v1: number;
+    fill: string;
+    stroke: string;
+  }> = [];
+  for (const z of zones) {
+    if (
+      z.kind === 'open' ||
+      z.kind === 'leg_void' ||
+      z.kind === 'void_outside' ||
+      z.kind === 'baskets'
+    ) {
+      continue;
+    }
+    const v0 = Math.min(z.vStart, z.vEnd);
+    const v1 = Math.max(z.vStart, z.vEnd);
+    const fill =
+      z.kind === 'door_glass' ? '#bae6fd' : z.kind === 'drawers' ? '#ffedd5' : '#fef9c3';
+    const stroke =
+      z.kind === 'door_glass' ? '#0369a1' : z.kind === 'drawers' ? '#c2410c' : '#0284c7';
+    const dup = sideFrontBands.some(
+      (b) => Math.abs(b.v0 - v0) <= 0.015 && Math.abs(b.v1 - v1) <= 0.015 && b.fill === fill,
+    );
+    if (!dup) {
+      sideFrontBands.push({ v0, v1, fill, stroke });
+    }
+  }
+  for (const band of sideFrontBands) {
+    const fy0 = band.v1 >= 0.99 ? sideY + 1 : mapV(band.v1) + 1;
+    const fy1 = band.v0 <= 0.01 ? sideY + fh - 1 : mapV(band.v0) - 1;
+    const bandH = Math.max(2, fy1 - fy0);
+    lines.push(
+      `<rect class="side-front-panel" x="${(sideX + sw + 1).toFixed(2)}" y="${fy0.toFixed(2)}" width="${ep.toFixed(2)}" height="${bandH.toFixed(2)}" fill="${band.fill}" stroke="${band.stroke}" stroke-width="1" />`,
+    );
+  }
+
+  lines.push(
+    `<line x1="${sideX.toFixed(1)}" y1="${dimTopY.toFixed(1)}" x2="${(sideX + sw).toFixed(1)}" y2="${dimTopY.toFixed(1)}" stroke="#7c3aed" stroke-width="1.3" />`,
+  );
+  lines.push(
+    `<text x="${(sideX + sw / 2).toFixed(1)}" y="${(dimTopY - 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" font-weight="700" fill="#7c3aed">Z = ${Math.round(zf)} mm</text>`,
+  );
 
   // =========================================================================
-  // 3. CARTELA TÉCNICA INFERIOR (RESUMEN DESPIECE, PLANCHAS 244×122 Y HERRAJES)
+  // 3. CARTELA TÉCNICA INFERIOR (DESPIECE, PLANCHAS DINÁMICAS Y HERRAJES)
   // =========================================================================
   const doorCount = despiece.matrizDespiece.filter((p) => p.tipo === 'puerta').length;
   const drawerCount = despiece.matrizDespiece.filter((p) => p.tipo === 'frente_cajon').length;
   const melPieces = despiece.matrizDespiece.filter((p) => p.espesor >= 10).length;
   const backPieces = despiece.matrizDespiece.filter((p) => p.espesor < 10).length;
   const hwText =
-    despiece.hardwareSummary
-      .map((h) => `${h.categoria}: ${h.cantidad}`)
-      .join(' · ') || 'Sin herrajes adicionales';
+    despiece.hardwareSummary.map((h) => `${h.categoria}: ${h.cantidad}`).join(' · ') ||
+    'Sin herrajes adicionales';
+  const sheetWcm = Math.round(params.sheetDimensions.width / 10);
+  const sheetHcm = Math.round(params.sheetDimensions.height / 10);
   const planText = opts.cuttingPlan
-    ? `Planchas 244×122 cm: ${opts.cuttingPlan.melamineSheetsCount} melamina + ${opts.cuttingPlan.backPanelSheetsCount} fondo 3mm · Uso ${opts.cuttingPlan.usagePercentage.toFixed(1)}%`
+    ? `Planchas ${sheetWcm}×${sheetHcm} cm: ${opts.cuttingPlan.melamineSheetsCount} melamina + ${opts.cuttingPlan.backPanelSheetsCount} fondo ${params.backPanelThickness}mm · Uso ${opts.cuttingPlan.usagePercentage.toFixed(1)}%`
     : `Área neta: ${despiece.totalNetAreaM2.toFixed(2)} m² · Tapacanto: ${despiece.totalEdgeBandingMeters.toFixed(1)} m`;
 
-  lines.push(`<rect x="18" y="446" width="${svgW - 36}" height="80" fill="#f8fafc" stroke="#0f2b4c" stroke-width="1.2" rx="4" />`);
   lines.push(
-    `<text x="30" y="466" font-family="Consolas, monospace" font-size="11" font-weight="700" fill="#0f2b4c">RESUMEN DE DESPIECE: ${melPieces} piezas melamina (${e} mm) · ${backPieces} piezas fondo 3 mm · ${doorCount} puerta(s) · ${drawerCount} cajón(es) [5 pzas/cajón]</text>`,
+    `<rect x="18" y="446" width="${svgW - 36}" height="80" fill="#f8fafc" stroke="#0f2b4c" stroke-width="1.2" rx="4" />`,
   );
   lines.push(
-    `<text x="30" y="486" font-family="Consolas, monospace" font-size="10.5" fill="#0369a1">${escapeXml(planText)} · Escala k=(${despiece.scaleFactors.kx.toFixed(2)}, ${despiece.scaleFactors.ky.toFixed(2)}, ${despiece.scaleFactors.kz.toFixed(2)})</text>`,
+    `<text x="30" y="466" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">RESUMEN DE DESPIECE: ${melPieces} piezas melamina (${e} mm) · ${backPieces} piezas fondo ${params.backPanelThickness} mm · ${doorCount} puerta(s) · ${drawerCount} cajón(es) [5 pzas/cajón]</text>`,
   );
   lines.push(
-    `<text x="30" y="506" font-family="Consolas, monospace" font-size="10" fill="#92400e">HERRAJES (NO MELAMINA): ${escapeXml(hwText)}</text>`,
+    `<text x="30" y="486" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" fill="#0369a1">${escapeXml(planText)} · Escala k=(${despiece.scaleFactors.kx.toFixed(2)}, ${despiece.scaleFactors.ky.toFixed(2)}, ${despiece.scaleFactors.kz.toFixed(2)})</text>`,
   );
   lines.push(
-    `<text x="${svgW - 30}" y="518" text-anchor="end" font-family="Consolas, monospace" font-size="9" fill="#64748b">Alertas estructurales: ${despiece.alerts.length} · 100% Offline SmartFurniture v4.0</text>`,
+    `<text x="30" y="506" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#92400e">HERRAJES (NO MELAMINA): ${escapeXml(hwText)}</text>`,
+  );
+  lines.push(
+    `<text x="${svgW - 30}" y="518" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#64748b">Alertas estructurales: ${despiece.alerts.length} · 100% Offline SmartFurniture v8.0</text>`,
   );
 
   return [

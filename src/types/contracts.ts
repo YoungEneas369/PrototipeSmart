@@ -1,5 +1,5 @@
 /**
- * SMARTFURNITURE — CONTRATOS INMUTABLES v3.0 (ÚNICA FUENTE DE VERDAD)
+ * SMARTFURNITURE — CONTRATOS INMUTABLES v8.0 (ÚNICA FUENTE DE VERDAD)
  *
  * CONVENCIONES GEOMÉTRICAS CONGELADAS:
  * 1. Sistema 3D mano derecha en milímetros (mm):
@@ -172,8 +172,33 @@ export interface FurnitureTopology {
   frontZones?: FrontZone[];
   /** Altura opcional de zócalo inferior en mm (si apoya en zócalo en vez de patas). */
   toeKickHeightMm?: number;
+  /** Acabado opcional para la cubierta superior (ej. cubierta roble sobre carcasa blanca). */
+  cubiertaMaterialOverride?: MelamineMaterial;
   /** Etiqueta descriptiva del tipo de mueble interpretado (para plano vectorial). */
   furnitureProfileLabel?: string;
+}
+
+/** Tarifas unitarias editables en Pesos Chilenos (CLP) para el estimador de presupuesto. */
+export interface CostEstimatorConfig {
+  melamineSheetStdClp: number;
+  melamineSheetLargeClp: number;
+  backPanelSheetStdClp: number;
+  backPanelSheetLargeClp: number;
+  edgeBandingPerMeterClp: number;
+  screwClp: number;
+  dowelClp: number;
+  glideClp: number;
+  nailClp: number;
+  legClp: number;
+  wheelClp: number;
+  handleClp: number;
+  hingeClp: number;
+  slideClp: number;
+  basketClp: number;
+  glassPanelClp: number;
+  countertopClp: number;
+  metalFrameClp: number;
+  otherClp: number;
 }
 
 export interface ScaleAndBoardParams {
@@ -193,6 +218,8 @@ export interface ScaleAndBoardParams {
   cornerJointType: 'topOverSides' | 'topBetweenSides';
   edgeBandingMode: 'fullPerimeter' | 'visibleEdgesOnly';
   material: MelamineMaterial;
+  /** Sobrescrituras opcionales de precios unitarios CLP editados por el usuario. */
+  costConfig?: Partial<CostEstimatorConfig>;
 }
 
 export interface EdgeBandingFlags {
@@ -216,6 +243,14 @@ export interface BoardPiece {
   dimensiones3D: [number, number, number];
   rotacion3D: [number, number, number];
   material: PieceMaterial;
+  /** ID de la FrontZone origen (para sincronización bidireccional 2D ↔ 3D). */
+  zoneId?: string;
+  /** Marca tipada para puertas vidriadas (evita parsing frágil de IDs en Viewer3D). */
+  isGlassDoor?: boolean;
+  /** Lado del tirador para puertas batientes/vidriadas o frentes de cajón. */
+  handleSide?: 'left' | 'right' | 'top' | 'none';
+  /** Ángulo de inglete en grados para divisiones diagonales. */
+  miterAngleDeg?: number;
 }
 
 export interface StructuralAlert {
@@ -254,8 +289,12 @@ export interface DespieceResult {
   matrixNx5: [number, number, number, number, PieceMaterial][];
   consolidatedRows: MatrixNx5Row[];
   totalNetAreaM2: number;
+  /** Área neta exclusiva de tableros de melamina estructural (excluye fondo 3 mm y fondos de cajón). */
+  melamineNetAreaM2?: number;
   backPanelAreaM2: number;
   totalEdgeBandingMeters: number;
+  /** Desglose de tapacanto por color de melamina (para muebles bicolor). */
+  edgeBandingByMaterial?: Partial<Record<MelamineMaterial, number>>;
   alerts: StructuralAlert[];
   /** Lista consolidada de accesorios/herrajes externos (patas, tiradores, etc.) fuera de melamina. */
   hardwareSummary: HardwareItem[];
@@ -277,11 +316,15 @@ export interface PlacedRectangle {
   ancho: number;
   alto: number;
   rotado: boolean;
+  material?: PieceMaterial;
+  tipo?: PieceType;
+  miterAngleDeg?: number;
 }
 
 export interface SheetLayout {
   sheetId: number;
   espesorMm: number;
+  material?: PieceMaterial;
   materialLabel: string;
   anchoSheet: number;
   altoSheet: number;

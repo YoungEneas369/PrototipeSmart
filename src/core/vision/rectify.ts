@@ -1,5 +1,5 @@
 /**
- * SMARTFURNITURE — RECTIFICACIÓN DE PERSPECTIVA Y ESTIMACIÓN DE RELACIÓN W/H (v3.0)
+ * SMARTFURNITURE — RECTIFICACIÓN DE PERSPECTIVA, AUTO-QUAD PROYECTIVO Y RELACIÓN W/H (v8.0)
  * 100% offline, álgebra pura, cero dependencias externas, sin parser EXIF.
  */
 import type { Point2D } from '../../types/contracts';
@@ -7,7 +7,17 @@ import {
   applyHomography,
   computeQuadToUnitHomography,
   type Matrix3x3,
-} from '../mathEngine/homography';
+} from '../mathEngine';
+import {
+  boxBlur3x3,
+  clamp,
+  computeSobelMag,
+  extractLuminanceBuffer,
+  isConvexQuad,
+  median,
+  quadArea,
+  rgbaLuminance,
+} from './imageOps';
 
 /**
  * Estima la relación de aspecto real W/H del mueble usando la fórmula vectorial de Zhang
@@ -44,8 +54,12 @@ export function estimateAspectRatioFixedFocal(
   }
 
   // r1 = K^-1 · h1, r2 = K^-1 · h2
-  const h10 = H[0][0], h11 = H[1][0], h12 = H[2][0];
-  const h20 = H[0][1], h21 = H[1][1], h22 = H[2][1];
+  const h10 = H[0][0],
+    h11 = H[1][0],
+    h12 = H[2][0];
+  const h20 = H[0][1],
+    h21 = H[1][1],
+    h22 = H[2][1];
 
   const r1x = (h10 - cx * h12) / f;
   const r1y = (h11 - cy * h12) / f;
@@ -98,7 +112,9 @@ export function extrapolateDimensionsFromSingleMeasure(
 
 /**
  * Calcula las dimensiones óptimas en píxeles para la rectificación del mueble,
- * garantizando >= 6 px por canto de melamina (18 mm) y acotando uso de RAM local.
+ * garantizando >= 6 px por canto de melamina (18 mm), acotando RAM local (<= 960×1200)
+ * y PRESERVANDO SIEMPRE la relación de aspecto `xMm / yMm` exacta (incluso en racks bajos
+ * 2200×400 o despenseros angostos 600×2200).
  */
 export function computeRectifiedSize(
   xMm: number,
@@ -108,9 +124,31 @@ export function computeRectifiedSize(
   const safeX = Math.max(200, xMm);
   const safeY = Math.max(200, yMm);
   const safeE = Math.max(6, eMm);
-  const width = Math.max(360, Math.min(960, Math.ceil((6 * safeX) / safeE)));
-  const height = Math.max(200, Math.min(1200, Math.round((width * safeY) / safeX)));
-  return { width, height };
+  const aspect = safeX / safeY;
+  const maxW = 960;
+  const maxH = 1200;
+
+  let w = Math.max(360, Math.ceil((6 * safeX) / safeE));
+  let h = w / aspect;
+
+  // Para muebles bajos y anchos, escalar uniformemente hacia h = 200 sin exceder maxW
+  if (h < 200) {
+    const scaleUp = Math.min(200 / h, maxW / w);
+    if (scaleUp > 1) {
+      w *= scaleUp;
+      h *= scaleUp;
+    }
+  }
+
+  // Escalamiento uniforme al acotar maxW / maxH para jamás distorsionar aspectRatioXY
+  const downScale = Math.min(1, maxW / w, maxH / h);
+  w *= downScale;
+  h *= downScale;
+
+  return {
+    width: Math.max(64, Math.round(w)),
+    height: Math.max(64, Math.round(h)),
+  };
 }
 
 /**
@@ -164,10 +202,16 @@ export function rectifyImageRGBA(
         srcRgba[i00] * w00 + srcRgba[i10] * w10 + srcRgba[i01] * w01 + srcRgba[i11] * w11,
       );
       out[dstIdx + 1] = Math.round(
-        srcRgba[i00 + 1] * w00 + srcRgba[i10 + 1] * w10 + srcRgba[i01 + 1] * w01 + srcRgba[i11 + 1] * w11,
+        srcRgba[i00 + 1] * w00 +
+          srcRgba[i10 + 1] * w10 +
+          srcRgba[i01 + 1] * w01 +
+          srcRgba[i11 + 1] * w11,
       );
       out[dstIdx + 2] = Math.round(
-        srcRgba[i00 + 2] * w00 + srcRgba[i10 + 2] * w10 + srcRgba[i01 + 2] * w01 + srcRgba[i11 + 2] * w11,
+        srcRgba[i00 + 2] * w00 +
+          srcRgba[i10 + 2] * w10 +
+          srcRgba[i01 + 2] * w01 +
+          srcRgba[i11 + 2] * w11,
       );
       out[dstIdx + 3] = 255;
     }
@@ -265,7 +309,7 @@ export function estimateCameraPoseMeters(
   // Horizonte de paralaje cero: P(0.5, v) · r2 = 0 => v = 0.5 - (centerRaw · h2) / ||h2||²
   const dotCenterH2 = centerRaw[0] * h2[0] + centerRaw[1] * h2[1] + centerRaw[2] * h2[2];
   const rawHorizonV = 0.5 - dotCenterH2 / (norm2 * norm2);
-  const estimatedHorizonV = Math.max(0.05, Math.min(0.95, rawHorizonV));
+  const estimatedHorizonV = clamp(rawHorizonV, 0.05, 0.95);
 
   let distanceQuality: CameraPoseEstimate['distanceQuality'] = 'optimal';
   if (distanceMeters < 1.8) {
@@ -296,13 +340,6 @@ export interface AutoQuadResult {
   exteriorBgRgb: [number, number, number];
 }
 
-function medianNum(values: number[]): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
-}
-
 interface BackgroundSegGrid {
   gw: number;
   gh: number;
@@ -315,11 +352,11 @@ interface BackgroundSegGrid {
 
 /**
  * Segmentación pixel a pixel en 3 etapas robusta a fotos reales (100% offline):
- *   1. Pre-suavizado 3×3 + gradiente Sobel (atenúa juntas de ladrillo / textura de pared).
- *   2. Flood-Fill iterativo BFS desde techo y costados (NUNCA desde el piso central,
- *      evitando invadir el hueco de piernas de escritorios).
- *   3. Selección de componente conexa aterrizada (prioriza muebles en mitad inferior sobre
- *      TVs o cuadros colgados arriba) + unión de patas/laterales inferiores alineados.
+ *   1. Barrera de gradiente Sobel 3×3 multi-escala (suavizado + crudo + cromático RGB),
+ *      evitando fugas en muebles blancos sobre fondo blanco o sombras inferiores.
+ *   2. Flood-Fill iterativo BFS desde techo y costados con criterio combinado color + gradiente
+ *      (sin sembrar píxeles perimetrales con alto gradiente tocando el mueble).
+ *   3. Selección de componente conexa aterrizada + unión de patas/laterales inferiores alineados.
  */
 function segmentForegroundGrid(
   rgba: Uint8ClampedArray,
@@ -360,59 +397,23 @@ function segmentForegroundGrid(
         gR[gi] = r;
         gG[gi] = g;
         gB[gi] = b;
-        gLum[gi] = 0.299 * r + 0.587 * g + 0.114 * b;
+        gLum[gi] = rgbaLuminance(r, g, b);
       }
     }
   }
 
-  // Suavizado 3×3 para amortiguar textura fina de paredes (ladrillo/estuco) antes de Sobel
-  const smoothLum = new Float32Array(n);
-  for (let y = 0; y < gh; y++) {
-    for (let x = 0; x < gw; x++) {
-      if (y === 0 || y === gh - 1 || x === 0 || x === gw - 1) {
-        smoothLum[y * gw + x] = gLum[y * gw + x];
-      } else {
-        const up = (y - 1) * gw;
-        const mid = y * gw;
-        const dn = (y + 1) * gw;
-        smoothLum[mid + x] =
-          (gLum[up + x - 1] +
-            gLum[up + x] +
-            gLum[up + x + 1] +
-            gLum[mid + x - 1] +
-            gLum[mid + x] +
-            gLum[mid + x + 1] +
-            gLum[dn + x - 1] +
-            gLum[dn + x] +
-            gLum[dn + x + 1]) /
-          9;
-      }
-    }
-  }
+  // Etapa 1: Barrera multi-escala Sobel 3×3 (luminancia suavizada + luminancia cruda + cromático RGB)
+  const smoothLum = boxBlur3x3(gLum, gw, gh);
+  const sobelSmooth = computeSobelMag(smoothLum, gw, gh);
+  const sobelRaw = computeSobelMag(gLum, gw, gh);
+  const sobelR = computeSobelMag(gR, gw, gh);
+  const sobelG = computeSobelMag(gG, gw, gh);
+  const sobelB = computeSobelMag(gB, gw, gh);
 
-  // Etapa 1: Barreras de bordes Sobel 3×3 sobre luminancia suavizada
   const sobelMag = new Float32Array(n);
-  for (let y = 1; y < gh - 1; y++) {
-    const up = (y - 1) * gw;
-    const mid = y * gw;
-    const dn = (y + 1) * gw;
-    for (let x = 1; x < gw - 1; x++) {
-      const gx =
-        -smoothLum[up + x - 1] +
-        smoothLum[up + x + 1] -
-        2 * smoothLum[mid + x - 1] +
-        2 * smoothLum[mid + x + 1] -
-        smoothLum[dn + x - 1] +
-        smoothLum[dn + x + 1];
-      const gy =
-        -smoothLum[up + x - 1] -
-        2 * smoothLum[up + x] -
-        smoothLum[up + x + 1] +
-        smoothLum[dn + x - 1] +
-        2 * smoothLum[dn + x] +
-        smoothLum[dn + x + 1];
-      sobelMag[mid + x] = Math.hypot(gx, gy);
-    }
+  for (let i = 0; i < n; i++) {
+    const chromaGrad = Math.max(sobelR[i], sobelG[i], sobelB[i]);
+    sobelMag[i] = Math.max(sobelSmooth[i], sobelRaw[i] * 0.72, chromaGrad * 0.62);
   }
 
   // Color mediano perimetral (solo borde superior y laterales altos, evitando piso/hueco de escritorio)
@@ -441,11 +442,11 @@ function segmentForegroundGrid(
       bgBs.push(gB[r]);
     }
   }
-  const medR = bgRs.length >= 12 ? medianNum(bgRs) : 250;
-  const medG = bgGs.length >= 12 ? medianNum(bgGs) : 250;
-  const medB = bgBs.length >= 12 ? medianNum(bgBs) : 250;
+  const medR = bgRs.length >= 12 ? median(bgRs) : 250;
+  const medG = bgGs.length >= 12 ? median(bgGs) : 250;
+  const medB = bgBs.length >= 12 ? median(bgBs) : 250;
 
-  // Etapa 2: Flood-Fill BFS iterativo desde transparencia + techo + laterales + esquinas inferiores
+  // Etapa 2: Flood-Fill BFS iterativo con criterio combinado color + barrera multi-escala
   const bgMask = new Uint8Array(n);
   const queue = new Int32Array(n);
   let qHead = 0;
@@ -463,7 +464,13 @@ function segmentForegroundGrid(
   const trySeed = (x: number, y: number) => {
     const idx = y * gw + x;
     if (bgMask[idx] === 1) return;
-    if (sobelMag[idx] > 88) return;
+    // No sembrar píxeles perimetrales con alto gradiente (tocando el borde del mueble)
+    const innerX = clamp(x, 1, gw - 2);
+    const innerY = clamp(y, 1, gh - 2);
+    const nearGrad = Math.max(sobelMag[idx], sobelMag[innerY * gw + innerX]);
+    if (nearGrad > 48) return;
+    const dSeedBg = Math.hypot(gR[idx] - medR, gG[idx] - medG, gB[idx] - medB);
+    if (dSeedBg > 85 && nearGrad > 22) return;
     bgMask[idx] = 1;
     queue[qTail++] = idx;
   };
@@ -482,9 +489,11 @@ function segmentForegroundGrid(
     trySeed(gw - 1 - x, gh - 1);
   }
 
-  const edgeBarrier = 60;
-  const localStepTol = 18;
-  const globalBgTol = 34;
+  const edgeBarrier = 48;
+  const softEdgeBarrier = 26;
+  const localStepTight = 14;
+  const localStepHard = 24;
+  const globalBgTol = 32;
 
   while (qHead < qTail) {
     const cur = queue[qHead++];
@@ -497,10 +506,15 @@ function segmentForegroundGrid(
     const checkNeighbor = (nx: number, ny: number) => {
       const ni = ny * gw + nx;
       if (bgMask[ni] === 1) return;
-      if (sobelMag[ni] >= edgeBarrier) return;
+      const grad = sobelMag[ni];
+      if (grad >= edgeBarrier) return;
       const dLocal = Math.hypot(gR[ni] - cr, gG[ni] - cg, gB[ni] - cb);
+      // Criterio combinado: jamás cruzar un salto cromático brusco aunque dGlobal sea pequeño
+      if (dLocal > localStepHard) return;
       const dGlobal = Math.hypot(gR[ni] - medR, gG[ni] - medG, gB[ni] - medB);
-      if (dLocal <= localStepTol || dGlobal <= globalBgTol) {
+      const smoothGradWall = dLocal <= localStepTight && grad < softEdgeBarrier;
+      const nearGlobalBg = dGlobal <= globalBgTol && grad < edgeBarrier * 0.82;
+      if (smoothGradWall || nearGlobalBg) {
         bgMask[ni] = 1;
         queue[qTail++] = ni;
       }
@@ -514,7 +528,7 @@ function segmentForegroundGrid(
 
   const backgroundCoverage = qTail / n;
 
-  // Etapa 3: Componentes conexas de primer plano priorizando el mueble aterrizado (ignora TVs/cuadros en muro alto)
+  // Etapa 3: Componentes conexas de primer plano priorizando el mueble aterrizado
   interface FgComp {
     pixels: Int32Array;
     minX: number;
@@ -540,8 +554,12 @@ function segmentForegroundGrid(
       let t = 0;
       visited[startIdx] = 1;
       compPixels[t++] = startIdx;
-      let minX = x, maxX = x, minY = y, maxY = y;
-      let sumX = 0, sumY = 0;
+      let minX = x,
+        maxX = x,
+        minY = y,
+        maxY = y;
+      let sumX = 0,
+        sumY = 0;
 
       while (h < t) {
         const cur = compPixels[h++];
@@ -572,7 +590,6 @@ function segmentForegroundGrid(
       const avgX = sumX / t;
       const avgY = sumY / t;
       const horizCenterBias = Math.max(0.45, 1.1 - Math.abs(avgX - centerX) / gw);
-      // Los muebles reales apoyan en el suelo o zona media-baja; TVs/cuadros flotan arriba (avgY < 0.35*gh)
       const normY = avgY / gh;
       const groundBias = normY < 0.36 ? 0.55 : normY > 0.88 ? 0.72 : 1.15;
       comps.push({
@@ -595,7 +612,6 @@ function segmentForegroundGrid(
     for (let i = 0; i < primary.pixels.length; i++) {
       fgMain[primary.pixels[i]] = 1;
     }
-    // Incluir patas/laterales inferiores de escritorio que estén alineados bajo la cubierta principal
     for (let k = 1; k < comps.length; k++) {
       const c = comps[k];
       if (
@@ -624,9 +640,314 @@ function segmentForegroundGrid(
 }
 
 /**
+ * Envolvente convexa 2D (Andrew's monotone chain) para localizar esquinas extremas de un trapezoide.
+ */
+function computeConvexHull(points: readonly Point2D[]): Point2D[] {
+  if (points.length <= 3) return [...points];
+  const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+  const cross = (o: Point2D, a: Point2D, b: Point2D) =>
+    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+
+  const lower: Point2D[] = [];
+  for (const p of sorted) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) {
+      lower.pop();
+    }
+    lower.push(p);
+  }
+  const upper: Point2D[] = [];
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const p = sorted[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) {
+      upper.pop();
+    }
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+interface RobustLineFit {
+  m: number;
+  c: number;
+  inlierRatio: number;
+}
+
+/**
+ * Ajuste lineal robusto Theil-Sen + refinamiento por mínimos cuadrados sobre inliers
+ * (`y = m * x + c`), inmune a outliers por objetos decorativos o ruido de contorno.
+ */
+function fitRobustLineTheilSen(
+  xs: readonly number[],
+  ys: readonly number[],
+  inlierTol = 1.85,
+): RobustLineFit | null {
+  const n = xs.length;
+  if (n < 6) return null;
+
+  // Submuestrear uniformemente hasta 36 puntos para calcular pendientes Theil-Sen en < 0.05 ms
+  const maxSub = 36;
+  const subIdx: number[] = [];
+  if (n <= maxSub) {
+    for (let i = 0; i < n; i++) subIdx.push(i);
+  } else {
+    for (let k = 0; k < maxSub; k++) {
+      subIdx.push(Math.floor((k * (n - 1)) / (maxSub - 1)));
+    }
+  }
+
+  const slopes: number[] = [];
+  for (let a = 0; a < subIdx.length; a++) {
+    const ia = subIdx[a];
+    for (let b = a + 1; b < subIdx.length; b++) {
+      const ib = subIdx[b];
+      const dx = xs[ib] - xs[ia];
+      if (Math.abs(dx) < 1) continue;
+      slopes.push((ys[ib] - ys[ia]) / dx);
+    }
+  }
+  if (slopes.length === 0) return null;
+
+  let m = median(slopes);
+  const intercepts: number[] = [];
+  for (let i = 0; i < n; i++) {
+    intercepts.push(ys[i] - m * xs[i]);
+  }
+  let c = median(intercepts);
+
+  // Refinar (m, c) con mínimos cuadrados únicamente sobre los inliers (elimina sesgo discreto)
+  let sX = 0,
+    sY = 0,
+    sXX = 0,
+    sXY = 0,
+    inCnt = 0;
+  for (let i = 0; i < n; i++) {
+    if (Math.abs(ys[i] - (m * xs[i] + c)) <= inlierTol) {
+      sX += xs[i];
+      sY += ys[i];
+      sXX += xs[i] * xs[i];
+      sXY += xs[i] * ys[i];
+      inCnt++;
+    }
+  }
+  if (inCnt >= 6) {
+    const denom = inCnt * sXX - sX * sX;
+    if (Math.abs(denom) > 1e-6) {
+      m = (inCnt * sXY - sX * sY) / denom;
+      c = (sY - m * sX) / inCnt;
+    }
+  }
+
+  let finalInliers = 0;
+  for (let i = 0; i < n; i++) {
+    if (Math.abs(ys[i] - (m * xs[i] + c)) <= inlierTol) finalInliers++;
+  }
+
+  return { m, c, inlierRatio: finalInliers / n };
+}
+
+/**
+ * Refina las 4 aristas del contorno del primer plano mediante ajuste lineal robusto Theil-Sen
+ * e intersección de las 4 rectas para recuperar un trapezoide/quad proyectivo real.
+ * Retorna `null` si el mueble es frontal puro (casi AABB) o si algún lado no es rectilíneo
+ * (ej. escritorio con hueco inferior abierto), garantizando fallback seguro al AABB.
+ */
+function fitPerspectiveQuadFromMask(
+  fgMain: Uint8Array,
+  gw: number,
+  gh: number,
+  bx0: number,
+  bx1: number,
+  by0: number,
+  by1: number,
+): [Point2D, Point2D, Point2D, Point2D] | null {
+  const bw = bx1 - bx0;
+  const bh = by1 - by0;
+  if (bw < 14 || bh < 14) return null;
+
+  // 1. Recolectar píxeles frontera de fgMain dentro del AABB acotado
+  const borderPts: Point2D[] = [];
+  for (let y = by0; y <= by1; y++) {
+    const rowOff = y * gw;
+    for (let x = bx0; x <= bx1; x++) {
+      if (fgMain[rowOff + x] !== 1) continue;
+      const isEdge =
+        x === bx0 ||
+        x === bx1 ||
+        y === by0 ||
+        y === by1 ||
+        fgMain[rowOff + x - 1] === 0 ||
+        fgMain[rowOff + x + 1] === 0 ||
+        fgMain[(y - 1) * gw + x] === 0 ||
+        fgMain[(y + 1) * gw + x] === 0;
+      if (isEdge) borderPts.push({ x, y });
+    }
+  }
+  if (borderPts.length < 24) return null;
+
+  // 2. Localizar las 4 esquinas extremas de la envolvente convexa para delimitar cada lado del trapezoide
+  const hull = computeConvexHull(borderPts);
+  if (hull.length < 4) return null;
+
+  let approxTL = hull[0],
+    approxTR = hull[0],
+    approxBR = hull[0],
+    approxBL = hull[0];
+  let bestTL = Infinity,
+    bestTR = -Infinity,
+    bestBR = -Infinity,
+    bestBL = Infinity;
+  for (const p of hull) {
+    const nx = (p.x - bx0) / bw;
+    const ny = (p.y - by0) / bh;
+    if (nx + ny < bestTL) {
+      bestTL = nx + ny;
+      approxTL = p;
+    }
+    if (nx - ny > bestTR) {
+      bestTR = nx - ny;
+      approxTR = p;
+    }
+    if (nx + ny > bestBR) {
+      bestBR = nx + ny;
+      approxBR = p;
+    }
+    if (nx - ny < bestBL) {
+      bestBL = nx - ny;
+      approxBL = p;
+    }
+  }
+
+  // 3. Extraer muestras de contorno en cada uno de los 4 lados evitando las esquinas (±10%)
+  const padT = Math.max(2, Math.round((approxTR.x - approxTL.x) * 0.1));
+  const topXs: number[] = [],
+    topYs: number[] = [];
+  for (let x = Math.ceil(approxTL.x + padT); x <= Math.floor(approxTR.x - padT); x++) {
+    if (x < bx0 || x > bx1) continue;
+    for (let y = by0; y <= by1; y++) {
+      if (fgMain[y * gw + x] === 1) {
+        topXs.push(x);
+        topYs.push(y);
+        break;
+      }
+    }
+  }
+
+  const padB = Math.max(2, Math.round((approxBR.x - approxBL.x) * 0.1));
+  const botXs: number[] = [],
+    botYs: number[] = [];
+  for (let x = Math.ceil(approxBL.x + padB); x <= Math.floor(approxBR.x - padB); x++) {
+    if (x < bx0 || x > bx1) continue;
+    for (let y = by1; y >= by0; y--) {
+      if (fgMain[y * gw + x] === 1) {
+        botXs.push(x);
+        botYs.push(y);
+        break;
+      }
+    }
+  }
+
+  const padL = Math.max(2, Math.round((approxBL.y - approxTL.y) * 0.1));
+  const leftYs: number[] = [],
+    leftXs: number[] = [];
+  for (let y = Math.ceil(approxTL.y + padL); y <= Math.floor(approxBL.y - padL); y++) {
+    if (y < by0 || y > by1) continue;
+    const rowOff = y * gw;
+    for (let x = bx0; x <= bx1; x++) {
+      if (fgMain[rowOff + x] === 1) {
+        leftYs.push(y);
+        leftXs.push(x);
+        break;
+      }
+    }
+  }
+
+  const padR = Math.max(2, Math.round((approxBR.y - approxTR.y) * 0.1));
+  const rightYs: number[] = [],
+    rightXs: number[] = [];
+  for (let y = Math.ceil(approxTR.y + padR); y <= Math.floor(approxBR.y - padR); y++) {
+    if (y < by0 || y > by1) continue;
+    const rowOff = y * gw;
+    for (let x = bx1; x >= bx0; x--) {
+      if (fgMain[rowOff + x] === 1) {
+        rightYs.push(y);
+        rightXs.push(x);
+        break;
+      }
+    }
+  }
+
+  const topLine = fitRobustLineTheilSen(topXs, topYs);
+  const botLine = fitRobustLineTheilSen(botXs, botYs);
+  const leftLine = fitRobustLineTheilSen(leftYs, leftXs);
+  const rightLine = fitRobustLineTheilSen(rightYs, rightXs);
+
+  if (!topLine || !botLine || !leftLine || !rightLine) return null;
+
+  // Exigir alto consenso lineal en los 4 bordes (evita deformar escritorios con vanos abiertos o escalones)
+  if (
+    topLine.inlierRatio < 0.72 ||
+    botLine.inlierRatio < 0.72 ||
+    leftLine.inlierRatio < 0.72 ||
+    rightLine.inlierRatio < 0.72
+  ) {
+    return null;
+  }
+
+  if (
+    Math.abs(topLine.m) > 0.55 ||
+    Math.abs(botLine.m) > 0.55 ||
+    Math.abs(leftLine.m) > 0.55 ||
+    Math.abs(rightLine.m) > 0.55
+  ) {
+    return null;
+  }
+
+  // Intersección de recta horizontal `y = mh * x + ch` con vertical `x = mv * y + cv`
+  const intersectHV = (h: RobustLineFit, v: RobustLineFit): Point2D | null => {
+    const denom = 1 - v.m * h.m;
+    if (Math.abs(denom) < 0.25) return null;
+    const x = (v.m * h.c + v.c) / denom;
+    const y = h.m * x + h.c;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return { x, y };
+  };
+
+  const tl = intersectHV(topLine, leftLine);
+  const tr = intersectHV(topLine, rightLine);
+  const br = intersectHV(botLine, rightLine);
+  const bl = intersectHV(botLine, leftLine);
+  if (!tl || !tr || !br || !bl) return null;
+
+  const quad: [Point2D, Point2D, Point2D, Point2D] = [tl, tr, br, bl];
+  if (!isConvexQuad(quad)) return null;
+
+  // Validar que las esquinas estén dentro de la imagen y el área sea coherente con el AABB
+  for (const pt of quad) {
+    if (pt.x < -2 || pt.x > gw + 2 || pt.y < -2 || pt.y > gh + 2) return null;
+  }
+  const aabbArea = bw * bh;
+  const qArea = quadArea(quad);
+  if (qArea < aabbArea * 0.52 || qArea > aabbArea * 1.18) return null;
+
+  // Si la perspectiva es despreciable (< 1.6 px de malla respecto al AABB), mantener AABB frontal limpio
+  const maxShift = Math.max(
+    Math.hypot(tl.x - bx0, tl.y - by0),
+    Math.hypot(tr.x - bx1, tr.y - by0),
+    Math.hypot(br.x - bx1, br.y - by1),
+    Math.hypot(bl.x - bx0, bl.y - by1),
+  );
+  if (maxShift < 1.6) return null;
+
+  return quad;
+}
+
+/**
  * Auto-propone las 4 esquinas iniciales [TL, TR, BR, BL] del mueble en la fotografía
- * usando segmentación en 3 etapas: Sobel suavizado + Flood-Fill BFS (techo/laterales)
- * + componente aterrizada (descarta cuadros/TVs altos y respeta huecos de escritorio).
+ * usando segmentación en 3 etapas (Sobel multi-escala + Flood-Fill BFS combinado + componente
+ * aterrizada) y ajuste de cuadrilátero proyectivo por Theil-Sen sobre los 4 bordes del contorno,
+ * con validación convexa y fallback seguro al AABB cuando el mueble está frontal puro.
  */
 export function autoDetectFurnitureQuad(
   rgba: Uint8ClampedArray,
@@ -717,7 +1038,7 @@ export function autoDetectFurnitureQuad(
   const [bx0, bx1] = findMainSpan(colCounts, 1, gw - 1, colThresh);
   let [by0, by1] = findMainSpan(rowCounts, 1, gh - 1, rowThresh);
 
-  // Recortar objetos decorativos estrechos apoyados encima de la cubierta (floreros, relojes, cuadros)
+  // Recortar objetos decorativos estrechos apoyados encima de la cubierta
   if (by0 >= 0 && by1 > by0 + 12) {
     const bodySpan = by1 - by0;
     const topBodyThresh = Math.max(0.22, maxRowD * 0.45);
@@ -748,7 +1069,6 @@ export function autoDetectFurnitureQuad(
         if (avgEdge >= 38 && avgEdge > bestEdgeScore) {
           bestEdgeScore = avgEdge;
           bestLineY = y;
-          // Preferir la línea fuerte más baja (base real del mueble sobre el piso)
           if (avgEdge >= 58) break;
         }
       }
@@ -778,16 +1098,24 @@ export function autoDetectFurnitureQuad(
     };
   }
 
-  const toImgX = (gx: number) => Math.max(4, Math.min(imgW - 4, Math.round(((gx + 0.5) / gw) * imgW)));
-  const toImgY = (gy: number) => Math.max(4, Math.min(imgH - 4, Math.round(((gy + 0.5) / gh) * imgH)));
+  const toImgX = (gx: number) => clamp(Math.round(((gx + 0.5) / gw) * imgW), 4, imgW - 4);
+  const toImgY = (gy: number) => clamp(Math.round(((gy + 0.5) / gh) * imgH), 4, imgH - 4);
 
-  // Por defecto entregar rectángulo limpio alineado al frente (evita deformar trapecios en escritorios con patas abiertas)
-  const quadCorners: [Point2D, Point2D, Point2D, Point2D] = [
-    { x: toImgX(bx0), y: toImgY(by0) },
-    { x: toImgX(bx1), y: toImgY(by0) },
-    { x: toImgX(bx1), y: toImgY(by1) },
-    { x: toImgX(bx0), y: toImgY(by1) },
-  ];
+  // Refinar a trapezoide proyectivo real cuando los 4 bordes del contorno son rectas inclinadas
+  const fittedGridQuad = fitPerspectiveQuadFromMask(fgMain, gw, gh, bx0, bx1, by0, by1);
+  const quadCorners: [Point2D, Point2D, Point2D, Point2D] = fittedGridQuad
+    ? [
+        { x: toImgX(fittedGridQuad[0].x), y: toImgY(fittedGridQuad[0].y) },
+        { x: toImgX(fittedGridQuad[1].x), y: toImgY(fittedGridQuad[1].y) },
+        { x: toImgX(fittedGridQuad[2].x), y: toImgY(fittedGridQuad[2].y) },
+        { x: toImgX(fittedGridQuad[3].x), y: toImgY(fittedGridQuad[3].y) },
+      ]
+    : [
+        { x: toImgX(bx0), y: toImgY(by0) },
+        { x: toImgX(bx1), y: toImgY(by0) },
+        { x: toImgX(bx1), y: toImgY(by1) },
+        { x: toImgX(bx0), y: toImgY(by1) },
+      ];
 
   let fgInside = 0;
   for (let y = by0; y <= by1; y++) {
@@ -796,7 +1124,7 @@ export function autoDetectFurnitureQuad(
     }
   }
   const fillRatio = fgInside / Math.max(1, (bw + 1) * (bh + 1));
-  const confidence = Number(Math.max(0.5, Math.min(0.96, 0.48 + fillRatio * 0.48)).toFixed(2));
+  const confidence = Number(clamp(0.48 + fillRatio * 0.48, 0.5, 0.96).toFixed(2));
   const estW = (bw / gw) * imgW;
   const estH = (bh / gh) * imgH;
 
@@ -821,11 +1149,8 @@ export function computeSobelEdgeOverlayRGBA(
 ): Uint8ClampedArray {
   const nPx = W * H;
   const seg = segmentForegroundGrid(rgba, W, H, 144);
-  const lum = new Float32Array(nPx);
-  for (let i = 0; i < nPx; i++) {
-    const p = i * 4;
-    lum[i] = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
-  }
+  const lum = extractLuminanceBuffer(rgba, W, H, false);
+  const sobelMag = computeSobelMag(lum, W, H);
 
   const out = new Uint8ClampedArray(nPx * 4);
   for (let y = 0; y < H; y++) {
@@ -836,43 +1161,19 @@ export function computeSobelEdgeOverlayRGBA(
       const isBg = seg.bgMask[gy * seg.gw + gx] === 1;
       const p = (rowOff + x) * 4;
       if (isBg) {
-        // Fondo detectado fuertemente atenuado en azul oscuro
         out[p] = Math.round(rgba[p] * 0.16 + 8);
         out[p + 1] = Math.round(rgba[p + 1] * 0.18 + 12);
         out[p + 2] = Math.round(rgba[p + 2] * 0.24 + 24);
       } else {
-        // Silueta del mueble preservada con contraste claro
         out[p] = Math.round(rgba[p] * 0.58);
         out[p + 1] = Math.round(rgba[p + 1] * 0.6);
         out[p + 2] = Math.round(rgba[p + 2] * 0.64);
       }
       out[p + 3] = 255;
-    }
-  }
 
-  for (let y = 1; y < H - 1; y++) {
-    const rowUp = (y - 1) * W;
-    const rowMid = y * W;
-    const rowDn = (y + 1) * W;
-    for (let x = 1; x < W - 1; x++) {
-      const gx =
-        -lum[rowUp + x - 1] +
-        lum[rowUp + x + 1] -
-        2 * lum[rowMid + x - 1] +
-        2 * lum[rowMid + x + 1] -
-        lum[rowDn + x - 1] +
-        lum[rowDn + x + 1];
-      const gy =
-        -lum[rowUp + x - 1] -
-        2 * lum[rowUp + x] -
-        lum[rowUp + x + 1] +
-        lum[rowDn + x - 1] +
-        2 * lum[rowDn + x] +
-        lum[rowDn + x + 1];
-      const mag = Math.hypot(gx, gy);
+      const mag = sobelMag[rowOff + x];
       if (mag > 44) {
         const intensity = Math.min(1, (mag - 44) / 200);
-        const p = (rowMid + x) * 4;
         out[p] = Math.min(255, Math.round(out[p] + intensity * 60));
         out[p + 1] = Math.min(255, Math.round(out[p + 1] + intensity * 225));
         out[p + 2] = Math.min(255, Math.round(out[p + 2] + intensity * 255));

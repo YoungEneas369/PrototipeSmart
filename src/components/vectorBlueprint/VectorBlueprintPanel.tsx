@@ -1,15 +1,14 @@
 /**
- * SMARTFURNITURE — PANEL DE PLANO VECTORIAL 2D Y APROBACIÓN DE REDIMENSIONAMIENTO (v3.2)
- * Muestra el esquema vectorial técnico 2D del mueble original (V0) frente al nuevo modelo
- * vectorial redimensionado (Vf), permite ajustar módulos frontales (puertas/cajones/abierto)
- * y exige aprobación explícita del usuario antes de pasar al despiece y corte en planchas 244×122.
+ * SMARTFURNITURE — PANEL DE PLANO VECTORIAL 2D, PARTES Y APROBACIÓN (v8.0)
+ * - Compara el modelo vectorial original (V₀) frente al modelo redimensionado (V_f).
+ * - Unifica la edición de módulos frontales con `ZoneInspector` (sincronizado 2D ↔ 3D).
+ * - Formato dinámico de plancha (sin hardcodings 244×122) y unidad sincronizada (`mm` / `cm`).
  */
 import { useMemo } from 'react';
 import { CheckCircle2, Download, SlidersHorizontal } from 'lucide-react';
 import type {
   CuttingPlanResult,
   DespieceResult,
-  FrontModuleKind,
   FrontZone,
   FurnitureTopology,
   ScaleAndBoardParams,
@@ -17,14 +16,21 @@ import type {
 import { calculateDespiece } from '../../core/mathEngine';
 import { renderFurnitureVectorBlueprintSvg } from '../../core/vectorBlueprint';
 import { NumericInput } from '../NumericInput';
+import { ZoneInspector } from '../vectorCanvas/ZoneInspector';
 
-interface VectorBlueprintPanelProps {
+export interface VectorBlueprintPanelProps {
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
   despiece: DespieceResult;
   cuttingPlan: CuttingPlanResult;
   modelApproved: boolean;
-  onUpdateDim: (axis: 'x' | 'y' | 'z', value: number) => void;
+  displayUnit?: 'mm' | 'cm';
+  selectedZoneId: string | null;
+  hoveredZoneId?: string | null;
+  onSelectZone: (zoneId: string | null) => void;
+  onHoverZone?: (zoneId: string | null) => void;
+  onUpdateDim: (axis: 'x' | 'y' | 'z', valueMm: number) => void;
+  onUpdateTopology: (next: FurnitureTopology) => void;
   onUpdateFrontZones: (zones: FrontZone[]) => void;
   onApproveModel: () => void;
 }
@@ -41,17 +47,36 @@ function downloadSvg(filename: string, svg: string): void {
   URL.revokeObjectURL(url);
 }
 
+function formatDimTriplet(
+  dims: { x: number; y: number; z: number },
+  unit: 'mm' | 'cm',
+): string {
+  if (unit === 'cm') {
+    const fx = Number((dims.x / 10).toFixed(1));
+    const fy = Number((dims.y / 10).toFixed(1));
+    const fz = Number((dims.z / 10).toFixed(1));
+    return `${fx}×${fy}×${fz} cm`;
+  }
+  return `${Math.round(dims.x)}×${Math.round(dims.y)}×${Math.round(dims.z)} mm`;
+}
+
 export function VectorBlueprintPanel({
   topology,
   params,
   despiece,
   cuttingPlan,
   modelApproved,
+  displayUnit = 'mm',
+  selectedZoneId,
+  hoveredZoneId,
+  onSelectZone,
+  onHoverZone,
   onUpdateDim,
+  onUpdateTopology,
   onUpdateFrontZones,
   onApproveModel,
 }: VectorBlueprintPanelProps) {
-  // Despiece del modelo ORIGINAL V0 para mostrar comparación lado a lado
+  // Despiece del modelo ORIGINAL V0 para comparación lado a lado
   const originalParams = useMemo<ScaleAndBoardParams>(
     () => ({
       ...params,
@@ -87,47 +112,19 @@ export function VectorBlueprintPanel({
     params.targetDimensions.y !== params.referenceDimensions.y ||
     params.targetDimensions.z !== params.referenceDimensions.z;
 
-  const zones = topology.frontZones ?? [];
-
-  const handleChangeZoneKind = (id: string, kind: FrontModuleKind) => {
-    const updated = zones.map((z) =>
-      z.id === id
-        ? {
-            ...z,
-            kind,
-            drawerCount: kind === 'drawers' ? (z.drawerCount ?? 2) : undefined,
-            basketCount: kind === 'baskets' ? (z.basketCount ?? 3) : undefined,
-            materialOverride:
-              kind === 'open' || kind === 'leg_void' || kind === 'void_outside' || kind === 'baskets'
-                ? undefined
-                : z.materialOverride,
-          }
-        : z,
-    );
-    onUpdateFrontZones(updated);
-  };
-
-  const handleChangeDrawerCount = (id: string, count: number) => {
-    const updated = zones.map((z) =>
-      z.id === id ? { ...z, drawerCount: Math.max(1, Math.min(6, count)) } : z,
-    );
-    onUpdateFrontZones(updated);
-  };
-
-  const handleChangeBasketCount = (id: string, count: number) => {
-    const updated = zones.map((z) =>
-      z.id === id ? { ...z, basketCount: Math.max(1, Math.min(6, count)) } : z,
-    );
-    onUpdateFrontZones(updated);
-  };
+  const sheetDimLabel = `${Math.round(params.sheetDimensions.width / 10)}×${Math.round(params.sheetDimensions.height / 10)} cm`;
+  const isCm = displayUnit === 'cm';
+  const toDisplay = (mm: number) => (isCm ? Number((mm / 10).toFixed(1)) : Math.round(mm));
+  const fromDisplay = (val: number) => (isCm ? Math.round(val * 10) : Math.round(val));
 
   return (
     <div className="vector-card">
       <div className="card-header-row">
         <div>
-          <h3>Paso 2 — Esquema Vectorial 2D, Redimensionamiento y Aprobación</h3>
+          <h3>2. Plano Vectorial 2D, Partes y Aprobación</h3>
           <p className="muted small-note">
-            Verifica la interpretación vectorial del mueble original (V₀), ajusta las nuevas dimensiones (V_f) y aprueba para generar el despiece completo y planchas 244×122 cm.
+            Verifica la interpretación vectorial original (V₀), ajusta las nuevas dimensiones (V
+            <sub>f</sub>) y aprueba para pasar al despiece y planchas {sheetDimLabel}.
           </p>
         </div>
         <div className="export-bar">
@@ -141,63 +138,71 @@ export function VectorBlueprintPanel({
               )
             }
           >
-            <Download size={15} /> Descargar Plano Vectorial SVG
+            <Download size={15} /> Descargar Plano SVG
           </button>
           <button
             type="button"
-            className="btn-approve"
+            className={modelApproved ? 'btn-approve is-approved' : 'btn-approve'}
             onClick={onApproveModel}
           >
             <CheckCircle2 size={16} />{' '}
             {modelApproved
-              ? 'Modelo Aprobado — Ver Despiece y Planchas 244×122'
-              : 'Aceptar Modelo Vectorial → Generar Despiece y Corte 244×122'}
+              ? `Plano Aprobado — Ir a Taller (${sheetDimLabel})`
+              : `Aprobar Plano 2D → Ir a Corte y Presupuesto (${sheetDimLabel})`}
           </button>
         </div>
       </div>
 
-      {/* Barra rápida de redimensionamiento solicitada por el cliente */}
+      {/* Barra rápida de redimensionamiento sincronizada con la unidad activa */}
       <div className="calib-box">
         <SlidersHorizontal size={15} />
-        <strong>Redimensionar modelo vectorial (mm):</strong>
+        <strong>Redimensionar V<sub>f</sub> ({displayUnit}):</strong>
         <label className="small-note inline-num">
           Ancho X:
           <NumericInput
-            min={300}
-            max={2400}
-            step={10}
-            value={params.targetDimensions.x}
-            onCommit={(v) => onUpdateDim('x', v)}
-            style={{ width: 76, marginLeft: 4 }}
-            ariaLabel="Ancho X en milímetros"
+            min={isCm ? 30 : 300}
+            max={isCm ? 260 : 2600}
+            step={isCm ? 1 : 10}
+            allowDecimals={isCm}
+            unitSuffix={displayUnit}
+            value={toDisplay(params.targetDimensions.x)}
+            onCommit={(v) => onUpdateDim('x', fromDisplay(v))}
+            style={{ width: 96 }}
+            ariaLabel={`Ancho X en ${displayUnit}`}
           />
         </label>
         <label className="small-note inline-num">
           Alto Y (cuerpo):
           <NumericInput
-            min={300}
-            max={2400}
-            step={10}
-            value={params.targetDimensions.y}
-            onCommit={(v) => onUpdateDim('y', v)}
-            style={{ width: 76, marginLeft: 4 }}
-            ariaLabel="Alto Y en milímetros"
+            min={isCm ? 30 : 300}
+            max={isCm ? 260 : 2600}
+            step={isCm ? 1 : 10}
+            allowDecimals={isCm}
+            unitSuffix={displayUnit}
+            value={toDisplay(params.targetDimensions.y)}
+            onCommit={(v) => onUpdateDim('y', fromDisplay(v))}
+            style={{ width: 96 }}
+            ariaLabel={`Alto Y en ${displayUnit}`}
           />
         </label>
         <label className="small-note inline-num">
           Profundidad Z:
           <NumericInput
-            min={200}
-            max={800}
-            step={10}
-            value={params.targetDimensions.z}
-            onCommit={(v) => onUpdateDim('z', v)}
-            style={{ width: 72, marginLeft: 4 }}
-            ariaLabel="Profundidad Z en milímetros"
+            min={isCm ? 18 : 180}
+            max={isCm ? 90 : 900}
+            step={isCm ? 1 : 10}
+            allowDecimals={isCm}
+            unitSuffix={displayUnit}
+            value={toDisplay(params.targetDimensions.z)}
+            onCommit={(v) => onUpdateDim('z', fromDisplay(v))}
+            style={{ width: 92 }}
+            ariaLabel={`Profundidad Z en ${displayUnit}`}
           />
         </label>
-        <span className="mono small-note">
-          {dimsChanged ? 'Redimensionado activo (nuevo plano vectorial calculado)' : 'Dimensiones originales V₀'}
+        <span className="mono small-note muted">
+          {dimsChanged
+            ? 'Redimensionado activo (nuevo plano V_f)'
+            : 'Dimensiones originales V₀'}
         </span>
       </div>
 
@@ -205,72 +210,38 @@ export function VectorBlueprintPanel({
       <div className="blueprint-grid">
         <div className="blueprint-pane">
           <div className="blueprint-pane-title">
-            1. Plano Vectorial Original Interpretado (V₀: {params.referenceDimensions.x}×{params.referenceDimensions.y}×{params.referenceDimensions.z} mm)
+            1. Plano Original (V₀: {formatDimTriplet(params.referenceDimensions, displayUnit)})
           </div>
-          <div
-            className="svg-preview"
-            dangerouslySetInnerHTML={{ __html: svgOriginal }}
-          />
+          <div className="svg-preview" dangerouslySetInnerHTML={{ __html: svgOriginal }} />
         </div>
 
         <div className="blueprint-pane">
           <div className="blueprint-pane-title resized">
-            2. Nuevo Plano Vectorial Redimensionado (V_f: {params.targetDimensions.x}×{params.targetDimensions.y}×{params.targetDimensions.z} mm)
+            2. Plano Redimensionado (V_f: {formatDimTriplet(params.targetDimensions, displayUnit)})
           </div>
-          <div
-            className="svg-preview"
-            dangerouslySetInnerHTML={{ __html: svgResized }}
-          />
+          <div className="svg-preview" dangerouslySetInnerHTML={{ __html: svgResized }} />
         </div>
       </div>
 
-      {/* Editor rápido de zonas frontales (Puertas / Cajones / Abierto / Vidrio) */}
-      {zones.length > 0 && (
-        <div className="metric-card">
-          <h4>Ajuste fino de Módulos Frontales ({zones.length} zonas interpretadas)</h4>
-          <div className="zone-editor-grid">
-            {zones.map((z) => (
-              <div key={z.id} className="zone-chip">
-                <strong>{z.label ?? z.id}</strong>
-                <select
-                  value={z.kind}
-                  onChange={(e) => handleChangeZoneKind(z.id, e.target.value as FrontModuleKind)}
-                >
-                  <option value="open">Abierto (Vano)</option>
-                  <option value="baskets">Canastos Metálicos</option>
-                  <option value="door_left">Puerta (Abre Izq)</option>
-                  <option value="door_right">Puerta (Abre Der)</option>
-                  <option value="door_double">Puerta Doble</option>
-                  <option value="door_glass">Puerta con Vidrio</option>
-                  <option value="drawers">Cajón / Cajonera</option>
-                  <option value="leg_void">Hueco Piernas</option>
-                  <option value="void_outside">Sin mueble (Vacío exterior)</option>
-                </select>
-                {z.kind === 'drawers' && (
-                  <NumericInput
-                    min={1}
-                    max={6}
-                    value={z.drawerCount ?? 2}
-                    onCommit={(v) => handleChangeDrawerCount(z.id, v)}
-                    style={{ width: 52 }}
-                    ariaLabel="Cantidad de cajones"
-                  />
-                )}
-                {z.kind === 'baskets' && (
-                  <NumericInput
-                    min={1}
-                    max={6}
-                    value={z.basketCount ?? 3}
-                    onCommit={(v) => handleChangeBasketCount(z.id, v)}
-                    style={{ width: 52 }}
-                    ariaLabel="Cantidad de canastos metálicos"
-                  />
-                )}
-              </div>
-            ))}
-          </div>
+      {/* Inspector unificado de zonas frontales compartido con VectorCanvas */}
+      <div className="metric-card">
+        <div className="card-header-row">
+          <h4>Inspector de Zonas y Módulos Frontales ({(topology.frontZones ?? []).length} zonas)</h4>
+          <span className="small-note muted">
+            Los cambios se reflejan al instante en el plano 2D, el visor 3D y el despiece.
+          </span>
         </div>
-      )}
+        <ZoneInspector
+          topology={topology}
+          params={params}
+          selectedZoneId={selectedZoneId}
+          hoveredZoneId={hoveredZoneId}
+          onSelectZone={onSelectZone}
+          onHoverZone={onHoverZone}
+          onUpdateTopology={onUpdateTopology}
+          onUpdateFrontZones={onUpdateFrontZones}
+        />
+      </div>
     </div>
   );
 }

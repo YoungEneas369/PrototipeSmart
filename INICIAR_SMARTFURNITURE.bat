@@ -1,11 +1,32 @@
 @echo off
-title SMARTFURNITURE v3.1 - APLICACION LOCAL OFFLINE
+setlocal
+title SmartFurniture v8.0 - Aplicacion Local 100%% Offline
 cd /d "%~dp0"
+
 echo ==========================================================
-echo   SMARTFURNITURE v3.1 // 100%% LOCAL OFFLINE (INACAP U3)
+echo   SMARTFURNITURE v8.0 // 100%% LOCAL OFFLINE (INACAP U3)
 echo ==========================================================
-echo   Abriendo servidor de desarrollo Vite en navegador...
+
+where node >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] No se encontro Node.js en el PATH del sistema.
+  echo         Instala Node.js LTS (v20 o superior^) y vuelve a ejecutar este archivo.
+  pause
+  exit /b 1
+)
+
+if not exist "node_modules" (
+  echo [INFO] Carpeta node_modules no encontrada. Instalando dependencias con npm ci...
+  call npm ci
+  if errorlevel 1 (
+    echo [ERROR] Fallo la instalacion de dependencias ^(npm ci^).
+    pause
+    exit /b 1
+  )
+)
+
+echo   Iniciando servidor local Vite y abriendo el navegador...
 echo   Presione Ctrl+C para detener.
 echo ==========================================================
-node node_modules\vite\bin\vite.js --open
+call npm run dev -- --open
 pause

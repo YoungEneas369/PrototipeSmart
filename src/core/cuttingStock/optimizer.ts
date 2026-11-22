@@ -1,14 +1,19 @@
 /**
- * SMARTFURNITURE — OPTIMIZADOR DE CORTE 2D (CUTTING STOCK) v3.0
- * - Separación estricta por espesor (18 mm Melamina vs 3 mm Durolac/MDF).
+ * SMARTFURNITURE — OPTIMIZADOR DE CORTE 2D (CUTTING STOCK) v8.0
+ * - Separación estricta por (espesor + material) para muebles bicolor y fondos 3 mm:
+ *   jamás mezcla 'blanco', 'roble', 'grafito' o 'durolac_3mm' en la misma plancha.
  * - Estrategia por defecto: Guillotina de 2 etapas (cortable en seccionadora real)
- *   con evaluación multi-orientación real cuando `respectGrain = false`.
+ *   con aprovechamiento de restos de franja para piezas angostas y ordenamiento por área
+ *   incluso con `respectGrain = true` (sin rotar), más evaluación multi-orientación
+ *   real cuando `respectGrain = false`.
  * - Estrategia opcional: MaxRects BSSF (estilo CNC).
  * - Kerf exacto por padding virtual + margen de escuadrado (`trimMm`).
  * - Promedio global ponderado por área real de planchas (sin sesgo al mezclar formatos).
  */
 import type {
   BoardPiece,
+  PieceMaterial,
+  PieceType,
   PlacedRectangle,
   ScaleAndBoardParams,
   SheetLayout,
@@ -22,7 +27,9 @@ interface FlatItem {
   ancho: number;
   alto: number;
   espesor: number;
-  material: string;
+  material: PieceMaterial;
+  tipo: PieceType;
+  miterAngleDeg?: number;
   canRotate: boolean;
   sourcePiece: BoardPiece;
 }
@@ -60,6 +67,16 @@ interface PackRunResult {
   unplaced: BoardPiece[];
 }
 
+type GuillotinePolicy =
+  | 'default'
+  | 'defaultReuse'
+  | 'areaDescReuse'
+  | 'preferLowHeight'
+  | 'preferLowHeightReuse'
+  | 'preferRotatedAll'
+  | 'preferRotatedAllReuse'
+  | 'mixedGreedy';
+
 function expandPieces(pieces: readonly BoardPiece[], respectGrainGlobal: boolean): FlatItem[] {
   const flat: FlatItem[] = [];
   for (const p of pieces) {
@@ -73,6 +90,8 @@ function expandPieces(pieces: readonly BoardPiece[], respectGrainGlobal: boolean
         alto: p.alto,
         espesor: p.espesor,
         material: p.material,
+        tipo: p.tipo,
+        miterAngleDeg: p.miterAngleDeg,
         canRotate,
         sourcePiece: p,
       });
@@ -83,6 +102,31 @@ function expandPieces(pieces: readonly BoardPiece[], respectGrainGlobal: boolean
 
 function fits(pw: number, ph: number, usableW: number, usableH: number): boolean {
   return pw <= usableW + EPS && ph <= usableH + EPS;
+}
+
+function makePlacedRect(
+  item: FlatItem,
+  x: number,
+  y: number,
+  pw: number,
+  ph: number,
+  rotado: boolean,
+): PlacedRectangle {
+  const rect: PlacedRectangle = {
+    idPieza: item.idPieza,
+    nombre: item.nombre,
+    x: Number(x.toFixed(4)),
+    y: Number(y.toFixed(4)),
+    ancho: Number(pw.toFixed(4)),
+    alto: Number(ph.toFixed(4)),
+    rotado,
+    material: item.material,
+    tipo: item.tipo,
+  };
+  if (item.miterAngleDeg !== undefined) {
+    rect.miterAngleDeg = item.miterAngleDeg;
+  }
+  return rect;
 }
 
 function packStripsToSheets(
@@ -114,20 +158,47 @@ function packStripsToSheets(
     let curY = 0;
     for (const st of vs.strips) {
       for (const pl of st.placements) {
-        placements.push({
-          idPieza: pl.item.idPieza,
-          nombre: pl.item.nombre,
-          x: Number((trimMm + pl.vx).toFixed(4)),
-          y: Number((trimMm + curY).toFixed(4)),
-          ancho: Number(pl.pw.toFixed(4)),
-          alto: Number(pl.ph.toFixed(4)),
-          rotado: pl.rotado,
-        });
+        placements.push(
+          makePlacedRect(
+            pl.item,
+            trimMm + pl.vx,
+            trimMm + curY,
+            pl.pw,
+            pl.ph,
+            pl.rotado,
+          ),
+        );
       }
       curY += st.height;
     }
     return { placements, stripCount: vs.strips.length, usedH: vs.usedH };
   });
+}
+
+function findBestStripForOrientation(
+  strips: readonly Strip[],
+  vw: number,
+  vh: number,
+  capW: number,
+  maxHeightDiffRatio: number,
+): { strip: Strip; score: number } | null {
+  let bestStrip: Strip | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (const st of strips) {
+    if (vh <= st.height + EPS && st.usedW + vw <= capW + EPS) {
+      const heightDiffRatio = (st.height - vh) / st.height;
+      if (heightDiffRatio <= maxHeightDiffRatio + EPS) {
+        const score = (st.height - vh) * 10 + (capW - (st.usedW + vw)) * 0.01;
+        if (score < bestScore) {
+          bestScore = score;
+          bestStrip = st;
+        }
+      }
+    }
+  }
+
+  return bestStrip ? { strip: bestStrip, score: bestScore } : null;
 }
 
 function runGuillotinePolicy(
@@ -136,15 +207,17 @@ function runGuillotinePolicy(
   usableH: number,
   kerf: number,
   trimMm: number,
-  policy: 'default' | 'preferLowHeight' | 'preferRotatedAll' | 'mixedGreedy',
+  policy: GuillotinePolicy,
 ): PackRunResult {
   const capW = usableW + kerf;
   const capH = usableH + kerf;
   const unplaced: BoardPiece[] = [];
 
-  if (policy === 'mixedGreedy') {
-    // Ordenar por área descendente y elegir dinámicamente la orientación que mejor aproveche franjas abiertas
-    const sorted = [...items].sort((a, b) => b.ancho * b.alto - a.ancho * a.alto);
+  if (policy === 'mixedGreedy' || policy === 'areaDescReuse') {
+    // Ordenar por área descendente y aprovechar restos de franja para piezas angostas
+    const sorted = [...items].sort(
+      (a, b) => b.ancho * b.alto - a.ancho * a.alto || b.alto - a.alto || b.ancho - a.ancho,
+    );
     const strips: Strip[] = [];
 
     for (const item of sorted) {
@@ -152,8 +225,14 @@ function runGuillotinePolicy(
       if (fits(item.ancho, item.alto, usableW, usableH)) {
         options.push({ pw: item.ancho, ph: item.alto, rotado: false });
       }
-      if (item.canRotate && Math.abs(item.ancho - item.alto) > EPS && fits(item.alto, item.ancho, usableW, usableH)) {
-        options.push({ pw: item.alto, ph: item.ancho, rotado: true });
+      if (
+        item.canRotate &&
+        Math.abs(item.ancho - item.alto) > EPS &&
+        fits(item.alto, item.ancho, usableW, usableH)
+      ) {
+        if (policy === 'mixedGreedy' || options.length === 0) {
+          options.push({ pw: item.alto, ph: item.ancho, rotado: true });
+        }
       }
       if (options.length === 0) {
         unplaced.push(item.sourcePiece);
@@ -164,20 +243,24 @@ function runGuillotinePolicy(
       let bestOpt: { pw: number; ph: number; rotado: boolean } | null = null;
       let bestScore = Number.POSITIVE_INFINITY;
 
+      // Paso 1: ajuste ajustado en altura (<= 30%)
       for (const opt of options) {
-        const vw = opt.pw + kerf;
-        const vh = opt.ph + kerf;
-        for (const st of strips) {
-          if (vh <= st.height + EPS && st.usedW + vw <= capW + EPS) {
-            const heightDiffRatio = (st.height - vh) / st.height;
-            if (heightDiffRatio <= 0.30 + EPS) {
-              const score = (st.height - vh) * 10 + (capW - (st.usedW + vw)) * 0.01;
-              if (score < bestScore) {
-                bestScore = score;
-                bestStrip = st;
-                bestOpt = opt;
-              }
-            }
+        const cand = findBestStripForOrientation(strips, opt.pw + kerf, opt.ph + kerf, capW, 0.30);
+        if (cand && cand.score < bestScore) {
+          bestScore = cand.score;
+          bestStrip = cand.strip;
+          bestOpt = opt;
+        }
+      }
+
+      // Paso 2: aprovechar restos horizontales de franjas existentes para piezas angostas (cajones/zócalos)
+      if (!bestStrip) {
+        for (const opt of options) {
+          const cand = findBestStripForOrientation(strips, opt.pw + kerf, opt.ph + kerf, capW, 1.0);
+          if (cand && cand.score < bestScore) {
+            bestScore = cand.score;
+            bestStrip = cand.strip;
+            bestOpt = opt;
           }
         }
       }
@@ -207,6 +290,11 @@ function runGuillotinePolicy(
   }
 
   // Políticas de orientación estática + FFD por altura de franja
+  const allowStripReuse =
+    policy === 'defaultReuse' ||
+    policy === 'preferLowHeightReuse' ||
+    policy === 'preferRotatedAllReuse';
+
   const oriented: OrientedItem[] = [];
   for (const item of items) {
     const normFits = fits(item.ancho, item.alto, usableW, usableH);
@@ -221,9 +309,9 @@ function runGuillotinePolicy(
     if (!normFits && rotFits) {
       useRot = true;
     } else if (normFits && rotFits) {
-      if (policy === 'preferRotatedAll') {
+      if (policy === 'preferRotatedAll' || policy === 'preferRotatedAllReuse') {
         useRot = Math.abs(item.ancho - item.alto) > EPS;
-      } else if (policy === 'preferLowHeight') {
+      } else if (policy === 'preferLowHeight' || policy === 'preferLowHeightReuse') {
         useRot = item.ancho < item.alto - EPS;
       } else {
         useRot = false;
@@ -244,28 +332,22 @@ function runGuillotinePolicy(
   for (const oi of oriented) {
     const vw = oi.pw + kerf;
     const vh = oi.ph + kerf;
-    let placed = false;
+    let targetStrip = findBestStripForOrientation(strips, vw, vh, capW, 0.25)?.strip ?? null;
 
-    for (const st of strips) {
-      if (
-        vh <= st.height + EPS &&
-        st.usedW + vw <= capW + EPS &&
-        (st.height - vh) / st.height <= 0.25 + EPS
-      ) {
-        st.placements.push({
-          item: oi.item,
-          vx: st.usedW,
-          pw: oi.pw,
-          ph: oi.ph,
-          rotado: oi.rotado,
-        });
-        st.usedW += vw;
-        placed = true;
-        break;
-      }
+    if (!targetStrip && allowStripReuse) {
+      targetStrip = findBestStripForOrientation(strips, vw, vh, capW, 1.0)?.strip ?? null;
     }
 
-    if (!placed) {
+    if (targetStrip) {
+      targetStrip.placements.push({
+        item: oi.item,
+        vx: targetStrip.usedW,
+        pw: oi.pw,
+        ph: oi.ph,
+        rotado: oi.rotado,
+      });
+      targetStrip.usedW += vw;
+    } else {
       strips.push({
         height: vh,
         usedW: vw,
@@ -323,7 +405,9 @@ function runMaxRectsBSSF(
 ): PackRunResult {
   const capW = usableW + kerf;
   const capH = usableH + kerf;
-  const sorted = [...items].sort((a, b) => Math.max(b.ancho, b.alto) - Math.max(a.ancho, a.alto) || b.ancho * b.alto - a.ancho * a.alto);
+  const sorted = [...items].sort(
+    (a, b) => Math.max(b.ancho, b.alto) - Math.max(a.ancho, a.alto) || b.ancho * b.alto - a.ancho * a.alto,
+  );
 
   const sheets: Array<{ freeRects: FreeRect[]; placements: PlacedRectangle[] }> = [];
   const unplaced: BoardPiece[] = [];
@@ -376,7 +460,6 @@ function runMaxRectsBSSF(
     }
 
     if (chosenSheetIdx === -1) {
-      // Abrir nueva plancha
       const firstCand = candidates[0];
       sheets.push({
         freeRects: [{ x: 0, y: 0, w: capW, h: capH }],
@@ -391,15 +474,9 @@ function runMaxRectsBSSF(
     const vw = pl.pw + kerf;
     const vh = pl.ph + kerf;
 
-    targetSheet.placements.push({
-      idPieza: item.idPieza,
-      nombre: item.nombre,
-      x: Number((trimMm + pl.x).toFixed(4)),
-      y: Number((trimMm + pl.y).toFixed(4)),
-      ancho: Number(pl.pw.toFixed(4)),
-      alto: Number(pl.ph.toFixed(4)),
-      rotado: pl.rotado,
-    });
+    targetSheet.placements.push(
+      makePlacedRect(item, trimMm + pl.x, trimMm + pl.y, pl.pw, pl.ph, pl.rotado),
+    );
 
     // Subdividir rectángulos libres que intersectan el rectángulo colocado
     const nextFree: FreeRect[] = [];
@@ -461,8 +538,15 @@ function runMaxRectsBSSF(
   };
 }
 
+interface PieceGroup {
+  thickness: number;
+  material: PieceMaterial;
+  pieces: BoardPiece[];
+}
+
 /**
- * Ejecuta el empaquetado 2D completo agrupando estrictamente por espesor.
+ * Ejecuta el empaquetado 2D completo agrupando estrictamente por clave compuesta
+ * `${espesor}::${material}` (separación bicolor y de fondos 3 mm garantizada).
  */
 export function optimizeCuttingSheets(
   pieces: readonly BoardPiece[],
@@ -479,15 +563,30 @@ export function optimizeCuttingSheets(
   const trimMm = Math.max(0, params.trimMm ?? 0);
   const strategy = params.packingStrategy ?? 'guillotine';
 
-  // Agrupar piezas por espesor (orden descendente: 18 mm primero, luego 3 mm)
-  const byThickness = new Map<number, BoardPiece[]>();
+  // Agrupar piezas por clave compuesta `${espesor}::${material}` (jamás mezclar acabados o espesores)
+  const groupMap = new Map<string, PieceGroup>();
   for (const piece of pieces) {
-    const key = Number(piece.espesor.toFixed(1));
-    const list = byThickness.get(key) ?? [];
-    list.push(piece);
-    byThickness.set(key, list);
+    const thickness = Number(piece.espesor.toFixed(1));
+    const key = `${thickness.toFixed(1)}::${piece.material}`;
+    const existing = groupMap.get(key);
+    if (existing) {
+      existing.pieces.push(piece);
+    } else {
+      groupMap.set(key, {
+        thickness,
+        material: piece.material,
+        pieces: [piece],
+      });
+    }
   }
-  const sortedThicknesses = Array.from(byThickness.keys()).sort((a, b) => b - a);
+
+  // Orden determinista: espesor descendente (18 mm primero), material principal primero, luego alfabético
+  const sortedGroups = Array.from(groupMap.values()).sort((a, b) => {
+    if (b.thickness !== a.thickness) return b.thickness - a.thickness;
+    if (a.material === params.material && b.material !== params.material) return -1;
+    if (b.material === params.material && a.material !== params.material) return 1;
+    return a.material.localeCompare(b.material);
+  });
 
   const sheetsUsed: SheetLayout[] = [];
   const unplacedPieces: BoardPiece[] = [];
@@ -495,9 +594,12 @@ export function optimizeCuttingSheets(
   let backPanelSheetsCount = 0;
   let nextSheetId = 1;
 
-  for (const thickness of sortedThicknesses) {
-    const groupPieces = byThickness.get(thickness) ?? [];
-    const isBackPanelGroup = Math.abs(thickness - params.backPanelThickness) <= 0.5 && thickness < params.boardThickness;
+  for (const group of sortedGroups) {
+    const { thickness, material, pieces: groupPieces } = group;
+    const isBackPanelGroup =
+      material === 'durolac_3mm' ||
+      (Math.abs(thickness - params.backPanelThickness) <= 0.5 &&
+        thickness < params.boardThickness);
     const sheetDim = isBackPanelGroup
       ? (params.backPanelSheetDimensions ?? params.sheetDimensions)
       : params.sheetDimensions;
@@ -516,10 +618,18 @@ export function optimizeCuttingSheets(
     if (strategy === 'maxrects') {
       runResult = runMaxRectsBSSF(flatItems, usableW, usableH, kerf, trimMm);
     } else {
-      const policies: Array<'default' | 'preferLowHeight' | 'preferRotatedAll' | 'mixedGreedy'> =
-        flatItems.some((i) => i.canRotate)
-          ? ['default', 'preferLowHeight', 'preferRotatedAll', 'mixedGreedy']
-          : ['default'];
+      const policies: GuillotinePolicy[] = flatItems.some((i) => i.canRotate)
+        ? [
+            'default',
+            'defaultReuse',
+            'areaDescReuse',
+            'preferLowHeight',
+            'preferLowHeightReuse',
+            'preferRotatedAll',
+            'preferRotatedAllReuse',
+            'mixedGreedy',
+          ]
+        : ['default', 'defaultReuse', 'areaDescReuse', 'mixedGreedy'];
 
       const results = policies.map((pol) =>
         runGuillotinePolicy(flatItems, usableW, usableH, kerf, trimMm, pol),
@@ -531,8 +641,8 @@ export function optimizeCuttingSheets(
     unplacedPieces.push(...runResult.unplaced);
 
     const materialLabel = isBackPanelGroup
-      ? `Durolac / MDF ${thickness} mm`
-      : `Melamina ${params.material.toUpperCase()} ${thickness} mm`;
+      ? `Fondo Durolac ${thickness} mm`
+      : `Melamina ${material.toUpperCase()} ${thickness} mm`;
 
     const sheetArea = sheetDim.width * sheetDim.height;
 
@@ -545,6 +655,7 @@ export function optimizeCuttingSheets(
       sheetsUsed.push({
         sheetId: nextSheetId++,
         espesorMm: thickness,
+        material,
         materialLabel,
         anchoSheet: sheetDim.width,
         altoSheet: sheetDim.height,

@@ -36,11 +36,20 @@ describe('SmartFurniture QA — 14 Muebles Reales: Planos Vectoriales, Redimensi
     for (const item of CATALOG_14_MUEBLES) {
       // Procedencia honesta: topologías curadas de catálogo SIEMPRE deben ser 'preset'
       expect(item.topology.detectionSource).toBe('preset');
+      expect(item.initialQuadNorm, `[${item.id}] debe definir initialQuadNorm calibrado`).toHaveLength(4);
+      for (const pt of item.initialQuadNorm!) {
+        expect(pt.x).toBeGreaterThanOrEqual(0);
+        expect(pt.x).toBeLessThanOrEqual(1);
+        expect(pt.y).toBeGreaterThanOrEqual(0);
+        expect(pt.y).toBeLessThanOrEqual(1);
+      }
       const expectedAspect = item.params.targetDimensions.x / item.params.targetDimensions.y;
       expect(item.topology.aspectRatioXY).toBeCloseTo(expectedAspect, 4);
 
       const cloned = cloneCatalogFurniture(item.id)!;
       expect(cloned).not.toBeNull();
+      expect(cloned.spec.initialQuadNorm).toEqual(item.initialQuadNorm);
+      expect(cloned.spec.initialQuadNorm).not.toBe(item.initialQuadNorm);
 
       // 1. Modelo Vectorial Original (V0) + Despiece + Corte
       const despOrig = calculateDespiece(cloned.topology, cloned.params);

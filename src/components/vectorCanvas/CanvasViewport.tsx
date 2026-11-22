@@ -8,7 +8,7 @@
  *   `activeDiagonals`) sin recalcular 3D ni despiece durante `pointermove`.
  */
 import { useEffect, useRef } from 'react';
-import { Camera, Sparkles, Upload } from 'lucide-react';
+import { Camera, Sparkles, Undo2, Upload, X } from 'lucide-react';
 import type {
   DiagonalSegment,
   FrontZone,
@@ -39,6 +39,9 @@ import {
   projectZoneQuad,
   type FrameMode,
   type LineRef,
+  type LinesSubMode,
+  type OrthoGuideAxis,
+  type SelectedSubRegion,
   type SnapIndicator,
   type SubTool,
   type TraceStep,
@@ -65,6 +68,7 @@ export interface ActiveHoverTarget {
 export interface LiveStrokeDrawState {
   startImg: Point2D;
   currentImg: Point2D;
+  orthoGuide?: OrthoGuideAxis;
 }
 
 export interface EyedropperPreview {
@@ -78,6 +82,7 @@ export interface CanvasViewportProps {
   viewTab: 'frontal' | 'lateral';
   traceStep: TraceStep;
   frameMode: FrameMode;
+  linesSubMode: LinesSubMode;
   subTool: SubTool;
   visualLayer: VisualLayerMode;
   strokeMode: UserStrokeMode;
@@ -87,6 +92,8 @@ export interface CanvasViewportProps {
   hShelves: NormalizedSegment[];
   diagonalDividers: DiagonalSegment[];
   frontZones: FrontZone[];
+  subRegions: SelectedSubRegion[];
+  draftRegion: { uStart: number; uEnd: number; vStart: number; vEnd: number } | null;
   photoVectorLines: VectorLine2D[];
   params: ScaleAndBoardParams;
   selectedZoneId: string | null;
@@ -107,9 +114,13 @@ export interface CanvasViewportProps {
   isSpacePan: boolean;
   isDragging: boolean;
   isDragOver: boolean;
+  canUndo: boolean;
+  undoCount: number;
   canvasCursor: string;
   canvasRef: React.RefObject<HTMLCanvasElement>;
   stageRef: React.RefObject<HTMLDivElement>;
+  onUndo: () => void;
+  onDeleteSelectedLine: () => void;
   onPointerDown: (e: React.PointerEvent<HTMLCanvasElement>) => void;
   onPointerMove: (e: React.PointerEvent<HTMLCanvasElement>) => void;
   onPointerUp: (e: React.PointerEvent<HTMLCanvasElement>) => void;
@@ -131,6 +142,7 @@ export function CanvasViewport({
   viewTab,
   traceStep,
   frameMode,
+  linesSubMode,
   subTool,
   visualLayer,
   strokeMode,
@@ -140,6 +152,8 @@ export function CanvasViewport({
   hShelves,
   diagonalDividers,
   frontZones,
+  subRegions,
+  draftRegion,
   photoVectorLines,
   params,
   selectedZoneId,
@@ -160,9 +174,13 @@ export function CanvasViewport({
   isSpacePan,
   isDragging,
   isDragOver,
+  canUndo,
+  undoCount,
   canvasCursor,
   canvasRef,
   stageRef,
+  onUndo,
+  onDeleteSelectedLine,
   onPointerDown,
   onPointerMove,
   onPointerUp,
@@ -203,7 +221,7 @@ export function CanvasViewport({
       ctx.fillRect(0, 0, cw, ch);
     } else if (viewTab === 'frontal' && visualLayer !== 'edges') {
       ctx.save();
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.28)';
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.24)';
       ctx.beginPath();
       ctx.rect(0, 0, cw, ch);
       ctx.moveTo(activeQuad[0].x, activeQuad[0].y);
@@ -214,6 +232,11 @@ export function CanvasViewport({
       ctx.fill('evenodd');
       ctx.restore();
     }
+
+    // Escala real en píxeles de pantalla para decidir etiquetas adaptativas sin solapamientos
+    const rectNow = canvas.getBoundingClientRect();
+    const screenScaleX = rectNow.width > 10 ? rectNow.width / cw : Math.min(1, 640 / cw);
+    const screenScaleY = rectNow.height > 10 ? rectNow.height / ch : screenScaleX;
 
     // 3. Guías de bordes vectoriales detectados (capa 'vectors_only')
     if (viewTab === 'frontal' && visualLayer === 'vectors_only' && photoVectorLines.length > 0) {
@@ -237,21 +260,38 @@ export function CanvasViewport({
     if (viewTab === 'frontal' && homography) {
       const { toCanvas } = homography;
 
-      // 4A. Zonas frontales (visibles en Paso 3 y sutiles en Paso 2 si capa = traced_zones)
+      // 4A. Zonas frontales (tinte muy suave para ver el mueble real debajo; etiquetas adaptativas sin encimarse)
       const showZones =
         visualLayer === 'traced_zones' &&
         frontZones.length > 0 &&
         (traceStep === 'zones' || traceStep === 'lines');
 
       if (showZones) {
+        const labelQueue: Array<{
+          zIdx: number;
+          z: FrontZone;
+          pTL: Point2D;
+          pTR: Point2D;
+          pBR: Point2D;
+          pBL: Point2D;
+          isSelZone: boolean;
+          isHovZone: boolean;
+          priority: number;
+        }> = [];
+
         for (let zIdx = 0; zIdx < frontZones.length; zIdx++) {
           const z = frontZones[zIdx];
           const zQuad = projectZoneQuad(z, toCanvas, e, xf, yf);
           if (!zQuad) continue;
           const [pTL, pTR, pBR, pBL] = zQuad;
           const palette = ZONE_COLORS[z.kind];
-          const isSelZone = selectedZoneId === z.id;
-          const isHovZone = hoveredZoneId === z.id;
+          const isSelZone = traceStep === 'zones' && selectedZoneId === z.id;
+          const isHovZone =
+            hoveredZoneId === z.id ||
+            (traceStep === 'lines' &&
+              linesSubMode === 'regions' &&
+              hoverTarget.kind === 'zone' &&
+              hoverTarget.zoneId === z.id);
 
           ctx.save();
           ctx.beginPath();
@@ -262,7 +302,7 @@ export function CanvasViewport({
           ctx.closePath();
 
           if (traceStep === 'lines') {
-            ctx.globalAlpha = isHovZone ? 0.65 : 0.36;
+            ctx.globalAlpha = isHovZone ? 0.52 : 0.28;
           }
           ctx.fillStyle = isHovZone || isSelZone ? palette.hoverFill : palette.fill;
           ctx.fill();
@@ -286,8 +326,8 @@ export function CanvasViewport({
               ? '#38bdf8'
               : palette.stroke;
           ctx.lineWidth = Math.max(
-            isSelZone ? 3.2 : isHovZone ? 2.4 : 1.3,
-            cw / (isSelZone ? 260 : 520),
+            isSelZone ? 3.0 : isHovZone ? 2.2 : 1.15,
+            cw / (isSelZone ? 270 : 560),
           );
           ctx.beginPath();
           ctx.moveTo(pTL.x, pTL.y);
@@ -298,55 +338,110 @@ export function CanvasViewport({
           ctx.stroke();
           ctx.restore();
 
-          // Etiqueta legible y semitransparente que no tapa la foto
           if (traceStep === 'zones' || isHovZone) {
-            const uMid = interiorToExterior((z.uStart + z.uEnd) / 2, e, xf);
-            const vMid = interiorToExterior((z.vStart + z.vEnd) / 2, e, yf);
-            const center = applyHomography(toCanvas, { x: uMid, y: vMid });
-            if (center) {
-              const tagText =
-                z.kind === 'drawers'
-                  ? `Z${zIdx + 1} · ${z.drawerCount ?? 3} Caj.`
-                  : z.kind === 'baskets'
-                    ? `Z${zIdx + 1} · ${z.basketCount ?? 3} Can.`
-                    : z.kind === 'void_outside'
-                      ? `Z${zIdx + 1} · Vacío`
-                      : `Z${zIdx + 1} · ${ZONE_SHORT_LABELS[z.kind]}`;
-              const fontPx = Math.max(11, Math.min(15, Math.round(cw / 68)));
-              ctx.save();
-              ctx.font = `700 ${fontPx}px system-ui, sans-serif`;
-              const tw = ctx.measureText(tagText).width;
-              const padX = 7;
-              const boxH = fontPx * 1.48;
-              ctx.fillStyle =
-                z.kind === 'void_outside'
-                  ? 'rgba(185, 28, 28, 0.80)'
-                  : isSelZone
-                    ? 'rgba(2, 132, 199, 0.90)'
-                    : isHovZone
-                      ? 'rgba(14, 116, 144, 0.86)'
-                      : 'rgba(15, 23, 42, 0.72)';
-              ctx.beginPath();
-              ctx.roundRect(
-                center.x - tw / 2 - padX,
-                center.y - boxH / 2,
-                tw + padX * 2,
-                boxH,
-                6,
-              );
-              ctx.fill();
-              if (isSelZone) {
-                ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
-                ctx.lineWidth = 1.5;
-                ctx.stroke();
-              }
-              ctx.fillStyle = '#ffffff';
-              ctx.textAlign = 'center';
-              ctx.textBaseline = 'middle';
-              ctx.fillText(tagText, center.x, center.y);
-              ctx.restore();
+            labelQueue.push({
+              zIdx,
+              z,
+              pTL,
+              pTR,
+              pBR,
+              pBL,
+              isSelZone,
+              isHovZone,
+              priority: isHovZone ? 2 : isSelZone ? 1 : 0,
+            });
+          }
+        }
+
+        // Dibujar etiquetas ordenadas: primero celdas normales, al final la seleccionada/hovered encima
+        labelQueue.sort((a, b) => a.priority - b.priority);
+        for (const item of labelQueue) {
+          const { zIdx, z, pTL, pTR, pBR, pBL, isSelZone, isHovZone } = item;
+          const palette = ZONE_COLORS[z.kind];
+          const uMid = interiorToExterior((z.uStart + z.uEnd) / 2, e, xf);
+          const vMid = interiorToExterior((z.vStart + z.vEnd) / 2, e, yf);
+          const center = applyHomography(toCanvas, { x: uMid, y: vMid });
+          if (!center) continue;
+
+          const topW = Math.hypot((pTR.x - pTL.x) * screenScaleX, (pTR.y - pTL.y) * screenScaleY);
+          const botW = Math.hypot((pBR.x - pBL.x) * screenScaleX, (pBR.y - pBL.y) * screenScaleY);
+          const leftH = Math.hypot((pBL.x - pTL.x) * screenScaleX, (pBL.y - pTL.y) * screenScaleY);
+          const rightH = Math.hypot((pBR.x - pTR.x) * screenScaleX, (pBR.y - pTR.y) * screenScaleY);
+          const cellScreenW = Math.min(topW, botW);
+          const cellScreenH = Math.min(leftH, rightH);
+
+          // Celda ultra angosta (< 34 px): solo un punto/badge mínimo si no está activa
+          if (!isSelZone && !isHovZone && (cellScreenW < 34 || cellScreenH < 20)) {
+            const dotR = Math.max(4.5, cw / 195);
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(center.x, center.y, dotR, 0, Math.PI * 2);
+            ctx.fillStyle = palette.dot;
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+            ctx.lineWidth = Math.max(1.4, cw / 580);
+            ctx.stroke();
+            ctx.restore();
+            continue;
+          }
+
+          const compactTag = `Z${zIdx + 1}`;
+          const fullTag =
+            z.kind === 'drawers'
+              ? `Z${zIdx + 1} · ${z.drawerCount ?? 3} Caj.`
+              : z.kind === 'baskets'
+                ? `Z${zIdx + 1} · ${z.basketCount ?? 3} Can.`
+                : z.kind === 'void_outside'
+                  ? `Z${zIdx + 1} · Vacío`
+                  : `Z${zIdx + 1} · ${ZONE_SHORT_LABELS[z.kind]}`;
+
+          const fontPx = Math.max(11, Math.min(14, Math.round(cw / 72)));
+          ctx.save();
+          ctx.font = `700 ${fontPx}px system-ui, sans-serif`;
+
+          // Celdas < 75 px de ancho en pantalla muestran solo "Z4" (jamás texto largo encimado)
+          let tagText = fullTag;
+          let padX = 6.5;
+          if (!isHovZone && !isSelZone && (cellScreenW < 75 || cellScreenH < 28)) {
+            tagText = compactTag;
+            padX = 4.5;
+          } else if (!isHovZone && !isSelZone) {
+            const fullW = ctx.measureText(fullTag).width;
+            if ((fullW + padX * 2) * screenScaleX > cellScreenW * 0.92) {
+              tagText = compactTag;
+              padX = 4.5;
             }
           }
+
+          const tw = ctx.measureText(tagText).width;
+          const boxH = fontPx * 1.38;
+          ctx.fillStyle =
+            z.kind === 'void_outside'
+              ? 'rgba(185, 28, 28, 0.80)'
+              : isSelZone
+                ? 'rgba(2, 132, 199, 0.92)'
+                : isHovZone
+                  ? 'rgba(14, 116, 144, 0.88)'
+                  : 'rgba(15, 23, 42, 0.70)';
+          ctx.beginPath();
+          ctx.roundRect(
+            center.x - tw / 2 - padX,
+            center.y - boxH / 2,
+            tw + padX * 2,
+            boxH,
+            5,
+          );
+          ctx.fill();
+          if (isSelZone || isHovZone) {
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+            ctx.lineWidth = 1.4;
+            ctx.stroke();
+          }
+          ctx.fillStyle = '#ffffff';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(tagText, center.x, center.y);
+          ctx.restore();
         }
       }
 
@@ -415,16 +510,16 @@ export function CanvasViewport({
           hoverTarget.lineRef.id === div.id;
 
         if (isSel || isHov) {
-          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.55)' : 'rgba(34, 197, 94, 0.40)';
-          ctx.lineWidth = Math.max(8, cw / 120);
+          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.58)' : 'rgba(74, 222, 128, 0.52)';
+          ctx.lineWidth = Math.max(9, cw / 110);
           ctx.beginPath();
           ctx.moveTo(proj.p0.x, proj.p0.y);
           ctx.lineTo(proj.p1.x, proj.p1.y);
           ctx.stroke();
         }
 
-        ctx.strokeStyle = isSel ? '#38bdf8' : '#22c55e';
-        ctx.lineWidth = Math.max(isSel ? 4.2 : 3, cw / (isSel ? 220 : 290));
+        ctx.strokeStyle = isSel ? '#38bdf8' : isHov ? '#4ade80' : '#22c55e';
+        ctx.lineWidth = Math.max(isSel ? 4.4 : isHov ? 4.0 : 3, cw / (isSel || isHov ? 215 : 290));
         ctx.beginPath();
         ctx.moveTo(proj.p0.x, proj.p0.y);
         ctx.lineTo(proj.p1.x, proj.p1.y);
@@ -465,16 +560,16 @@ export function CanvasViewport({
           hoverTarget.lineRef.id === sh.id;
 
         if (isSel || isHov) {
-          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.55)' : 'rgba(245, 158, 11, 0.40)';
-          ctx.lineWidth = Math.max(8, cw / 120);
+          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.58)' : 'rgba(251, 191, 36, 0.52)';
+          ctx.lineWidth = Math.max(9, cw / 110);
           ctx.beginPath();
           ctx.moveTo(proj.p0.x, proj.p0.y);
           ctx.lineTo(proj.p1.x, proj.p1.y);
           ctx.stroke();
         }
 
-        ctx.strokeStyle = isSel ? '#38bdf8' : '#f59e0b';
-        ctx.lineWidth = Math.max(isSel ? 4.2 : 3, cw / (isSel ? 220 : 290));
+        ctx.strokeStyle = isSel ? '#38bdf8' : isHov ? '#fbbf24' : '#f59e0b';
+        ctx.lineWidth = Math.max(isSel ? 4.4 : isHov ? 4.0 : 3, cw / (isSel || isHov ? 215 : 290));
         ctx.beginPath();
         ctx.moveTo(proj.p0.x, proj.p0.y);
         ctx.lineTo(proj.p1.x, proj.p1.y);
@@ -515,16 +610,16 @@ export function CanvasViewport({
           hoverTarget.lineRef.id === diag.id;
 
         if (isSel || isHov) {
-          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.55)' : 'rgba(217, 70, 239, 0.40)';
-          ctx.lineWidth = Math.max(8, cw / 120);
+          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.58)' : 'rgba(232, 121, 249, 0.52)';
+          ctx.lineWidth = Math.max(9, cw / 110);
           ctx.beginPath();
           ctx.moveTo(proj.p0.x, proj.p0.y);
           ctx.lineTo(proj.p1.x, proj.p1.y);
           ctx.stroke();
         }
 
-        ctx.strokeStyle = isSel ? '#38bdf8' : '#d946ef';
-        ctx.lineWidth = Math.max(isSel ? 4.4 : 3.2, cw / (isSel ? 215 : 275));
+        ctx.strokeStyle = isSel ? '#38bdf8' : isHov ? '#e879f9' : '#d946ef';
+        ctx.lineWidth = Math.max(isSel ? 4.5 : isHov ? 4.1 : 3.2, cw / (isSel || isHov ? 210 : 275));
         ctx.beginPath();
         ctx.moveTo(proj.p0.x, proj.p0.y);
         ctx.lineTo(proj.p1.x, proj.p1.y);
@@ -557,7 +652,7 @@ export function CanvasViewport({
         }
       }
 
-      // 4C. Vista previa EN VIVO del nuevo trazo (`liveStroke`)
+      // 4C. Vista previa EN VIVO del nuevo trazo (`liveStroke` con guía ortogonal suave Figma/Canva)
       if (liveStroke) {
         const previewVec = vectorizeUserStroke(
           liveStroke.startImg,
@@ -567,7 +662,7 @@ export function CanvasViewport({
           hShelves,
           e,
           params.targetDimensions,
-          true,
+          0.018,
           strokeMode,
         );
         ctx.save();
@@ -576,6 +671,8 @@ export function CanvasViewport({
           let pB: Point2D | null = null;
           let strokeCol = '#4ade80';
           let lbl = '';
+          const isOrthoLocked =
+            liveStroke.orthoGuide === 'horizontal' || liveStroke.orthoGuide === 'vertical';
 
           if (previewVec.kind === 'diagonal') {
             pA = applyHomography(toCanvas, {
@@ -598,7 +695,7 @@ export function CanvasViewport({
               y: interiorToExterior(previewVec.segment.position, e, yf),
             });
             strokeCol = '#fbbf24';
-            lbl = `→ Repisa Y=${previewVec.positionMm} mm (luz ${previewVec.spanMm} mm)`;
+            lbl = `→ Repisa Y=${previewVec.positionMm} mm (luz ${previewVec.spanMm} mm)${isOrthoLocked ? ' · Recta' : ''}`;
           } else {
             pA = applyHomography(toCanvas, {
               x: interiorToExterior(previewVec.segment.position, e, xf),
@@ -609,13 +706,27 @@ export function CanvasViewport({
               y: interiorToExterior(previewVec.segment.end, e, yf),
             });
             strokeCol = '#4ade80';
-            lbl = `↓ Divisor X=${previewVec.positionMm} mm (alto ${previewVec.spanMm} mm)`;
+            lbl = `↓ Divisor X=${previewVec.positionMm} mm (alto ${previewVec.spanMm} mm)${isOrthoLocked ? ' · Recta' : ''}`;
           }
 
           if (pA && pB) {
+            // Si está en transición 7°–18°, mostrar guía tenue de la mano real + línea proyectada limpia
+            if (
+              liveStroke.orthoGuide === 'near_horizontal' ||
+              liveStroke.orthoGuide === 'near_vertical'
+            ) {
+              ctx.strokeStyle = 'rgba(226, 232, 240, 0.45)';
+              ctx.lineWidth = 1.6;
+              ctx.setLineDash([4, 4]);
+              ctx.beginPath();
+              ctx.moveTo(liveStroke.startImg.x, liveStroke.startImg.y);
+              ctx.lineTo(liveStroke.currentImg.x, liveStroke.currentImg.y);
+              ctx.stroke();
+            }
+
             ctx.strokeStyle = strokeCol;
             ctx.lineWidth = Math.max(4, cw / 220);
-            ctx.setLineDash([10, 6]);
+            ctx.setLineDash(isOrthoLocked ? [] : [10, 6]);
             ctx.beginPath();
             ctx.moveTo(pA.x, pA.y);
             ctx.lineTo(pB.x, pB.y);
@@ -640,6 +751,77 @@ export function CanvasViewport({
           ctx.stroke();
         }
         ctx.restore();
+      }
+
+      // 4E. Secciones seleccionadas para auto-detección multi-sección (`S1`, `S2`, `S3`...)
+      if (traceStep === 'lines' && (subRegions.length > 0 || draftRegion)) {
+        const drawSubRegionOverlay = (
+          reg: { uStart: number; uEnd: number; vStart: number; vEnd: number },
+          labelText: string,
+          isDraft: boolean,
+        ) => {
+          const rQuad = projectZoneQuad(reg, toCanvas, e, xf, yf);
+          if (!rQuad) return;
+          const [pTL, pTR, pBR, pBL] = rQuad;
+
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(pTL.x, pTL.y);
+          ctx.lineTo(pTR.x, pTR.y);
+          ctx.lineTo(pBR.x, pBR.y);
+          ctx.lineTo(pBL.x, pBL.y);
+          ctx.closePath();
+
+          ctx.fillStyle = isDraft ? 'rgba(56, 189, 248, 0.18)' : 'rgba(139, 92, 246, 0.17)';
+          ctx.fill();
+
+          // Doble borde punteado brillante para contraste nítido en madera clara u oscura
+          ctx.strokeStyle = 'rgba(15, 23, 42, 0.78)';
+          ctx.lineWidth = Math.max(4.5, cw / 220);
+          ctx.stroke();
+
+          ctx.setLineDash([9, 5]);
+          ctx.strokeStyle = isDraft ? '#38bdf8' : '#c084fc';
+          ctx.lineWidth = Math.max(2.6, cw / 310);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Etiqueta S1, S2, S3... dentro de la esquina superior izquierda (o centro si es angosta)
+          const cx = (pTL.x + pTR.x + pBR.x + pBL.x) / 4;
+          const cy = (pTL.y + pTR.y + pBR.y + pBL.y) / 4;
+          const bx = pTL.x + (cx - pTL.x) * 0.28;
+          const by = pTL.y + (cy - pTL.y) * 0.28;
+          const fontPx = Math.max(11, Math.min(14, Math.round(cw / 70)));
+          ctx.font = `800 ${fontPx}px system-ui, sans-serif`;
+          const tw = ctx.measureText(labelText).width;
+          const padX = 6;
+          const boxH = fontPx * 1.4;
+          const tagX = isDraft ? cx : bx;
+          const tagY = isDraft ? cy : by;
+
+          ctx.fillStyle = isDraft ? 'rgba(2, 132, 199, 0.94)' : 'rgba(109, 40, 217, 0.92)';
+          ctx.beginPath();
+          ctx.roundRect(tagX - tw / 2 - padX, tagY - boxH / 2, tw + padX * 2, boxH, 5);
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.4;
+          ctx.stroke();
+          ctx.fillStyle = '#ffffff';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(labelText, tagX, tagY);
+          ctx.restore();
+        };
+
+        subRegions.forEach((reg, idx) => {
+          drawSubRegionOverlay(reg, `S${idx + 1}`, false);
+        });
+
+        if (draftRegion && draftRegion.uEnd - draftRegion.uStart > 0.01 && draftRegion.vEnd - draftRegion.vStart > 0.01) {
+          const wMm = Math.round((draftRegion.uEnd - draftRegion.uStart) * xInt);
+          const hMm = Math.round((draftRegion.vEnd - draftRegion.vStart) * yInt);
+          drawSubRegionOverlay(draftRegion, `S${subRegions.length + 1} · ${wMm}×${hMm}mm`, true);
+        }
       }
 
       // 4D. Calibración A4
@@ -878,6 +1060,7 @@ export function CanvasViewport({
     viewTab,
     traceStep,
     frameMode,
+    linesSubMode,
     subTool,
     visualLayer,
     strokeMode,
@@ -887,6 +1070,8 @@ export function CanvasViewport({
     hShelves,
     diagonalDividers,
     frontZones,
+    subRegions,
+    draftRegion,
     photoVectorLines,
     params.boardThickness,
     params.targetDimensions,
@@ -901,6 +1086,7 @@ export function CanvasViewport({
     snapIndicator,
     loupeFocusPt,
     isDragging,
+    zoom,
   ]);
 
   // Render de la Lupa 4× fija en el viewport visible (centrada en `loupeFocusPt` ya imantado)
@@ -1066,6 +1252,49 @@ export function CanvasViewport({
               onPointerLeave={onPointerLeave}
             />
           </div>
+
+          {/* Píldora flotante rápida en esquina superior izquierda: Deshacer y Borrar línea */}
+          {!(loupeFocusPt && loupeSide === 'left') &&
+            (canUndo ||
+              (pickingCorners !== null && pickingCorners.length > 0) ||
+              (viewTab === 'frontal' &&
+                traceStep === 'lines' &&
+                selectedLine !== null &&
+                subTool === 'none')) && (
+              <div className="vc-float-actions-tl">
+                {(canUndo || (pickingCorners !== null && pickingCorners.length > 0)) && (
+                  <button
+                    type="button"
+                    className="vc-float-pill vc-float-undo"
+                    onClick={onUndo}
+                    title="Deshacer la última acción (Ctrl+Z)"
+                  >
+                    <Undo2 size={13} />
+                    <span>
+                      {pickingCorners !== null && pickingCorners.length > 0
+                        ? 'Deshacer toque (Ctrl+Z)'
+                        : undoCount > 1
+                          ? `Deshacer (${undoCount}) · Ctrl+Z`
+                          : 'Deshacer (Ctrl+Z)'}
+                    </span>
+                  </button>
+                )}
+                {viewTab === 'frontal' &&
+                  traceStep === 'lines' &&
+                  selectedLine !== null &&
+                  subTool === 'none' && (
+                    <button
+                      type="button"
+                      className="vc-float-pill vc-float-delete"
+                      onClick={onDeleteSelectedLine}
+                      title="Eliminar la línea seleccionada (Supr)"
+                    >
+                      <X size={13} />
+                      <span>Borrar línea</span>
+                    </button>
+                  )}
+              </div>
+            )}
 
           {/* Lupa 4× fija dentro del viewport visible (nunca cortada fuera del scroll) */}
           {loupeFocusPt && (

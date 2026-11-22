@@ -84,6 +84,8 @@ function makeDeterministicId(base: string, existingIds: ReadonlySet<string>): st
 /**
  * Imán de bordes (Sobel 3×3 unificado): ajusta un punto tocado por el usuario al borde de mayor
  * contraste más cercano dentro de `radiusPx` (ideal para trazos en pantalla táctil o mouse).
+ * Incluye razón mínima `minGradientRatio` respecto al ruido local para no enganchar textura suave
+ * (ladrillos/vetas de madera) cuando `radiusPx <= 5`.
  */
 export function snapPointToStrongEdge(
   rgba: Uint8ClampedArray,
@@ -92,6 +94,7 @@ export function snapPointToStrongEdge(
   pt: Point2D,
   radiusPx = 8,
   minGradient = 34,
+  minGradientRatio = 1.45,
 ): { snapped: Point2D; didSnap: boolean; gradient: number } {
   if (imgW < 8 || imgH < 8 || rgba.length < imgW * imgH * 4) {
     return { snapped: pt, didSnap: false, gradient: 0 };
@@ -100,11 +103,14 @@ export function snapPointToStrongEdge(
   const cx = clamp(Math.round(pt.x), 1, imgW - 2);
   const cy = clamp(Math.round(pt.y), 1, imgH - 2);
   const r = clamp(Math.round(radiusPx), 2, 18);
+  const effectiveMinGrad = r <= 5 ? Math.max(minGradient, 46) : minGradient;
 
   let bestX = cx;
   let bestY = cy;
   let bestScore = -1;
   let bestGrad = 0;
+  let gradSum = 0;
+  let sampleCnt = 0;
 
   const y0 = Math.max(1, cy - r);
   const y1 = Math.min(imgH - 2, cy + r);
@@ -117,7 +123,9 @@ export function snapPointToStrongEdge(
       if (dist > r) continue;
       const [gx, gy] = sobel3x3AtRgba(rgba, imgW, imgH, x, y);
       const grad = Math.hypot(gx, gy);
-      if (grad < minGradient) continue;
+      gradSum += grad;
+      sampleCnt++;
+      if (grad < effectiveMinGrad) continue;
       const score = grad / (1 + dist * 0.14);
       if (score > bestScore) {
         bestScore = score;
@@ -128,7 +136,13 @@ export function snapPointToStrongEdge(
     }
   }
 
-  if (bestScore > 0) {
+  const localMeanGrad = sampleCnt > 0 ? gradSum / sampleCnt : 0;
+  const ratioOk =
+    minGradientRatio <= 1 ||
+    localMeanGrad < 12 ||
+    bestGrad >= localMeanGrad * minGradientRatio;
+
+  if (bestScore > 0 && ratioOk) {
     return {
       snapped: { x: bestX, y: bestY },
       didSnap: true,

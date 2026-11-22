@@ -6,12 +6,16 @@ import {
   autoDetectFurnitureQuad,
   classifyMelamineMaterialFromRgb,
   classifyPartitionedZonesFromPhoto,
+  classifyZonesUnified,
   computeRectifiedSize,
   computeSobelEdgeOverlayRGBA,
+  detectBasketPattern,
+  detectStructureInSubRegions,
   estimateAspectRatioFixedFocal,
   estimateCameraPoseMeters,
   evaluate3DvsPhotoSimilarity,
   evaluateMarginsAgainstPhoto,
+  extractLuminanceBuffer,
   extractStructuralVectorLines,
   extrapolateDimensionsFromSingleMeasure,
   interiorToExteriorPoint,
@@ -1615,5 +1619,278 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
       18,
     );
     expect(zonesTraced).toHaveLength(2);
+  });
+
+  it('Escenario 29 (Detección multi-sección `detectStructureInSubRegions`): detecta líneas SOLO dentro de 2 secciones seleccionadas, preserva líneas externas y deduplica', () => {
+    const xMm = 1500;
+    const yMm = 1800;
+    const eMm = 18;
+    const { rgba: rectRgba, W: rectW, H: rectH } = renderSyntheticRectified({
+      xMm,
+      yMm,
+      depthMm: 340,
+      eMm,
+      boardRgb: [200, 154, 102],
+      cavityRgb: [46, 50, 58],
+      dividersUInt: [1 / 3, 2 / 3],
+      shelves: [
+        // Sección izquierda [0..1/3]: 3 repisas reales
+        { vInt: 0.25, uStart: 0, uEnd: 1 / 3 },
+        { vInt: 0.5, uStart: 0, uEnd: 1 / 3 },
+        { vInt: 0.75, uStart: 0, uEnd: 1 / 3 },
+        // Sección central [1/3..2/3]: 2 repisas reales (NO seleccionada -> NO debe agregar líneas!)
+        { vInt: 0.33, uStart: 1 / 3, uEnd: 2 / 3 },
+        { vInt: 0.67, uStart: 1 / 3, uEnd: 2 / 3 },
+        // Sección derecha [2/3..1]: 2 repisas reales
+        { vInt: 0.35, uStart: 2 / 3, uEnd: 1 },
+        { vInt: 0.7, uStart: 2 / 3, uEnd: 1 },
+      ],
+      seed: 2929,
+    });
+
+    // Incrustar en una foto con margen exterior de pared clara
+    const padX = 40;
+    const padY = 30;
+    const photoW = rectW + padX * 2;
+    const photoH = rectH + padY * 2;
+    const photoRgba = new Uint8ClampedArray(photoW * photoH * 4);
+    for (let i = 0; i < photoW * photoH; i++) {
+      photoRgba[i * 4] = 240;
+      photoRgba[i * 4 + 1] = 242;
+      photoRgba[i * 4 + 2] = 246;
+      photoRgba[i * 4 + 3] = 255;
+    }
+    for (let y = 0; y < rectH; y++) {
+      for (let x = 0; x < rectW; x++) {
+        const si = (y * rectW + x) * 4;
+        const di = ((y + padY) * photoW + (x + padX)) * 4;
+        photoRgba[di] = rectRgba[si];
+        photoRgba[di + 1] = rectRgba[si + 1];
+        photoRgba[di + 2] = rectRgba[si + 2];
+        photoRgba[di + 3] = 255;
+      }
+    }
+
+    const quad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: padX, y: padY },
+      { x: padX + rectW, y: padY },
+      { x: padX + rectW, y: padY + rectH },
+      { x: padX, y: padY + rectH },
+    ];
+
+    const existing = {
+      vDividers: [
+        { id: 'ex_div_1', position: 1 / 3, start: 0, end: 1 },
+        { id: 'ex_div_2', position: 2 / 3, start: 0, end: 1 },
+      ],
+      hShelves: [
+        // Repisa ya existente en sección izquierda (v=0.50 -> NO debe duplicarse!)
+        { id: 'ex_rep_left_mid', position: 0.5, start: 0, end: 1 / 3 },
+        // Repisa existente fuera de las secciones seleccionadas (debe permanecer intacta!)
+        { id: 'ex_rep_center_manual', position: 0.42, start: 1 / 3, end: 2 / 3 },
+      ],
+    };
+
+    const res = detectStructureInSubRegions(
+      photoRgba,
+      photoW,
+      photoH,
+      quad,
+      [
+        { id: 'sec_izq', uStart: 0, uEnd: 1 / 3, vStart: 0, vEnd: 1 },
+        { id: 'sec_der', uStart: 2 / 3, uEnd: 1, vStart: 0, vEnd: 1 },
+      ],
+      existing,
+      {
+        dimsMm: { x: xMm, y: yMm, z: 340 },
+        boardThicknessMm: eMm,
+        carcassMaterial: 'roble',
+        exteriorBgRgb: [240, 242, 246],
+      },
+    );
+
+    expect(res.regionsProcessed).toBe(2);
+    // Líneas existentes preservadas intactas
+    expect(res.vDividers.some((d) => d.id === 'ex_div_1')).toBe(true);
+    expect(res.vDividers.some((d) => d.id === 'ex_div_2')).toBe(true);
+    expect(res.hShelves.some((s) => s.id === 'ex_rep_center_manual')).toBe(true);
+    expect(res.hShelves.some((s) => s.id === 'ex_rep_left_mid')).toBe(true);
+
+    // Repisas nuevas detectadas en sección izquierda (~0.25 y ~0.75) sin duplicar 0.50
+    const leftShelves = res.hShelves.filter((s) => s.end <= 0.36);
+    expect(leftShelves.some((s) => Math.abs(s.position - 0.25) < 0.04)).toBe(true);
+    expect(leftShelves.some((s) => Math.abs(s.position - 0.75) < 0.04)).toBe(true);
+    const leftAroundMid = leftShelves.filter((s) => Math.abs(s.position - 0.5) < 0.035);
+    expect(leftAroundMid).toHaveLength(1);
+
+    // Repisas nuevas detectadas en sección derecha (~0.35 y ~0.70)
+    const rightShelves = res.hShelves.filter((s) => s.start >= 0.64);
+    expect(rightShelves.some((s) => Math.abs(s.position - 0.35) < 0.04)).toBe(true);
+    expect(rightShelves.some((s) => Math.abs(s.position - 0.7) < 0.04)).toBe(true);
+    expect(res.addedHCount).toBeGreaterThanOrEqual(4);
+
+    // CERO líneas nuevas agregadas en la sección central no seleccionada
+    const centerShelves = res.hShelves.filter((s) => s.start >= 0.3 && s.end <= 0.7);
+    expect(centerShelves).toHaveLength(1);
+    expect(centerShelves[0].id).toBe('ex_rep_center_manual');
+
+    // Re-ejecutar sobre el resultado es idempotente (0 duplicados)
+    const repeat = detectStructureInSubRegions(
+      photoRgba,
+      photoW,
+      photoH,
+      quad,
+      [
+        { id: 'sec_izq', uStart: 0, uEnd: 1 / 3, vStart: 0, vEnd: 1 },
+        { id: 'sec_der', uStart: 2 / 3, uEnd: 1, vStart: 0, vEnd: 1 },
+      ],
+      {
+        vDividers: res.vDividers,
+        hShelves: res.hShelves,
+        diagonalDividers: res.diagonalDividers,
+      },
+      {
+        dimsMm: { x: xMm, y: yMm, z: 340 },
+        boardThicknessMm: eMm,
+        carcassMaterial: 'roble',
+        exteriorBgRgb: [240, 242, 246],
+      },
+    );
+    expect(repeat.addedVCount).toBe(0);
+    expect(repeat.addedHCount).toBe(0);
+    expect(repeat.addedDCount).toBe(0);
+  });
+
+  it('Escenario 30 (Anti-falsos positivos v8.0): 0 canastos en libros/mesas anchas, nogal oscuro -> roble, snap anti-textura y recorte de jarrón superior', () => {
+    // 1. Estantería abierta llena de libros coloridos de anchos/altos variados -> NUNCA 'baskets'
+    const bW = 280;
+    const bH = 260;
+    const booksRgba = new Uint8ClampedArray(bW * bH * 4);
+    const fillBuf = (
+      buf: Uint8ClampedArray,
+      W: number,
+      H: number,
+      x0: number,
+      y0: number,
+      x1: number,
+      y1: number,
+      rgb: [number, number, number],
+    ) => {
+      for (let y = Math.max(0, Math.floor(y0)); y < Math.min(H, Math.ceil(y1)); y++) {
+        for (let x = Math.max(0, Math.floor(x0)); x < Math.min(W, Math.ceil(x1)); x++) {
+          const i = (y * W + x) * 4;
+          buf[i] = rgb[0];
+          buf[i + 1] = rgb[1];
+          buf[i + 2] = rgb[2];
+          buf[i + 3] = 255;
+        }
+      }
+    };
+
+    fillBuf(booksRgba, bW, bH, 0, 0, bW, bH, [62, 54, 46]);
+    const bookColors: Array<[number, number, number]> = [
+      [188, 52, 46],
+      [42, 108, 174],
+      [216, 172, 54],
+      [58, 146, 86],
+      [158, 72, 142],
+      [212, 118, 48],
+      [124, 92, 62],
+    ];
+    let bx = 14;
+    let bIdx = 0;
+    while (bx < bW - 22) {
+      const bw = 9 + ((bIdx * 7) % 15);
+      const bh = 110 + ((bIdx * 23) % 75);
+      const col = bookColors[bIdx % bookColors.length];
+      fillBuf(booksRgba, bW, bH, bx, bH - 14 - bh, bx + bw, bH - 14, col);
+      // Lomo con banda de título horizontal aleatoria
+      fillBuf(booksRgba, bW, bH, bx + 1, bH - 14 - bh + 18, bx + bw - 1, bH - 14 - bh + 23, [
+        235, 210, 140,
+      ]);
+      bx += bw + 2;
+      bIdx++;
+    }
+    const booksLum = extractLuminanceBuffer(booksRgba, bW, bH, true);
+    const booksBasket = detectBasketPattern(booksLum, bW, bH, 10, bW - 10, 10, bH - 10, booksRgba);
+    expect(booksBasket.wireGridScore).toBe(0);
+
+    const booksZones = classifyZonesUnified(
+      [{ id: 'shelf_books', uStart: 0, uEnd: 0.5, vStart: 0.25, vEnd: 0.75 }],
+      {
+        rectRgba: booksRgba,
+        rectW: bW,
+        rectH: bH,
+        dimsMm: { x: 1200, y: 1600 },
+        boardThicknessMm: 18,
+        carcassMaterial: 'roble',
+        modeHint: 'hybrid',
+      },
+    );
+    expect(booksZones[0].kind).not.toBe('baskets');
+
+    // 2. Mesa de centro ancha (spanU = 1.0 > 0.75 sin divisores) -> JAMÁS clasificada como 'baskets'
+    const tW = 440;
+    const tH = 180;
+    const tableRgba = new Uint8ClampedArray(tW * tH * 4);
+    fillBuf(tableRgba, tW, tH, 0, 0, tW, tH, [64, 68, 74]);
+    for (let x = 10; x < tW - 10; x += 12) {
+      fillBuf(tableRgba, tW, tH, x, 8, x + 2, tH - 8, [215, 218, 222]);
+    }
+    for (let y = 10; y < tH - 10; y += 12) {
+      fillBuf(tableRgba, tW, tH, 8, y, tW - 8, y + 2, [215, 218, 222]);
+    }
+    const tableZones = classifyZonesUnified(
+      [{ id: 'wide_table', uStart: 0, uEnd: 1, vStart: 0, vEnd: 1 }],
+      {
+        rectRgba: tableRgba,
+        rectW: tW,
+        rectH: tH,
+        dimsMm: { x: 1100, y: 420 },
+        boardThicknessMm: 18,
+        carcassMaterial: 'roble',
+        modeHint: 'hybrid',
+      },
+    );
+    expect(tableZones[0].kind).not.toBe('baskets');
+
+    // 3. CIE-Lab: madera nogal medio-oscura y roble claro -> 'roble' (nunca 'grafito' ni 'blanco')
+    expect(classifyMelamineMaterialFromRgb(115, 82, 52)).toBe('roble');
+    expect(classifyMelamineMaterialFromRgb(94, 72, 60)).toBe('roble');
+    expect(classifyMelamineMaterialFromRgb(221, 197, 181)).toBe('roble');
+    expect(classifyMelamineMaterialFromRgb(97, 97, 97)).toBe('grafito');
+    expect(classifyMelamineMaterialFromRgb(240, 241, 244)).toBe('blanco');
+
+    // 4. snapPointToStrongEdge cuando radiusPx <= 5 NO se engancha a textura uniforme de ladrillo/veta
+    const texW = 60;
+    const texH = 60;
+    const texRgba = new Uint8ClampedArray(texW * texH * 4);
+    for (let y = 0; y < texH; y++) {
+      for (let x = 0; x < texW; x++) {
+        // Textura suave periódica de ladrillo con gradiente ~40-50 en todos los píxeles
+        const v = (x + y) % 2 === 0 ? 158 : 142;
+        const i = (y * texW + x) * 4;
+        texRgba[i] = v;
+        texRgba[i + 1] = v;
+        texRgba[i + 2] = v;
+        texRgba[i + 3] = 255;
+      }
+    }
+    const noSnap = snapPointToStrongEdge(texRgba, texW, texH, { x: 30, y: 30 }, 4, 34, 1.45);
+    expect(noSnap.didSnap).toBe(false);
+
+    // 5. autoDetectFurnitureQuad recorta jarrón estrecho (< 45% ancho) apoyado encima de la cubierta
+    const fW = 360;
+    const fH = 300;
+    const vasePhoto = new Uint8ClampedArray(fW * fH * 4);
+    fillBuf(vasePhoto, fW, fH, 0, 0, fW, fH, [242, 244, 248]);
+    // Buffet ancho en [50..310] × [145..265]
+    fillBuf(vasePhoto, fW, fH, 50, 145, 310, 265, [190, 140, 88]);
+    // Jarrón estrecho encima del buffet en [162..198] × [85..145] (ancho = 14% del buffet)
+    fillBuf(vasePhoto, fW, fH, 162, 85, 198, 145, [55, 72, 96]);
+    const quadVase = autoDetectFurnitureQuad(vasePhoto, fW, fH);
+    expect(quadVase.usedFallback).toBe(false);
+    // El borde superior detectado debe caer cerca de la cubierta real (y ≈ 145), NO arriba en el jarrón (y = 85)
+    expect(quadVase.quadCorners[0].y).toBeGreaterThanOrEqual(130);
   });
 });

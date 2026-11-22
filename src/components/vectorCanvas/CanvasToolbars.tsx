@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
+  BoxSelect,
   Camera,
   CheckCircle2,
   Contrast,
@@ -19,7 +20,7 @@ import {
   LayoutGrid,
   Magnet,
   Maximize2,
-  Move,
+  MousePointer2,
   PenTool,
   Pipette,
   Redo2,
@@ -45,6 +46,7 @@ import {
   scoreToneClass,
   type FrameMode,
   type LinesSubMode,
+  type SelectedSubRegion,
   type SubTool,
   type TraceStep,
   type VisualLayerMode,
@@ -64,8 +66,14 @@ export interface CanvasTopBarsProps {
   calibPtsCount: number;
   internalLineCount: number;
   zonesCount: number;
+  hasSelectedLine: boolean;
+  subRegions: SelectedSubRegion[];
+  xIntMm: number;
+  yIntMm: number;
   canUndo: boolean;
   canRedo: boolean;
+  undoCount: number;
+  redoCount: number;
   zoom: number;
   panToolActive: boolean;
   isSpacePan: boolean;
@@ -94,7 +102,12 @@ export interface CanvasTopBarsProps {
   onToggleMagneticSnap: () => void;
   onAutoContour: () => void;
   onClearLines: () => void;
+  onDeleteSelectedLine: () => void;
   onChangeLinesSubMode: (mode: LinesSubMode) => void;
+  onOpenRegionsMode: () => void;
+  onRemoveSubRegion: (id: string) => void;
+  onClearSubRegions: () => void;
+  onDetectSubRegions: () => void;
   onChangeStrokeMode: (mode: UserStrokeMode) => void;
   onAutoSuggestLines: () => void;
   onActivateExternalLegs?: () => void;
@@ -115,8 +128,14 @@ export function CanvasTopBars({
   calibPtsCount,
   internalLineCount,
   zonesCount,
+  hasSelectedLine,
+  subRegions,
+  xIntMm,
+  yIntMm,
   canUndo,
   canRedo,
+  undoCount,
+  redoCount,
   zoom,
   panToolActive,
   isSpacePan,
@@ -145,15 +164,24 @@ export function CanvasTopBars({
   onToggleMagneticSnap,
   onAutoContour,
   onClearLines,
+  onDeleteSelectedLine,
   onChangeLinesSubMode,
+  onOpenRegionsMode,
+  onRemoveSubRegion,
+  onClearSubRegions,
+  onDetectSubRegions,
   onChangeStrokeMode,
   onAutoSuggestLines,
   onActivateExternalLegs,
   onRunRealVisionOnCatalog,
 }: CanvasTopBarsProps) {
+  const effectiveUndoCount =
+    pickingCorners && pickingCorners.length > 0 ? pickingCorners.length : undoCount;
+  const canTriggerUndo = canUndo || Boolean(pickingCorners && pickingCorners.length > 0);
+
   return (
     <>
-      {/* BARRA 1 (PRINCIPAL): Stepper 3 pasos + Undo/Redo + Zoom/Pan + Subir foto */}
+      {/* BARRA 1 (PRINCIPAL): Stepper 3 pasos + Deshacer/Rehacer claros + Zoom/Pan + Subir foto */}
       <div className="vc-bar vc-bar-primary">
         <div className="vc-stepper" role="tablist" aria-label="Pasos de trazado 2D">
           <button
@@ -167,7 +195,7 @@ export function CanvasTopBars({
             }
             onClick={() => onSelectStep('frame')}
           >
-            <Crop size={14} /> <span>1. Contorno</span>
+            <Crop size={13} /> <span>1. Contorno</span>
           </button>
           <button
             type="button"
@@ -180,7 +208,7 @@ export function CanvasTopBars({
             }
             onClick={() => onSelectStep('lines')}
           >
-            <PenTool size={14} /> <span>2. Líneas ({internalLineCount})</span>
+            <PenTool size={13} /> <span>2. Líneas ({internalLineCount})</span>
           </button>
           <button
             type="button"
@@ -193,31 +221,35 @@ export function CanvasTopBars({
             }
             onClick={() => onSelectStep('zones')}
           >
-            <LayoutGrid size={14} /> <span>3. Partes ({zonesCount})</span>
+            <LayoutGrid size={13} /> <span>3. Partes ({zonesCount})</span>
           </button>
         </div>
 
         <div className="vc-bar-right">
-          <div className="vc-btn-group" role="group" aria-label="Historial">
+          <div className="vc-history-group" role="group" aria-label="Historial Deshacer y Rehacer">
             <button
               type="button"
-              className="vc-icon-text-btn"
+              className={`vc-history-btn vc-undo-btn${canTriggerUndo ? ' is-ready' : ''}`}
               onClick={onUndo}
-              disabled={!canUndo && !(pickingCorners && pickingCorners.length > 0)}
-              title="Deshacer (Ctrl+Z)"
+              disabled={!canTriggerUndo}
+              title="Deshacer última acción (Ctrl+Z)"
               aria-label="Deshacer"
             >
-              <Undo2 size={14} />
+              <Undo2 size={13} />
+              <span>
+                Deshacer{effectiveUndoCount > 0 ? ` (${effectiveUndoCount})` : ''}
+              </span>
             </button>
             <button
               type="button"
-              className="vc-icon-text-btn"
+              className={`vc-history-btn vc-redo-btn${canRedo ? ' is-ready' : ''}`}
               onClick={onRedo}
               disabled={!canRedo}
               title="Rehacer (Ctrl+Y / Ctrl+Shift+Z)"
               aria-label="Rehacer"
             >
-              <Redo2 size={14} />
+              <Redo2 size={13} />
+              <span>Rehacer{redoCount > 0 ? ` (${redoCount})` : ''}</span>
             </button>
           </div>
 
@@ -231,7 +263,7 @@ export function CanvasTopBars({
                 title="Alejar (Ctrl+Rueda)"
                 aria-label="Alejar"
               >
-                <ZoomOut size={14} />
+                <ZoomOut size={13} />
               </button>
               <button
                 type="button"
@@ -249,7 +281,7 @@ export function CanvasTopBars({
                 title="Acercar (Ctrl+Rueda)"
                 aria-label="Acercar"
               >
-                <ZoomIn size={14} />
+                <ZoomIn size={13} />
               </button>
               <button
                 type="button"
@@ -258,7 +290,7 @@ export function CanvasTopBars({
                 title="Ajustar foto al viewport"
                 aria-label="Ajustar vista"
               >
-                <Maximize2 size={13} />
+                <Maximize2 size={12} />
               </button>
               <button
                 type="button"
@@ -267,17 +299,17 @@ export function CanvasTopBars({
                 title="Herramienta Mano para mover la foto (o mantén Espacio)"
                 aria-label="Mover vista (Pan)"
               >
-                <Hand size={13} />
+                <Hand size={12} />
               </button>
             </div>
           )}
 
           <button
             type="button"
-            className="vc-btn vc-btn-primary vc-btn-sm"
+            className="vc-btn vc-btn-primary vc-btn-xs"
             onClick={onUploadFrontPhoto}
           >
-            <Camera size={14} /> {hasPhoto ? 'Cambiar foto' : 'Subir foto'}
+            <Camera size={13} /> {hasPhoto ? 'Foto' : 'Subir foto'}
           </button>
         </div>
       </div>
@@ -412,9 +444,9 @@ export function CanvasTopBars({
                     type="button"
                     className="vc-chip"
                     onClick={onAutoContour}
-                    title="Detectar contorno exterior automáticamente conservando tus líneas internas"
+                    title="Re-detectar el contorno exterior desde la foto completa conservando tus líneas internas"
                   >
-                    <Scan size={12} /> Auto-contorno
+                    <Scan size={12} /> Auto-contorno exterior
                   </button>
                   <button
                     type="button"
@@ -423,49 +455,58 @@ export function CanvasTopBars({
                     onClick={onClearLines}
                     title="Limpia solo las líneas internas para comenzar de cero (con Undo)"
                   >
-                    <Trash2 size={12} /> Limpiar líneas internas
+                    <Trash2 size={12} /> Limpiar líneas
                   </button>
                 </div>
                 <button
                   type="button"
-                  className="vc-btn vc-btn-primary vc-btn-sm"
+                  className="vc-btn vc-btn-primary vc-btn-xs"
                   onClick={() => onSelectStep('lines')}
                 >
-                  Paso 2: Líneas <ArrowRight size={13} />
+                  2. Líneas <ArrowRight size={12} />
                 </button>
               </>
             )
           ) : traceStep === 'lines' ? (
             <>
               <div className="vc-context-actions">
-                <div className="vc-segmented" role="group" aria-label="Herramienta de líneas">
+                <div className="vc-segmented" role="group" aria-label="Modo de edición y trazado">
                   <button
                     type="button"
-                    className={linesSubMode === 'draw' ? 'active' : ''}
-                    onClick={() => onChangeLinesSubMode('draw')}
-                    title="Arrastra para crear líneas (iniciar sobre otra línea ancla una Unión T sin moverla)"
+                    className={linesSubMode === 'smart' ? 'active' : ''}
+                    onClick={() => onChangeLinesSubMode('smart')}
+                    title="Haz clic o arrastra una línea existente para moverla/ajustarla; arrastra en espacio libre para trazar una nueva"
                   >
-                    <PenTool size={12} /> Trazar línea
+                    <MousePointer2 size={11} /> Editar / Trazar
                   </button>
                   <button
                     type="button"
-                    className={linesSubMode === 'move' ? 'active' : ''}
-                    onClick={() => onChangeLinesSubMode('move')}
-                    title="Selecciona y arrastra líneas completas o sus extremos"
+                    className={linesSubMode === 'draw_only' ? 'active' : ''}
+                    onClick={() => onChangeLinesSubMode('draw_only')}
+                    title="Fuerza trazado de línea nueva incluso sobre zonas muy apretadas"
                   >
-                    <Move size={12} /> Mover / Editar
+                    <PenTool size={11} /> + Solo trazar
+                  </button>
+                  <button
+                    type="button"
+                    className={linesSubMode === 'regions' ? 'active vc-tab-regions' : ''}
+                    onClick={() => onChangeLinesSubMode('regions')}
+                    title="Marca 1 o varias secciones dentro del contorno para auto-detectar líneas solo en ellas"
+                  >
+                    <BoxSelect size={11} /> Secciones auto
+                    {subRegions.length > 0 ? ` (${subRegions.length})` : ''}
                   </button>
                 </div>
 
-                {linesSubMode === 'draw' && (
+                {linesSubMode !== 'regions' && (
                   <div className="vc-segmented vc-segmented-soft" role="group" aria-label="Tipo de trazo">
                     <button
                       type="button"
                       className={strokeMode === 'auto' ? 'active' : ''}
                       onClick={() => onChangeStrokeMode('auto')}
-                      title="Auto-orienta H/V en perspectiva o crea diagonal real entre 18° y 72°"
+                      title="Guía recta suave ≤ 7° o diagonal limpia > 18°"
                     >
-                      Auto H/V/Diag
+                      Auto
                     </button>
                     <button
                       type="button"
@@ -473,7 +514,7 @@ export function CanvasTopBars({
                       onClick={() => onChangeStrokeMode('ortho')}
                       title="Solo divisores verticales y repisas horizontales"
                     >
-                      Solo Recta
+                      Recta
                     </button>
                     <button
                       type="button"
@@ -481,7 +522,7 @@ export function CanvasTopBars({
                       onClick={() => onChangeStrokeMode('diagonal')}
                       title="Solo divisiones diagonales / oblicuas"
                     >
-                      Solo Diagonal
+                      Diagonal
                     </button>
                   </div>
                 )}
@@ -490,17 +531,17 @@ export function CanvasTopBars({
                   type="button"
                   className={magneticSnap ? 'vc-chip active' : 'vc-chip'}
                   onClick={onToggleMagneticSnap}
-                  title="Imán a bordes y uniones T (mantén Alt para desactivar temporalmente)"
+                  title="Imán suave (≤ 5 px) a bordes de alto contraste (apagado por defecto para trazo 100% fluido)"
                 >
-                  <Magnet size={12} /> Imán {magneticSnap ? 'ON' : 'OFF'}
+                  <Magnet size={11} /> Imán {magneticSnap ? 'ON' : 'OFF'}
                 </button>
                 <button
                   type="button"
                   className="vc-chip"
                   onClick={onAutoSuggestLines}
-                  title="Sugiere líneas internas automáticamente dentro del contorno actual"
+                  title="Sugiere líneas internas respetando siempre tu contorno actual"
                 >
-                  <Wand2 size={12} /> Sugerir auto
+                  <Wand2 size={11} /> Sugerir en contorno
                 </button>
                 <button
                   type="button"
@@ -508,45 +549,64 @@ export function CanvasTopBars({
                   onClick={() => onToggleSubTool('eyedropper')}
                   title="Muestrear color de melamina con 1 clic"
                 >
-                  <Pipette size={12} /> Gotero
+                  <Pipette size={11} /> Gotero
                 </button>
+                {hasSelectedLine && (
+                  <button
+                    type="button"
+                    className="vc-chip vc-chip-danger-soft"
+                    onClick={onDeleteSelectedLine}
+                    title="Eliminar la línea seleccionada (Supr)"
+                  >
+                    <X size={11} /> Borrar línea
+                  </button>
+                )}
                 <button
                   type="button"
                   className="vc-chip"
                   disabled={internalLineCount === 0}
                   onClick={onClearLines}
+                  title="Limpiar todas las líneas internas (con Undo)"
                 >
-                  <Trash2 size={12} /> Limpiar
+                  <Trash2 size={11} /> Limpiar
                 </button>
               </div>
               <button
                 type="button"
-                className="vc-btn vc-btn-primary vc-btn-sm"
+                className="vc-btn vc-btn-primary vc-btn-xs"
                 onClick={() => onSelectStep('zones')}
               >
-                Paso 3: Partes <ArrowRight size={13} />
+                3. Partes <ArrowRight size={12} />
               </button>
             </>
           ) : (
             <>
               <span className="vc-context-banner-text">
                 <span className="vc-pill vc-pill-success">PASO 3</span>
-                Haz clic sobre cualquier celda para editar su tipo abajo y verla resaltada en el 3D.
+                Haz clic en cualquier celda para definir puertas, cajones o bicolor.
               </span>
               <div className="vc-context-actions">
+                <button
+                  type="button"
+                  className="vc-chip vc-chip-regions"
+                  onClick={onOpenRegionsMode}
+                  title="Marca 1 o varias secciones dentro del contorno para auto-detectar líneas adicionales"
+                >
+                  <BoxSelect size={11} /> Secciones auto
+                </button>
                 <button
                   type="button"
                   className="vc-chip"
                   onClick={() => onToggleSubTool('eyedropper')}
                 >
-                  <Pipette size={12} /> Gotero color
+                  <Pipette size={11} /> Gotero
                 </button>
                 <button
                   type="button"
-                  className="vc-btn vc-btn-secondary vc-btn-sm"
+                  className="vc-btn vc-btn-secondary vc-btn-xs"
                   onClick={() => onSelectStep('lines')}
                 >
-                  <ArrowLeft size={13} /> Volver a Líneas
+                  <ArrowLeft size={12} /> Líneas
                 </button>
               </div>
             </>
@@ -554,11 +614,84 @@ export function CanvasTopBars({
         </div>
       )}
 
+      {/* Barra compacta Multi-Sección (solo visible cuando el modo Secciones está activo o hay secciones marcadas) */}
+      {hasPhoto &&
+        viewTab === 'frontal' &&
+        traceStep === 'lines' &&
+        subTool === 'none' &&
+        (linesSubMode === 'regions' || subRegions.length > 0) && (
+          <div className="vc-regions-bar" role="region" aria-label="Auto-detección multi-sección">
+            <div className="vc-regions-list">
+              <span className="vc-pill vc-pill-regions">SECCIONES</span>
+              {subRegions.length === 0 ? (
+                <span className="vc-regions-hint">
+                  Arrastra rectángulos sobre las zonas del mueble (o haz clic en celdas) para marcar{' '}
+                  <strong>S1, S2, S3…</strong>
+                </span>
+              ) : (
+                subRegions.map((reg, idx) => {
+                  const wCm = Math.round(((reg.uEnd - reg.uStart) * xIntMm) / 10);
+                  const hCm = Math.round(((reg.vEnd - reg.vStart) * yIntMm) / 10);
+                  return (
+                    <span key={reg.id} className="vc-region-chip">
+                      <strong>S{idx + 1}</strong>
+                      <span className="vc-region-dims">
+                        {wCm}×{hCm}cm
+                      </span>
+                      <button
+                        type="button"
+                        className="vc-region-remove"
+                        onClick={() => onRemoveSubRegion(reg.id)}
+                        title={`Quitar sección S${idx + 1}`}
+                        aria-label={`Quitar sección S${idx + 1}`}
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
+                  );
+                })
+              )}
+            </div>
+            <div className="vc-regions-actions">
+              <button
+                type="button"
+                className="vc-btn vc-btn-regions vc-btn-xs"
+                disabled={subRegions.length === 0}
+                onClick={onDetectSubRegions}
+                title="Detecta divisores, repisas y diagonales solo dentro de las secciones marcadas"
+              >
+                <Sparkles size={12} /> Auto-detectar líneas en {subRegions.length}{' '}
+                {subRegions.length === 1 ? 'sección' : 'secciones'}
+              </button>
+              {subRegions.length > 0 && (
+                <button
+                  type="button"
+                  className="vc-chip"
+                  onClick={onClearSubRegions}
+                  title="Borrar todas las secciones marcadas"
+                >
+                  Limpiar secciones
+                </button>
+              )}
+              {linesSubMode === 'regions' && (
+                <button
+                  type="button"
+                  className="vc-chip"
+                  onClick={() => onChangeLinesSubMode('smart')}
+                  title="Volver al modo normal Editar / Trazar"
+                >
+                  Listo
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
       {/* Aviso de patas detectadas */}
       {legHintDetected && !hasExternalLegs && onActivateExternalLegs && (
         <div className="vc-inline-alert">
           <span>
-            <AlertTriangle size={14} /> Posibles patas externas detectadas debajo del cuerpo de
+            <AlertTriangle size={13} /> Posibles patas externas detectadas debajo del cuerpo de
             melamina.
           </span>
           <button type="button" className="vc-chip active" onClick={onActivateExternalLegs}>
@@ -567,31 +700,32 @@ export function CanvasTopBars({
         </div>
       )}
 
-      {/* Insignia honesta para Catálogo QA (14 fotos reales) + botón explícito de Visión Real */}
+      {/* Insignia ultra-compacta de 1 línea para Catálogo QA + Visión Real dentro de tu contorno */}
       {hasPhoto && isCatalogReference && viewTab === 'frontal' && (
         <div className="vc-catalog-bar">
           <span className="vc-catalog-badge">
             {ranRealVisionOnCatalog ? (
               <>
-                <CheckCircle2 size={14} /> Visión real offline ejecutada sobre{' '}
-                <strong>{externalPhotoLabel ?? 'foto del catálogo'}</strong>
+                <CheckCircle2 size={13} /> Visión real ejecutada en contorno ·{' '}
+                <strong>{externalPhotoLabel ?? 'Catálogo QA'}</strong>
               </>
             ) : (
               <>
-                <Sparkles size={14} /> Topología de referencia (Catálogo QA)
+                <Sparkles size={13} /> Catálogo QA
                 {externalPhotoLabel ? ` · ${externalPhotoLabel}` : ''}
               </>
             )}
           </span>
           <button
             type="button"
-            className="vc-btn vc-btn-secondary vc-btn-sm"
+            className="vc-btn vc-btn-secondary vc-btn-xs vc-catalog-action"
             onClick={onRunRealVisionOnCatalog}
+            title="Analiza la foto con el motor offline respetando siempre tu contorno actual"
           >
-            <Wand2 size={13} />{' '}
+            <Wand2 size={12} />{' '}
             {ranRealVisionOnCatalog
-              ? 'Re-ejecutar visión real'
-              : 'Ejecutar visión real sobre esta foto'}
+              ? 'Re-ejecutar visión real en contorno'
+              : 'Ejecutar visión real en contorno'}
           </button>
         </div>
       )}

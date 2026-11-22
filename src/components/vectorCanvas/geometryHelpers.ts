@@ -32,9 +32,25 @@ import {
 
 export type TraceStep = 'frame' | 'lines' | 'zones';
 export type FrameMode = 'box' | 'quad';
-export type LinesSubMode = 'move' | 'draw';
+export type LinesSubMode = 'smart' | 'draw_only' | 'regions';
 export type SubTool = 'none' | 'calibA4' | 'eyedropper';
 export type VisualLayerMode = 'traced_zones' | 'vectors_only' | 'photo' | 'edges';
+
+export type OrthoGuideAxis =
+  | 'horizontal'
+  | 'vertical'
+  | 'near_horizontal'
+  | 'near_vertical'
+  | 'diagonal'
+  | null;
+
+export interface SelectedSubRegion {
+  id: string;
+  uStart: number;
+  uEnd: number;
+  vStart: number;
+  vEnd: number;
+}
 
 export interface WorkingBitmap {
   canvas: HTMLCanvasElement;
@@ -117,56 +133,56 @@ export const ZONE_COLORS: Record<
   { fill: string; hoverFill: string; stroke: string; dot: string }
 > = {
   open: {
-    fill: 'rgba(14, 165, 233, 0.14)',
-    hoverFill: 'rgba(14, 165, 233, 0.28)',
+    fill: 'rgba(14, 165, 233, 0.09)',
+    hoverFill: 'rgba(14, 165, 233, 0.24)',
     stroke: '#38bdf8',
     dot: '#0284c7',
   },
   door_left: {
-    fill: 'rgba(250, 204, 21, 0.18)',
-    hoverFill: 'rgba(250, 204, 21, 0.34)',
+    fill: 'rgba(250, 204, 21, 0.11)',
+    hoverFill: 'rgba(250, 204, 21, 0.28)',
     stroke: '#facc15',
     dot: '#ca8a04',
   },
   door_right: {
-    fill: 'rgba(250, 204, 21, 0.18)',
-    hoverFill: 'rgba(250, 204, 21, 0.34)',
+    fill: 'rgba(250, 204, 21, 0.11)',
+    hoverFill: 'rgba(250, 204, 21, 0.28)',
     stroke: '#facc15',
     dot: '#ca8a04',
   },
   door_double: {
-    fill: 'rgba(245, 158, 11, 0.18)',
-    hoverFill: 'rgba(245, 158, 11, 0.34)',
+    fill: 'rgba(245, 158, 11, 0.11)',
+    hoverFill: 'rgba(245, 158, 11, 0.28)',
     stroke: '#f59e0b',
     dot: '#d97706',
   },
   door_glass: {
-    fill: 'rgba(125, 211, 252, 0.22)',
-    hoverFill: 'rgba(125, 211, 252, 0.38)',
+    fill: 'rgba(125, 211, 252, 0.13)',
+    hoverFill: 'rgba(125, 211, 252, 0.30)',
     stroke: '#7dd3fc',
     dot: '#0ea5e9',
   },
   drawers: {
-    fill: 'rgba(249, 115, 22, 0.20)',
-    hoverFill: 'rgba(249, 115, 22, 0.36)',
+    fill: 'rgba(249, 115, 22, 0.12)',
+    hoverFill: 'rgba(249, 115, 22, 0.30)',
     stroke: '#fb923c',
     dot: '#ea580c',
   },
   baskets: {
-    fill: 'rgba(16, 185, 129, 0.18)',
-    hoverFill: 'rgba(16, 185, 129, 0.34)',
+    fill: 'rgba(16, 185, 129, 0.11)',
+    hoverFill: 'rgba(16, 185, 129, 0.28)',
     stroke: '#34d399',
     dot: '#059669',
   },
   leg_void: {
-    fill: 'rgba(168, 85, 247, 0.18)',
-    hoverFill: 'rgba(168, 85, 247, 0.34)',
+    fill: 'rgba(168, 85, 247, 0.11)',
+    hoverFill: 'rgba(168, 85, 247, 0.28)',
     stroke: '#c084fc',
     dot: '#9333ea',
   },
   void_outside: {
-    fill: 'rgba(239, 68, 68, 0.20)',
-    hoverFill: 'rgba(239, 68, 68, 0.36)',
+    fill: 'rgba(239, 68, 68, 0.13)',
+    hoverFill: 'rgba(239, 68, 68, 0.30)',
     stroke: '#f87171',
     dot: '#dc2626',
   },
@@ -533,7 +549,7 @@ export function hitTestLinesScreenPx(
   isTouch = false,
 ): LineHitResult | null {
   const endTol = isTouch ? 18 : 13;
-  const bodyTol = isTouch ? 14 : 10;
+  const bodyTol = isTouch ? 15 : 11;
 
   let bestEnd: LineHitResult | null = null;
   let bestBody: LineHitResult | null = null;
@@ -586,7 +602,9 @@ export function hitTestLinesScreenPx(
 
 /**
  * Ajusta un punto interior (u, v) a bordes exteriores (0/1) o a líneas perpendiculares existentes
- * (uniones T) usando tolerancia en píxeles de pantalla.
+ * (uniones T) usando tolerancia suave en píxeles de pantalla (por defecto `6 px`).
+ * `axisLock` permite anclar solo el eje perpendicular al trazo activo (`'uOnly'` o `'vOnly'`)
+ * para no jalar violentamente hacia bordes paralelos mientras se dibuja.
  */
 export function snapPointToStructuralAnchors(
   rawPtImg: Point2D,
@@ -599,8 +617,9 @@ export function snapPointToStructuralAnchors(
   yf: number,
   scaleX: number,
   scaleY: number,
-  snapTolPx = 12,
+  snapTolPx = 6,
   excludeId?: string,
+  axisLock: 'both' | 'uOnly' | 'vOnly' = 'both',
 ): { snappedImg: Point2D; u: number; v: number; indicator: SnapIndicator | null } | null {
   const unit = applyHomography(toUnit, rawPtImg);
   if (!unit) return null;
@@ -613,58 +632,62 @@ export function snapPointToStructuralAnchors(
   let vKind: 'wall' | 'tjunction' = 'wall';
 
   // Candidatos U (paredes izquierda/derecha + divisores verticales activos en v)
-  const uAnchors: Array<{ val: number; kind: 'wall' | 'tjunction' }> = [
-    { val: 0, kind: 'wall' },
-    { val: 1, kind: 'wall' },
-  ];
-  for (const d of vDividers) {
-    if (d.id === excludeId) continue;
-    if (v >= d.start - 0.04 && v <= d.end + 0.04) {
-      uAnchors.push({ val: d.position, kind: 'tjunction' });
+  if (axisLock !== 'vOnly') {
+    const uAnchors: Array<{ val: number; kind: 'wall' | 'tjunction' }> = [
+      { val: 0, kind: 'wall' },
+      { val: 1, kind: 'wall' },
+    ];
+    for (const d of vDividers) {
+      if (d.id === excludeId) continue;
+      if (v >= d.start - 0.04 && v <= d.end + 0.04) {
+        uAnchors.push({ val: d.position, kind: 'tjunction' });
+      }
     }
-  }
 
-  let bestUDist = snapTolPx;
-  for (const a of uAnchors) {
-    const testImg = applyHomography(toCanvas, {
-      x: interiorToExterior(a.val, e, xf),
-      y: interiorToExterior(v, e, yf),
-    });
-    if (!testImg) continue;
-    const dist = distScreenPx(rawPtImg, testImg, scaleX, scaleY);
-    if (dist <= bestUDist) {
-      bestUDist = dist;
-      u = a.val;
-      snappedU = true;
-      uKind = a.kind;
+    let bestUDist = snapTolPx;
+    for (const a of uAnchors) {
+      const testImg = applyHomography(toCanvas, {
+        x: interiorToExterior(a.val, e, xf),
+        y: interiorToExterior(v, e, yf),
+      });
+      if (!testImg) continue;
+      const dist = distScreenPx(rawPtImg, testImg, scaleX, scaleY);
+      if (dist <= bestUDist) {
+        bestUDist = dist;
+        u = a.val;
+        snappedU = true;
+        uKind = a.kind;
+      }
     }
   }
 
   // Candidatos V (base/cubierta + repisas horizontales activas en u)
-  const vAnchors: Array<{ val: number; kind: 'wall' | 'tjunction' }> = [
-    { val: 0, kind: 'wall' },
-    { val: 1, kind: 'wall' },
-  ];
-  for (const s of hShelves) {
-    if (s.id === excludeId) continue;
-    if (u >= s.start - 0.04 && u <= s.end + 0.04) {
-      vAnchors.push({ val: s.position, kind: 'tjunction' });
+  if (axisLock !== 'uOnly') {
+    const vAnchors: Array<{ val: number; kind: 'wall' | 'tjunction' }> = [
+      { val: 0, kind: 'wall' },
+      { val: 1, kind: 'wall' },
+    ];
+    for (const s of hShelves) {
+      if (s.id === excludeId) continue;
+      if (u >= s.start - 0.04 && u <= s.end + 0.04) {
+        vAnchors.push({ val: s.position, kind: 'tjunction' });
+      }
     }
-  }
 
-  let bestVDist = snapTolPx;
-  for (const a of vAnchors) {
-    const testImg = applyHomography(toCanvas, {
-      x: interiorToExterior(u, e, xf),
-      y: interiorToExterior(a.val, e, yf),
-    });
-    if (!testImg) continue;
-    const dist = distScreenPx(rawPtImg, testImg, scaleX, scaleY);
-    if (dist <= bestVDist) {
-      bestVDist = dist;
-      v = a.val;
-      snappedV = true;
-      vKind = a.kind;
+    let bestVDist = snapTolPx;
+    for (const a of vAnchors) {
+      const testImg = applyHomography(toCanvas, {
+        x: interiorToExterior(u, e, xf),
+        y: interiorToExterior(a.val, e, yf),
+      });
+      if (!testImg) continue;
+      const dist = distScreenPx(rawPtImg, testImg, scaleX, scaleY);
+      if (dist <= bestVDist) {
+        bestVDist = dist;
+        v = a.val;
+        snappedV = true;
+        vKind = a.kind;
+      }
     }
   }
 
@@ -697,6 +720,104 @@ export function snapPointToStructuralAnchors(
       kind: isTJunction ? 'tjunction' : 'wall',
       label,
     },
+  };
+}
+
+/**
+ * Guía ortogonal suave (estilo Figma/Canva) para trazado en vivo (`liveStroke`):
+ *  - En modo `'auto'` u `'ortho'`, si el trazo está a `≤ 7°` de horizontal o vertical en espacio
+ *    rectificado, suaviza el extremo proyectado para mostrar una línea recta y firme sin temblor.
+ *  - Si se inclina `> 18°` (y `< 72°`) en modo `'auto'` (o siempre en `'diagonal'`), transiciona
+ *    limpiamente a diagonal real.
+ */
+export function computeSmoothOrthoGuide(
+  startU: number,
+  startV: number,
+  rawEndPt: Point2D,
+  toUnit: Matrix3x3,
+  toCanvas: Matrix3x3,
+  e: number,
+  xf: number,
+  yf: number,
+  strokeMode: 'auto' | 'ortho' | 'diagonal',
+): {
+  axis: OrthoGuideAxis;
+  u: number;
+  v: number;
+  guidedImg: Point2D;
+  angleFromHorizDeg: number;
+} {
+  const unit = applyHomography(toUnit, rawEndPt);
+  if (!unit) {
+    return {
+      axis: null,
+      u: startU,
+      v: startV,
+      guidedImg: rawEndPt,
+      angleFromHorizDeg: 0,
+    };
+  }
+  const u2 = exteriorToInterior(unit.x, e, xf);
+  const v2 = exteriorToInterior(unit.y, e, yf);
+  const xInt = Math.max(1, xf - 2 * e);
+  const yInt = Math.max(1, yf - 2 * e);
+  const dxMm = Math.abs((u2 - startU) * xInt);
+  const dyMm = Math.abs((v2 - startV) * yInt);
+  const lenMm = Math.hypot(dxMm, dyMm);
+
+  if (lenMm < 8) {
+    return { axis: null, u: u2, v: v2, guidedImg: rawEndPt, angleFromHorizDeg: 0 };
+  }
+
+  const angleFromHorizDeg = (Math.atan2(dyMm, dxMm) * 180) / Math.PI;
+
+  if (strokeMode === 'diagonal') {
+    return { axis: 'diagonal', u: u2, v: v2, guidedImg: rawEndPt, angleFromHorizDeg };
+  }
+
+  if (strokeMode === 'ortho') {
+    if (dxMm >= dyMm) {
+      const proj =
+        applyHomography(toCanvas, {
+          x: interiorToExterior(u2, e, xf),
+          y: interiorToExterior(startV, e, yf),
+        }) ?? rawEndPt;
+      return { axis: 'horizontal', u: u2, v: startV, guidedImg: proj, angleFromHorizDeg };
+    }
+    const proj =
+      applyHomography(toCanvas, {
+        x: interiorToExterior(startU, e, xf),
+        y: interiorToExterior(v2, e, yf),
+      }) ?? rawEndPt;
+    return { axis: 'vertical', u: startU, v: v2, guidedImg: proj, angleFromHorizDeg };
+  }
+
+  // Modo 'auto': guía firme ≤ 7°; zona libre entre 7°..18°; diagonal limpia entre 18°..72°
+  if (angleFromHorizDeg <= 7) {
+    const proj =
+      applyHomography(toCanvas, {
+        x: interiorToExterior(u2, e, xf),
+        y: interiorToExterior(startV, e, yf),
+      }) ?? rawEndPt;
+    return { axis: 'horizontal', u: u2, v: startV, guidedImg: proj, angleFromHorizDeg };
+  }
+  if (angleFromHorizDeg >= 83) {
+    const proj =
+      applyHomography(toCanvas, {
+        x: interiorToExterior(startU, e, xf),
+        y: interiorToExterior(v2, e, yf),
+      }) ?? rawEndPt;
+    return { axis: 'vertical', u: startU, v: v2, guidedImg: proj, angleFromHorizDeg };
+  }
+  if (angleFromHorizDeg >= 18 && angleFromHorizDeg <= 72) {
+    return { axis: 'diagonal', u: u2, v: v2, guidedImg: rawEndPt, angleFromHorizDeg };
+  }
+  return {
+    axis: angleFromHorizDeg < 45 ? 'near_horizontal' : 'near_vertical',
+    u: u2,
+    v: v2,
+    guidedImg: rawEndPt,
+    angleFromHorizDeg,
   };
 }
 

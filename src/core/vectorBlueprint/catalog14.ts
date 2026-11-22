@@ -3,7 +3,7 @@
  * Cada ficha modela fielmente la topología, material, puertas, cajones, nichos abiertos,
  * patas/ruedas/estructura metálica y herrajes de las 14 fotos reales entregadas para QA.
  */
-import type { FurnitureTopology, ScaleAndBoardParams } from '../../types/contracts';
+import type { FurnitureTopology, Point2D, ScaleAndBoardParams } from '../../types/contracts';
 
 export interface CatalogFurnitureSpec {
   id: string;
@@ -11,6 +11,8 @@ export interface CatalogFurnitureSpec {
   photoFile: string;
   name: string;
   category: 'cerrado' | 'abierto' | 'mixto' | 'escritorio' | 'dos_niveles' | 'mesa_metal';
+  /** Contorno calibrado [TL, TR, BR, BL] en coordenadas normalizadas [0..1] del cuerpo de melamina real. */
+  initialQuadNorm?: [Point2D, Point2D, Point2D, Point2D];
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
 }
@@ -47,6 +49,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '01_buffet_madera.webp',
     name: '01 — Buffet Madera 3 Puertas + 3 Cajones',
     category: 'cerrado',
+    initialQuadNorm: [
+      { x: 0.152, y: 0.388 },
+      { x: 0.918, y: 0.358 },
+      { x: 0.92, y: 0.695 },
+      { x: 0.155, y: 0.772 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1800 / 760,
@@ -81,6 +89,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '02_despensero_microondas.webp',
     name: '02 — Despensero Microondas 2 Cuerpos',
     category: 'dos_niveles',
+    initialQuadNorm: [
+      { x: 0.33, y: 0.012 },
+      { x: 0.618, y: 0.025 },
+      { x: 0.628, y: 0.885 },
+      { x: 0.382, y: 0.935 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 650 / 1820,
@@ -117,6 +131,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '03_buffet_nordico_blanco_roble.webp',
     name: '03 — Buffet Nórdico Blanco + Roble',
     category: 'cerrado',
+    initialQuadNorm: [
+      { x: 0.092, y: 0.244 },
+      { x: 0.992, y: 0.188 },
+      { x: 0.974, y: 0.564 },
+      { x: 0.108, y: 0.704 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1600 / 640,
@@ -149,6 +169,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '04_armario_oficina_mixto.webp',
     name: '04 — Armario Oficina Mixto (Grafito + Nogal)',
     category: 'mixto',
+    initialQuadNorm: [
+      { x: 0.17, y: 0.105 },
+      { x: 0.946, y: 0.08 },
+      { x: 0.946, y: 0.85 },
+      { x: 0.17, y: 0.924 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 800 / 1200,
@@ -193,6 +219,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '05_escritorio_ejecutivo.webp',
     name: '05 — Escritorio Ejecutivo 2 Pedestales',
     category: 'escritorio',
+    initialQuadNorm: [
+      { x: 0.05, y: 0.095 },
+      { x: 0.994, y: 0.062 },
+      { x: 0.99, y: 0.842 },
+      { x: 0.052, y: 0.925 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1500 / 750,
@@ -240,6 +272,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '06_vitrina_4_puertas.webp',
     name: '06 — Vitrina Alta 4 Puertas (2 Vidriadas + 2 Ciegas)',
     category: 'dos_niveles',
+    initialQuadNorm: [
+      { x: 0.008, y: 0.005 },
+      { x: 0.992, y: 0.005 },
+      { x: 0.992, y: 0.962 },
+      { x: 0.008, y: 0.962 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 800 / 1900,
@@ -284,6 +322,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '07_rack_tv_blanco_mixto.webp',
     name: '07 — Rack TV Blanco Mixto (2 Cajones + Nicho + 2 Puertas)',
     category: 'mixto',
+    initialQuadNorm: [
+      { x: 0.07, y: 0.606 },
+      { x: 0.93, y: 0.606 },
+      { x: 0.93, y: 0.782 },
+      { x: 0.07, y: 0.782 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1800 / 480,
@@ -317,6 +361,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '08_mesa_centro_fierro.webp',
     name: '08 — Mesa de Centro Roble + Estructura Metálica',
     category: 'mesa_metal',
+    initialQuadNorm: [
+      { x: 0.268, y: 0.606 },
+      { x: 0.892, y: 0.436 },
+      { x: 0.868, y: 0.674 },
+      { x: 0.278, y: 0.858 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1100 / 420,
@@ -353,6 +403,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '09_alacena_cocina_meson.webp',
     name: '09 — Alacena Cocina Blanca con Mesón Granito',
     category: 'dos_niveles',
+    initialQuadNorm: [
+      { x: 0.008, y: 0.052 },
+      { x: 0.955, y: 0.005 },
+      { x: 0.902, y: 0.955 },
+      { x: 0.108, y: 0.818 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1600 / 1950,
@@ -408,6 +464,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '10_librero_3_cuerpos_roble.webp',
     name: '10 — Librero Modular 3 Cuerpos Abierto (Roble)',
     category: 'abierto',
+    initialQuadNorm: [
+      { x: 0.205, y: 0.168 },
+      { x: 0.772, y: 0.226 },
+      { x: 0.768, y: 0.742 },
+      { x: 0.206, y: 0.804 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1700 / 2000,
@@ -454,6 +516,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '11_escritorio_cajonera_der.webp',
     name: '11 — Escritorio Simple con Cajonera Derecha (2 Cajones)',
     category: 'escritorio',
+    initialQuadNorm: [
+      { x: 0.03, y: 0.232 },
+      { x: 0.97, y: 0.232 },
+      { x: 0.97, y: 0.855 },
+      { x: 0.03, y: 0.855 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1200 / 750,
@@ -494,6 +562,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '12_carro_cocina_escalonado.jpg',
     name: '12 — Carro Auxiliar Cocina (Cajón + 3 Canastos + 2 Puertas + Ruedas)',
     category: 'mixto',
+    initialQuadNorm: [
+      { x: 0.192, y: 0.18 },
+      { x: 0.835, y: 0.156 },
+      { x: 0.835, y: 0.808 },
+      { x: 0.196, y: 0.916 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 950 / 820,
@@ -550,6 +624,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '13_cocina_integral_blanca.webp',
     name: '13 — Mueble Cocina Integral Blanco 2 Niveles',
     category: 'dos_niveles',
+    initialQuadNorm: [
+      { x: 0.18, y: 0.008 },
+      { x: 0.868, y: 0.012 },
+      { x: 0.898, y: 0.902 },
+      { x: 0.206, y: 0.948 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1500 / 1920,
@@ -594,6 +674,12 @@ export const CATALOG_14_MUEBLES: readonly CatalogFurnitureSpec[] = [
     photoFile: '14_cocina_bicolor_roble.jpg',
     name: '14 — Mueble Cocina Bicolor Blanco + Roble',
     category: 'dos_niveles',
+    initialQuadNorm: [
+      { x: 0.256, y: 0.14 },
+      { x: 0.752, y: 0.156 },
+      { x: 0.776, y: 0.746 },
+      { x: 0.276, y: 0.804 },
+    ],
     topology: {
       viewsMode: 1,
       aspectRatioXY: 1600 / 1950,
@@ -645,8 +731,14 @@ export function cloneCatalogFurniture(id: string): {
 } | null {
   const found = CATALOG_14_MUEBLES.find((c) => c.id === id);
   if (!found) return null;
+  const clonedQuadNorm = found.initialQuadNorm
+    ? (found.initialQuadNorm.map((p) => ({ ...p })) as [Point2D, Point2D, Point2D, Point2D])
+    : undefined;
   return {
-    spec: found,
+    spec: {
+      ...found,
+      initialQuadNorm: clonedQuadNorm,
+    },
     topology: {
       ...found.topology,
       vDividers: found.topology.vDividers.map((d) => ({ ...d })),

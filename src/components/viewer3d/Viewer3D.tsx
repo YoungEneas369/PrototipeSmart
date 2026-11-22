@@ -115,30 +115,47 @@ function CameraRig({
   modelKey,
   camDist,
   targetY,
+  furnitureDimsM,
 }: {
   preset: CameraPreset;
   presetTrigger: number;
   modelKey?: string;
   camDist: number;
   targetY: number;
+  furnitureDimsM: [number, number, number];
 }) {
-  const { camera } = useThree();
+  const { camera, size } = useThree();
   const controlsRef = useRef<ComponentRef<typeof OrbitControls> | null>(null);
   const camDistRef = useRef<number>(camDist);
   const targetYRef = useRef<number>(targetY);
+  const dimsRef = useRef<[number, number, number]>(furnitureDimsM);
+  const aspectRef = useRef<number>(size.width / Math.max(1, size.height));
 
   camDistRef.current = camDist;
   targetYRef.current = targetY;
+  dimsRef.current = furnitureDimsM;
+  aspectRef.current = size.width / Math.max(1, size.height);
 
   useEffect(() => {
-    const dist = camDistRef.current;
+    const [xm, ymTotal, zm] = dimsRef.current;
+    const aspect = Math.max(0.45, aspectRef.current);
+    // Compensa el FOV horizontal en paneles angostos (modo Dividido) y deja margen de aire para cotas X/Y/Z
+    const apparentHalfW =
+      preset === 'front'
+        ? xm * 0.5 + 0.16
+        : preset === 'side'
+          ? zm * 0.5 + 0.16
+          : (xm * 0.83 + zm * 0.57) * 0.5 + 0.17;
+    const horizFitDist = apparentHalfW / (0.39 * aspect);
+    const vertFitDist = (ymTotal * 0.5 + 0.18) / 0.42;
+    const dist = Math.max(camDistRef.current, horizFitDist, vertFitDist);
     const ty = targetYRef.current;
     const pos: [number, number, number] =
       preset === 'front'
-        ? [0, ty, dist * 1.38]
+        ? [0, ty, dist * 1.42]
         : preset === 'side'
-          ? [dist * 1.38, ty * 1.05, 0.02]
-          : [dist * 0.72, Math.max(ty * 1.15, dist * 0.58), dist * 1.05];
+          ? [dist * 1.42, ty * 1.05, 0.02]
+          : [dist * 0.72, Math.max(ty * 1.15, dist * 0.58), dist * 1.08];
 
     camera.position.set(pos[0], pos[1], pos[2]);
     if (controlsRef.current) {
@@ -802,15 +819,16 @@ function FurnitureMeshGroup({
           <>
             <Line
               points={[
-                [0, -0.05, zm + 0.06],
-                [xm, -0.05, zm + 0.06],
+                [0, -0.045, zm + 0.05],
+                [xm, -0.045, zm + 0.05],
               ]}
               color="#0284c7"
               lineWidth={2}
             />
             <Html
-              position={[xm / 2, -0.09, zm + 0.06]}
+              position={[xm / 2, -0.085, zm + 0.05]}
               center
+              zIndexRange={[1, 4]}
               wrapperClass="dim-html-wrapper"
               style={{ pointerEvents: 'none' }}
             >
@@ -819,41 +837,43 @@ function FurnitureMeshGroup({
 
             <Line
               points={[
-                [xm + 0.07, 0, zm],
-                [xm + 0.07, ym, zm],
+                [xm + 0.045, 0, zm],
+                [xm + 0.045, ym, zm],
               ]}
               color="#059669"
               lineWidth={2}
             />
             <Html
-              position={[xm + 0.14, ym / 2, zm]}
+              position={[xm + 0.045, ym / 2, zm]}
               center
+              zIndexRange={[1, 4]}
               wrapperClass="dim-html-wrapper"
               style={{ pointerEvents: 'none' }}
             >
               <div className="dim-badge dim-y">
-                Y: {Math.round(yf)} mm
-                {support.type === 'wheels'
-                  ? ` (+${legHeightMm} ruedas)`
-                  : support.type === 'legs'
-                    ? ` (+${legHeightMm} patas)`
-                    : support.type === 'toe_kick' && toeKickMm > 0
-                      ? ` (+${toeKickMm} zócalo)`
-                      : ''}
+                <span>Y: {Math.round(yf)} mm</span>
+                {support.type === 'wheels' ? (
+                  <span className="dim-sub">+{legHeightMm} ruedas</span>
+                ) : support.type === 'legs' ? (
+                  <span className="dim-sub">+{legHeightMm} patas</span>
+                ) : support.type === 'toe_kick' && toeKickMm > 0 ? (
+                  <span className="dim-sub">+{toeKickMm} zócalo</span>
+                ) : null}
               </div>
             </Html>
 
             <Line
               points={[
-                [-0.07, ym + 0.03, 0],
-                [-0.07, ym + 0.03, zm],
+                [-0.055, ym + 0.03, 0],
+                [-0.055, ym + 0.03, zm],
               ]}
               color="#7c3aed"
               lineWidth={2}
             />
             <Html
-              position={[-0.12, ym + 0.07, zm / 2]}
+              position={[-0.065, ym + 0.07, zm / 2]}
               center
+              zIndexRange={[1, 4]}
               wrapperClass="dim-html-wrapper"
               style={{ pointerEvents: 'none' }}
             >
@@ -923,14 +943,12 @@ export function Viewer3D({
         ? supportSummary.heightMm
         : 0
       : supportSummary.heightMm;
-  const maxDim =
-    Math.max(
-      params.targetDimensions.x,
-      params.targetDimensions.y + legExtraMm,
-      params.targetDimensions.z,
-    ) / 1000;
-  const camDist = Math.max(1.8, maxDim * 1.65);
-  const targetY = (params.targetDimensions.y + legExtraMm) / 2000;
+  const xm = params.targetDimensions.x / 1000;
+  const ymTotal = (params.targetDimensions.y + legExtraMm) / 1000;
+  const zm = params.targetDimensions.z / 1000;
+  const maxDim = Math.max(xm, ymTotal, zm);
+  const camDist = Math.max(2.0, maxDim * 1.84);
+  const targetY = ymTotal / 2;
 
   const pandeoAlerts = despiece.alerts.filter((a) => a.tipo === 'pandeo');
   const maxSpan = pandeoAlerts.reduce((m, a) => Math.max(m, a.luzLibreMm ?? 0), 0);
@@ -1084,7 +1102,7 @@ export function Viewer3D({
       <Canvas
         shadows
         camera={{
-          position: [camDist * 0.72, Math.max(targetY * 1.15, camDist * 0.58), camDist * 1.05],
+          position: [camDist * 0.72, Math.max(targetY * 1.15, camDist * 0.58), camDist * 1.08],
           fov: 42,
         }}
         onPointerMissed={() => setSelectedPieceId(null)}
@@ -1114,6 +1132,7 @@ export function Viewer3D({
           modelKey={modelKey}
           camDist={camDist}
           targetY={targetY}
+          furnitureDimsM={[xm, ymTotal, zm]}
         />
       </Canvas>
     </div>

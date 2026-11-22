@@ -32,7 +32,11 @@ import {
   type BandDetectionResult,
   type LowerGapHintResult,
 } from './bandDetector';
-import { MATERIAL_BASE_RGB } from './colorClassifier';
+import {
+  MATERIAL_BASE_RGB,
+  classifyMelamineMaterial,
+  rgbDeltaE,
+} from './colorClassifier';
 import {
   clamp,
   edgeInwardUnitNormal,
@@ -40,11 +44,13 @@ import {
   gaussianBlur3x3,
   interiorToExteriorPoint,
   interiorToExteriorRect,
+  median,
   pointInQuad,
   quadArea,
   rgbaLuminance,
   sampleExteriorBgRgb,
   sampleLumSafe,
+  sampleRgbaSafe,
   sobel3x3At,
 } from './imageOps';
 import {
@@ -750,7 +756,60 @@ export function extractStructuralVectorLines(
 
   const mergedH = mergeCollinear(rawHoriz, true);
   const mergedV = mergeCollinear(rawVert, false);
-  const mergedD = mergeDiagonalSegs(rawDiag);
+
+  // Filtrar diagonales fantasma (sombras difusas / bordes débiles): exigir gradiente fuerte continuo >= 75%
+  // de su longitud y coherencia de luminancia a lo largo de la arista/franja del tablero
+  const mergedD = mergeDiagonalSegs(rawDiag).filter((seg) => {
+    const segLen = Math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1);
+    if (segLen < minDiagLen) return false;
+    const ux = (seg.x2 - seg.x1) / segLen;
+    const uy = (seg.y2 - seg.y1) / segLen;
+    const nx = -uy;
+    const ny = ux;
+    const samples = 24;
+    const gradBand = Math.max(4, Math.round(Math.min(W, H) * 0.022));
+    const minGrad = edgeThresh * 1.1;
+
+    let gradHits = 0;
+    for (let k = 1; k < samples; k++) {
+      const t = k / samples;
+      const bx = seg.x1 + (seg.x2 - seg.x1) * t;
+      const by = seg.y1 + (seg.y2 - seg.y1) * t;
+      let localMax = 0;
+      for (let d = -gradBand; d <= gradBand; d++) {
+        const px = clamp(Math.round(bx + nx * d), 1, W - 2);
+        const py = clamp(Math.round(by + ny * d), 1, H - 2);
+        const m = magMap[py * W + px];
+        if (m > localMax) localMax = m;
+      }
+      if (localMax >= minGrad) gradHits++;
+    }
+    if (gradHits / (samples - 1) < 0.75) return false;
+
+    // Verificar coherencia de luminancia en la franja (centro o alguno de los 2 costados del borde)
+    let bestStripStd = Infinity;
+    for (const shift of [0, -3, 3]) {
+      let sumL = 0;
+      let sumL2 = 0;
+      let cnt = 0;
+      for (let k = 2; k <= samples - 2; k++) {
+        const t = k / samples;
+        const px = clamp(Math.round(seg.x1 + (seg.x2 - seg.x1) * t + nx * shift), 0, W - 1);
+        const py = clamp(Math.round(seg.y1 + (seg.y2 - seg.y1) * t + ny * shift), 0, H - 1);
+        const gi = py * W + px;
+        const l = rgbaLuminance(chR[gi], chG[gi], chB[gi]);
+        sumL += l;
+        sumL2 += l * l;
+        cnt++;
+      }
+      if (cnt >= 8) {
+        const meanL = sumL / cnt;
+        const stdL = Math.sqrt(Math.max(0, sumL2 / cnt - meanL * meanL));
+        if (stdL < bestStripStd) bestStripStd = stdL;
+      }
+    }
+    return bestStripStd <= 34;
+  });
 
   // Clasificar cada vector según su posición respecto a los márgenes del mueble
   const classifyRole = (seg: RawSeg): VectorLineRole => {
@@ -1544,6 +1603,105 @@ export function reconstructStructureFromVectors(
   const toUInt = (uExt: number) => clamp(exteriorToInterior(uExt, boardThicknessMm, dimsMm.x), 0, 1);
   const toVInt = (vExt: number) => clamp(exteriorToInterior(vExt, boardThicknessMm, dimsMm.y), 0, 1);
 
+  // Muestrear color real de la carcasa desde el perímetro de la imagen rectificada para validar diagonales
+  const carcassRgb = sampleCarcassBorderRgb(rectRgba, W, H, exteriorBgRgb, detectedMaterial);
+  const boardHalfPx = Math.max(
+    2,
+    Math.round(
+      (boardThicknessMm / Math.max(100, Math.min(dimsMm.x, dimsMm.y))) * Math.min(W, H) * 0.45,
+    ),
+  );
+
+  const isCoherentMelamineDiagonal = (u1: number, v1: number, u2: number, v2: number): boolean => {
+    const p1Ext = interiorToExteriorPoint(u1, v1, dimsMm, boardThicknessMm);
+    const p2Ext = interiorToExteriorPoint(u2, v2, dimsMm, boardThicknessMm);
+    const x1 = p1Ext.uExt * W;
+    const y1 = (1 - p1Ext.vExt) * H;
+    const x2 = p2Ext.uExt * W;
+    const y2 = (1 - p2Ext.vExt) * H;
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    if (len < 16) return false;
+    const nx = -(y2 - y1) / len;
+    const ny = (x2 - x1) / len;
+    const samples = 24;
+
+    const sampleStrip = (offsetPx: number) => {
+      let sR = 0,
+        sG = 0,
+        sB = 0,
+        sL = 0,
+        sL2 = 0,
+        bgHits = 0,
+        cnt = 0;
+      for (let k = 2; k <= samples - 2; k++) {
+        const t = k / samples;
+        const px = x1 + (x2 - x1) * t + nx * offsetPx;
+        const py = y1 + (y2 - y1) * t + ny * offsetPx;
+        const [r, g, b, a] = sampleRgbaSafe(rectRgba, W, H, px, py);
+        if (a < 128) {
+          bgHits++;
+          cnt++;
+          continue;
+        }
+        const l = rgbaLuminance(r, g, b);
+        sR += r;
+        sG += g;
+        sB += b;
+        sL += l;
+        sL2 += l * l;
+        const dBg = Math.hypot(r - exteriorBgRgb[0], g - exteriorBgRgb[1], b - exteriorBgRgb[2]);
+        if (dBg < 28) bgHits++;
+        cnt++;
+      }
+      const opaque = Math.max(1, cnt - bgHits);
+      const meanR = sR / Math.max(1, cnt);
+      const meanG = sG / Math.max(1, cnt);
+      const meanB = sB / Math.max(1, cnt);
+      const meanL = sL / Math.max(1, cnt);
+      const stdL = Math.sqrt(Math.max(0, sL2 / Math.max(1, cnt) - meanL * meanL));
+      return {
+        rgb: [meanR, meanG, meanB] as [number, number, number],
+        meanL,
+        stdL,
+        bgFrac: bgHits / Math.max(1, cnt),
+        opaque,
+      };
+    };
+
+    const centerStrip = sampleStrip(0);
+    const leftStrip = sampleStrip(-boardHalfPx);
+    const rightStrip = sampleStrip(boardHalfPx);
+    const flankDist = boardHalfPx + 6;
+    const flankL = sampleStrip(-flankDist);
+    const flankR = sampleStrip(flankDist);
+
+    // Evaluar el mejor candidato de tira de tablero (priorizando el eje central fusionado)
+    const candidates = [centerStrip, leftStrip, rightStrip].filter((s) => s.bgFrac < 0.35);
+    if (candidates.length === 0) return false;
+
+    const best = candidates.reduce((acc, cur) => {
+      const dAcc = rgbDeltaE(acc.rgb, carcassRgb);
+      const dCur = rgbDeltaE(cur.rgb, carcassRgb);
+      return dCur < dAcc ? cur : acc;
+    });
+
+    if (best.stdL > 32) return false;
+
+    const dCarcass = rgbDeltaE(best.rgb, carcassRgb);
+    const dMatBase = rgbDeltaE(best.rgb, MATERIAL_BASE_RGB[detectedMaterial]);
+    const stripMat = classifyMelamineMaterial(best.rgb[0], best.rgb[1], best.rgb[2], exteriorBgRgb);
+    const melamineMatch = dCarcass <= 34 || dMatBase <= 30 || stripMat === detectedMaterial;
+    if (!melamineMatch) return false;
+
+    // Descartar sombras difusas o aristas en perspectiva contra piso/fondo exterior (ej. hueco de piernas escritorio)
+    const oneFlankIsBg =
+      (flankL.bgFrac >= 0.5 && flankR.bgFrac < 0.25) ||
+      (flankR.bgFrac >= 0.5 && flankL.bgFrac < 0.25);
+    if (oneFlankIsBg && dCarcass > 20) return false;
+
+    return true;
+  };
+
   const rawV: NormVecSeg[] = [];
   const rawH: NormVecSeg[] = [];
   const rawDiags: Array<{ u1: number; v1: number; u2: number; v2: number; strength: number }> = [];
@@ -1558,12 +1716,13 @@ export function reconstructStructureFromVectors(
       const v2 = toVInt(ln.normEnd.y);
       const du = u2 - u1;
       const dv = v2 - v1;
-      if (Math.hypot(du, dv) < 0.16) continue;
+      // Exigir longitud interior >= 0.24 (descarta aristas cortas de sombra/esquinas en perspectiva)
+      if (Math.hypot(du, dv) < 0.24) continue;
       // Verificar ángulo físico real 18°–72° en espacio del mueble
       const xInt = Math.max(1, dimsMm.x - 2 * boardThicknessMm);
       const yInt = Math.max(1, dimsMm.y - 2 * boardThicknessMm);
       const deg = (Math.atan2(Math.abs(dv * yInt), Math.abs(du * xInt)) * 180) / Math.PI;
-      if (deg >= 18 && deg <= 72) {
+      if (deg >= 18 && deg <= 72 && isCoherentMelamineDiagonal(u1, v1, u2, v2)) {
         rawDiags.push({ u1, v1, u2, v2, strength: ln.strength });
       }
       continue;
@@ -2040,5 +2199,472 @@ export function runIterativePhotoTo3D(
     similarity3D: bestSim,
     selectedStrategy,
     iterationsRun,
+  };
+}
+
+/**
+ * Muestrea el color RGB mediano del perímetro de la carcasa en la imagen rectificada
+ * (excluyendo píxeles similares al fondo exterior para escritorios abiertos).
+ */
+function sampleCarcassBorderRgb(
+  rectRgba: Uint8ClampedArray,
+  W: number,
+  H: number,
+  exteriorBgRgb: readonly [number, number, number],
+  fallbackMaterial: MelamineMaterial,
+): [number, number, number] {
+  if (W < 12 || H < 12 || rectRgba.length < W * H * 4) {
+    return [...MATERIAL_BASE_RGB[fallbackMaterial]];
+  }
+  const rs: number[] = [];
+  const gs: number[] = [];
+  const bs: number[] = [];
+  const bandX = clamp(Math.round(W * 0.02), 2, 8);
+  const bandY = clamp(Math.round(H * 0.02), 2, 8);
+  const stepX = Math.max(1, Math.floor(W / 64));
+  const stepY = Math.max(1, Math.floor(H / 64));
+
+  const pushSample = (x: number, y: number) => {
+    const p = (y * W + x) * 4;
+    if (rectRgba[p + 3] < 128) return;
+    const r = rectRgba[p];
+    const g = rectRgba[p + 1];
+    const b = rectRgba[p + 2];
+    const dBg = Math.hypot(r - exteriorBgRgb[0], g - exteriorBgRgb[1], b - exteriorBgRgb[2]);
+    if (dBg < 32) return;
+    rs.push(r);
+    gs.push(g);
+    bs.push(b);
+  };
+
+  for (let x = bandX; x < W - bandX; x += stepX) {
+    for (let dy = 1; dy <= bandY; dy++) {
+      pushSample(x, dy);
+      if (x < W * 0.16 || x > W * 0.84) {
+        pushSample(x, H - 1 - dy);
+      }
+    }
+  }
+  for (let y = bandY; y < H - bandY; y += stepY) {
+    for (let dx = 1; dx <= bandX; dx++) {
+      pushSample(dx, y);
+      pushSample(W - 1 - dx, y);
+    }
+  }
+
+  if (rs.length < 16) {
+    return [...MATERIAL_BASE_RGB[fallbackMaterial]];
+  }
+  return [Math.round(median(rs)), Math.round(median(gs)), Math.round(median(bs))];
+}
+
+function cropAndResampleRgba(
+  srcRgba: Uint8ClampedArray,
+  srcW: number,
+  srcH: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  minLongSide = 220,
+): { rgba: Uint8ClampedArray; width: number; height: number } {
+  const sx0 = clamp(Math.floor(x0), 0, srcW - 1);
+  const sy0 = clamp(Math.floor(y0), 0, srcH - 1);
+  const sx1 = clamp(Math.ceil(x1), sx0, srcW - 1);
+  const sy1 = clamp(Math.ceil(y1), sy0, srcH - 1);
+  const cw = sx1 - sx0 + 1;
+  const ch = sy1 - sy0 + 1;
+  const longSide = Math.max(cw, ch);
+
+  if (longSide >= minLongSide) {
+    const out = new Uint8ClampedArray(cw * ch * 4);
+    for (let y = 0; y < ch; y++) {
+      const srcRow = (sy0 + y) * srcW + sx0;
+      const dstRow = y * cw;
+      for (let x = 0; x < cw; x++) {
+        const si = (srcRow + x) * 4;
+        const di = (dstRow + x) * 4;
+        out[di] = srcRgba[si];
+        out[di + 1] = srcRgba[si + 1];
+        out[di + 2] = srcRgba[si + 2];
+        out[di + 3] = srcRgba[si + 3];
+      }
+    }
+    return { rgba: out, width: cw, height: ch };
+  }
+
+  const scale = clamp(minLongSide / Math.max(1, longSide), 1, 3);
+  const dstW = Math.max(32, Math.round(cw * scale));
+  const dstH = Math.max(32, Math.round(ch * scale));
+  const out = new Uint8ClampedArray(dstW * dstH * 4);
+
+  for (let y = 0; y < dstH; y++) {
+    const fy = sy0 + ((y + 0.5) / dstH) * (cw > 0 ? ch : 1) - 0.5;
+    const iy0 = clamp(Math.floor(fy), sy0, sy1);
+    const iy1 = clamp(iy0 + 1, sy0, sy1);
+    const ty = clamp(fy - iy0, 0, 1);
+
+    for (let x = 0; x < dstW; x++) {
+      const fx = sx0 + ((x + 0.5) / dstW) * cw - 0.5;
+      const ix0 = clamp(Math.floor(fx), sx0, sx1);
+      const ix1 = clamp(ix0 + 1, sx0, sx1);
+      const tx = clamp(fx - ix0, 0, 1);
+
+      const i00 = (iy0 * srcW + ix0) * 4;
+      const i10 = (iy0 * srcW + ix1) * 4;
+      const i01 = (iy1 * srcW + ix0) * 4;
+      const i11 = (iy1 * srcW + ix1) * 4;
+
+      const w00 = (1 - tx) * (1 - ty);
+      const w10 = tx * (1 - ty);
+      const w01 = (1 - tx) * ty;
+      const w11 = tx * ty;
+
+      const di = (y * dstW + x) * 4;
+      out[di] = Math.round(
+        srcRgba[i00] * w00 + srcRgba[i10] * w10 + srcRgba[i01] * w01 + srcRgba[i11] * w11,
+      );
+      out[di + 1] = Math.round(
+        srcRgba[i00 + 1] * w00 +
+          srcRgba[i10 + 1] * w10 +
+          srcRgba[i01 + 1] * w01 +
+          srcRgba[i11 + 1] * w11,
+      );
+      out[di + 2] = Math.round(
+        srcRgba[i00 + 2] * w00 +
+          srcRgba[i10 + 2] * w10 +
+          srcRgba[i01 + 2] * w01 +
+          srcRgba[i11 + 2] * w11,
+      );
+      out[di + 3] = 255;
+    }
+  }
+  return { rgba: out, width: dstW, height: dstH };
+}
+
+function paintCarcassFrameCopy(
+  src: Uint8ClampedArray,
+  W: number,
+  H: number,
+  padX: number,
+  padY: number,
+  frameRgb: readonly [number, number, number],
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(src);
+  const px = clamp(padX, 2, Math.floor(W * 0.12));
+  const py = clamp(padY, 2, Math.floor(H * 0.12));
+  for (let y = 0; y < H; y++) {
+    const isRowBorder = y < py || y >= H - py;
+    const rowOff = y * W;
+    for (let x = 0; x < W; x++) {
+      if (isRowBorder || x < px || x >= W - px) {
+        const i = (rowOff + x) * 4;
+        out[i] = frameRgb[0];
+        out[i + 1] = frameRgb[1];
+        out[i + 2] = frameRgb[2];
+        out[i + 3] = 255;
+      }
+    }
+  }
+  return out;
+}
+
+export interface SubRegionRect {
+  id?: string;
+  uStart: number;
+  uEnd: number;
+  vStart: number;
+  vEnd: number;
+}
+
+export interface SubRegionDetectionResult {
+  vDividers: NormalizedSegment[];
+  hShelves: NormalizedSegment[];
+  diagonalDividers: DiagonalSegment[];
+  addedVCount: number;
+  addedHCount: number;
+  addedDCount: number;
+  regionsProcessed: number;
+}
+
+/**
+ * Detección estructural multi-sección 100% offline:
+ * Rectifica el `quad` del usuario, recorta cada sub-región válida `[uStart..uEnd] × [vStart..vEnd]`
+ * en espacio INTERIOR, ejecuta `analyzeRectifiedFurniture` + `reconstructStructureFromVectors`
+ * estrictamente dentro de cada sub-región, remapea los segmentos locales al espacio interior global
+ * y los combina con `existing` deduplicando (`|posA - posB| < 0.035` con solapamiento `>= 60%`).
+ */
+export function detectStructureInSubRegions(
+  rgba: Uint8ClampedArray,
+  imgW: number,
+  imgH: number,
+  quad: [Point2D, Point2D, Point2D, Point2D],
+  regions: SubRegionRect[],
+  existing: {
+    vDividers: NormalizedSegment[];
+    hShelves: NormalizedSegment[];
+    diagonalDividers?: DiagonalSegment[];
+  },
+  opts: {
+    dimsMm: { x: number; y: number; z: number };
+    boardThicknessMm: number;
+    carcassMaterial: MelamineMaterial;
+    exteriorBgRgb: [number, number, number];
+  },
+): SubRegionDetectionResult {
+  const outV: NormalizedSegment[] = existing.vDividers.map((d) => ({ ...d }));
+  const outH: NormalizedSegment[] = existing.hShelves.map((s) => ({ ...s }));
+  const outD: DiagonalSegment[] = (existing.diagonalDividers ?? []).map((d) => ({ ...d }));
+
+  if (imgW < 24 || imgH < 24 || rgba.length < imgW * imgH * 4 || regions.length === 0) {
+    return {
+      vDividers: outV,
+      hShelves: outH,
+      diagonalDividers: outD,
+      addedVCount: 0,
+      addedHCount: 0,
+      addedDCount: 0,
+      regionsProcessed: 0,
+    };
+  }
+
+  const hom = computeQuadToUnitHomography(quad);
+  if (!hom) {
+    return {
+      vDividers: outV,
+      hShelves: outH,
+      diagonalDividers: outD,
+      addedVCount: 0,
+      addedHCount: 0,
+      addedDCount: 0,
+      regionsProcessed: 0,
+    };
+  }
+
+  const e = Math.max(6, opts.boardThicknessMm);
+  const { width: rectW, height: rectH } = computeRectifiedSize(opts.dimsMm.x, opts.dimsMm.y, e);
+  const rectRgba = rectifyImageRGBA(rgba, imgW, imgH, hom.toCanvas, rectW, rectH);
+  const xInt = Math.max(60, opts.dimsMm.x - 2 * e);
+  const yInt = Math.max(60, opts.dimsMm.y - 2 * e);
+  const fullCarcassRgb = sampleCarcassBorderRgb(
+    rectRgba,
+    rectW,
+    rectH,
+    opts.exteriorBgRgb,
+    opts.carcassMaterial,
+  );
+
+  const usedIds = new Set<string>([
+    ...outV.map((d) => d.id),
+    ...outH.map((s) => s.id),
+    ...outD.map((d) => d.id),
+  ]);
+  const nextUniqueId = (base: string): string => {
+    if (!usedIds.has(base)) {
+      usedIds.add(base);
+      return base;
+    }
+    let idx = 2;
+    while (usedIds.has(`${base}_${idx}`)) idx++;
+    const id = `${base}_${idx}`;
+    usedIds.add(id);
+    return id;
+  };
+
+  const isDuplicateOrtho = (
+    list: readonly NormalizedSegment[],
+    pos: number,
+    start: number,
+    end: number,
+  ): boolean => {
+    const s0 = Math.min(start, end);
+    const s1 = Math.max(start, end);
+    const spanNew = Math.max(1e-4, s1 - s0);
+    return list.some((ex) => {
+      if (Math.abs(ex.position - pos) >= 0.035) return false;
+      const e0 = Math.min(ex.start, ex.end);
+      const e1 = Math.max(ex.start, ex.end);
+      const overlap = Math.max(0, Math.min(s1, e1) - Math.max(s0, e0));
+      const denom = Math.max(1e-4, Math.min(spanNew, e1 - e0));
+      return overlap / denom >= 0.6;
+    });
+  };
+
+  const isDuplicateDiag = (
+    list: readonly DiagonalSegment[],
+    u1: number,
+    v1: number,
+    u2: number,
+    v2: number,
+  ): boolean =>
+    list.some((ex) => {
+      const same =
+        Math.hypot(ex.u1 - u1, ex.v1 - v1) < 0.05 && Math.hypot(ex.u2 - u2, ex.v2 - v2) < 0.05;
+      const rev =
+        Math.hypot(ex.u1 - u2, ex.v1 - v2) < 0.05 && Math.hypot(ex.u2 - u1, ex.v2 - v1) < 0.05;
+      return same || rev;
+    });
+
+  let addedVCount = 0;
+  let addedHCount = 0;
+  let addedDCount = 0;
+  let regionsProcessed = 0;
+
+  const padRectX = Math.max(2, Math.round((e / Math.max(100, opts.dimsMm.x)) * rectW));
+  const padRectY = Math.max(2, Math.round((e / Math.max(100, opts.dimsMm.y)) * rectH));
+
+  for (const reg of regions) {
+    const u0 = clamp(Math.min(reg.uStart, reg.uEnd), 0, 1);
+    const u1 = clamp(Math.max(reg.uStart, reg.uEnd), 0, 1);
+    const v0 = clamp(Math.min(reg.vStart, reg.vEnd), 0, 1);
+    const v1 = clamp(Math.max(reg.vStart, reg.vEnd), 0, 1);
+    const spanU = u1 - u0;
+    const spanV = v1 - v0;
+    if (spanU <= 0.06 || spanV <= 0.06) continue;
+
+    const pxRect = interiorToExteriorRect(
+      { uStart: u0, uEnd: u1, vStart: v0, vEnd: v1 },
+      { x: opts.dimsMm.x, y: opts.dimsMm.y },
+      e,
+      rectW,
+      rectH,
+      0,
+    );
+
+    const cx0 = clamp(pxRect.x0 - padRectX, 0, rectW - 1);
+    const cx1 = clamp(pxRect.x1 + padRectX, cx0, rectW - 1);
+    const cy0 = clamp(pxRect.y0 - padRectY, 0, rectH - 1);
+    const cy1 = clamp(pxRect.y1 + padRectY, cy0, rectH - 1);
+    if (cx1 - cx0 < 16 || cy1 - cy0 < 16) continue;
+
+    const { rgba: cropRgba, width: cropW, height: cropH } = cropAndResampleRgba(
+      rectRgba,
+      rectW,
+      rectH,
+      cx0,
+      cy0,
+      cx1,
+      cy1,
+      220,
+    );
+    const subDims = {
+      x: spanU * xInt + 2 * e,
+      y: spanV * yInt + 2 * e,
+    };
+
+    const scoreBand = (d: BandDetectionResult): number => {
+      const cnt = d.vDividers.length + d.hShelves.length;
+      if (cnt === 0 || d.confidence < 0.48) return 0;
+      return d.confidence * (1 + Math.min(8, cnt) * 0.28);
+    };
+
+    let bandDet = analyzeRectifiedFurniture(cropRgba, cropW, cropH, subDims, e, {
+      parallaxAware: true,
+      exteriorBgRgb: opts.exteriorBgRgb,
+    });
+    let bestBandScore = scoreBand(bandDet);
+
+    // Si la sub-región flota en medio de cavidades sin tocar bordes de carcasa, probar con marco real de carcasa
+    const hasInteriorEdge = u0 > 0.02 || u1 < 0.98 || v0 > 0.02 || v1 < 0.98;
+    if (hasInteriorEdge && (bestBandScore === 0 || bandDet.confidence < 0.55)) {
+      const tPxSub = Math.max(3, Math.round((e / Math.max(100, subDims.x)) * cropW));
+      const tPySub = Math.max(3, Math.round((e / Math.max(100, subDims.y)) * cropH));
+      const framedCrop = paintCarcassFrameCopy(cropRgba, cropW, cropH, tPxSub, tPySub, fullCarcassRgb);
+      const detFramed = analyzeRectifiedFurniture(framedCrop, cropW, cropH, subDims, e, {
+        parallaxAware: true,
+        exteriorBgRgb: opts.exteriorBgRgb,
+      });
+      const framedScore = scoreBand(detFramed);
+      if (framedScore > bestBandScore) {
+        bandDet = detFramed;
+        bestBandScore = framedScore;
+      }
+    }
+
+    const vecDet = reconstructStructureFromVectors(
+      cropRgba,
+      cropW,
+      cropH,
+      subDims,
+      e,
+      opts.carcassMaterial,
+      opts.exteriorBgRgb,
+    );
+    const vecCnt = vecDet.vDividers.length + vecDet.hShelves.length;
+    const vecScore = vecCnt > 0 ? 0.65 * (1 + Math.min(8, vecCnt) * 0.24) : 0;
+
+    const chosenV = bestBandScore >= vecScore ? bandDet.vDividers : vecDet.vDividers;
+    const chosenH = bestBandScore >= vecScore ? bandDet.hShelves : vecDet.hShelves;
+    const chosenD = vecDet.diagonalDividers;
+
+    for (const lv of chosenV) {
+      if (lv.position <= 0.04 || lv.position >= 0.96) continue;
+      const gPos = Number(clamp(u0 + lv.position * spanU, 0.02, 0.98).toFixed(4));
+      const gStart = Number(clamp(v0 + Math.min(lv.start, lv.end) * spanV, 0, 1).toFixed(4));
+      const gEnd = Number(clamp(v0 + Math.max(lv.start, lv.end) * spanV, 0, 1).toFixed(4));
+      if (gEnd - gStart < 0.05) continue;
+      if (isDuplicateOrtho(outV, gPos, gStart, gEnd)) continue;
+
+      outV.push({
+        id: nextUniqueId(
+          `sub_div_${Math.round(gPos * 1000)}_${Math.round(gStart * 1000)}_${Math.round(gEnd * 1000)}`,
+        ),
+        position: gPos,
+        start: gStart,
+        end: gEnd,
+      });
+      addedVCount++;
+    }
+
+    for (const lh of chosenH) {
+      if (lh.position <= 0.04 || lh.position >= 0.96) continue;
+      const gPos = Number(clamp(v0 + lh.position * spanV, 0.02, 0.98).toFixed(4));
+      const gStart = Number(clamp(u0 + Math.min(lh.start, lh.end) * spanU, 0, 1).toFixed(4));
+      const gEnd = Number(clamp(u0 + Math.max(lh.start, lh.end) * spanU, 0, 1).toFixed(4));
+      if (gEnd - gStart < 0.05) continue;
+      if (isDuplicateOrtho(outH, gPos, gStart, gEnd)) continue;
+
+      outH.push({
+        id: nextUniqueId(
+          `sub_rep_${Math.round(gPos * 1000)}_${Math.round(gStart * 1000)}_${Math.round(gEnd * 1000)}`,
+        ),
+        position: gPos,
+        start: gStart,
+        end: gEnd,
+      });
+      addedHCount++;
+    }
+
+    for (const ld of chosenD) {
+      const gu1 = Number(clamp(u0 + ld.u1 * spanU, 0, 1).toFixed(4));
+      const gv1 = Number(clamp(v0 + ld.v1 * spanV, 0, 1).toFixed(4));
+      const gu2 = Number(clamp(u0 + ld.u2 * spanU, 0, 1).toFixed(4));
+      const gv2 = Number(clamp(v0 + ld.v2 * spanV, 0, 1).toFixed(4));
+      if (Math.hypot(gu2 - gu1, gv2 - gv1) < 0.08) continue;
+      if (isDuplicateDiag(outD, gu1, gv1, gu2, gv2)) continue;
+
+      outD.push({
+        id: nextUniqueId(
+          `sub_diag_${Math.round(gu1 * 1000)}_${Math.round(gv1 * 1000)}_${Math.round(gu2 * 1000)}_${Math.round(gv2 * 1000)}`,
+        ),
+        u1: gu1,
+        v1: gv1,
+        u2: gu2,
+        v2: gv2,
+      });
+      addedDCount++;
+    }
+
+    regionsProcessed++;
+  }
+
+  return {
+    vDividers: outV,
+    hShelves: outH,
+    diagonalDividers: outD,
+    addedVCount,
+    addedHCount,
+    addedDCount,
+    regionsProcessed,
   };
 }

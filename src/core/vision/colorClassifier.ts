@@ -87,8 +87,9 @@ function applyChromaticAdaptation(
   const [ar, ag, ab] = ambientWhiteRgb;
   const ambLab = rgbToLab(ar, ag, ab);
   const ambChroma = Math.hypot(ambLab[1], ambLab[2]);
-  // Aplicar balance de blancos solo si la referencia es realmente una pared clara casi neutra
-  if (ambLab[0] < 72 || ambChroma > 18 || Math.min(ar, ag, ab) < 150) {
+  // Aplicar balance de blancos solo si la referencia es realmente una pared blanca clara casi neutra
+  // (evita neutralizar madera real cuando la pared de fondo es beige/cálida de luminancia media)
+  if (ambLab[0] < 80 || ambChroma > 16 || Math.min(ar, ag, ab) < 175) {
     return [r, g, b];
   }
   const avg = (ar + ag + ab) / 3;
@@ -101,30 +102,36 @@ function applyChromaticAdaptation(
 
 /**
  * Determina en espacio CIE-Lab si un color corresponde a madera genuina (`roble` / pino / nogal),
- * separándola de blancos bajo luz cálida (alta `L*`, bajo croma) y sombras neutras.
+ * separándola de blancos bajo luz cálida (`L* > 85` o `C* < 10`) y de grafito neutro/frío (`C* < 10`).
  */
 export function isWarmWoodLab(
   lab: readonly [number, number, number],
   stdL?: number,
 ): boolean {
   const [L, a, b] = lab;
-  if (L < 22 || L > 86) return false;
-  if (b < 13.5 || a < 1.5) return false;
+  if (L < 22 || L > 85) return false;
+  if (b < 6 || a < 0.8) return false;
   const chroma = Math.hypot(a, b);
-  // Para tonos muy claros (L* > 80) exigir mayor croma para no confundir blanco bajo luz cálida
-  const minChroma = L > 80 ? 20.5 : 15.5;
-  if (chroma < minChroma) return false;
-  if (L > 80 && b < 18) return false;
-  // Ángulo de tono en el cuadrante cálido amarillo-naranja (aprox. 28°..85°)
+  // Ángulo de tono en el cuadrante cálido madera (marrón/nogal/roble/pino: ~22°..86°)
   const hueDeg = (Math.atan2(b, a) * 180) / Math.PI;
-  if (hueDeg < 26 || hueDeg > 86) return false;
-  if (stdL !== undefined && stdL > 34 && b < 22) return false;
+  if (hueDeg < 22 || hueDeg > 86) return false;
+
+  // Caso 1: Madera marrón / nogal medio-oscuro (L* ∈ [25..62]) — jamás confundir con grafito
+  const isWalnutBrown = L >= 25 && L <= 62 && (b >= 8 || (a >= 4 && b >= 6));
+  // Caso 2: Roble claro bajo luz blanca (L* <= 85, b* >= 11) — jamás confundir con blanco
+  const isLightOak = L <= 85 && b >= 11 && (L <= 76 ? a >= 1.5 : a >= 2.2) && chroma >= 11.2;
+  // Caso 3: Roble medio/beige suave (62 < L* <= 76) con calidez marrón-amarillenta clara
+  const isMidOak = L > 62 && L <= 76 && a >= 3.2 && b >= 9.0 && chroma >= 10;
+
+  if (!isWalnutBrown && !isLightOak && !isMidOak) return false;
+  // Si hay alta dispersión de textura (objetos/libros/sombras), exigir tono cálido más marcado
+  if (stdL !== undefined && stdL > 38 && b < 16) return false;
   return true;
 }
 
 /**
  * Clasificador unificado de acabado de melamina (`blanco` | `roble` | `grafito`) en CIE-Lab.
- * Invariante a luz cálida/fría interior y distingue nogal oscuro (`roble`) de `grafito`.
+ * Invariante a luz cálida/fría interior y distingue nogal medio-oscuro y roble claro de grafito/blanco.
  */
 export function classifyMelamineMaterial(
   r: number,
@@ -135,27 +142,31 @@ export function classifyMelamineMaterial(
   const [cr, cg, cb] = applyChromaticAdaptation(r, g, b, ambientWhiteRgb);
   const lab = rgbToLab(cr, cg, cb);
   const [L, a, bVal] = lab;
+  const chroma = Math.hypot(a, bVal);
 
-  // 1. Madera cálida genuina (incluye nogal oscuro L* ≈ 35..45 y roble claro L* ≈ 75)
+  // 1. Madera cálida genuina (nogal oscuro/medio L* ∈ [25..62] y roble claro L* <= 85)
   if (isWarmWoodLab(lab)) {
     return 'roble';
   }
 
-  // 2. Melamina blanca (incluso bajo iluminación cálida suave o fría azulada)
-  if (L >= 68) {
+  // 2. Melamina blanca: requiere alta claridad y bajo croma (o claridad muy alta L* > 85)
+  if ((L >= 74 && chroma < 10) || L > 85) {
     return 'blanco';
   }
 
-  // 3. Melamina grafito / gris oficina
-  if (L <= 55) {
+  // 3. Melamina grafito / gris oficina: verdaderamente neutro o frío (C* < 10 o tono frío b* < 4) y L* < 52
+  if (L < 52 && (chroma < 10 || bVal < 4)) {
     return 'grafito';
   }
 
-  // 4. Zona intermedia (55 < L* < 68): desempate por calidez Lab
-  if (bVal >= 12 && a >= 1.0) {
+  // 4. Zona intermedia o saturada: desempate cromático limpio
+  if (L >= 25 && L <= 85 && bVal >= 8 && a >= 1.2) {
     return 'roble';
   }
-  return L >= 62 ? 'blanco' : 'grafito';
+  if (L <= 58) {
+    return 'grafito';
+  }
+  return L >= 66 ? 'blanco' : 'grafito';
 }
 
 /**
@@ -246,7 +257,7 @@ export function clusterCarcassVsFronts(
     }
   }
 
-  if (farthestIdx < 0 || maxDist < 16) {
+  if (farthestIdx < 0 || maxDist < 14) {
     return {
       carcassLab,
       secondaryLab: null,
@@ -274,7 +285,7 @@ export function clusterCarcassVsFronts(
     for (let i = 0; i < cellLabs.length; i++) {
       const d0 = deltaE76(cellLabs[i], c0);
       const d1 = deltaE76(cellLabs[i], c1);
-      const next: 'carcass' | 'secondary' = d1 + 1.5 < d0 && d0 >= 14 ? 'secondary' : 'carcass';
+      const next: 'carcass' | 'secondary' = d1 + 1.5 < d0 && d0 >= 12.5 ? 'secondary' : 'carcass';
       if (next !== assign[i]) {
         assign[i] = next;
         changed = true;
@@ -303,7 +314,7 @@ export function clusterCarcassVsFronts(
   for (let i = 0; i < assign.length; i++) {
     if (assign[i] === 'secondary') secIndices.push(i);
   }
-  if (secIndices.length === 0 || deltaE76(c0, c1) < 16) {
+  if (secIndices.length === 0 || deltaE76(c0, c1) < 14) {
     return {
       carcassLab,
       secondaryLab: null,

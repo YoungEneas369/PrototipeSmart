@@ -36,6 +36,7 @@ import {
   extractLuminanceBuffer,
   interiorToExteriorPoint,
   interiorToExteriorRect,
+  mad,
   median,
   rgbaLuminance,
   sampleLumSafe,
@@ -85,8 +86,47 @@ export interface CellPixelStats {
 }
 
 /**
+ * Evalúa la periodicidad regular de una lista de separaciones entre barrotes de alambre (en píxeles).
+ * Exige paso fundamental `>= 6 px`, alta proporción de inliers alrededor de la mediana y baja dispersión
+ * (rechaza lomos de libros irregulares, sombras de mesas de centro y textura caótica de alfombras).
+ */
+function evaluateWireSpacingPeriodicity(spacings: readonly number[]): {
+  regular: boolean;
+  score: number;
+  medianStep: number;
+} {
+  if (spacings.length < 6) {
+    return { regular: false, score: 0, medianStep: 0 };
+  }
+  const med = median(spacings);
+  if (med < 6) {
+    return { regular: false, score: 0, medianStep: med };
+  }
+  const inliers = spacings.filter((s) => s >= med * 0.58 && s <= med * 1.48);
+  const inlierFrac = inliers.length / spacings.length;
+  if (inlierFrac < 0.6 || inliers.length < 4) {
+    return { regular: false, score: 0, medianStep: med };
+  }
+  const normMad = mad(spacings, med) / Math.max(1, med);
+  const meanIn = inliers.reduce((acc, v) => acc + v, 0) / inliers.length;
+  const varIn =
+    inliers.reduce((acc, v) => acc + (v - meanIn) * (v - meanIn), 0) / inliers.length;
+  const inlierCv = Math.sqrt(varIn) / Math.max(1, meanIn);
+
+  const regular = normMad <= 0.32 && inlierCv <= 0.28;
+  const score = regular
+    ? clamp(0.55 * inlierFrac + 0.45 * (1 - Math.min(1, inlierCv / 0.35)), 0, 1)
+    : 0;
+  return { regular, score, medianStep: med };
+}
+
+/**
  * Detecta patrones repetitivos de alta frecuencia tipo rejilla metálica (`baskets`)
- * buscando cruces periódicos de alambres delgados en AMBAS direcciones (horizontal y vertical).
+ * exigiendo:
+ *  1. Trazos de alambre de baja saturación / acromáticos (`C* < 18`, metal negro/gris/cromado)
+ *     sobre un fondo de cavidad más oscuro o uniforme (cuando `rectRgba` está disponible).
+ *  2. Polaridad coherente dominante (alambres claros sobre cavidad oscura o alambres oscuros sobre fondo claro).
+ *  3. Periodicidad regular en AMBOS ejes (horizontal y vertical) con baja varianza de paso.
  */
 export function detectBasketPattern(
   lum: Float32Array,
@@ -96,6 +136,7 @@ export function detectBasketPattern(
   x1: number,
   y0: number,
   y1: number,
+  rectRgba?: Uint8ClampedArray,
 ): BasketPatternEstimate {
   if (W < 8 || H < 8 || lum.length < W * H) {
     return { wireGridScore: 0, estimatedCount: 3 };
@@ -110,70 +151,219 @@ export function detectBasketPattern(
     return { wireGridScore: 0, estimatedCount: 3 };
   }
 
-  const wireThresh = 17;
+  const hasRgb = rectRgba !== undefined && rectRgba.length >= W * H * 4;
+  const wireThresh = 19;
+  const maxWireChroma = 18;
   const stepY = Math.max(1, Math.floor(ch / 64));
   const stepX = Math.max(1, Math.floor(cw / 64));
 
-  // 1. Cruces de alambres verticales a lo largo de filas horizontales
-  // Exigir pulso bilateral (pico o valle: dL * dR > 0) para rechazar 100% escalones de marcos de vidrio
+  const isAchromaticMetallic = (idx: number): boolean => {
+    if (!hasRgb || !rectRgba) return true;
+    const p = idx * 4;
+    const lab = rgbToLab(rectRgba[p], rectRgba[p + 1], rectRgba[p + 2]);
+    return Math.hypot(lab[1], lab[2]) < maxWireChroma;
+  };
+
+  let totalPulses = 0;
+  let achromPulses = 0;
+
+  let brightWireLumSum = 0;
+  let brightWireCnt = 0;
+  let brightBgLumSum = 0;
+  let brightBgLumSqSum = 0;
+  let brightBgCnt = 0;
+
+  let darkWireLumSum = 0;
+  let darkWireCnt = 0;
+  let darkBgLumSum = 0;
+  let darkBgLumSqSum = 0;
+  let darkBgCnt = 0;
+
+  // 1. Cruces de alambres verticales a lo largo de filas horizontales (separando polaridad clara vs oscura)
   let rowsChecked = 0;
-  let rowsWithGrid = 0;
-  let totalVWires = 0;
-  const rowWireEnergy: number[] = [];
+  let rowsBrightGrid = 0;
+  let rowsDarkGrid = 0;
+  let totalBrightV = 0;
+  let totalDarkV = 0;
+  const brightVSpacings: number[] = [];
+  const darkVSpacings: number[] = [];
+  const rowBrightEnergy: number[] = [];
+  const rowDarkEnergy: number[] = [];
 
   for (let y = sy0 + 2; y <= sy1 - 2; y += stepY) {
     const rowOff = y * W;
-    let crossings = 0;
-    let lastCross = -10;
+    const bXs: number[] = [];
+    const dXs: number[] = [];
+    let lastBright = -10;
+    let lastDark = -10;
+
     for (let x = sx0 + 3; x <= sx1 - 3; x++) {
-      if (x - lastCross < 5) continue;
       const cur = lum[rowOff + x];
-      const dL = cur - lum[rowOff + x - 3];
-      const dR = cur - lum[rowOff + x + 3];
+      const lFlank = lum[rowOff + x - 3];
+      const rFlank = lum[rowOff + x + 3];
+      const dL = cur - lFlank;
+      const dR = cur - rFlank;
       if (dL * dR <= 0) continue;
       const pulse = Math.min(Math.abs(dL), Math.abs(dR));
-      if (pulse >= wireThresh) {
-        const dL2 = cur - lum[rowOff + x - 2];
-        const dR2 = cur - lum[rowOff + x + 2];
-        if (dL2 * dR2 > 0 || Math.max(Math.abs(dL2), Math.abs(dR2)) >= wireThresh * 0.65) {
-          crossings++;
-          lastCross = x;
-        }
+      if (pulse < wireThresh) continue;
+
+      const dL2 = cur - lum[rowOff + x - 2];
+      const dR2 = cur - lum[rowOff + x + 2];
+      if (!(dL2 * dR2 > 0 || Math.max(Math.abs(dL2), Math.abs(dR2)) >= wireThresh * 0.65)) {
+        continue;
+      }
+
+      const isBright = dL > 0;
+      if (isBright) {
+        if (x - lastBright < 5) continue;
+        lastBright = x;
+      } else {
+        if (x - lastDark < 5) continue;
+        lastDark = x;
+      }
+
+      totalPulses++;
+      if (!isAchromaticMetallic(rowOff + x)) continue;
+      achromPulses++;
+
+      const bgSample = 0.5 * (lFlank + rFlank);
+      if (isBright) {
+        bXs.push(x);
+        brightWireLumSum += cur;
+        brightWireCnt++;
+        brightBgLumSum += bgSample;
+        brightBgLumSqSum += bgSample * bgSample;
+        brightBgCnt++;
+      } else {
+        dXs.push(x);
+        darkWireLumSum += cur;
+        darkWireCnt++;
+        darkBgLumSum += bgSample;
+        darkBgLumSqSum += bgSample * bgSample;
+        darkBgCnt++;
       }
     }
+
     rowsChecked++;
-    totalVWires += crossings;
-    if (crossings >= 3) rowsWithGrid++;
-    rowWireEnergy.push(crossings);
+    totalBrightV += bXs.length;
+    totalDarkV += dXs.length;
+    if (bXs.length >= 3) {
+      rowsBrightGrid++;
+      for (let i = 1; i < bXs.length; i++) brightVSpacings.push(bXs[i] - bXs[i - 1]);
+    }
+    if (dXs.length >= 3) {
+      rowsDarkGrid++;
+      for (let i = 1; i < dXs.length; i++) darkVSpacings.push(dXs[i] - dXs[i - 1]);
+    }
+    rowBrightEnergy.push(bXs.length);
+    rowDarkEnergy.push(dXs.length);
   }
 
   // 2. Cruces de alambres horizontales a lo largo de columnas verticales
   let colsChecked = 0;
-  let colsWithGrid = 0;
-  let totalHWires = 0;
+  let colsBrightGrid = 0;
+  let colsDarkGrid = 0;
+  let totalBrightH = 0;
+  let totalDarkH = 0;
+  const brightHSpacings: number[] = [];
+  const darkHSpacings: number[] = [];
 
   for (let x = sx0 + 2; x <= sx1 - 2; x += stepX) {
-    let crossings = 0;
-    let lastCross = -10;
+    const bYs: number[] = [];
+    const dYs: number[] = [];
+    let lastBright = -10;
+    let lastDark = -10;
+
     for (let y = sy0 + 3; y <= sy1 - 3; y++) {
-      if (y - lastCross < 5) continue;
       const cur = lum[y * W + x];
-      const dU = cur - lum[(y - 3) * W + x];
-      const dD = cur - lum[(y + 3) * W + x];
+      const uFlank = lum[(y - 3) * W + x];
+      const dnFlank = lum[(y + 3) * W + x];
+      const dU = cur - uFlank;
+      const dD = cur - dnFlank;
       if (dU * dD <= 0) continue;
       const pulse = Math.min(Math.abs(dU), Math.abs(dD));
-      if (pulse >= wireThresh) {
-        const dU2 = cur - lum[(y - 2) * W + x];
-        const dD2 = cur - lum[(y + 2) * W + x];
-        if (dU2 * dD2 > 0 || Math.max(Math.abs(dU2), Math.abs(dD2)) >= wireThresh * 0.65) {
-          crossings++;
-          lastCross = y;
-        }
+      if (pulse < wireThresh) continue;
+
+      const dU2 = cur - lum[(y - 2) * W + x];
+      const dD2 = cur - lum[(y + 2) * W + x];
+      if (!(dU2 * dD2 > 0 || Math.max(Math.abs(dU2), Math.abs(dD2)) >= wireThresh * 0.65)) {
+        continue;
+      }
+
+      const isBright = dU > 0;
+      if (isBright) {
+        if (y - lastBright < 5) continue;
+        lastBright = y;
+      } else {
+        if (y - lastDark < 5) continue;
+        lastDark = y;
+      }
+
+      totalPulses++;
+      if (!isAchromaticMetallic(y * W + x)) continue;
+      achromPulses++;
+
+      if (isBright) {
+        bYs.push(y);
+      } else {
+        dYs.push(y);
       }
     }
+
     colsChecked++;
-    totalHWires += crossings;
-    if (crossings >= 3) colsWithGrid++;
+    totalBrightH += bYs.length;
+    totalDarkH += dYs.length;
+    if (bYs.length >= 3) {
+      colsBrightGrid++;
+      for (let i = 1; i < bYs.length; i++) brightHSpacings.push(bYs[i] - bYs[i - 1]);
+    }
+    if (dYs.length >= 3) {
+      colsDarkGrid++;
+      for (let i = 1; i < dYs.length; i++) darkHSpacings.push(dYs[i] - dYs[i - 1]);
+    }
+  }
+
+  // Guardia cromática: exigir mayoría de trazos metálicos acromáticos (C* < 18)
+  if (hasRgb && (totalPulses === 0 || achromPulses / totalPulses < 0.58)) {
+    return { wireGridScore: 0, estimatedCount: 3 };
+  }
+
+  // Guardia de polaridad coherente (alambres metálicos comparten polaridad; alfombras/libros/mimbre son 50/50)
+  const brightTotal = totalBrightV + totalBrightH;
+  const darkTotal = totalDarkV + totalDarkH;
+  const achromSum = brightTotal + darkTotal;
+  if (achromSum === 0) {
+    return { wireGridScore: 0, estimatedCount: 3 };
+  }
+  const polarityDominance = Math.max(brightTotal, darkTotal) / achromSum;
+  if (polarityDominance < 0.65) {
+    return { wireGridScore: 0, estimatedCount: 3 };
+  }
+
+  const useBright = brightTotal >= darkTotal;
+  const rowsWithGrid = useBright ? rowsBrightGrid : rowsDarkGrid;
+  const colsWithGrid = useBright ? colsBrightGrid : colsDarkGrid;
+  const totalVWires = useBright ? totalBrightV : totalDarkV;
+  const totalHWires = useBright ? totalBrightH : totalDarkH;
+  const vSpacings = useBright ? brightVSpacings : darkVSpacings;
+  const hSpacings = useBright ? brightHSpacings : darkHSpacings;
+  const rowWireEnergy = useBright ? rowBrightEnergy : rowDarkEnergy;
+
+  // Guardia de cavidad más oscura o uniforme detrás de la rejilla
+  if (useBright && brightWireCnt >= 6 && brightBgCnt >= 6) {
+    const meanWireL = brightWireLumSum / brightWireCnt;
+    const meanBgL = brightBgLumSum / brightBgCnt;
+    const bgStdL = Math.sqrt(Math.max(0, brightBgLumSqSum / brightBgCnt - meanBgL * meanBgL));
+    if (meanWireL - meanBgL < 26 || meanBgL > 165 || bgStdL > 48) {
+      return { wireGridScore: 0, estimatedCount: 3 };
+    }
+  } else if (!useBright && darkWireCnt >= 6 && darkBgCnt >= 6) {
+    const meanWireL = darkWireLumSum / darkWireCnt;
+    const meanBgL = darkBgLumSum / darkBgCnt;
+    const bgStdL = Math.sqrt(Math.max(0, darkBgLumSqSum / darkBgCnt - meanBgL * meanBgL));
+    if (meanBgL - meanWireL < 26 || bgStdL > 42) {
+      return { wireGridScore: 0, estimatedCount: 3 };
+    }
   }
 
   const rowGridFrac = rowsChecked > 0 ? rowsWithGrid / rowsChecked : 0;
@@ -182,14 +372,22 @@ export function detectBasketPattern(
   const avgH = colsChecked > 0 ? totalHWires / colsChecked : 0;
 
   // Exigir rejilla bidireccional repetitiva (alambres verticales Y horizontales)
-  if (rowGridFrac < 0.32 || colGridFrac < 0.32 || avgV < 2.5 || avgH < 2.5) {
+  if (rowGridFrac < 0.34 || colGridFrac < 0.34 || avgV < 2.6 || avgH < 2.6) {
+    return { wireGridScore: 0, estimatedCount: 3 };
+  }
+
+  // Exigir periodicidad regular en ambos ejes (baja varianza de separación entre barrotes)
+  const periodV = evaluateWireSpacingPeriodicity(vSpacings);
+  const periodH = evaluateWireSpacingPeriodicity(hSpacings);
+  if (!periodV.regular || !periodH.regular) {
     return { wireGridScore: 0, estimatedCount: 3 };
   }
 
   const wireGridScore = clamp(
-    0.4 * Math.min(1, rowGridFrac / 0.7) +
-      0.4 * Math.min(1, colGridFrac / 0.7) +
-      0.2 * Math.min(1, Math.min(avgV, avgH) / 6),
+    0.3 * Math.min(1, rowGridFrac / 0.7) +
+      0.3 * Math.min(1, colGridFrac / 0.7) +
+      0.2 * Math.min(1, Math.min(avgV, avgH) / 6) +
+      0.2 * (0.5 * (periodV.score + periodH.score)),
     0,
     1,
   );
@@ -213,7 +411,8 @@ export function detectBasketPattern(
       }
     }
   }
-  const estimatedCount = bands >= 2 && bands <= 5 ? bands : clamp(Math.round(ch / Math.max(24, cw * 0.6)), 2, 4);
+  const estimatedCount =
+    bands >= 2 && bands <= 5 ? bands : clamp(Math.round(ch / Math.max(24, cw * 0.6)), 2, 4);
 
   return { wireGridScore, estimatedCount };
 }
@@ -380,7 +579,7 @@ export function measureCellStats(
   }
   const centerSpecularRatio = centerLums.length > 0 ? specHits / centerLums.length : 0;
 
-  const basket = detectBasketPattern(lum, rectW, rectH, x0, x1, y0, y1);
+  const basket = detectBasketPattern(lum, rectW, rectH, x0, x1, y0, y1, rectRgba);
 
   return {
     meanR,
@@ -866,11 +1065,18 @@ export function classifyZonesUnified(
       stats.stdL < 22 &&
       (!matchMap || stats.matchRatio < 0.28);
 
-    // 3c. Canastos metálicos (`baskets` v7.0/v8.0 — rejilla repetitiva de alta frecuencia)
+    // 3c. Canastos metálicos (`baskets` v8.0 — rejilla metálica acromática periódica en vano dedicado)
+    // Descarta celdas anchas (> 75% del ancho del mueble sin divisores, ej. mesa de centro) y repisas muy apaisadas
+    const basketGeometryValid =
+      spanU <= 0.75 &&
+      cellHmm >= 220 &&
+      cellWmm <= 700 &&
+      cellWmm / Math.max(1, cellHmm) <= 1.65;
     const isBaskets =
       !isLegVoid &&
       !isVoidOutside &&
-      stats.wireGridScore >= 0.48 &&
+      basketGeometryValid &&
+      stats.wireGridScore >= 0.54 &&
       stats.stdL >= 14 &&
       !isWarmWood;
 

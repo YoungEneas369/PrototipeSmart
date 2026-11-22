@@ -66,6 +66,7 @@ export {
 } from './userVectorTrace';
 export type { PartitionRectCell, TracedStrokeResult, UserStrokeMode } from './userVectorTrace';
 export {
+  detectStructureInSubRegions,
   evaluate3DvsPhotoSimilarity,
   evaluateMarginsAgainstPhoto,
   extractStructuralVectorLines,
@@ -76,6 +77,8 @@ export type {
   IterativePhoto3DOptions,
   IterativePhoto3DResult,
   MarginEvaluationResult,
+  SubRegionDetectionResult,
+  SubRegionRect,
   VectorLine2D,
   VectorLineExtractionResult,
   VectorLineOrientation,

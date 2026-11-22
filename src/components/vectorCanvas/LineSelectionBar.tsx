@@ -10,7 +10,7 @@ import {
   Slash,
   StretchHorizontal,
   StretchVertical,
-  Trash2,
+  Undo2,
   X,
 } from 'lucide-react';
 import type {
@@ -26,6 +26,8 @@ export interface LineSelectionBarProps {
   selectedLine: LineRef;
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
+  canUndo?: boolean;
+  onUndo?: () => void;
   onUpdateVDivider: (id: string, next: NormalizedSegment) => void;
   onUpdateHShelf: (id: string, next: NormalizedSegment) => void;
   onUpdateDiagonal: (id: string, next: DiagonalSegment) => void;
@@ -37,6 +39,8 @@ export function LineSelectionBar({
   selectedLine,
   topology,
   params,
+  canUndo = false,
+  onUndo,
   onUpdateVDivider,
   onUpdateHShelf,
   onUpdateDiagonal,
@@ -169,13 +173,23 @@ export function LineSelectionBar({
             >
               <Maximize2 size={12} /> 0–100%
             </button>
+            {canUndo && onUndo && (
+              <button
+                type="button"
+                className="vc-chip vc-chip-undo"
+                onClick={onUndo}
+                title="Deshacer último cambio (Ctrl+Z)"
+              >
+                <Undo2 size={12} /> Deshacer
+              </button>
+            )}
             <button
               type="button"
-              className="vc-chip vc-chip-danger"
+              className="vc-chip vc-chip-danger-soft"
               onClick={onDeleteSelected}
               title="Eliminar este divisor (Supr)"
             >
-              <Trash2 size={12} /> Eliminar
+              <X size={12} /> Borrar línea
             </button>
           </div>
         </div>
@@ -302,13 +316,23 @@ export function LineSelectionBar({
             >
               <Maximize2 size={12} /> 0–100%
             </button>
+            {canUndo && onUndo && (
+              <button
+                type="button"
+                className="vc-chip vc-chip-undo"
+                onClick={onUndo}
+                title="Deshacer último cambio (Ctrl+Z)"
+              >
+                <Undo2 size={12} /> Deshacer
+              </button>
+            )}
             <button
               type="button"
-              className="vc-chip vc-chip-danger"
+              className="vc-chip vc-chip-danger-soft"
               onClick={onDeleteSelected}
               title="Eliminar esta repisa (Supr)"
             >
-              <Trash2 size={12} /> Eliminar
+              <X size={12} /> Borrar línea
             </button>
           </div>
         </div>
@@ -452,13 +476,23 @@ export function LineSelectionBar({
           >
             <FlipHorizontal2 size={12} /> Invertir / ↔ \
           </button>
+          {canUndo && onUndo && (
+            <button
+              type="button"
+              className="vc-chip vc-chip-undo"
+              onClick={onUndo}
+              title="Deshacer último cambio (Ctrl+Z)"
+            >
+              <Undo2 size={12} /> Deshacer
+            </button>
+          )}
           <button
             type="button"
-            className="vc-chip vc-chip-danger"
+            className="vc-chip vc-chip-danger-soft"
             onClick={onDeleteSelected}
             title="Eliminar esta diagonal (Supr)"
           >
-            <Trash2 size={12} /> Eliminar
+            <X size={12} /> Borrar línea
           </button>
         </div>
       </div>

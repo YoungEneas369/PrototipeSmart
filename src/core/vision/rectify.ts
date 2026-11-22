@@ -343,6 +343,9 @@ export interface AutoQuadResult {
 interface BackgroundSegGrid {
   gw: number;
   gh: number;
+  gR: Float32Array;
+  gG: Float32Array;
+  gB: Float32Array;
   bgMask: Uint8Array;
   fgMain: Uint8Array;
   sobelMag: Float32Array;
@@ -631,6 +634,9 @@ function segmentForegroundGrid(
   return {
     gw,
     gh,
+    gR,
+    gG,
+    gB,
     bgMask,
     fgMain,
     sobelMag,
@@ -1035,20 +1041,138 @@ export function autoDetectFurnitureQuad(
     return [first, last];
   };
 
-  const [bx0, bx1] = findMainSpan(colCounts, 1, gw - 1, colThresh);
+  let [bx0, bx1] = findMainSpan(colCounts, 1, gw - 1, colThresh);
   let [by0, by1] = findMainSpan(rowCounts, 1, gh - 1, rowThresh);
 
-  // Recortar objetos decorativos estrechos apoyados encima de la cubierta
+  // Recortar objetos estrechos o desacoplados encima de la cubierta (jarrones, cafeteras, cuadros)
   if (by0 >= 0 && by1 > by0 + 12) {
     const bodySpan = by1 - by0;
-    const topBodyThresh = Math.max(0.22, maxRowD * 0.45);
-    const maxTrimY = by0 + Math.round(bodySpan * 0.32);
-    if (rowCounts[by0] < topBodyThresh) {
-      for (let y = by0; y <= maxTrimY; y++) {
-        if (rowCounts[y] >= topBodyThresh && (rowCounts[y + 1] ?? 0) >= topBodyThresh) {
+    const midY0 = by0 + Math.round(bodySpan * 0.38);
+    const midY1 = by0 + Math.round(bodySpan * 0.85);
+    let bodyRowSum = 0;
+    let bodyRowCnt = 0;
+    for (let y = midY0; y <= midY1; y++) {
+      if (rowCounts[y] > 0) {
+        bodyRowSum += rowCounts[y];
+        bodyRowCnt++;
+      }
+    }
+    const bodyMeanRowD = bodyRowCnt > 0 ? bodyRowSum / bodyRowCnt : maxRowD;
+    const narrowThresh = Math.max(0.14, bodyMeanRowD * 0.45);
+    const valleyThresh = Math.max(0.1, bodyMeanRowD * 0.36);
+    const maxTrimY = by0 + Math.round(bodySpan * 0.38);
+    const origBy0 = by0;
+
+    // 1. Perfil fila por fila desde arriba: recortar apéndices estrechos (< 45% del ancho medio del cuerpo)
+    //    o un cuello/vacío intermedio que separa un objeto superior (cuadro/jarrón) de la cubierta real
+    let scanStart = by0;
+    for (let y = by0 + 2; y <= maxTrimY - 2; y++) {
+      if (rowCounts[y] < valleyThresh) {
+        scanStart = y + 1;
+      }
+    }
+    if (scanStart > by0 || rowCounts[by0] < narrowThresh) {
+      for (let y = scanStart; y <= maxTrimY; y++) {
+        if (rowCounts[y] >= narrowThresh && (rowCounts[y + 1] ?? 0) >= narrowThresh) {
           by0 = y;
           break;
         }
+      }
+    }
+
+    // 2. Salto cromático + arista horizontal fuerte separando cafetera/cuadro superior del cuerpo del mueble
+    if (by0 === origBy0 && bx1 > bx0 + 10) {
+      const scanColorMaxY = by0 + Math.round(bodySpan * 0.32);
+      const bodySampleEnd = Math.min(by1 - 2, scanColorMaxY + Math.round(bodySpan * 0.38));
+      let bR = 0,
+        bG = 0,
+        bB = 0,
+        bCnt = 0;
+      for (let y = scanColorMaxY + 2; y <= bodySampleEnd; y++) {
+        const rowOff = y * gw;
+        for (let x = bx0 + 1; x <= bx1 - 1; x++) {
+          if (fgMain[rowOff + x] === 1) {
+            bR += seg.gR[rowOff + x];
+            bG += seg.gG[rowOff + x];
+            bB += seg.gB[rowOff + x];
+            bCnt++;
+          }
+        }
+      }
+      if (bCnt >= 16) {
+        bR /= bCnt;
+        bG /= bCnt;
+        bB /= bCnt;
+        let bestCutY = -1;
+        let bestCutScore = 0;
+        let aboveRowSum = 0;
+        let aboveRowCnt = 0;
+        let aR = 0,
+          aG = 0,
+          aB = 0,
+          aCnt = 0;
+
+        for (let y = by0; y <= scanColorMaxY; y++) {
+          const rowOff = y * gw;
+          aboveRowSum += rowCounts[y];
+          aboveRowCnt++;
+          for (let x = bx0 + 1; x <= bx1 - 1; x++) {
+            if (fgMain[rowOff + x] === 1) {
+              aR += seg.gR[rowOff + x];
+              aG += seg.gG[rowOff + x];
+              aB += seg.gB[rowOff + x];
+              aCnt++;
+            }
+          }
+          if (y < by0 + 5 || aCnt < 12) continue;
+          const meanAboveW = aboveRowSum / aboveRowCnt;
+          const colDiff = Math.hypot(aR / aCnt - bR, aG / aCnt - bG, aB / aCnt - bB);
+          let edgeSum = 0;
+          let edgeCnt = 0;
+          for (let x = bx0 + 2; x <= bx1 - 2; x++) {
+            edgeSum += seg.sobelMag[rowOff + x];
+            edgeCnt++;
+          }
+          const avgEdge = edgeSum / Math.max(1, edgeCnt);
+          const looksLikeAppendage =
+            (meanAboveW < bodyMeanRowD * 0.68 && colDiff >= 44 && avgEdge >= 32) ||
+            (origBy0 <= 3 && colDiff >= 48 && avgEdge >= 42);
+          if (looksLikeAppendage) {
+            const cutScore = avgEdge + colDiff * 0.7;
+            if (cutScore > bestCutScore) {
+              bestCutScore = cutScore;
+              bestCutY = y;
+            }
+          }
+        }
+        if (bestCutY > by0 + 4 && bestCutY < by1 - 10) {
+          by0 = bestCutY;
+        }
+      }
+    }
+
+    // Reajustar márgenes laterales sobre el cuerpo recortado si se removió un apéndice superior
+    if (by0 > origBy0 && by1 > by0 + 8) {
+      const trimmedColCounts = new Float32Array(gw);
+      let trimmedMaxCol = 0;
+      const trimmedH = Math.max(1, by1 - by0 + 1);
+      for (let x = 1; x < gw - 1; x++) {
+        let cnt = 0;
+        for (let y = by0; y <= by1; y++) {
+          if (fgMain[y * gw + x] === 1) cnt++;
+        }
+        trimmedColCounts[x] = cnt / trimmedH;
+        if (trimmedColCounts[x] > trimmedMaxCol) trimmedMaxCol = trimmedColCounts[x];
+      }
+      const [nx0, nx1] = findMainSpan(
+        trimmedColCounts,
+        1,
+        gw - 1,
+        Math.max(0.04, trimmedMaxCol * 0.16),
+      );
+      if (nx0 >= 0 && nx1 - nx0 >= gw * 0.14) {
+        bx0 = nx0;
+        bx1 = nx1;
       }
     }
 

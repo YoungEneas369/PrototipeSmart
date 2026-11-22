@@ -12,11 +12,11 @@ import {
   Columns2,
   Eye,
   EyeOff,
-  Image as ImageIcon,
   Lock,
   Ruler,
   Unlock,
   Wrench,
+  ZoomIn,
 } from 'lucide-react';
 import type {
   BaseSupportType,
@@ -25,6 +25,7 @@ import type {
   FurnitureTopology,
   HardwareItem,
   MelamineMaterial,
+  Point2D,
   ScaleAndBoardParams,
 } from './types/contracts';
 import {
@@ -98,6 +99,9 @@ export default function App() {
   const [activeCatalogId, setActiveCatalogId] = useState<string>('');
   const [externalPhotoUrl, setExternalPhotoUrl] = useState<string | null>(null);
   const [externalPhotoLabel, setExternalPhotoLabel] = useState<string | null>(null);
+  const [externalInitialQuadNorm, setExternalInitialQuadNorm] = useState<
+    [Point2D, Point2D, Point2D, Point2D] | null
+  >(null);
   const [topology, setTopology] = useState<FurnitureTopology>(initial.topology);
   const [params, setParams] = useState<ScaleAndBoardParams>(initial.params);
   const [explodeFactor, setExplodeFactor] = useState<number>(0);
@@ -173,6 +177,7 @@ export default function App() {
     setActiveCatalogId('');
     setExternalPhotoUrl(null);
     setExternalPhotoLabel(null);
+    setExternalInitialQuadNorm(null);
     setSelectedZoneId(null);
     setHoveredZoneId(null);
     setPendingFrontMaterialChoice(null);
@@ -180,7 +185,11 @@ export default function App() {
     setParams(cloned.params);
     setModelApproved(false);
     setLockProportion(false);
-    setLockedRatioXY(cloned.topology.aspectRatioXY);
+    setLockedRatioXY(
+      cloned.params.targetDimensions.y > 0
+        ? cloned.params.targetDimensions.x / cloned.params.targetDimensions.y
+        : cloned.topology.aspectRatioXY,
+    );
     setExplodeFactor(0);
     setModelKey(`preset_${key}_${Date.now()}`);
   };
@@ -196,18 +205,23 @@ export default function App() {
     if (params.costConfig) {
       cloned.params.costConfig = { ...params.costConfig };
     }
+    const catalogRatio =
+      cloned.params.targetDimensions.y > 0
+        ? cloned.params.targetDimensions.x / cloned.params.targetDimensions.y
+        : cloned.topology.aspectRatioXY;
     setActivePreset(null);
     setActiveCatalogId(catalogId);
-    setTopology(cloned.topology);
+    setTopology({ ...cloned.topology, aspectRatioXY: catalogRatio });
     setParams(cloned.params);
     setExternalPhotoUrl(`./ejemplos/${cloned.spec.photoFile}`);
     setExternalPhotoLabel(cloned.spec.name);
+    setExternalInitialQuadNorm(cloned.spec.initialQuadNorm ?? null);
     setSelectedZoneId(null);
     setHoveredZoneId(null);
     setPendingFrontMaterialChoice(null);
     setModelApproved(false);
     setLockProportion(false);
-    setLockedRatioXY(cloned.topology.aspectRatioXY);
+    setLockedRatioXY(catalogRatio);
     setExplodeFactor(0);
     setModelKey(`catalog_${catalogId}_${Date.now()}`);
     setActiveView('studio');
@@ -218,18 +232,26 @@ export default function App() {
     setActivePreset(null);
     setModelApproved(false);
     setPendingFrontMaterialChoice(null);
-    // Si el usuario ajusta las esquinas en VectorCanvas cambiando aspectRatioXY, sincroniza lockedRatioXY
+    // En muebles del catálogo QA con dimensiones reales verificadas, conserva su proporción
+    // de referencia para que una perspectiva 3/4 de la foto nunca dispare falsas alertas (~245%).
+    const catalogRefRatio =
+      activeCatalogId !== '' && params.referenceDimensions.y > 0
+        ? params.referenceDimensions.x / params.referenceDimensions.y
+        : null;
+    const normalizedNext: FurnitureTopology =
+      catalogRefRatio !== null ? { ...next, aspectRatioXY: catalogRefRatio } : next;
+
+    // Si cambia aspectRatioXY tras ajustar contorno, sincroniza lockedRatioXY limpiamente
     if (
-      lockProportion &&
-      next.aspectRatioXY > 0.05 &&
-      Math.abs(next.aspectRatioXY - topology.aspectRatioXY) > 1e-4
+      normalizedNext.aspectRatioXY > 0.05 &&
+      Math.abs(normalizedNext.aspectRatioXY - topology.aspectRatioXY) > 1e-4
     ) {
-      setLockedRatioXY(next.aspectRatioXY);
+      setLockedRatioXY(normalizedNext.aspectRatioXY);
     }
-    if (selectedZoneId && !(next.frontZones ?? []).some((z) => z.id === selectedZoneId)) {
+    if (selectedZoneId && !(normalizedNext.frontZones ?? []).some((z) => z.id === selectedZoneId)) {
       setSelectedZoneId(null);
     }
-    setTopology(next);
+    setTopology(normalizedNext);
   };
 
   const handleUpdateFrontZones = (zones: FrontZone[]) => {
@@ -324,7 +346,9 @@ export default function App() {
   const handleApplyCalibratedDims = (rawDims: { x: number; y: number; z: number }) => {
     const safeDims = clampDims(rawDims);
     if (safeDims.y > 0) {
-      setLockedRatioXY(safeDims.x / safeDims.y);
+      const nextRatio = safeDims.x / safeDims.y;
+      setLockedRatioXY(nextRatio);
+      setTopology((prev) => ({ ...prev, aspectRatioXY: nextRatio }));
     }
     setModelApproved(false);
     setParams((p) => ({
@@ -338,17 +362,32 @@ export default function App() {
     rawDims: { x: number; y: number; z: number },
     detectedMaterial?: MelamineMaterial,
   ) => {
-    const safeDims = clampDims(rawDims);
-    if (safeDims.y > 0) {
-      setLockedRatioXY(safeDims.x / safeDims.y);
-      setLockProportion(true);
+    // Si el usuario está editando un mueble del catálogo QA, conserva sus dimensiones actuales
+    // y sincroniza lockedRatioXY con la silueta vigente sin activar candado ni alertas falsas.
+    if (activeCatalogId !== '') {
+      const curRatio =
+        params.targetDimensions.y > 0
+          ? params.targetDimensions.x / params.targetDimensions.y
+          : topology.aspectRatioXY;
+      setLockedRatioXY(curRatio);
+      setModelApproved(false);
+      setStudioMode((cur) => (cur === 'photo' ? 'split' : cur));
+      return;
     }
+
+    const safeDims = clampDims(rawDims);
+    const nextRatio = safeDims.y > 0 ? safeDims.x / safeDims.y : topology.aspectRatioXY;
+    setLockedRatioXY(nextRatio);
     setModelApproved(false);
     setParams((p) => ({
       ...p,
       referenceDimensions: { ...safeDims },
       targetDimensions: { ...safeDims },
       material: detectedMaterial ?? p.material,
+    }));
+    setTopology((prev) => ({
+      ...prev,
+      aspectRatioXY: nextRatio,
     }));
     setStudioMode((cur) => (cur === 'photo' ? 'split' : cur));
   };
@@ -591,12 +630,12 @@ export default function App() {
   return (
     <div className="app-shell">
       <header className="app-header">
-        <div className="brand-block">
-          <div className="brand-title">SmartFurniture v8.0</div>
-          <div className="brand-sub">
-            100% Local Offline · Homografía 3×3, Trazado Vectorial, 3D Bicolor, Unidad 3, Corte 2D y
-            Presupuesto CLP
-          </div>
+        <div
+          className="brand-block"
+          title="100% Local Offline · Homografía 3×3, Trazado Vectorial, 3D Bicolor, Unidad 3, Corte 2D y Presupuesto CLP"
+        >
+          <span className="brand-title">SmartFurniture v8.0</span>
+          <span className="brand-sub">100% Offline · 3D · Corte 2D · CLP</span>
         </div>
         <div className="preset-bar">
           {(Object.keys(PRESETS) as PresetKey[]).map((k) => (
@@ -1393,46 +1432,62 @@ export default function App() {
             </div>
           </details>
 
-          {/* Barra contextual de vista Estudio: Solo Foto / Dividido / Solo 3D */}
+          {/* Barra contextual de vista Estudio: Ampliar Foto / Dividido / Solo 3D */}
           {activeView === 'studio' && (
             <div className="studio-mode-bar">
               <div className="studio-mode-group" role="group" aria-label="Disposición del estudio">
                 <button
                   type="button"
-                  className={studioMode === 'photo' ? 'mode-btn active' : 'mode-btn'}
+                  className={
+                    studioMode === 'photo'
+                      ? 'mode-btn mode-btn-photo active'
+                      : 'mode-btn mode-btn-photo'
+                  }
                   onClick={() => setStudioMode('photo')}
+                  title="Ampliar la foto al ancho completo para trazar esquinas y divisiones con máxima comodidad"
+                  aria-pressed={studioMode === 'photo'}
                 >
-                  <ImageIcon size={14} /> Solo Foto
+                  <ZoomIn size={13} /> {studioMode === 'photo' ? 'Foto Ampliada' : 'Ampliar Foto'}
                 </button>
                 <button
                   type="button"
-                  className={studioMode === 'split' ? 'mode-btn active' : 'mode-btn'}
+                  className={
+                    studioMode === 'split'
+                      ? 'mode-btn active'
+                      : studioMode === 'photo'
+                        ? 'mode-btn mode-btn-return'
+                        : 'mode-btn'
+                  }
                   onClick={() => setStudioMode('split')}
+                  title="Ver la foto de trazado junto al modelo 3D en vivo"
+                  aria-pressed={studioMode === 'split'}
                 >
-                  <Columns2 size={14} /> Dividido
+                  <Columns2 size={13} /> {studioMode === 'photo' ? 'Volver a Dividido' : 'Dividido'}
                 </button>
                 <button
                   type="button"
                   className={studioMode === '3d' ? 'mode-btn active' : 'mode-btn'}
                   onClick={() => setStudioMode('3d')}
+                  title="Ver el visor 3D a pantalla completa del estudio"
+                  aria-pressed={studioMode === '3d'}
                 >
-                  <Box size={14} /> Solo 3D
+                  <Box size={13} /> Solo 3D
                 </button>
               </div>
               <div className="studio-shortcuts">
                 <button
                   type="button"
-                  className="btn-secondary"
+                  className="btn-secondary studio-shortcut-btn"
                   onClick={() => setActiveView('blueprint')}
                 >
                   2. Revisar Plano 2D →
                 </button>
                 <button
                   type="button"
-                  className="btn-primary"
+                  className="btn-primary studio-shortcut-btn"
                   onClick={() => setActiveView('workshop')}
                 >
-                  <Wrench size={14} /> 3. Taller y Corte
+                  <Wrench size={13} /> 3. Taller y Corte
                 </button>
               </div>
             </div>
@@ -1456,6 +1511,7 @@ export default function App() {
                 isVisible={isPhotoVisible}
                 externalPhotoUrl={externalPhotoUrl}
                 externalPhotoLabel={externalPhotoLabel}
+                externalInitialQuadNorm={externalInitialQuadNorm}
                 isCatalogReference={Boolean(activeCatalogId)}
                 selectedZoneId={selectedZoneId}
                 hoveredZoneId={hoveredZoneId}
@@ -1560,12 +1616,18 @@ export default function App() {
                 unitVec={unitVec}
                 shapeComp={shapeComp}
                 requestedTab={workshopRequestedTab}
-                onFixReferenceV0={() =>
+                onFixReferenceV0={() => {
+                  const nextRatio =
+                    params.targetDimensions.y > 0
+                      ? params.targetDimensions.x / params.targetDimensions.y
+                      : topology.aspectRatioXY;
+                  setLockedRatioXY(nextRatio);
+                  setTopology((prev) => ({ ...prev, aspectRatioXY: nextRatio }));
                   setParams((p) => ({
                     ...p,
                     referenceDimensions: { ...p.targetDimensions },
-                  }))
-                }
+                  }));
+                }}
                 onAddCenterDivider={() => {
                   if (!hasCenterDivider) handleToggleCenterDivider();
                 }}

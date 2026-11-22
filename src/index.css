@@ -614,6 +614,51 @@ input[type='range'] {
   cursor: pointer;
 }
 
+.toggle-backpanel {
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--sf-border);
+  background: var(--sf-surface-alt);
+  color: var(--sf-navy);
+  font-size: 12px;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.toggle-backpanel.active {
+  background: #f0f9ff;
+  border-color: var(--sf-primary);
+}
+
+.toggle-backpanel input[type='checkbox'] {
+  accent-color: var(--sf-primary);
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.btn-eyedropper-photo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: var(--sf-radius-sm);
+  border: 1px solid #7dd3fc;
+  background: var(--sf-primary-soft);
+  color: var(--sf-navy);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.btn-eyedropper-photo:hover {
+  background: #bae6fd;
+  border-color: var(--sf-primary);
+}
+
 .select-input {
   width: 100%;
   margin-top: 3px;

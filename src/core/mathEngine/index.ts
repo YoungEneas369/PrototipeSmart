@@ -30,6 +30,7 @@ import {
   clipSegmentAgainstMmBoxes,
   clipShelfSpanAgainstVoids,
   computeBackPanelNonVoidRects,
+  computeLegVoidBackExcludedBoxes,
   emitStepCutoutStructures,
   resolveVoidCutouts,
   type ActiveDividerSpan,
@@ -898,7 +899,7 @@ export function calculateDespiece(
     });
   }
 
-  // 4B. FONDO DUROLAC / MDF 3 mm (subdivisión inteligente en X e Y + respeto de `void_outside`)
+  // 4B. FONDO DUROLAC / MDF 3 mm (subdivisión inteligente en X e Y + respeto de `void_outside` y `leg_void`)
   if (topology.hasBackPanel && backE > 0) {
     const backSheet = params.backPanelSheetDimensions ?? params.sheetDimensions;
     const trim = Math.max(0, params.trimMm ?? 0);
@@ -907,7 +908,8 @@ export function calculateDespiece(
     const minS = Math.min(usableW, usableH);
     const maxS = Math.max(usableW, usableH);
 
-    const backStrips = computeBackPanelNonVoidRects(xf, yf, cutouts);
+    const legVoidBackBoxes = computeLegVoidBackExcludedBoxes(frontZones, xf, yf, e);
+    const backStrips = computeBackPanelNonVoidRects(xf, yf, cutouts, legVoidBackBoxes);
     const backSubPanels: Array<{ x0: number; x1: number; y0: number; y1: number; label: string }> = [];
 
     for (const strip of backStrips) {

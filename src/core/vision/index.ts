@@ -3,7 +3,9 @@
  */
 export {
   analyzeRectifiedFurniture,
+  consolidateNarrowCenterDividers,
   detectLowerGapHint,
+  detectSteppedCornerCutout,
 } from './bandDetector';
 export type {
   BandDetectionResult,
@@ -11,6 +13,7 @@ export type {
   DetectedCavity,
   DetectedHandlePoint,
   LowerGapHintResult,
+  SteppedCornerCutout,
 } from './bandDetector';
 export {
   MATERIAL_BASE_RGB,
@@ -42,12 +45,13 @@ export {
   quadArea,
   rgbaLuminance,
   sampleExteriorBgRgb,
+  sampleLocalExteriorBgRgb,
   sampleLumSafe,
   sampleRgbaSafe,
   sobel3x3At,
   sobel3x3AtRgba,
 } from './imageOps';
-export type { ExteriorPixelRect } from './imageOps';
+export type { ExteriorPixelRect, LocalExteriorBgSamples } from './imageOps';
 export {
   autoDetectFurnitureQuad,
   computeRectifiedSize,
@@ -100,6 +104,8 @@ export {
   detectBaseSupportHint,
   detectBasketPattern,
   detectHandlesLocalContrast,
+  detectInternalDrawersInCell,
+  detectMetallicBasketRails,
   isGlassDoorFromStats,
   measureCellStats,
   suppressShelvesInsideDrawers,
@@ -107,7 +113,9 @@ export {
 export type {
   BaseSupportHintResult,
   BasketPatternEstimate,
+  BasketRailEstimate,
   CellPixelStats,
   CellRect,
+  InternalDrawerAnalysis,
   ZoneClassificationContext,
 } from './zoneClassifier';

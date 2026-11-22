@@ -22,7 +22,6 @@ import {
   Maximize2,
   MousePointer2,
   PenTool,
-  Pipette,
   Redo2,
   RotateCcw,
   Scan,
@@ -94,7 +93,6 @@ export interface CanvasTopBarsProps {
   onReturnToFrontal: () => void;
   onApplyCalibA4: () => void;
   onExitSubTool: () => void;
-  onToggleSubTool: (tool: SubTool) => void;
   onToggleFrameMode: (mode: FrameMode) => void;
   onStartPickCorners: () => void;
   onUndoPickCorner: () => void;
@@ -156,7 +154,6 @@ export function CanvasTopBars({
   onReturnToFrontal,
   onApplyCalibA4,
   onExitSubTool,
-  onToggleSubTool,
   onToggleFrameMode,
   onStartPickCorners,
   onUndoPickCorner,
@@ -353,9 +350,8 @@ export function CanvasTopBars({
           ) : subTool === 'eyedropper' ? (
             <>
               <span className="vc-context-banner-text">
-                <span className="vc-pill vc-pill-accent">GOTERO COLOR</span>
-                Haz clic sobre la superficie de melamina para detectar su acabado sin modificar
-                medidas ni trazos.
+                <span className="vc-pill vc-pill-accent">COPIAR COLOR DE FOTO</span>
+                Haz clic sobre la madera del mueble para copiar su acabado al 3D
               </span>
               <div className="vc-context-actions">
                 <button
@@ -502,27 +498,19 @@ export function CanvasTopBars({
                   <div className="vc-segmented vc-segmented-soft" role="group" aria-label="Tipo de trazo">
                     <button
                       type="button"
-                      className={strokeMode === 'auto' ? 'active' : ''}
-                      onClick={() => onChangeStrokeMode('auto')}
-                      title="Guía recta suave ≤ 7° o diagonal limpia > 18°"
-                    >
-                      Auto
-                    </button>
-                    <button
-                      type="button"
-                      className={strokeMode === 'ortho' ? 'active' : ''}
+                      className={strokeMode !== 'diagonal' ? 'active' : ''}
                       onClick={() => onChangeStrokeMode('ortho')}
-                      title="Solo divisores verticales y repisas horizontales"
+                      title="Traza repisas horizontales y divisores verticales siguiendo la perspectiva del mueble (cero saltos)"
                     >
-                      Recta
+                      Recta H/V
                     </button>
                     <button
                       type="button"
                       className={strokeMode === 'diagonal' ? 'active' : ''}
                       onClick={() => onChangeStrokeMode('diagonal')}
-                      title="Solo divisiones diagonales / oblicuas"
+                      title="Traza divisiones diagonales u oblicuas 1:1 exactamente donde está tu cursor"
                     >
-                      Diagonal
+                      Diagonal / Libre
                     </button>
                   </div>
                 )}
@@ -531,7 +519,7 @@ export function CanvasTopBars({
                   type="button"
                   className={magneticSnap ? 'vc-chip active' : 'vc-chip'}
                   onClick={onToggleMagneticSnap}
-                  title="Imán suave (≤ 5 px) a bordes de alto contraste (apagado por defecto para trazo 100% fluido)"
+                  title="Imán opcional muy suave (≤ 3 px) al iniciar o mover extremos (apagado por defecto para trazo 100 % libre sin saltos)"
                 >
                   <Magnet size={11} /> Imán {magneticSnap ? 'ON' : 'OFF'}
                 </button>
@@ -542,14 +530,6 @@ export function CanvasTopBars({
                   title="Sugiere líneas internas respetando siempre tu contorno actual"
                 >
                   <Wand2 size={11} /> Sugerir en contorno
-                </button>
-                <button
-                  type="button"
-                  className="vc-chip"
-                  onClick={() => onToggleSubTool('eyedropper')}
-                  title="Muestrear color de melamina con 1 clic"
-                >
-                  <Pipette size={11} /> Gotero
                 </button>
                 {hasSelectedLine && (
                   <button
@@ -593,13 +573,6 @@ export function CanvasTopBars({
                   title="Marca 1 o varias secciones dentro del contorno para auto-detectar líneas adicionales"
                 >
                   <BoxSelect size={11} /> Secciones auto
-                </button>
-                <button
-                  type="button"
-                  className="vc-chip"
-                  onClick={() => onToggleSubTool('eyedropper')}
-                >
-                  <Pipette size={11} /> Gotero
                 </button>
                 <button
                   type="button"

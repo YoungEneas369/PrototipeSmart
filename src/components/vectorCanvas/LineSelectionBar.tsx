@@ -67,7 +67,7 @@ export function LineSelectionBar({
 
     const commitPosMm = (nextMm: number) => {
       const clampedMm = clampNum(nextMm, minPosMm, maxPosMm);
-      const nextU = round4(clampNum((clampedMm - e) / xInt, 0.03, 0.97));
+      const nextU = round4(clampNum((clampedMm - e) / xInt, 0.015, 0.985));
       onUpdateVDivider(seg.id, { ...seg, position: nextU });
     };
 
@@ -210,7 +210,7 @@ export function LineSelectionBar({
 
     const commitPosMm = (nextMm: number) => {
       const clampedMm = clampNum(nextMm, minPosMm, maxPosMm);
-      const nextV = round4(clampNum((clampedMm - e) / yInt, 0.03, 0.97));
+      const nextV = round4(clampNum((clampedMm - e) / yInt, 0.015, 0.985));
       onUpdateHShelf(seg.id, { ...seg, position: nextV });
     };
 

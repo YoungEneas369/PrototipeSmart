@@ -36,7 +36,47 @@ export interface Viewer3DProps {
   onAddCenterDivider?: () => void;
 }
 
-type CameraPreset = 'iso' | 'front' | 'side';
+type CameraPreset = 'iso' | 'front' | 'side' | 'back';
+
+interface BasketRodSpec {
+  position: [number, number, number];
+  rotation: [number, number, number];
+  length: number;
+}
+
+const _rodUpAxis = new THREE.Vector3(0, 1, 0);
+const _rodDirVec = new THREE.Vector3();
+const _rodQuat = new THREE.Quaternion();
+const _rodEuler = new THREE.Euler();
+
+function makeWireRod(
+  ax: number,
+  ay: number,
+  az: number,
+  bx: number,
+  by: number,
+  bz: number,
+): BasketRodSpec {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const dz = bz - az;
+  const length = Math.hypot(dx, dy, dz);
+  if (length < 1e-6) {
+    return { position: [ax, ay, az], rotation: [0, 0, 0], length: 0 };
+  }
+  _rodDirVec.set(dx / length, dy / length, dz / length);
+  if (_rodDirVec.y < -0.999999) {
+    _rodEuler.set(Math.PI, 0, 0);
+  } else {
+    _rodQuat.setFromUnitVectors(_rodUpAxis, _rodDirVec);
+    _rodEuler.setFromQuaternion(_rodQuat);
+  }
+  return {
+    position: [(ax + bx) / 2, (ay + by) / 2, (az + bz) / 2],
+    rotation: [_rodEuler.x, _rodEuler.y, _rodEuler.z],
+    length,
+  };
+}
 
 function createProceduralTexture(
   kind: MelamineMaterial | 'durolac_3mm',
@@ -86,11 +126,27 @@ function createProceduralTexture(
         ctx.stroke();
       }
     } else {
-      ctx.fillStyle = '#a47e58';
+      // Tablero MDF / Durolac 3 mm beige-madera claro limpio con sutil textura prensada
+      const grad = ctx.createLinearGradient(0, 0, 256, 256);
+      grad.addColorStop(0, '#e3d6c2');
+      grad.addColorStop(0.5, '#ebdfce');
+      grad.addColorStop(1, '#dbcbb4');
+      ctx.fillStyle = grad;
       ctx.fillRect(0, 0, 256, 256);
-      ctx.fillStyle = 'rgba(65, 42, 20, 0.12)';
-      for (let i = 0; i < 256; i += 4) {
-        ctx.fillRect(i, 0, 1, 256);
+
+      // Sutil fibra horizontal de tablero prensado
+      ctx.fillStyle = 'rgba(148, 118, 84, 0.065)';
+      for (let y = 0; y < 256; y += 5) {
+        ctx.fillRect(0, y, 256, 1);
+      }
+      // Micro-moteado determinista tipo MDF crudo fino
+      for (let i = 0; i < 420; i++) {
+        const px = ((i * 73 + 19) % 256);
+        const py = ((i * 137 + 41) % 256);
+        const w = 2 + (i % 4);
+        ctx.fillStyle =
+          i % 3 === 0 ? 'rgba(255, 250, 242, 0.16)' : 'rgba(130, 102, 72, 0.08)';
+        ctx.fillRect(px, py, w, 1.5);
       }
     }
   }
@@ -143,9 +199,11 @@ function CameraRig({
     const apparentHalfW =
       preset === 'front'
         ? xm * 0.5 + 0.16
-        : preset === 'side'
-          ? zm * 0.5 + 0.16
-          : (xm * 0.83 + zm * 0.57) * 0.5 + 0.17;
+        : preset === 'back'
+          ? (xm * 0.96 + zm * 0.26) * 0.5 + 0.16
+          : preset === 'side'
+            ? zm * 0.5 + 0.16
+            : (xm * 0.83 + zm * 0.57) * 0.5 + 0.17;
     const horizFitDist = apparentHalfW / (0.39 * aspect);
     const vertFitDist = (ymTotal * 0.5 + 0.18) / 0.42;
     const dist = Math.max(camDistRef.current, horizFitDist, vertFitDist);
@@ -153,9 +211,11 @@ function CameraRig({
     const pos: [number, number, number] =
       preset === 'front'
         ? [0, ty, dist * 1.42]
-        : preset === 'side'
-          ? [dist * 1.42, ty * 1.05, 0.02]
-          : [dist * 0.72, Math.max(ty * 1.15, dist * 0.58), dist * 1.08];
+        : preset === 'back'
+          ? [-dist * 0.24, Math.max(ty * 1.06, dist * 0.22), -dist * 1.4]
+          : preset === 'side'
+            ? [dist * 1.42, ty * 1.05, 0.02]
+            : [dist * 0.72, Math.max(ty * 1.15, dist * 0.58), dist * 1.08];
 
     camera.position.set(pos[0], pos[1], pos[2]);
     if (controlsRef.current) {
@@ -317,7 +377,62 @@ function FurnitureMeshGroup({
     return coords;
   }, [support.count, xm, zm, legInset]);
 
-  // Geometría 3D procedural de canastos metálicos extraíbles (excluidos de melamina)
+  // Geometría y materiales compartidos (GPU-safe) para canastos metálicos cromados modernos
+  const basketResources = useMemo(() => {
+    return {
+      unitCyl: new THREE.CylinderGeometry(1, 1, 1, 8),
+      rimMat: new THREE.MeshStandardMaterial({
+        color: '#f1f5f9',
+        metalness: 0.78,
+        roughness: 0.18,
+      }),
+      rimMatHi: new THREE.MeshStandardMaterial({
+        color: '#38bdf8',
+        metalness: 0.55,
+        roughness: 0.22,
+      }),
+      wireMat: new THREE.MeshStandardMaterial({
+        color: '#e8eef5',
+        metalness: 0.74,
+        roughness: 0.2,
+      }),
+      wireMatHi: new THREE.MeshStandardMaterial({
+        color: '#7dd3fc',
+        metalness: 0.5,
+        roughness: 0.22,
+      }),
+      railMat: new THREE.MeshStandardMaterial({
+        color: '#e2e8f0',
+        metalness: 0.52,
+        roughness: 0.28,
+      }),
+      railMatHi: new THREE.MeshStandardMaterial({
+        color: '#0ea5e9',
+        metalness: 0.45,
+        roughness: 0.26,
+      }),
+      railLipMat: new THREE.MeshStandardMaterial({
+        color: '#cbd5e1',
+        metalness: 0.62,
+        roughness: 0.24,
+      }),
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      basketResources.unitCyl.dispose();
+      basketResources.rimMat.dispose();
+      basketResources.rimMatHi.dispose();
+      basketResources.wireMat.dispose();
+      basketResources.wireMatHi.dispose();
+      basketResources.railMat.dispose();
+      basketResources.railMatHi.dispose();
+      basketResources.railLipMat.dispose();
+    };
+  }, [basketResources]);
+
+  // Geometría 3D procedural de canastos metálicos extraíbles (estilizados, aireados y con rejilla abierta real)
   const basketVisuals = useMemo(() => {
     const list: Array<{
       key: string;
@@ -328,8 +443,13 @@ function FurnitureMeshGroup({
       w: number;
       h: number;
       d: number;
-      xLeftRail: number;
-      xRightRail: number;
+      xLeftWall: number;
+      xRightWall: number;
+      railY: number;
+      railCz: number;
+      railLen: number;
+      rimRods: BasketRodSpec[];
+      wireRods: BasketRodSpec[];
     }> = [];
     for (const z of topology.frontZones ?? []) {
       if (z.kind !== 'baskets') continue;
@@ -345,23 +465,109 @@ function FurnitureMeshGroup({
       const wIn = x1 - x0;
       const hIn = y1 - y0;
       if (wIn < 80 || hIn < 90) continue;
-      const bw = Math.max(60, wIn - 24) / 1000;
-      const bd = Math.max(120, zf - 44) / 1000;
+
+      const bw = Math.max(60, wIn - 16) / 1000;
+      const bd = Math.max(120, zf - 48) / 1000;
       const slotH = hIn / nb;
-      const bh = Math.max(70, Math.min(175, slotH * 0.6)) / 1000;
+      const slotHM = slotH / 1000;
+      // Proporción real y aireada de canasto frutero moderno (deja espacio abierto encima de cada canasto)
+      const bh = Math.max(0.045, Math.min(0.115, slotHM * 0.44));
+
+      const halfW = bw / 2;
+      const halfD = bd / 2;
+      const halfH = bh / 2;
+      const taperX = Math.min(0.012, bw * 0.055);
+      const taperZ = Math.min(0.01, bd * 0.03);
+      const botHalfW = Math.max(0.016, halfW - taperX);
+      const botHalfD = Math.max(0.03, halfD - taperZ);
+      const midHalfW = (halfW + botHalfW) / 2;
+      const midHalfD = (halfD + botHalfD) / 2;
+
+      const handleHalfW = Math.min(0.048, bw * 0.19);
+      const handleOut = 0.011;
+      const handleY = halfH + 0.001;
+
+      const rimRods: BasketRodSpec[] = [
+        // Marco superior cromado
+        makeWireRod(-halfW, halfH, halfD, halfW, halfH, halfD),
+        makeWireRod(-halfW, halfH, -halfD, halfW, halfH, -halfD),
+        makeWireRod(-halfW, halfH, -halfD, -halfW, halfH, halfD),
+        makeWireRod(halfW, halfH, -halfD, halfW, halfH, halfD),
+        // Asa frontal sutil integrada al marco superior
+        makeWireRod(-handleHalfW, halfH, halfD, -handleHalfW, handleY, halfD + handleOut),
+        makeWireRod(handleHalfW, halfH, halfD, handleHalfW, handleY, halfD + handleOut),
+        makeWireRod(
+          -handleHalfW,
+          handleY,
+          halfD + handleOut,
+          handleHalfW,
+          handleY,
+          halfD + handleOut,
+        ),
+      ];
+
+      const wireRods: BasketRodSpec[] = [
+        // Aro horizontal medio perimetral (frente, atrás, izquierda, derecha)
+        makeWireRod(-midHalfW, 0, midHalfD, midHalfW, 0, midHalfD),
+        makeWireRod(-midHalfW, 0, -midHalfD, midHalfW, 0, -midHalfD),
+        makeWireRod(-midHalfW, 0, -midHalfD, -midHalfW, 0, midHalfD),
+        makeWireRod(midHalfW, 0, -midHalfD, midHalfW, 0, midHalfD),
+        // Marco inferior de rejilla
+        makeWireRod(-botHalfW, -halfH, botHalfD, botHalfW, -halfH, botHalfD),
+        makeWireRod(-botHalfW, -halfH, -botHalfD, botHalfW, -halfH, -botHalfD),
+        makeWireRod(-botHalfW, -halfH, -botHalfD, -botHalfW, -halfH, botHalfD),
+        makeWireRod(botHalfW, -halfH, -botHalfD, botHalfW, -halfH, botHalfD),
+        // 4 esquinas verticales suavemente ahusadas
+        makeWireRod(-halfW, halfH, halfD, -botHalfW, -halfH, botHalfD),
+        makeWireRod(halfW, halfH, halfD, botHalfW, -halfH, botHalfD),
+        makeWireRod(-halfW, halfH, -halfD, -botHalfW, -halfH, -botHalfD),
+        makeWireRod(halfW, halfH, -halfD, botHalfW, -halfH, -botHalfD),
+      ];
+
+      // Varillas verticales frente/atrás + varillas longitudinales del fondo abierto
+      const nX = Math.max(4, Math.min(8, Math.round(bw / 0.044)));
+      for (let i = 1; i <= nX; i++) {
+        const t = -1 + (2 * i) / (nX + 1);
+        wireRods.push(
+          makeWireRod(t * halfW, halfH, halfD, t * botHalfW, -halfH, botHalfD),
+          makeWireRod(t * halfW, halfH, -halfD, t * botHalfW, -halfH, -botHalfD),
+          makeWireRod(t * botHalfW, -halfH, -botHalfD, t * botHalfW, -halfH, botHalfD),
+        );
+      }
+
+      // Varillas verticales laterales izq/der + varillas transversales del fondo abierto
+      const nZ = Math.max(4, Math.min(8, Math.round(bd / 0.054)));
+      for (let j = 1; j <= nZ; j++) {
+        const t = -1 + (2 * j) / (nZ + 1);
+        wireRods.push(
+          makeWireRod(-halfW, halfH, t * halfD, -botHalfW, -halfH, t * botHalfD),
+          makeWireRod(halfW, halfH, t * halfD, botHalfW, -halfH, t * botHalfD),
+          makeWireRod(-botHalfW, -halfH, t * botHalfD, botHalfW, -halfH, t * botHalfD),
+        );
+      }
+
+      const railCz = (zf - 14 - (bd * 1000) / 2) / 1000;
+      const railLen = Math.min((zf - 12) / 1000, bd + 0.012);
+
       for (let k = 0; k < nb; k++) {
-        const cyMm = y0 + (k + 0.44) * slotH;
+        const yBotMm = y0 + (k + 0.16) * slotH;
+        const cyM = (yBotMm + (bh * 1000) / 2) / 1000;
         list.push({
           key: `basket_${z.id}_${k}`,
           zoneId: z.id,
           cx: (x0 + x1) / 2000,
-          cy: cyMm / 1000,
-          cz: (zf - 12 - (bd * 1000) / 2) / 1000 + explodeDist * 0.65,
+          cy: cyM,
+          cz: (zf - 18 - (bd * 1000) / 2) / 1000 + explodeDist * 0.65,
           w: bw,
           h: bh,
           d: bd,
-          xLeftRail: (x0 + 5) / 1000,
-          xRightRail: (x1 - 5) / 1000,
+          xLeftWall: x0 / 1000,
+          xRightWall: x1 / 1000,
+          railY: cyM + halfH,
+          railCz,
+          railLen,
+          rimRods,
+          wireRods,
         });
       }
     }
@@ -499,9 +705,11 @@ function FurnitureMeshGroup({
             ? '#0284c7'
             : sev
               ? '#7f1d1d'
-              : melMat === 'grafito'
-                ? '#94a3b8'
-                : edgeLineColor;
+              : isBack
+                ? '#64748b'
+                : melMat === 'grafito'
+                  ? '#94a3b8'
+                  : edgeLineColor;
 
           const dxM = dx / 1000;
           const dyM = dy / 1000;
@@ -676,7 +884,7 @@ function FurnitureMeshGroup({
                   map={tex}
                   emissive={emissiveColor}
                   emissiveIntensity={emissiveIntensity}
-                  roughness={isBack ? 0.85 : 0.55}
+                  roughness={isBack ? 0.76 : 0.55}
                 />
               )}
               <Edges color={pieceEdgeColor} />
@@ -731,14 +939,16 @@ function FurnitureMeshGroup({
           </mesh>
         )}
 
-        {/* Canastos metálicos cromados extraíbles (herraje externo no-melamina) */}
+        {/* Canastos metálicos cromados extraíbles de rejilla abierta real (herraje externo no-melamina) */}
         {basketVisuals.map((bk) => {
-          const rodR = 0.003;
-          const wireOffsets = [-0.36, -0.18, 0, 0.18, 0.36];
+          const rodR = 0.0022;
+          const rimR = 0.0029;
           const isBkHighlight =
             selectedZoneId === bk.zoneId || hoveredZoneId === bk.zoneId;
-          const wireColor = isBkHighlight ? '#38bdf8' : '#cbd5e1';
-          const frontWireColor = isBkHighlight ? '#7dd3fc' : '#e2e8f0';
+          const rimMat = isBkHighlight ? basketResources.rimMatHi : basketResources.rimMat;
+          const wireMat = isBkHighlight ? basketResources.wireMatHi : basketResources.wireMat;
+          const railMat = isBkHighlight ? basketResources.railMatHi : basketResources.railMat;
+          const railLipMat = isBkHighlight ? basketResources.railMatHi : basketResources.railLipMat;
           return (
             <group
               key={bk.key}
@@ -756,59 +966,53 @@ function FurnitureMeshGroup({
                 onHoverZone?.(null);
               }}
             >
-              <mesh position={[bk.xLeftRail, bk.cy + bk.h * 0.35, bk.cz]}>
-                <boxGeometry args={[0.008, 0.012, bk.d]} />
-                <meshStandardMaterial color="#64748b" metalness={0.75} roughness={0.3} />
-              </mesh>
-              <mesh position={[bk.xRightRail, bk.cy + bk.h * 0.35, bk.cz]}>
-                <boxGeometry args={[0.008, 0.012, bk.d]} />
-                <meshStandardMaterial color="#64748b" metalness={0.75} roughness={0.3} />
-              </mesh>
+              {/* Riel corredera izquierdo en perfil C pegado limpiamente a la pared del vano */}
+              <group position={[bk.xLeftWall, bk.railY, bk.railCz]}>
+                <mesh position={[0.0015, 0, 0]} material={railMat}>
+                  <boxGeometry args={[0.003, 0.015, bk.railLen]} />
+                </mesh>
+                <mesh position={[0.0055, -0.0055, 0]} material={railLipMat}>
+                  <boxGeometry args={[0.01, 0.0028, bk.railLen]} />
+                </mesh>
+                <mesh position={[0.0055, 0.0055, 0]} material={railLipMat}>
+                  <boxGeometry args={[0.01, 0.0028, bk.railLen]} />
+                </mesh>
+              </group>
+              {/* Riel corredera derecho en perfil C pegado limpiamente a la pared del vano */}
+              <group position={[bk.xRightWall, bk.railY, bk.railCz]}>
+                <mesh position={[-0.0015, 0, 0]} material={railMat}>
+                  <boxGeometry args={[0.003, 0.015, bk.railLen]} />
+                </mesh>
+                <mesh position={[-0.0055, -0.0055, 0]} material={railLipMat}>
+                  <boxGeometry args={[0.01, 0.0028, bk.railLen]} />
+                </mesh>
+                <mesh position={[-0.0055, 0.0055, 0]} material={railLipMat}>
+                  <boxGeometry args={[0.01, 0.0028, bk.railLen]} />
+                </mesh>
+              </group>
+
+              {/* Cuerpo de rejilla cromada abierta (se desliza hacia adelante en vista explotada) */}
               <group position={[bk.cx, bk.cy, bk.cz]}>
-                <mesh position={[0, bk.h / 2, bk.d / 2]}>
-                  <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
-                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
-                </mesh>
-                <mesh position={[0, -bk.h / 2, bk.d / 2]}>
-                  <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
-                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
-                </mesh>
-                <mesh position={[0, bk.h / 2, -bk.d / 2]}>
-                  <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
-                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
-                </mesh>
-                <mesh position={[-bk.w / 2, bk.h / 2, 0]}>
-                  <boxGeometry args={[rodR * 2, rodR * 2, bk.d]} />
-                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
-                </mesh>
-                <mesh position={[bk.w / 2, bk.h / 2, 0]}>
-                  <boxGeometry args={[rodR * 2, rodR * 2, bk.d]} />
-                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
-                </mesh>
-                <mesh position={[0, -bk.h / 2, 0]}>
-                  <boxGeometry args={[bk.w, rodR * 1.4, bk.d]} />
-                  <meshStandardMaterial
-                    color={isBkHighlight ? '#0ea5e9' : '#94a3b8'}
-                    metalness={0.7}
-                    roughness={0.32}
-                    transparent
-                    opacity={0.72}
+                {bk.rimRods.map((rod, ri) => (
+                  <mesh
+                    key={`rim_${ri}`}
+                    geometry={basketResources.unitCyl}
+                    material={rimMat}
+                    position={rod.position}
+                    rotation={rod.rotation}
+                    scale={[rimR, rod.length, rimR]}
                   />
-                </mesh>
-                {wireOffsets.map((frac, wi) => (
-                  <mesh key={wi} position={[bk.w * frac, 0, bk.d / 2]}>
-                    <boxGeometry args={[rodR * 1.6, bk.h, rodR * 1.6]} />
-                    <meshStandardMaterial color={frontWireColor} metalness={0.85} roughness={0.2} />
-                  </mesh>
                 ))}
-                {([-1, 1] as const).map((sx) =>
-                  ([-1, 1] as const).map((sz) => (
-                    <mesh key={`${sx}_${sz}`} position={[(sx * bk.w) / 2, 0, (sz * bk.d) / 2]}>
-                      <boxGeometry args={[rodR * 2, bk.h, rodR * 2]} />
-                      <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
-                    </mesh>
-                  )),
-                )}
+                {bk.wireRods.map((rod, wi) => (
+                  <mesh
+                    key={`wire_${wi}`}
+                    geometry={basketResources.unitCyl}
+                    material={wireMat}
+                    position={rod.position}
+                    rotation={rod.rotation}
+                    scale={[rodR, rod.length, rodR]}
+                  />
+                ))}
               </group>
             </group>
           );
@@ -1015,6 +1219,15 @@ export function Viewer3D({
           </button>
           <button
             type="button"
+            className={camPreset === 'back' ? 'cam-btn active' : 'cam-btn'}
+            onClick={() => selectView('back')}
+            title="Vista trasera para inspeccionar la tapa / fondo Durolac"
+            aria-label="Vista trasera del mueble"
+          >
+            Atrás
+          </button>
+          <button
+            type="button"
             className={showDimensions ? 'cam-btn active' : 'cam-btn'}
             onClick={() => setShowDimensions((v) => !v)}
             title="Mostrar u ocultar cotas 3D"
@@ -1111,7 +1324,7 @@ export function Viewer3D({
         <ambientLight intensity={0.75} />
         <hemisphereLight args={['#ffffff', '#cbd5e1', 0.6]} />
         <directionalLight position={[4, 7, 5]} intensity={1.1} castShadow />
-        <directionalLight position={[-4, 3, -3]} intensity={0.4} />
+        <directionalLight position={[-2.5, 2.5, -4.5]} intensity={0.55} />
         <gridHelper args={[6, 24, '#94a3b8', '#cbd5e1']} position={[0, -0.001, 0]} />
         <FurnitureMeshGroup
           despiece={despiece}

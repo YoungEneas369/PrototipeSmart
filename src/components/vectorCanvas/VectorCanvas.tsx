@@ -100,6 +100,7 @@ export interface VectorCanvasProps {
   onUpdateMaterialOnly?: (material: MelamineMaterial) => void;
   onToggleExternalLegs?: (hasLegs: boolean, heightMm?: number, count?: number) => void;
   onSelectDepthMm?: (depthMm: number) => void;
+  eyedropperTrigger?: number;
 }
 
 function isEditableFocus(target: EventTarget | null): boolean {
@@ -128,6 +129,7 @@ export function VectorCanvas({
   onUpdateMaterialOnly,
   onToggleExternalLegs,
   onSelectDepthMm,
+  eyedropperTrigger,
 }: VectorCanvasProps) {
   // Pasos y herramientas activas
   const [viewTab, setViewTab] = useState<'frontal' | 'lateral'>('frontal');
@@ -135,9 +137,10 @@ export function VectorCanvas({
   const [frameMode, setFrameMode] = useState<FrameMode>('quad');
   const [pickingCorners, setPickingCorners] = useState<Point2D[] | null>(null);
   const [linesSubMode, setLinesSubMode] = useState<LinesSubMode>('smart');
-  const [strokeMode, setStrokeMode] = useState<UserStrokeMode>('auto');
+  const [strokeMode, setStrokeMode] = useState<UserStrokeMode>('ortho');
   const [subTool, setSubTool] = useState<SubTool>('none');
   const returnStepRef = useRef<TraceStep>('lines');
+  const lastEyedropperTriggerRef = useRef<number>(0);
 
   // Imán APAGADO por defecto para trazado 100% fluido y sin saltos inesperados
   const [magneticSnap, setMagneticSnap] = useState<boolean>(false);
@@ -451,7 +454,6 @@ export function VectorCanvas({
         prevZones,
         params.boardThickness,
       );
-      const hasLegVoid = zones.some((z) => z.kind === 'leg_void');
       const matchedZone = matchZoneIdByCentroid(
         prevZones.find((z) => z.id === effectiveSelectedZoneId),
         zones,
@@ -470,7 +472,7 @@ export function VectorCanvas({
         hShelves: nextHShelves,
         diagonalDividers: nextDiags,
         frontZones: zones,
-        hasBackPanel: hasLegVoid ? false : topology.hasBackPanel,
+        hasBackPanel: topology.hasBackPanel,
         detectionSource: 'manual',
         detectionConfidence: Math.max(0.85, mEval.overallScore / 100),
       });
@@ -527,7 +529,6 @@ export function VectorCanvas({
         opts.preserveZones !== false ? prevZones : [],
         params.boardThickness,
       );
-      const hasLegVoid = zones.some((z) => z.kind === 'leg_void');
       const matchedZone = matchZoneIdByCentroid(
         prevZones.find((z) => z.id === effectiveSelectedZoneId),
         zones,
@@ -547,7 +548,7 @@ export function VectorCanvas({
         hShelves: nextHShelves,
         diagonalDividers: nextDiags,
         frontZones: zones,
-        hasBackPanel: hasLegVoid ? false : topology.hasBackPanel,
+        hasBackPanel: topology.hasBackPanel,
         detectionSource: 'manual',
         detectionConfidence: 0.96,
       });
@@ -883,11 +884,37 @@ export function VectorCanvas({
       setStatusMsg(
         next === 'calibA4'
           ? 'Calibración A4 activa: haz clic en los 2 extremos de tu referencia (297 mm) sobre la foto.'
-          : 'Gotero de color activo: haz clic sobre la melamina para detectar su acabado sin alterar dimensiones.',
+          : 'COPIAR COLOR DE FOTO: Haz clic sobre la madera del mueble para copiar su acabado al 3D.',
       );
     },
     [subTool, traceStep, setLoupeFocusPt, setEyedropperPreview],
   );
+
+  // Activación externa desde la barra lateral ("Copiar color de la foto") vía `eyedropperTrigger`
+  useEffect(() => {
+    if (
+      typeof eyedropperTrigger === 'number' &&
+      eyedropperTrigger > 0 &&
+      eyedropperTrigger !== lastEyedropperTriggerRef.current
+    ) {
+      lastEyedropperTriggerRef.current = eyedropperTrigger;
+      if (!frontBitmap) {
+        setStatusMsg('Sube primero una foto del mueble para copiar su color al 3D.');
+        return;
+      }
+      if (subTool === 'none') {
+        returnStepRef.current = traceStep;
+      }
+      setPickingCorners(null);
+      setSelectedLine(null);
+      setCalibPts([]);
+      setViewTab('frontal');
+      setSubTool('eyedropper');
+      setStatusMsg(
+        'COPIAR COLOR DE FOTO: Haz clic sobre la madera del mueble para copiar su acabado al 3D.',
+      );
+    }
+  }, [eyedropperTrigger, frontBitmap, subTool, traceStep]);
 
   const exitSubTool = useCallback(() => {
     setSubTool('none');
@@ -943,10 +970,10 @@ export function VectorCanvas({
         focal35mm,
         boardThicknessMm: params.boardThickness,
         currentDepthMm: params.targetDimensions.z,
-        preferredDimsMm:
-          origin === 'suggest_lines'
-            ? { x: params.targetDimensions.x, y: params.targetDimensions.y }
-            : undefined,
+        preferredDimsMm: {
+          x: params.targetDimensions.x,
+          y: params.targetDimensions.y,
+        },
         existingBackPanel: topology.hasBackPanel,
       });
       if (!res) return;
@@ -961,7 +988,6 @@ export function VectorCanvas({
 
       const hom = computeQuadToUnitHomography(res.usedQuad);
       const det = res.detection;
-      const hasLegVoid = det.inferredZones.some((z) => z.kind === 'leg_void');
       onAutoPhotoReconstructed?.(res.estimatedDimsMm, det.detectedMaterial);
       onUpdateTopology({
         ...topology,
@@ -974,7 +1000,7 @@ export function VectorCanvas({
         hShelves: det.hShelves,
         diagonalDividers: det.diagonalDividers ?? [],
         frontZones: det.inferredZones,
-        hasBackPanel: hasLegVoid ? false : topology.hasBackPanel,
+        hasBackPanel: topology.hasBackPanel,
         detectionSource: 'auto',
         detectionConfidence: det.confidence,
       });
@@ -1080,6 +1106,7 @@ export function VectorCanvas({
           hShelves: [],
           diagonalDividers: [],
           frontZones: [initZone],
+          hasBackPanel: true,
           detectionSource: 'manual',
           detectionConfidence: 0.9,
         });
@@ -1346,7 +1373,7 @@ export function VectorCanvas({
             if (dxMm !== 0) {
               handleUpdateVDivider(seg.id, {
                 ...seg,
-                position: round4(clampNum(seg.position + dxMm / xInt, 0.03, 0.97)),
+                position: round4(clampNum(seg.position + dxMm / xInt, 0.015, 0.985)),
               });
             } else if (dyMm !== 0 && (seg.start > 0.005 || seg.end < 0.995)) {
               const span = seg.end - seg.start;
@@ -1363,7 +1390,7 @@ export function VectorCanvas({
             if (dyMm !== 0) {
               handleUpdateHShelf(seg.id, {
                 ...seg,
-                position: round4(clampNum(seg.position + dyMm / yInt, 0.03, 0.97)),
+                position: round4(clampNum(seg.position + dyMm / yInt, 0.015, 0.985)),
               });
             } else if (dxMm !== 0 && (seg.start > 0.005 || seg.end < 0.995)) {
               const span = seg.end - seg.start;
@@ -1524,7 +1551,6 @@ export function VectorCanvas({
         onReturnToFrontal={() => setViewTab('frontal')}
         onApplyCalibA4={handleApplyCalibA4}
         onExitSubTool={exitSubTool}
-        onToggleSubTool={toggleSubTool}
         onToggleFrameMode={handleToggleFrameMode}
         onStartPickCorners={() => {
           setFrameMode('quad');
@@ -1591,7 +1617,6 @@ export function VectorCanvas({
         linesSubMode={linesSubMode}
         subTool={subTool}
         visualLayer={visualLayer}
-        strokeMode={strokeMode}
         activeQuad={activeDisplayQuad}
         homography={pointer.displayHomography}
         vDividers={activeVDividers}

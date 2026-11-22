@@ -36,13 +36,7 @@ export type LinesSubMode = 'smart' | 'draw_only' | 'regions';
 export type SubTool = 'none' | 'calibA4' | 'eyedropper';
 export type VisualLayerMode = 'traced_zones' | 'vectors_only' | 'photo' | 'edges';
 
-export type OrthoGuideAxis =
-  | 'horizontal'
-  | 'vertical'
-  | 'near_horizontal'
-  | 'near_vertical'
-  | 'diagonal'
-  | null;
+export type OrthoGuideAxis = 'horizontal' | 'vertical' | 'diagonal' | null;
 
 export interface SelectedSubRegion {
   id: string;
@@ -724,11 +718,12 @@ export function snapPointToStructuralAnchors(
 }
 
 /**
- * Guía ortogonal suave (estilo Figma/Canva) para trazado en vivo (`liveStroke`):
- *  - En modo `'auto'` u `'ortho'`, si el trazo está a `≤ 7°` de horizontal o vertical en espacio
- *    rectificado, suaviza el extremo proyectado para mostrar una línea recta y firme sin temblor.
- *  - Si se inclina `> 18°` (y `< 72°`) en modo `'auto'` (o siempre en `'diagonal'`), transiciona
- *    limpiamente a diagonal real.
+ * Guía ortogonal CERO-SALTOS para trazado en vivo (`liveStroke`):
+ *  - En modo `'diagonal'`: devuelve `rawEndPt` 100 % exacto pixel a pixel (0 saltos, 0 snapping).
+ *  - En modo `'ortho'` (Recta H/V, modo por defecto): determina el eje dominante suavemente
+ *    (`|du * xInt| >= |dv * yInt|`) con histéresis de `6 px` de pantalla para evitar titileo en
+ *    diagonales cercanas a 45°, y proyecta `rawEndPt` directamente sobre el riel en perspectiva
+ *    (`u = rawU, v = startV` si horizontal; `u = startU, v = rawV` si vertical).
  */
 export function computeSmoothOrthoGuide(
   startU: number,
@@ -740,6 +735,10 @@ export function computeSmoothOrthoGuide(
   xf: number,
   yf: number,
   strokeMode: 'auto' | 'ortho' | 'diagonal',
+  prevAxis: 'horizontal' | 'vertical' | null = null,
+  scaleX = 1,
+  scaleY = 1,
+  startImg?: Point2D,
 ): {
   axis: OrthoGuideAxis;
   u: number;
@@ -757,68 +756,70 @@ export function computeSmoothOrthoGuide(
       angleFromHorizDeg: 0,
     };
   }
-  const u2 = exteriorToInterior(unit.x, e, xf);
-  const v2 = exteriorToInterior(unit.y, e, yf);
+  const rawU = exteriorToInterior(unit.x, e, xf);
+  const rawV = exteriorToInterior(unit.y, e, yf);
   const xInt = Math.max(1, xf - 2 * e);
   const yInt = Math.max(1, yf - 2 * e);
-  const dxMm = Math.abs((u2 - startU) * xInt);
-  const dyMm = Math.abs((v2 - startV) * yInt);
+  const dxMm = Math.abs((rawU - startU) * xInt);
+  const dyMm = Math.abs((rawV - startV) * yInt);
   const lenMm = Math.hypot(dxMm, dyMm);
+  const angleFromHorizDeg = lenMm > 1e-3 ? (Math.atan2(dyMm, dxMm) * 180) / Math.PI : 0;
 
-  if (lenMm < 8) {
-    return { axis: null, u: u2, v: v2, guidedImg: rawEndPt, angleFromHorizDeg: 0 };
-  }
-
-  const angleFromHorizDeg = (Math.atan2(dyMm, dxMm) * 180) / Math.PI;
-
+  // Modo Diagonal / Libre: puntero 100 % exacto pixel a pixel, cero snapping ni saltos
   if (strokeMode === 'diagonal') {
-    return { axis: 'diagonal', u: u2, v: v2, guidedImg: rawEndPt, angleFromHorizDeg };
+    return { axis: 'diagonal', u: rawU, v: rawV, guidedImg: rawEndPt, angleFromHorizDeg };
   }
 
-  if (strokeMode === 'ortho') {
-    if (dxMm >= dyMm) {
-      const proj =
-        applyHomography(toCanvas, {
-          x: interiorToExterior(u2, e, xf),
-          y: interiorToExterior(startV, e, yf),
-        }) ?? rawEndPt;
-      return { axis: 'horizontal', u: u2, v: startV, guidedImg: proj, angleFromHorizDeg };
+  // Modo Recta H/V ('ortho', o fallback limpio): proyección directa sobre riel en perspectiva
+  const clampedU = clampNum(rawU, 0, 1);
+  const clampedV = clampNum(rawV, 0, 1);
+  const projH =
+    applyHomography(toCanvas, {
+      x: interiorToExterior(clampedU, e, xf),
+      y: interiorToExterior(startV, e, yf),
+    }) ?? rawEndPt;
+  const projV =
+    applyHomography(toCanvas, {
+      x: interiorToExterior(startU, e, xf),
+      y: interiorToExterior(clampedV, e, yf),
+    }) ?? rawEndPt;
+
+  const originImg =
+    startImg ??
+    applyHomography(toCanvas, {
+      x: interiorToExterior(startU, e, xf),
+      y: interiorToExterior(startV, e, yf),
+    }) ??
+    rawEndPt;
+  const screenDist = distScreenPx(originImg, rawEndPt, scaleX, scaleY);
+
+  if (screenDist < 3 && lenMm < 6) {
+    if (prevAxis === 'horizontal') {
+      return { axis: 'horizontal', u: clampedU, v: startV, guidedImg: projH, angleFromHorizDeg };
     }
-    const proj =
-      applyHomography(toCanvas, {
-        x: interiorToExterior(startU, e, xf),
-        y: interiorToExterior(v2, e, yf),
-      }) ?? rawEndPt;
-    return { axis: 'vertical', u: startU, v: v2, guidedImg: proj, angleFromHorizDeg };
+    if (prevAxis === 'vertical') {
+      return { axis: 'vertical', u: startU, v: clampedV, guidedImg: projV, angleFromHorizDeg };
+    }
+    return { axis: null, u: rawU, v: rawV, guidedImg: rawEndPt, angleFromHorizDeg };
   }
 
-  // Modo 'auto': guía firme ≤ 7°; zona libre entre 7°..18°; diagonal limpia entre 18°..72°
-  if (angleFromHorizDeg <= 7) {
-    const proj =
-      applyHomography(toCanvas, {
-        x: interiorToExterior(u2, e, xf),
-        y: interiorToExterior(startV, e, yf),
-      }) ?? rawEndPt;
-    return { axis: 'horizontal', u: u2, v: startV, guidedImg: proj, angleFromHorizDeg };
+  // Histéresis de 6 px reales de pantalla convertida al espacio físico del mueble
+  const mmPerPx = screenDist > 1e-3 ? lenMm / screenDist : 1;
+  const hystMm = 6 * mmPerPx;
+
+  let chosenAxis: 'horizontal' | 'vertical';
+  if (prevAxis === 'horizontal') {
+    chosenAxis = dyMm > dxMm + hystMm ? 'vertical' : 'horizontal';
+  } else if (prevAxis === 'vertical') {
+    chosenAxis = dxMm > dyMm + hystMm ? 'horizontal' : 'vertical';
+  } else {
+    chosenAxis = dxMm >= dyMm ? 'horizontal' : 'vertical';
   }
-  if (angleFromHorizDeg >= 83) {
-    const proj =
-      applyHomography(toCanvas, {
-        x: interiorToExterior(startU, e, xf),
-        y: interiorToExterior(v2, e, yf),
-      }) ?? rawEndPt;
-    return { axis: 'vertical', u: startU, v: v2, guidedImg: proj, angleFromHorizDeg };
+
+  if (chosenAxis === 'horizontal') {
+    return { axis: 'horizontal', u: clampedU, v: startV, guidedImg: projH, angleFromHorizDeg };
   }
-  if (angleFromHorizDeg >= 18 && angleFromHorizDeg <= 72) {
-    return { axis: 'diagonal', u: u2, v: v2, guidedImg: rawEndPt, angleFromHorizDeg };
-  }
-  return {
-    axis: angleFromHorizDeg < 45 ? 'near_horizontal' : 'near_vertical',
-    u: u2,
-    v: v2,
-    guidedImg: rawEndPt,
-    angleFromHorizDeg,
-  };
+  return { axis: 'vertical', u: startU, v: clampedV, guidedImg: projV, angleFromHorizDeg };
 }
 
 // ============================================================================

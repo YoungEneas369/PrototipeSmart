@@ -28,6 +28,7 @@ import {
 } from '../mathEngine';
 import {
   analyzeRectifiedFurniture,
+  consolidateNarrowCenterDividers,
   detectLowerGapHint,
   type BandDetectionResult,
   type LowerGapHintResult,
@@ -49,9 +50,11 @@ import {
   quadArea,
   rgbaLuminance,
   sampleExteriorBgRgb,
+  sampleLocalExteriorBgRgb,
   sampleLumSafe,
   sampleRgbaSafe,
   sobel3x3At,
+  type LocalExteriorBgSamples,
 } from './imageOps';
 import {
   autoDetectFurnitureQuad,
@@ -66,6 +69,7 @@ import { runRecursiveXYCut, type XYCutCandidate } from './xyCut';
 import {
   classifyZonesUnified,
   detectHandlesLocalContrast,
+  detectMetallicBasketRails,
   suppressShelvesInsideDrawers,
 } from './zoneClassifier';
 
@@ -1229,6 +1233,7 @@ export function evaluate3DvsPhotoSimilarity(
   topology: FurnitureTopology,
   params: ScaleAndBoardParams,
   exteriorBgRgb: [number, number, number] = [242, 244, 248],
+  localExteriorBg?: LocalExteriorBgSamples,
 ): Visual3DSimilarityResult {
   if (rectW < 24 || rectH < 24 || despiece.matrizDespiece.length === 0) {
     return {
@@ -1250,6 +1255,10 @@ export function evaluate3DvsPhotoSimilarity(
   const synB = new Float32Array(n);
   const synOcc = new Uint8Array(n); // 0 = fondo ext, 1 = vano abierto sombreado, 2 = tablero/puerta/cajón/rejilla
   const synZ = new Float32Array(n).fill(-1e9);
+  // Fondo de referencia por píxel (soporta paredes locales distintas en esquinas `void_outside`)
+  const refBgR = new Float32Array(n).fill(exteriorBgRgb[0]);
+  const refBgG = new Float32Array(n).fill(exteriorBgRgb[1]);
+  const refBgB = new Float32Array(n).fill(exteriorBgRgb[2]);
 
   const hasBack = topology.hasBackPanel;
   const cavityShade = hasBack ? 0.55 : 0.85;
@@ -1272,6 +1281,13 @@ export function evaluate3DvsPhotoSimilarity(
   for (const z of topology.frontZones ?? []) {
     if (z.kind === 'leg_void' || z.kind === 'void_outside') {
       const isOut = z.kind === 'void_outside';
+      const cornerWallBg = isOut
+        ? z.uEnd >= 0.94
+          ? (localExteriorBg?.rightWallBgRgb ?? localExteriorBg?.topRightBgRgb ?? exteriorBgRgb)
+          : z.uStart <= 0.06
+            ? (localExteriorBg?.leftWallBgRgb ?? localExteriorBg?.topLeftBgRgb ?? exteriorBgRgb)
+            : exteriorBgRgb
+        : exteriorBgRgb;
       const rect = interiorToExteriorRect(z, { x: xf, y: yf }, eMm, gW, gH, 0);
       const x0 = isOut && z.uStart <= 0.02 ? 0 : rect.x0;
       const x1 = isOut && z.uEnd >= 0.98 ? gW - 1 : rect.x1;
@@ -1280,9 +1296,12 @@ export function evaluate3DvsPhotoSimilarity(
       for (let y = y0; y <= y1; y++) {
         for (let x = x0; x <= x1; x++) {
           const idx = y * gW + x;
-          synR[idx] = exteriorBgRgb[0];
-          synG[idx] = exteriorBgRgb[1];
-          synB[idx] = exteriorBgRgb[2];
+          synR[idx] = cornerWallBg[0];
+          synG[idx] = cornerWallBg[1];
+          synB[idx] = cornerWallBg[2];
+          refBgR[idx] = cornerWallBg[0];
+          refBgG[idx] = cornerWallBg[1];
+          refBgB[idx] = cornerWallBg[2];
           synOcc[idx] = 0;
         }
       }
@@ -1291,9 +1310,24 @@ export function evaluate3DvsPhotoSimilarity(
       const bw = rect.x1 - rect.x0;
       const bh = rect.y1 - rect.y0;
       if (bw >= 4 && bh >= 6) {
+        // Fondo interior oscuro de nicho + rieles metálicos brillantes y rejilla frontal
+        const cavRgb: [number, number, number] = [
+          baseCarcassRgb[0] * 0.42,
+          baseCarcassRgb[1] * 0.42,
+          baseCarcassRgb[2] * 0.42,
+        ];
+        for (let y = rect.y0; y <= rect.y1; y++) {
+          for (let x = rect.x0; x <= rect.x1; x++) {
+            const idx = y * gW + x;
+            synR[idx] = cavRgb[0];
+            synG[idx] = cavRgb[1];
+            synB[idx] = cavRgb[2];
+            synOcc[idx] = 1;
+          }
+        }
         const nb = Math.max(1, Math.min(6, Math.round(z.basketCount ?? 3)));
         const slotH = bh / nb;
-        const wireRgb: [number, number, number] = [188, 194, 202];
+        const wireRgb: [number, number, number] = [202, 206, 212];
         const basketZ = params.targetDimensions.z * 0.9;
         for (let k = 0; k < nb; k++) {
           const by0 = clamp(Math.round(rect.y0 + k * slotH + slotH * 0.22), rect.y0, rect.y1);
@@ -1429,11 +1463,11 @@ export function evaluate3DvsPhotoSimilarity(
       colorDistSum += dCol;
 
       const dExt = Math.hypot(
-        phoR[gi] - exteriorBgRgb[0],
-        phoG[gi] - exteriorBgRgb[1],
-        phoB[gi] - exteriorBgRgb[2],
+        phoR[gi] - refBgR[gi],
+        phoG[gi] - refBgG[gi],
+        phoB[gi] - refBgB[gi],
       );
-      const photoIsVoid = dExt < 26;
+      const photoIsVoid = dExt < 32;
       const synIsVoid = synOcc[gi] === 0;
       if (photoIsVoid === synIsVoid) silHits++;
     }
@@ -1582,6 +1616,7 @@ export function reconstructStructureFromVectors(
   boardThicknessMm: number,
   detectedMaterial: MelamineMaterial,
   exteriorBgRgb: [number, number, number] = [245, 245, 245],
+  localExteriorBg?: LocalExteriorBgSamples,
 ): VectorStructureReconstruction {
   const fullQuad: [Point2D, Point2D, Point2D, Point2D] = [
     { x: 0, y: 0 },
@@ -1793,7 +1828,20 @@ export function reconstructStructureFromVectors(
     );
   });
 
+  const lum = extractLuminanceBuffer(rectRgba, W, H, true);
+  const isBasketReg = (u0: number, u1: number, v0: number, v1: number): boolean => {
+    const spanU = u1 - u0;
+    const spanV = v1 - v0;
+    if (spanU < 0.14 || spanU > 0.52 || spanV < 0.36) return false;
+    const cellWmm = spanU * dimsMm.x;
+    const cellHmm = spanV * dimsMm.y;
+    if (cellHmm < 240 || cellWmm > 560 || cellWmm / Math.max(1, cellHmm) > 1.2) return false;
+    const r = interiorToExteriorRect({ uStart: u0, uEnd: u1, vStart: v0, vEnd: v1 }, dimsMm, boardThicknessMm, W, H, 0.02);
+    return detectMetallicBasketRails(rectRgba, lum, W, H, r.x0, r.x1, r.y0, r.y1).isBasketRails;
+  };
+
   // Partición jerárquica XY-Cut unificada en espacio interior normalizado puro (`vTopDownPx: false`)
+  const minVertSpacing = dimsMm.x <= 900 ? 0.2 : 0.14;
   const xyRes = runRecursiveXYCut(
     { rx0: 0, rx1: 1, ry0: 0, ry1: 1, u0: 0, u1: 1, v0: 0, v1: 1 },
     {
@@ -1806,6 +1854,7 @@ export function reconstructStructureFromVectors(
       vTopDownPx: false,
       idPrefix: { v: 'vec_div', h: 'vec_rep' },
       findVerticalCuts: (reg): XYCutCandidate[] => {
+        if (isBasketReg(reg.u0, reg.u1, reg.v0, reg.v1)) return [];
         const spanU = reg.u1 - reg.u0;
         const spanV = reg.v1 - reg.v0;
         const vIn = candV
@@ -1825,7 +1874,7 @@ export function reconstructStructureFromVectors(
 
         const selected: XYCutCandidate[] = [];
         for (const v of vIn) {
-          if (selected.every((prev) => Math.abs(prev.posNorm - v.pos) >= 0.14)) {
+          if (selected.every((prev) => Math.abs(prev.posNorm - v.pos) >= minVertSpacing)) {
             selected.push({
               posNorm: clamp(v.pos, 0.05, 0.95),
               posPx: clamp(v.pos, 0.05, 0.95),
@@ -1836,6 +1885,7 @@ export function reconstructStructureFromVectors(
         return selected;
       },
       findHorizontalCuts: (reg): XYCutCandidate[] => {
+        if (isBasketReg(reg.u0, reg.u1, reg.v0, reg.v1)) return [];
         const spanU = reg.u1 - reg.u0;
         const spanV = reg.v1 - reg.v0;
         const hIn = candH
@@ -1869,15 +1919,15 @@ export function reconstructStructureFromVectors(
         const scoreV = vCuts.reduce((acc, s) => Math.max(acc, s.score), 0);
         const scoreH = hCuts.reduce((acc, s) => Math.max(acc, s.score), 0);
         if (vCuts.length === 0 && hCuts.length === 0) return 'none';
-        const preferHoriz = dimsMm.y > dimsMm.x * 1.12 && hCuts.length > 0 && scoreH >= scoreV * 0.82;
+        const preferHoriz = dimsMm.y > dimsMm.x * 1.05 && hCuts.length > 0 && scoreH >= scoreV * 0.78;
         if (hCuts.length > 0 && (preferHoriz || scoreH > scoreV)) return 'horizontal';
         return vCuts.length > 0 ? 'vertical' : 'horizontal';
       },
     },
   );
 
-  const lum = extractLuminanceBuffer(rectRgba, W, H, true);
-  const vSeamPxs = xyRes.vDividers.map(
+  const consolidatedV = consolidateNarrowCenterDividers(xyRes.vDividers, dimsMm);
+  const vSeamPxs = consolidatedV.map(
     (d) => interiorToExteriorPoint(d.position, 0.5, dimsMm, boardThicknessMm).uExt * W,
   );
   const hSeamPxs = xyRes.hShelves.map((s) => ({
@@ -1886,11 +1936,11 @@ export function reconstructStructureFromVectors(
     uEnd: s.end,
   }));
   const detectedHandles =
-    xyRes.vDividers.length + xyRes.hShelves.length > 0
+    consolidatedV.length + xyRes.hShelves.length > 0
       ? detectHandlesLocalContrast(lum, W, H, vSeamPxs, hSeamPxs, dimsMm, boardThicknessMm)
       : [];
 
-  // Clasificación unificada CIE-Lab + interiorToExteriorRect + fusión verificada de cajones
+  // Clasificación unificada CIE-Lab + interiorToExteriorRect usando el `carcassRgb` real de la foto
   const inferredZones = classifyZonesUnified(
     xyRes.leaves.map((lf) => ({ uStart: lf.u0, uEnd: lf.u1, vStart: lf.v0, vEnd: lf.v1 })),
     {
@@ -1900,8 +1950,9 @@ export function reconstructStructureFromVectors(
       dimsMm,
       boardThicknessMm,
       carcassMaterial: detectedMaterial,
-      refRgb: MATERIAL_BASE_RGB[detectedMaterial],
+      refRgb: carcassRgb,
       exteriorBgRgb,
+      localExteriorBg,
       lum,
       detectedHandles,
       mergeDrawers: true,
@@ -1913,8 +1964,42 @@ export function reconstructStructureFromVectors(
   // Eliminar repisas interiores duplicadas dentro de zonas clasificadas como `drawers`
   const hShelves = suppressShelvesInsideDrawers(xyRes.hShelves, inferredZones);
 
+  // Guardia anti-sobre-segmentación para mesas bajas muy apaisadas abiertas (`H <= 500 mm, W/H >= 2.0`, #08)
+  const isLowWideTable = dimsMm.y <= 500 && dimsMm.x / Math.max(1, dimsMm.y) >= 2.0;
+  if (
+    isLowWideTable &&
+    !consolidatedV.some((d) => d.end - d.start >= 0.78) &&
+    rawDiags.length === 0
+  ) {
+    const openFrac =
+      inferredZones.length > 0
+        ? inferredZones.filter((z) => z.kind === 'open').length / inferredZones.length
+        : 1;
+    if (openFrac >= 0.5) {
+      return {
+        vDividers: [],
+        hShelves: [],
+        diagonalDividers: [],
+        inferredZones: [
+          {
+            id: 'vz_open_1',
+            uStart: 0,
+            uEnd: 1,
+            vStart: 0,
+            vEnd: 1,
+            kind: 'open',
+            label: 'Vano 1',
+          },
+        ],
+        detectedMaterial,
+        vectorLinesUsed: 0,
+        furnitureMode: 'open',
+      };
+    }
+  }
+
   // Anclar extremos de diagonales reales detectadas a muros/divisores/repisas en espacio interior
-  const uAnchors = [0, ...xyRes.vDividers.map((d) => d.position), 1];
+  const uAnchors = [0, ...consolidatedV.map((d) => d.position), 1];
   const vAnchors = [0, ...hShelves.map((s) => s.position), 1];
   const diagonalDividers: DiagonalSegment[] = rawDiags.map((d, idx) => ({
     id: `vec_diag_${idx + 1}`,
@@ -1934,7 +2019,7 @@ export function reconstructStructureFromVectors(
     hasOpen && hasClosed ? 'hybrid' : hasClosed ? 'closed_front' : 'open';
 
   return {
-    vDividers: xyRes.vDividers,
+    vDividers: consolidatedV,
     hShelves,
     diagonalDividers,
     inferredZones,
@@ -2061,13 +2146,21 @@ export function runIterativePhotoTo3D(
   const { width: dstW, height: dstH } = computeRectifiedSize(effX, effY, e);
   const rectRgba = rectifyImageRGBA(rgba, imgW, imgH, hom.toCanvas, dstW, dstH);
   const legsHint = detectLowerGapHint(rgba, imgW, imgH, usedQuad, autoQuad.exteriorBgRgb);
+  const localExteriorBg = sampleLocalExteriorBgRgb(
+    rgba,
+    imgW,
+    imgH,
+    usedQuad,
+    autoQuad.exteriorBgRgb,
+  );
 
-  // Candidato A: Detector Dual/Híbrido unificado
+  // Candidato A: Detector Dual/Híbrido unificado (con niveles jerárquicos, escalón local y canastos)
   const detA = analyzeRectifiedFurniture(rectRgba, dstW, dstH, { x: effX, y: effY }, e, {
     seedPoint: opts.seedPoint,
     parallaxAware: true,
     horizonV: cameraPose?.estimatedHorizonV ?? 0.5,
     exteriorBgRgb: autoQuad.exteriorBgRgb,
+    localExteriorBg,
   });
 
   const scoreCandidate = (
@@ -2085,7 +2178,8 @@ export function runIterativePhotoTo3D(
       diagonalDividers: detObj.diagonalDividers,
       shelfMode: 'custom',
       equalShelfCount: 0,
-      hasBackPanel: hasLegVoid ? false : (opts.existingBackPanel ?? true),
+      // Mantener `hasBackPanel` verdadero por defecto; `mathEngine` ya recorta el fondo detrás de `leg_void`
+      hasBackPanel: opts.existingBackPanel ?? true,
       baseSupportType: hasLegVoid
         ? 'none'
         : (legsHint.supportType ?? (legsHint.possibleExternalLegs ? 'legs' : 'none')),
@@ -2120,6 +2214,7 @@ export function runIterativePhotoTo3D(
       topo,
       prm,
       autoQuad.exteriorBgRgb,
+      localExteriorBg,
     );
   };
 
@@ -2138,6 +2233,7 @@ export function runIterativePhotoTo3D(
       e,
       detA.detectedMaterial,
       autoQuad.exteriorBgRgb,
+      localExteriorBg,
     );
     if (vecRec.inferredZones.length > 0 || vecRec.diagonalDividers.length > 0) {
       const detB: BandDetectionResult = {
@@ -2151,7 +2247,28 @@ export function runIterativePhotoTo3D(
         confidence: Math.max(detA.confidence, 0.72),
       };
       const simB = scoreCandidate(detB, detB.detectedMaterial);
-      if (simB.overallScore > bestSim.overallScore) {
+      const detAHasSpecial = detA.inferredZones.some(
+        (z) =>
+          z.kind === 'void_outside' ||
+          z.kind === 'baskets' ||
+          z.kind === 'door_glass' ||
+          z.kind === 'drawers' ||
+          z.materialOverride !== undefined,
+      );
+      const detBLosesStructure =
+        detA.vDividers.length > detB.vDividers.length ||
+        (detAHasSpecial &&
+          !detB.inferredZones.some(
+            (z) => z.kind === 'void_outside' || z.kind === 'baskets' || z.kind === 'door_glass',
+          ));
+      // Priorizar la topología limpia de `band_hybrid` (detA) cuando ya es confiable (>= 0.62),
+      // evitando el auto-sesgo de líneas Canny crudas en `vector_first` salvo que detA sea incierto o vacío
+      const detAReliable =
+        detA.furnitureMode !== 'uncertain' &&
+        detA.confidence >= 0.62 &&
+        detA.inferredZones.length >= 1;
+      const minMargin = detAReliable ? (detBLosesStructure || detAHasSpecial ? 18 : 12) : 0;
+      if (simB.overallScore > bestSim.overallScore + minMargin) {
         bestDet = detB;
         bestSim = simB;
         selectedStrategy = 'vector_first';

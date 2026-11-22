@@ -5,7 +5,7 @@
  *   2. Plano 2D y Partes (V₀ vs V_f + ZoneInspector unificado)
  *   3. Taller (Unidad 3, Alertas DIN, Matrices n×3/n×5, Herrajes + Presupuesto CLP editable y Corte 2D)
  */
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Box,
@@ -13,6 +13,7 @@ import {
   Eye,
   EyeOff,
   Lock,
+  Pipette,
   Ruler,
   Unlock,
   Wrench,
@@ -123,6 +124,12 @@ export default function App() {
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
   const [hoveredZoneId, setHoveredZoneId] = useState<string | null>(null);
 
+  // Disparo del selector de color desde la foto (`VectorCanvas.eyedropperTrigger`) y control de tapa trasera
+  const [eyedropperTrigger, setEyedropperTrigger] = useState<number>(0);
+  const [hasLoadedPhoto, setHasLoadedPhoto] = useState<boolean>(false);
+  const photoSessionRef = useRef<boolean>(false);
+  const userBackPanelOverrideRef = useRef<boolean | null>(null);
+
   // Confirmación no bloqueante al sobrescribir acabados mixtos por zona
   const [pendingFrontMaterialChoice, setPendingFrontMaterialChoice] = useState<
     MelamineMaterial | 'same' | null
@@ -173,6 +180,9 @@ export default function App() {
     if (params.costConfig) {
       cloned.params.costConfig = { ...params.costConfig };
     }
+    photoSessionRef.current = false;
+    userBackPanelOverrideRef.current = null;
+    setHasLoadedPhoto(false);
     setActivePreset(key);
     setActiveCatalogId('');
     setExternalPhotoUrl(null);
@@ -209,9 +219,13 @@ export default function App() {
       cloned.params.targetDimensions.y > 0
         ? cloned.params.targetDimensions.x / cloned.params.targetDimensions.y
         : cloned.topology.aspectRatioXY;
+    photoSessionRef.current = true;
+    userBackPanelOverrideRef.current = null;
+    setHasLoadedPhoto(true);
     setActivePreset(null);
     setActiveCatalogId(catalogId);
-    setTopology({ ...cloned.topology, aspectRatioXY: catalogRatio });
+    // Activa tapa trasera por defecto en muebles reales del catálogo (respeta `leg_void` y `void_outside`)
+    setTopology({ ...cloned.topology, aspectRatioXY: catalogRatio, hasBackPanel: true });
     setParams(cloned.params);
     setExternalPhotoUrl(`./ejemplos/${cloned.spec.photoFile}`);
     setExternalPhotoLabel(cloned.spec.name);
@@ -232,14 +246,35 @@ export default function App() {
     setActivePreset(null);
     setModelApproved(false);
     setPendingFrontMaterialChoice(null);
+
+    const isPhotoBacked =
+      photoSessionRef.current ||
+      activeCatalogId !== '' ||
+      Boolean(externalPhotoUrl) ||
+      Boolean(next.quadCorners) ||
+      next.detectionSource === 'auto';
+    if (isPhotoBacked) {
+      photoSessionRef.current = true;
+      if (!hasLoadedPhoto) setHasLoadedPhoto(true);
+    }
+
+    const resolvedHasBackPanel =
+      userBackPanelOverrideRef.current !== null
+        ? userBackPanelOverrideRef.current
+        : isPhotoBacked
+          ? true
+          : next.hasBackPanel;
+
     // En muebles del catálogo QA con dimensiones reales verificadas, conserva su proporción
     // de referencia para que una perspectiva 3/4 de la foto nunca dispare falsas alertas (~245%).
     const catalogRefRatio =
       activeCatalogId !== '' && params.referenceDimensions.y > 0
         ? params.referenceDimensions.x / params.referenceDimensions.y
         : null;
-    const normalizedNext: FurnitureTopology =
-      catalogRefRatio !== null ? { ...next, aspectRatioXY: catalogRefRatio } : next;
+    const normalizedNext: FurnitureTopology = {
+      ...(catalogRefRatio !== null ? { ...next, aspectRatioXY: catalogRefRatio } : next),
+      hasBackPanel: resolvedHasBackPanel,
+    };
 
     // Si cambia aspectRatioXY tras ajustar contorno, sincroniza lockedRatioXY limpiamente
     if (
@@ -362,6 +397,10 @@ export default function App() {
     rawDims: { x: number; y: number; z: number },
     detectedMaterial?: MelamineMaterial,
   ) => {
+    photoSessionRef.current = true;
+    setHasLoadedPhoto(true);
+    const desiredBackPanel = userBackPanelOverrideRef.current ?? true;
+
     // Si el usuario está editando un mueble del catálogo QA, conserva sus dimensiones actuales
     // y sincroniza lockedRatioXY con la silueta vigente sin activar candado ni alertas falsas.
     if (activeCatalogId !== '') {
@@ -371,6 +410,14 @@ export default function App() {
           : topology.aspectRatioXY;
       setLockedRatioXY(curRatio);
       setModelApproved(false);
+      if (detectedMaterial) {
+        setParams((p) => (p.material === detectedMaterial ? p : { ...p, material: detectedMaterial }));
+      }
+      setTopology((prev) =>
+        prev.hasBackPanel === desiredBackPanel
+          ? prev
+          : { ...prev, hasBackPanel: desiredBackPanel },
+      );
       setStudioMode((cur) => (cur === 'photo' ? 'split' : cur));
       return;
     }
@@ -388,6 +435,7 @@ export default function App() {
     setTopology((prev) => ({
       ...prev,
       aspectRatioXY: nextRatio,
+      hasBackPanel: desiredBackPanel,
     }));
     setStudioMode((cur) => (cur === 'photo' ? 'split' : cur));
   };
@@ -616,6 +664,7 @@ export default function App() {
 
   const hasCenterDivider = topology.vDividers.some((d) => Math.abs(d.position - 0.5) < 0.03);
   const isPhotoVisible = activeView === 'studio' && studioMode !== '3d';
+  const hasPhotoAvailable = Boolean(activeCatalogId || externalPhotoUrl || hasLoadedPhoto);
   const depthPresetMm = [320, 400, 500, 550];
 
   const choiceLabel = (choice: MelamineMaterial | 'same'): string =>
@@ -908,16 +957,27 @@ export default function App() {
               </div>
             </div>
 
-            <label className="toggle-label">
+            <label
+              className={
+                topology.hasBackPanel
+                  ? 'toggle-label toggle-backpanel active'
+                  : 'toggle-label toggle-backpanel'
+              }
+              title="Coloca una plancha trasera sólida de Durolac/MDF detrás del mueble (respeta automáticamente huecos de piernas y escalones)"
+            >
               <input
                 type="checkbox"
                 checked={topology.hasBackPanel}
                 onChange={(e) => {
+                  const checked = e.target.checked;
+                  userBackPanelOverrideRef.current = checked;
                   setModelApproved(false);
-                  setTopology((prev) => ({ ...prev, hasBackPanel: e.target.checked }));
+                  setTopology((prev) => ({ ...prev, hasBackPanel: checked }));
                 }}
               />
-              Fondo trasero Durolac / MDF ({params.backPanelThickness} mm)
+              <span>
+                <strong>Tapa / Fondo trasero (Durolac {params.backPanelThickness} mm)</strong>
+              </span>
             </label>
 
             <div className="thickness-row">
@@ -1134,6 +1194,21 @@ export default function App() {
                 </button>
               ))}
             </div>
+
+            {hasPhotoAvailable && (
+              <button
+                type="button"
+                className="btn-eyedropper-photo"
+                onClick={() => {
+                  if (activeView !== 'studio') setActiveView('studio');
+                  if (studioMode === '3d') setStudioMode('split');
+                  setEyedropperTrigger((n) => n + 1);
+                }}
+                title="Haz clic sobre cualquier parte del mueble en la foto para copiar su color automáticamente"
+              >
+                <Pipette size={13} /> Copiar color desde la foto
+              </button>
+            )}
 
             <div className="small-note muted">Cubierta superior (opcional):</div>
             <div className="chip-row">
@@ -1524,6 +1599,7 @@ export default function App() {
                 onUpdateMaterialOnly={handleUpdateMaterialOnly}
                 onToggleExternalLegs={handleToggleExternalLegs}
                 onSelectDepthMm={(z) => updateTargetDim('z', z)}
+                eyedropperTrigger={eyedropperTrigger}
               />
             </div>
 

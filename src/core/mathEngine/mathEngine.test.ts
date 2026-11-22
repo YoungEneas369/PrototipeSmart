@@ -661,4 +661,94 @@ describe('SmartFurniture Bloque 1 — Motor Matemático y Homografía (v3.0)', (
     const restored = applyHomography(hom!.toCanvas, u)!;
     expect(Math.hypot(restored.x - probe4k.x, restored.y - probe4k.y)).toBeLessThan(1e-6);
   });
+
+  it('20. Tapa trasera inteligente con `leg_void`: cierra cajoneras/pedestales y deja abierto el hueco de piernas con 0 solapamientos 3D', () => {
+    // Caso A: Escritorio con hueco de piernas a la izquierda + cajonera derecha de piso a cubierta
+    const { topology, params } = clonePreset('estanteria');
+    params.targetDimensions = { x: 1400, y: 750, z: 600 };
+    params.referenceDimensions = { x: 1400, y: 750, z: 600 };
+    params.cornerJointType = 'topOverSides';
+    topology.shelfMode = 'custom';
+    topology.equalShelfCount = 0;
+    topology.hasBackPanel = true;
+    topology.vDividers = [{ id: 'ped_div', position: 0.65, start: 0, end: 1 }];
+    topology.hShelves = [];
+    topology.frontZones = [
+      { id: 'hueco_piernas', uStart: 0, uEnd: 0.65, vStart: 0, vEnd: 1, kind: 'leg_void' },
+      { id: 'ped_cajones', uStart: 0.65, uEnd: 1, vStart: 0, vEnd: 1, kind: 'drawers', drawerCount: 3 },
+    ];
+
+    const resA = calculateDespiece(topology, params);
+    assertNo3DOverlap(resA.matrizDespiece);
+
+    const pedDiv = resA.matrizDespiece.find((p) => p.id === 'ped_div')!;
+    const fondosA = resA.matrizDespiece.filter((p) => p.tipo === 'fondo');
+    expect(fondosA).toHaveLength(1);
+    const fondoPed = fondosA[0];
+    const fMinX = fondoPed.posicion3D[0] - fondoPed.dimensiones3D[0] / 2;
+    const fMaxX = fondoPed.posicion3D[0] + fondoPed.dimensiones3D[0] / 2;
+    const fMinY = fondoPed.posicion3D[1] - fondoPed.dimensiones3D[1] / 2;
+    const fMaxY = fondoPed.posicion3D[1] + fondoPed.dimensiones3D[1] / 2;
+    // Tapa trasera sólida cubre estrictamente la cajonera derecha [pedDiv.cx, xf] × [0, yf]
+    expect(fMinX).toBeCloseTo(pedDiv.posicion3D[0], 3);
+    expect(fMaxX).toBeCloseTo(1400, 3);
+    expect(fMinY).toBeCloseTo(0, 3);
+    expect(fMaxY).toBeCloseTo(750, 3);
+    expect(fondoPed.posicion3D[2]).toBeCloseTo(-1.5, 4);
+
+    // Caso B: Escritorio ejecutivo con 2 pedestales laterales + hueco central de piernas + cajón central superior
+    const exec = clonePreset('estanteria');
+    exec.params.targetDimensions = { x: 1500, y: 750, z: 600 };
+    exec.params.referenceDimensions = { x: 1500, y: 750, z: 600 };
+    exec.topology.shelfMode = 'custom';
+    exec.topology.equalShelfCount = 0;
+    exec.topology.hasBackPanel = true;
+    exec.topology.vDividers = [
+      { id: 'd_izq', position: 0.27, start: 0, end: 1 },
+      { id: 'd_der', position: 0.73, start: 0, end: 1 },
+    ];
+    exec.topology.hShelves = [
+      { id: 'r_caj_cen', position: 0.8, start: 0.27, end: 0.73 },
+    ];
+    exec.topology.frontZones = [
+      { id: 'p_izq', uStart: 0, uEnd: 0.27, vStart: 0, vEnd: 1, kind: 'door_left' },
+      { id: 'void_c', uStart: 0.27, uEnd: 0.73, vStart: 0, vEnd: 0.8, kind: 'leg_void' },
+      { id: 'c_cen', uStart: 0.27, uEnd: 0.73, vStart: 0.8, vEnd: 1, kind: 'drawers', drawerCount: 1 },
+      { id: 'p_der', uStart: 0.73, uEnd: 1, vStart: 0, vEnd: 1, kind: 'door_right' },
+    ];
+
+    const resB = calculateDespiece(exec.topology, exec.params);
+    assertNo3DOverlap(resB.matrizDespiece);
+
+    const fondosB = resB.matrizDespiece.filter((p) => p.tipo === 'fondo');
+    expect(fondosB).toHaveLength(3);
+    // Los 2 pedestales tienen tapa completa de 750 mm; el cajón central superior tiene tapa recortada encima del hueco de piernas
+    expect(fondosB.filter((f) => Math.abs(f.alto - 750) < 0.5)).toHaveLength(2);
+    const cenTopBack = fondosB.find((f) => f.alto < 300)!;
+    expect(cenTopBack).toBeDefined();
+    expect(cenTopBack.posicion3D[1] - cenTopBack.dimensiones3D[1] / 2).toBeGreaterThan(550);
+
+    // Caso C: Cajonera suspendida derecha sobre doble `leg_void` (izquierda + debajo)
+    const susp = clonePreset('estanteria');
+    susp.params.targetDimensions = { x: 1200, y: 750, z: 600 };
+    susp.params.referenceDimensions = { x: 1200, y: 750, z: 600 };
+    susp.topology.shelfMode = 'custom';
+    susp.topology.equalShelfCount = 0;
+    susp.topology.hasBackPanel = true;
+    susp.topology.vDividers = [{ id: 'd_caj', position: 0.64, start: 0.56, end: 1 }];
+    susp.topology.hShelves = [{ id: 'r_bajo_caj', position: 0.56, start: 0.64, end: 1 }];
+    susp.topology.frontZones = [
+      { id: 'void_izq', uStart: 0, uEnd: 0.64, vStart: 0, vEnd: 1, kind: 'leg_void' },
+      { id: 'void_bajo', uStart: 0.64, uEnd: 1, vStart: 0, vEnd: 0.56, kind: 'leg_void' },
+      { id: 'caj_der', uStart: 0.64, uEnd: 1, vStart: 0.56, vEnd: 1, kind: 'drawers', drawerCount: 2 },
+    ];
+
+    const resC = calculateDespiece(susp.topology, susp.params);
+    assertNo3DOverlap(resC.matrizDespiece);
+
+    const fondosC = resC.matrizDespiece.filter((p) => p.tipo === 'fondo');
+    expect(fondosC).toHaveLength(1);
+    expect(fondosC[0].posicion3D[0] - fondosC[0].dimensiones3D[0] / 2).toBeGreaterThan(750);
+    expect(fondosC[0].posicion3D[1] - fondosC[0].dimensiones3D[1] / 2).toBeGreaterThan(400);
+  });
 });

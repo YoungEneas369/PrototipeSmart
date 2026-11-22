@@ -700,19 +700,58 @@ export interface BackPanelRect {
 }
 
 /**
+ * Convierte zonas `leg_void` (huecos de piernas de escritorios/mesas) en rectángulos exteriores mm
+ * a excluir del fondo trasero 3 mm, manteniendo tapa trasera sólida detrás de cajoneras y puertas.
+ */
+export function computeLegVoidBackExcludedBoxes(
+  frontZones: readonly FrontZone[],
+  xf: number,
+  yf: number,
+  e: number,
+): Array<{ x0: number; x1: number; y0: number; y1: number }> {
+  const xInt = xf - 2 * e;
+  const yInt = yf - 2 * e;
+  const boxes: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
+
+  for (const z of frontZones) {
+    if (z.kind !== 'leg_void') continue;
+    const u0 = clamp01(Math.min(z.uStart, z.uEnd));
+    const u1 = clamp01(Math.max(z.uStart, z.uEnd));
+    const v0 = clamp01(Math.min(z.vStart, z.vEnd));
+    const v1 = clamp01(Math.max(z.vStart, z.vEnd));
+    if (u1 - u0 <= 0.02 || v1 - v0 <= 0.02) continue;
+
+    boxes.push({
+      x0: u0 <= 0.02 ? 0 : e + u0 * xInt,
+      x1: u1 >= 0.98 ? xf : e + u1 * xInt,
+      y0: v0 <= 0.02 ? 0 : e + v0 * yInt,
+      y1: v1 >= 0.98 ? yf : e + v1 * yInt,
+    });
+  }
+
+  return boxes;
+}
+
+/**
  * Descompone el rectángulo exterior `[0, xf] × [0, yf]` en rectángulos exactos de fondo 3 mm
- * excluyendo todas las zonas `void_outside` (4 esquinas o múltiples) sin superposición.
+ * excluyendo todas las zonas `void_outside` (4 esquinas o múltiples) y cualquier exclusión adicional
+ * (como `leg_void` en escritorios), sin superposición 3D.
  */
 export function computeBackPanelNonVoidRects(
   xf: number,
   yf: number,
   cutouts: VoidCutoutPlan,
+  extraExcludedBoxes: ReadonlyArray<{ x0: number; x1: number; y0: number; y1: number }> = [],
 ): BackPanelRect[] {
-  const boxes = cutouts.backVoidMmBoxes;
+  const boxes =
+    extraExcludedBoxes.length > 0
+      ? [...cutouts.backVoidMmBoxes, ...extraExcludedBoxes]
+      : cutouts.backVoidMmBoxes;
   if (boxes.length === 0) {
     return [{ x0: 0, x1: xf, y0: 0, y1: yf, label: '' }];
   }
 
+  const hasStepVoid = cutouts.backVoidMmBoxes.length > 0;
   const rawXs = [0, xf];
   for (const b of boxes) {
     if (b.x0 > GEOM_EPS && b.x0 < xf - GEOM_EPS) rawXs.push(b.x0);
@@ -727,10 +766,11 @@ export function computeBackPanelNonVoidRects(
     }
   }
 
-  const rects: BackPanelRect[] = [];
+  const rawRects: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
   for (let i = 0; i < uniqueXs.length - 1; i++) {
     const sx0 = uniqueXs[i];
     const sx1 = uniqueXs[i + 1];
+    if (sx1 - sx0 <= 0.5) continue;
     const midX = (sx0 + sx1) / 2;
 
     const blockedY: Array<[number, number]> = [];
@@ -742,15 +782,39 @@ export function computeBackPanelNonVoidRects(
 
     const ySpans = subtractIntervals([0, yf], blockedY, 0.5);
     for (const [sy0, sy1] of ySpans) {
-      let label = 'Cuerpo Alto';
-      if (sy1 - sy0 < yf - 1) {
-        if (sx0 <= 0.5) label = 'Escalón Izq';
-        else if (sx1 >= xf - 0.5) label = 'Escalón Der';
-        else label = 'Cuerpo Central';
-      }
-      rects.push({ x0: sx0, x1: sx1, y0: sy0, y1: sy1, label });
+      rawRects.push({ x0: sx0, x1: sx1, y0: sy0, y1: sy1 });
     }
   }
 
-  return rects;
+  // Fusiona franjas horizontalmente adyacentes que comparten exactamente el mismo tramo vertical `[y0, y1]`
+  const mergedRects: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
+  for (const r of rawRects) {
+    const adj = mergedRects.find(
+      (prev) =>
+        Math.abs(prev.x1 - r.x0) <= 0.5 &&
+        Math.abs(prev.y0 - r.y0) <= 0.5 &&
+        Math.abs(prev.y1 - r.y1) <= 0.5,
+    );
+    if (adj) {
+      adj.x1 = r.x1;
+    } else {
+      mergedRects.push({ ...r });
+    }
+  }
+
+  return mergedRects.map((r) => {
+    let label = hasStepVoid ? 'Cuerpo Alto' : 'Módulo';
+    if (hasStepVoid) {
+      if (r.y1 - r.y0 < yf - 1) {
+        if (r.x0 <= 0.5) label = 'Escalón Izq';
+        else if (r.x1 >= xf - 0.5) label = 'Escalón Der';
+        else label = 'Cuerpo Central';
+      }
+    } else if (mergedRects.length > 1) {
+      if (r.x0 <= 0.5) label = 'Módulo Izq';
+      else if (r.x1 >= xf - 0.5) label = 'Módulo Der';
+      else label = 'Módulo Central';
+    }
+    return { ...r, label };
+  });
 }

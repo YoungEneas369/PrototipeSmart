@@ -203,18 +203,32 @@ export function vectorizeUserStroke(
     ...existingHShelves.map((s) => s.id),
   ]);
 
+  const extendTol =
+    typeof autoExtend === 'number'
+      ? clamp(autoExtend, 0, 0.25)
+      : autoExtend
+        ? 0.06
+        : 0;
+  const anchorSnapTol =
+    autoExtend === false
+      ? 0.01
+      : typeof autoExtend === 'number' && autoExtend <= 0.02
+        ? clamp(autoExtend, 0, 0.02)
+        : Math.min(0.06, extendTol);
+
   // Rango unificado 18°–72° (consistente con dEdge en vectorLines.ts y con la UI)
   const shouldBeDiagonal =
     strokeMode === 'diagonal' ||
     (strokeMode === 'auto' && absAngleFromHorizDeg >= 18 && absAngleFromHorizDeg <= 72);
 
   if (shouldBeDiagonal) {
+    const diagSnapTol = Math.min(0.045, anchorSnapTol);
     const allUAnchors = [0, ...existingVDividers.map((d) => d.position), 1];
     const allVAnchors = [0, ...existingHShelves.map((s) => s.position), 1];
-    const su1 = clamp(snapToAnchors(clamp(x1, 0, 1), allUAnchors, 0.045), 0, 1);
-    const sv1 = clamp(snapToAnchors(clamp(y1, 0, 1), allVAnchors, 0.045), 0, 1);
-    const su2 = clamp(snapToAnchors(clamp(x2, 0, 1), allUAnchors, 0.045), 0, 1);
-    const sv2 = clamp(snapToAnchors(clamp(y2, 0, 1), allVAnchors, 0.045), 0, 1);
+    const su1 = clamp(snapToAnchors(clamp(x1, 0, 1), allUAnchors, diagSnapTol), 0, 1);
+    const sv1 = clamp(snapToAnchors(clamp(y1, 0, 1), allVAnchors, diagSnapTol), 0, 1);
+    const su2 = clamp(snapToAnchors(clamp(x2, 0, 1), allUAnchors, diagSnapTol), 0, 1);
+    const sv2 = clamp(snapToAnchors(clamp(y2, 0, 1), allVAnchors, diagSnapTol), 0, 1);
 
     const fdx = (su2 - su1) * xInt;
     const fdy = (sv2 - sv1) * yInt;
@@ -239,18 +253,10 @@ export function vectorizeUserStroke(
     };
   }
 
-  const extendTol =
-    typeof autoExtend === 'number'
-      ? clamp(autoExtend, 0, 0.25)
-      : autoExtend
-        ? 0.06
-        : 0;
-  const anchorSnapTol = extendTol > 0 ? Math.min(0.06, extendTol) : 0.035;
-
   const isHorizontal = dxMm >= dyMm;
 
   if (isHorizontal) {
-    const vPos = clamp((y1 + y2) / 2, 0.04, 0.96);
+    const vPos = clamp((y1 + y2) / 2, 0.015, 0.985);
     const activeVAnchors = [
       0,
       ...existingVDividers
@@ -291,7 +297,7 @@ export function vectorizeUserStroke(
   }
 
   // Vector Vertical -> Divisor
-  const uPos = clamp((x1 + x2) / 2, 0.04, 0.96);
+  const uPos = clamp((x1 + x2) / 2, 0.015, 0.985);
   const activeHAnchors = [
     0,
     ...existingHShelves
@@ -375,7 +381,7 @@ export function partitionCellsFromVectors(
       colBorderIdx > 0 ? us[colBorderIdx] - us[colBorderIdx - 1] : 1,
       colBorderIdx + 1 < us.length ? us[colBorderIdx + 1] - us[colBorderIdx] : 1,
     );
-    const posTol = Math.min(0.015, minColGap * 0.45);
+    const posTol = Math.max(0.013, Math.min(0.018, minColGap * 0.55));
     return vDividers.some((d) => {
       if (Math.abs(d.position - uWall) > posTol) return false;
       const dStart = Math.min(d.start, d.end);
@@ -394,7 +400,7 @@ export function partitionCellsFromVectors(
       rowBorderIdx > 0 ? vs[rowBorderIdx] - vs[rowBorderIdx - 1] : 1,
       rowBorderIdx + 1 < vs.length ? vs[rowBorderIdx + 1] - vs[rowBorderIdx] : 1,
     );
-    const posTol = Math.min(0.015, minRowGap * 0.45);
+    const posTol = Math.max(0.013, Math.min(0.018, minRowGap * 0.55));
     return hShelves.some((s) => {
       if (Math.abs(s.position - vWall) > posTol) return false;
       const sStart = Math.min(s.start, s.end);

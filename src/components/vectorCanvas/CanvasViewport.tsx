@@ -22,17 +22,14 @@ import {
   interiorToExterior,
   type Matrix3x3,
 } from '../../core/mathEngine';
-import {
-  vectorizeUserStroke,
-  type UserStrokeMode,
-  type VectorLine2D,
-} from '../../core/vision';
+import type { VectorLine2D } from '../../core/vision';
 import {
   CORNER_LABELS,
   MELAMINE_LABELS,
   VECTOR_ROLE_COLORS,
   ZONE_COLORS,
   ZONE_SHORT_LABELS,
+  clampNum,
   projectDiagonal,
   projectHShelf,
   projectVDivider,
@@ -68,6 +65,10 @@ export interface ActiveHoverTarget {
 export interface LiveStrokeDrawState {
   startImg: Point2D;
   currentImg: Point2D;
+  startU: number;
+  startV: number;
+  currentU: number;
+  currentV: number;
   orthoGuide?: OrthoGuideAxis;
 }
 
@@ -85,7 +86,6 @@ export interface CanvasViewportProps {
   linesSubMode: LinesSubMode;
   subTool: SubTool;
   visualLayer: VisualLayerMode;
-  strokeMode: UserStrokeMode;
   activeQuad: [Point2D, Point2D, Point2D, Point2D];
   homography: { toUnit: Matrix3x3; toCanvas: Matrix3x3 } | null;
   vDividers: NormalizedSegment[];
@@ -145,7 +145,6 @@ export function CanvasViewport({
   linesSubMode,
   subTool,
   visualLayer,
-  strokeMode,
   activeQuad,
   homography,
   vDividers,
@@ -652,103 +651,74 @@ export function CanvasViewport({
         }
       }
 
-      // 4C. Vista previa EN VIVO del nuevo trazo (`liveStroke` con guía ortogonal suave Figma/Canva)
+      // 4C. Vista previa EN VIVO del nuevo trazo (100 % continua 1:1, cero snapping en movimiento)
       if (liveStroke) {
-        const previewVec = vectorizeUserStroke(
-          liveStroke.startImg,
-          liveStroke.currentImg,
-          homography.toUnit,
-          vDividers,
-          hShelves,
-          e,
-          params.targetDimensions,
-          0.018,
-          strokeMode,
-        );
         ctx.save();
-        if (previewVec) {
-          let pA: Point2D | null = null;
-          let pB: Point2D | null = null;
-          let strokeCol = '#4ade80';
-          let lbl = '';
-          const isOrthoLocked =
-            liveStroke.orthoGuide === 'horizontal' || liveStroke.orthoGuide === 'vertical';
+        const pA = liveStroke.startImg;
+        const pB = liveStroke.currentImg;
+        const dxMm = (liveStroke.currentU - liveStroke.startU) * xInt;
+        const dyMm = (liveStroke.currentV - liveStroke.startV) * yInt;
+        const lenMm = Math.round(Math.hypot(dxMm, dyMm));
 
-          if (previewVec.kind === 'diagonal') {
-            pA = applyHomography(toCanvas, {
-              x: interiorToExterior(previewVec.segment.u1, e, xf),
-              y: interiorToExterior(previewVec.segment.v1, e, yf),
-            });
-            pB = applyHomography(toCanvas, {
-              x: interiorToExterior(previewVec.segment.u2, e, xf),
-              y: interiorToExterior(previewVec.segment.v2, e, yf),
-            });
-            strokeCol = '#e879f9';
-            lbl = `⟋ Diagonal ${Math.abs(previewVec.angleDeg)}° · ${previewVec.spanMm} mm`;
-          } else if (previewVec.kind === 'hShelf') {
-            pA = applyHomography(toCanvas, {
-              x: interiorToExterior(previewVec.segment.start, e, xf),
-              y: interiorToExterior(previewVec.segment.position, e, yf),
-            });
-            pB = applyHomography(toCanvas, {
-              x: interiorToExterior(previewVec.segment.end, e, xf),
-              y: interiorToExterior(previewVec.segment.position, e, yf),
-            });
-            strokeCol = '#fbbf24';
-            lbl = `→ Repisa Y=${previewVec.positionMm} mm (luz ${previewVec.spanMm} mm)${isOrthoLocked ? ' · Recta' : ''}`;
-          } else {
-            pA = applyHomography(toCanvas, {
-              x: interiorToExterior(previewVec.segment.position, e, xf),
-              y: interiorToExterior(previewVec.segment.start, e, yf),
-            });
-            pB = applyHomography(toCanvas, {
-              x: interiorToExterior(previewVec.segment.position, e, xf),
-              y: interiorToExterior(previewVec.segment.end, e, yf),
-            });
-            strokeCol = '#4ade80';
-            lbl = `↓ Divisor X=${previewVec.positionMm} mm (alto ${previewVec.spanMm} mm)${isOrthoLocked ? ' · Recta' : ''}`;
+        let strokeCol = '#38bdf8';
+        let lbl = '';
+        const isOrthoLocked =
+          liveStroke.orthoGuide === 'horizontal' || liveStroke.orthoGuide === 'vertical';
+
+        if (liveStroke.orthoGuide === 'diagonal') {
+          strokeCol = '#e879f9';
+          const angleDeg = Math.round(Math.abs((Math.atan2(dyMm, dxMm) * 180) / Math.PI));
+          if (lenMm >= 15) {
+            lbl = `⟋ Diagonal ${angleDeg}° · ${lenMm} mm`;
           }
-
-          if (pA && pB) {
-            // Si está en transición 7°–18°, mostrar guía tenue de la mano real + línea proyectada limpia
-            if (
-              liveStroke.orthoGuide === 'near_horizontal' ||
-              liveStroke.orthoGuide === 'near_vertical'
-            ) {
-              ctx.strokeStyle = 'rgba(226, 232, 240, 0.45)';
-              ctx.lineWidth = 1.6;
-              ctx.setLineDash([4, 4]);
-              ctx.beginPath();
-              ctx.moveTo(liveStroke.startImg.x, liveStroke.startImg.y);
-              ctx.lineTo(liveStroke.currentImg.x, liveStroke.currentImg.y);
-              ctx.stroke();
-            }
-
-            ctx.strokeStyle = strokeCol;
-            ctx.lineWidth = Math.max(4, cw / 220);
-            ctx.setLineDash(isOrthoLocked ? [] : [10, 6]);
-            ctx.beginPath();
-            ctx.moveTo(pA.x, pA.y);
-            ctx.lineTo(pB.x, pB.y);
-            ctx.stroke();
-            ctx.setLineDash([]);
-
-            drawLineBadge(
-              (pA.x + pB.x) / 2,
-              (pA.y + pB.y) / 2,
-              lbl,
-              'rgba(15, 23, 42, 0.92)',
-              true,
-            );
+        } else if (liveStroke.orthoGuide === 'horizontal') {
+          strokeCol = '#fbbf24';
+          const yMm = Math.round(e + clampNum(liveStroke.startV, 0.015, 0.985) * yInt);
+          const spanMm = Math.round(Math.abs(dxMm));
+          if (spanMm >= 15) {
+            lbl = `→ Repisa Y=${yMm} mm (luz ${spanMm} mm)`;
           }
-        } else {
-          ctx.strokeStyle = '#38bdf8';
-          ctx.lineWidth = 2.5;
-          ctx.setLineDash([6, 4]);
+        } else if (liveStroke.orthoGuide === 'vertical') {
+          strokeCol = '#4ade80';
+          const xMm = Math.round(e + clampNum(liveStroke.startU, 0.015, 0.985) * xInt);
+          const spanMm = Math.round(Math.abs(dyMm));
+          if (spanMm >= 15) {
+            lbl = `↓ Divisor X=${xMm} mm (alto ${spanMm} mm)`;
+          }
+        }
+
+        ctx.strokeStyle = strokeCol;
+        ctx.lineWidth = Math.max(
+          isOrthoLocked || liveStroke.orthoGuide === 'diagonal' ? 4 : 2.5,
+          cw / 220,
+        );
+        ctx.setLineDash(isOrthoLocked ? [] : [8, 5]);
+        ctx.beginPath();
+        ctx.moveTo(pA.x, pA.y);
+        ctx.lineTo(pB.x, pB.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Marcadores nítidos en ambos extremos del trazo en vivo
+        const endDotR = Math.max(4, cw / 210);
+        for (const pt of [pA, pB]) {
           ctx.beginPath();
-          ctx.moveTo(liveStroke.startImg.x, liveStroke.startImg.y);
-          ctx.lineTo(liveStroke.currentImg.x, liveStroke.currentImg.y);
+          ctx.arc(pt.x, pt.y, endDotR, 0, Math.PI * 2);
+          ctx.fillStyle = '#ffffff';
+          ctx.fill();
+          ctx.strokeStyle = strokeCol;
+          ctx.lineWidth = 2;
           ctx.stroke();
+        }
+
+        if (lbl) {
+          drawLineBadge(
+            (pA.x + pB.x) / 2,
+            (pA.y + pB.y) / 2,
+            lbl,
+            'rgba(15, 23, 42, 0.92)',
+            true,
+          );
         }
         ctx.restore();
       }
@@ -1063,7 +1033,6 @@ export function CanvasViewport({
     linesSubMode,
     subTool,
     visualLayer,
-    strokeMode,
     activeQuad,
     homography,
     vDividers,

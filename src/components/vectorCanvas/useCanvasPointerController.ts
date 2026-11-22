@@ -17,7 +17,6 @@ import {
   applyHomography,
   computeQuadToUnitHomography,
   exteriorToInterior,
-  interiorToExterior,
   type Matrix3x3,
 } from '../../core/mathEngine';
 import {
@@ -107,6 +106,9 @@ type ActiveDrag =
       startU: number;
       startV: number;
       guidedEndImg: Point2D;
+      guidedEndU: number;
+      guidedEndV: number;
+      lockedAxis: 'horizontal' | 'vertical' | null;
       startClient: Point2D;
       clickFallbackLine: LineRef | null;
       pointerId: number;
@@ -398,36 +400,46 @@ export function useCanvasPointerController({
       const xf = params.targetDimensions.x;
       const yf = params.targetDimensions.y;
 
-      if (!altKey) {
-        const structSnap = snapPointToStructuralAnchors(
-          rawPt,
-          displayHomography.toUnit,
-          displayHomography.toCanvas,
-          vDivs,
-          hShs,
-          eMm,
-          xf,
-          yf,
-          scaleX,
-          scaleY,
-          6,
-          excludeId,
-          axisLock,
-        );
-        if (structSnap && structSnap.indicator) {
-          return {
-            pt: structSnap.snappedImg,
-            u: structSnap.u,
-            v: structSnap.v,
-            indicator: structSnap.indicator,
-          };
-        }
+      // Por defecto (Imán OFF) o con Alt: CERO snapping — devuelve rawPt 100 % exacto
+      if (!magneticSnap || altKey) {
+        const unit = applyHomography(displayHomography.toUnit, rawPt);
+        if (!unit) return null;
+        return {
+          pt: rawPt,
+          u: exteriorToInterior(unit.x, eMm, xf),
+          v: exteriorToInterior(unit.y, eMm, yf),
+          indicator: null,
+        };
       }
 
-      // Cuando se ancla solo un eje perpendicular durante trazo recto, evitar imán Sobel 2D que jale lateralmente
+      // Solo cuando el usuario activó explícitamente Imán ON: transición muy suave ≤ 3 px
+      const structSnap = snapPointToStructuralAnchors(
+        rawPt,
+        displayHomography.toUnit,
+        displayHomography.toCanvas,
+        vDivs,
+        hShs,
+        eMm,
+        xf,
+        yf,
+        scaleX,
+        scaleY,
+        3,
+        excludeId,
+        axisLock,
+      );
+      if (structSnap && structSnap.indicator) {
+        return {
+          pt: structSnap.snappedImg,
+          u: structSnap.u,
+          v: structSnap.v,
+          indicator: structSnap.indicator,
+        };
+      }
+
       const edgeRes =
         axisLock === 'both'
-          ? snapEdgeIfEnabled(rawPt, altKey, scaleX, scaleY, 5)
+          ? snapEdgeIfEnabled(rawPt, altKey, scaleX, scaleY, 3)
           : { pt: rawPt, indicator: null };
       const unit = applyHomography(displayHomography.toUnit, edgeRes.pt);
       if (!unit) return null;
@@ -438,7 +450,7 @@ export function useCanvasPointerController({
         indicator: edgeRes.indicator,
       };
     },
-    [displayHomography, params.boardThickness, params.targetDimensions, snapEdgeIfEnabled],
+    [displayHomography, magneticSnap, params.boardThickness, params.targetDimensions, snapEdgeIfEnabled],
   );
 
   const handlePointerCancel = useCallback(() => {
@@ -514,7 +526,7 @@ export function useCanvasPointerController({
         setEyedropperPreview(null);
         onEyedropperSampled(sampled.material, sampled.rgb);
         onSetStatusMsg(
-          `Acabado detectado por gotero: ${MELAMINE_LABELS[sampled.material]} (RGB ${sampled.rgb.join(', ')}). Medidas y trazos intactos.`,
+          `Color copiado de la foto: ${MELAMINE_LABELS[sampled.material]}. Medidas y trazos intactos.`,
         );
         return;
       }
@@ -730,30 +742,36 @@ export function useCanvasPointerController({
         return;
       }
 
-      // Espacio libre en 'smart' o modo explícito 'draw_only': iniciar trazo limpio
-      const snappedStart = snapForLineOperation(
-        rawPt,
-        scaleX,
-        scaleY,
-        e.altKey,
-        vDivs,
-        hShs,
-        undefined,
-        'both',
-      );
+      // Espacio libre en 'smart' o modo explícito 'draw_only': tomar rawPt EXACTAMENTE donde hizo clic
+      // (cero teletransporte Sobel ni salto al borde, salvo si el usuario encendió explícitamente Imán ON ≤ 3 px)
+      const snappedStart =
+        magneticSnap && !e.altKey
+          ? snapForLineOperation(rawPt, scaleX, scaleY, false, vDivs, hShs, undefined, 'both')
+          : null;
       const startPt = snappedStart?.pt ?? rawPt;
       const startUnit = applyHomography(displayHomography.toUnit, startPt);
       const startU = snappedStart?.u ?? (startUnit ? exteriorToInterior(startUnit.x, eMm, xf) : 0.5);
       const startV = snappedStart?.v ?? (startUnit ? exteriorToInterior(startUnit.y, eMm, yf) : 0.5);
       setSnapIndicator(snappedStart?.indicator ?? null);
       setLoupeFocusPt(startPt);
-      setLiveStroke({ startImg: startPt, currentImg: startPt, orthoGuide: null });
+      setLiveStroke({
+        startImg: startPt,
+        currentImg: startPt,
+        startU,
+        startV,
+        currentU: startU,
+        currentV: startV,
+        orthoGuide: null,
+      });
       dragRef.current = {
         kind: 'drawVector',
         startImg: startPt,
         startU,
         startV,
         guidedEndImg: startPt,
+        guidedEndU: startU,
+        guidedEndV: startV,
+        lockedAxis: null,
         startClient: { x: e.clientX, y: e.clientY },
         clickFallbackLine: hit ? { kind: hit.kind, id: hit.id } : null,
         pointerId: e.pointerId,
@@ -891,17 +909,21 @@ export function useCanvasPointerController({
         }
 
         setHoverTarget({ kind: 'none' });
-        const snapped = snapForLineOperation(
-          rawPt,
-          scaleX,
-          scaleY,
-          e.altKey,
-          materializedBase.vDividers,
-          materializedBase.hShelves,
-          undefined,
-          'both',
-        );
-        setSnapIndicator(snapped?.indicator ?? null);
+        if (magneticSnap && !e.altKey) {
+          const snapped = snapForLineOperation(
+            rawPt,
+            scaleX,
+            scaleY,
+            false,
+            materializedBase.vDividers,
+            materializedBase.hShelves,
+            undefined,
+            'both',
+          );
+          setSnapIndicator(snapped?.indicator ?? null);
+        } else {
+          setSnapIndicator(null);
+        }
         setLoupeFocusPt(null);
         return;
       }
@@ -1073,7 +1095,9 @@ export function useCanvasPointerController({
       const eMm = params.boardThickness;
       const xf = params.targetDimensions.x;
       const yf = params.targetDimensions.y;
+      const effectiveMode: UserStrokeMode = strokeMode === 'diagonal' ? 'diagonal' : 'ortho';
 
+      // CERO snapping durante pointerMove: movimiento 100 % suave y continuo 1:1 con tu mano
       const guide = computeSmoothOrthoGuide(
         active.startU,
         active.startV,
@@ -1083,51 +1107,31 @@ export function useCanvasPointerController({
         eMm,
         xf,
         yf,
-        strokeMode,
-      );
-
-      // Ancla SOLO el eje perpendicular al trazo (≤ 6 px) para no jalar nunca a bordes paralelos
-      const axisLock: 'both' | 'uOnly' | 'vOnly' =
-        guide.axis === 'horizontal' || guide.axis === 'near_horizontal'
-          ? 'uOnly'
-          : guide.axis === 'vertical' || guide.axis === 'near_vertical'
-            ? 'vOnly'
-            : 'both';
-
-      const snapped = snapForLineOperation(
-        rawPt,
+        effectiveMode,
+        active.lockedAxis,
         scaleX,
         scaleY,
-        e.altKey,
-        materializedBase.vDividers,
-        materializedBase.hShelves,
-        undefined,
-        axisLock,
+        active.startImg,
       );
 
-      let finalEndImg = snapped?.pt ?? guide.guidedImg;
-      if (guide.axis === 'horizontal') {
-        const finalU = snapped ? snapped.u : guide.u;
-        finalEndImg =
-          applyHomography(displayHomography.toCanvas, {
-            x: interiorToExterior(finalU, eMm, xf),
-            y: interiorToExterior(active.startV, eMm, yf),
-          }) ?? guide.guidedImg;
-      } else if (guide.axis === 'vertical') {
-        const finalV = snapped ? snapped.v : guide.v;
-        finalEndImg =
-          applyHomography(displayHomography.toCanvas, {
-            x: interiorToExterior(active.startU, eMm, xf),
-            y: interiorToExterior(finalV, eMm, yf),
-          }) ?? guide.guidedImg;
+      if (guide.axis === 'horizontal' || guide.axis === 'vertical') {
+        active.lockedAxis = guide.axis;
       }
 
+      const finalEndImg = effectiveMode === 'diagonal' ? rawPt : guide.guidedImg;
       active.guidedEndImg = finalEndImg;
-      setSnapIndicator(snapped?.indicator ?? null);
+      active.guidedEndU = guide.u;
+      active.guidedEndV = guide.v;
+
+      setSnapIndicator(null);
       setLoupeFocusPt(finalEndImg);
       setLiveStroke({
         startImg: active.startImg,
         currentImg: finalEndImg,
+        startU: active.startU,
+        startV: active.startV,
+        currentU: guide.u,
+        currentV: guide.v,
         orthoGuide: guide.axis,
       });
       return;
@@ -1144,9 +1148,17 @@ export function useCanvasPointerController({
       let focusPt: Point2D;
       let ind: SnapIndicator | null = null;
 
-      if (hit.part === 'body' && hit.kind !== 'diagonal') {
-        // Movimiento suave de cuerpo: sin saltos > 4 px ni jalones a bordes paralelos
-        const edgeRes = snapEdgeIfEnabled(rawPt, e.altKey, scaleX, scaleY, 4);
+      // Por defecto (Imán OFF) o con Alt: CERO snapping — rawPt 100 % directo sin saltos
+      if (!magneticSnap || e.altKey) {
+        const unit = applyHomography(displayHomography.toUnit, rawPt);
+        if (!unit) return;
+        u = exteriorToInterior(unit.x, eMm, xf);
+        v = exteriorToInterior(unit.y, eMm, yf);
+        focusPt = rawPt;
+        ind = null;
+      } else if (hit.part === 'body' && hit.kind !== 'diagonal') {
+        // Imán ON explícito: transición suave ≤ 3 px
+        const edgeRes = snapEdgeIfEnabled(rawPt, false, scaleX, scaleY, 3);
         const unit = applyHomography(displayHomography.toUnit, edgeRes.pt);
         if (!unit) return;
         u = exteriorToInterior(unit.x, eMm, xf);
@@ -1160,7 +1172,7 @@ export function useCanvasPointerController({
           rawPt,
           scaleX,
           scaleY,
-          e.altKey,
+          false,
           baseLines.vDividers,
           baseLines.hShelves,
           hit.id,
@@ -1179,7 +1191,7 @@ export function useCanvasPointerController({
       if (hit.kind === 'vDivider') {
         const nextVDivs = baseLines.vDividers.map((d) => {
           if (d.id !== hit.id) return d;
-          if (hit.part === 'body') return { ...d, position: round4(clampNum(u, 0.03, 0.97)) };
+          if (hit.part === 'body') return { ...d, position: round4(clampNum(u, 0.015, 0.985)) };
           if (hit.part === 'start') {
             return { ...d, start: round4(clampNum(v, 0, Math.max(0, d.end - 0.05))) };
           }
@@ -1195,7 +1207,7 @@ export function useCanvasPointerController({
       } else if (hit.kind === 'hShelf') {
         const nextHShelves = baseLines.hShelves.map((s) => {
           if (s.id !== hit.id) return s;
-          if (hit.part === 'body') return { ...s, position: round4(clampNum(v, 0.03, 0.97)) };
+          if (hit.part === 'body') return { ...s, position: round4(clampNum(v, 0.015, 0.985)) };
           if (hit.part === 'start') {
             return { ...s, start: round4(clampNum(u, 0, Math.max(0, s.end - 0.05))) };
           }
@@ -1413,50 +1425,38 @@ export function useCanvasPointerController({
       const eMm = params.boardThickness;
       const xf = params.targetDimensions.x;
       const yf = params.targetDimensions.y;
-      const guide = computeSmoothOrthoGuide(
-        finished.startU,
-        finished.startV,
-        endRaw,
-        committedHomography.toUnit,
-        committedHomography.toCanvas,
-        eMm,
-        xf,
-        yf,
-        strokeMode,
-      );
-      const axisLock: 'both' | 'uOnly' | 'vOnly' =
-        guide.axis === 'horizontal' || guide.axis === 'near_horizontal'
-          ? 'uOnly'
-          : guide.axis === 'vertical' || guide.axis === 'near_vertical'
-            ? 'vOnly'
-            : 'both';
-      const snappedEnd = snapForLineOperation(
-        endRaw,
-        scaleX,
-        scaleY,
-        e.altKey,
-        materializedBase.vDividers,
-        materializedBase.hShelves,
-        undefined,
-        axisLock,
-      );
-      let endPt = snappedEnd?.pt ?? guide.guidedImg;
-      if (guide.axis === 'horizontal') {
-        const finalU = snappedEnd ? snappedEnd.u : guide.u;
-        endPt =
-          applyHomography(committedHomography.toCanvas, {
-            x: interiorToExterior(finalU, eMm, xf),
-            y: interiorToExterior(finished.startV, eMm, yf),
-          }) ?? finished.guidedEndImg;
-      } else if (guide.axis === 'vertical') {
-        const finalV = snappedEnd ? snappedEnd.v : guide.v;
-        endPt =
-          applyHomography(committedHomography.toCanvas, {
-            x: interiorToExterior(finished.startU, eMm, xf),
-            y: interiorToExterior(finalV, eMm, yf),
-          }) ?? finished.guidedEndImg;
+      const xInt = Math.max(1, xf - 2 * eMm);
+      const yInt = Math.max(1, yf - 2 * eMm);
+      const effectiveMode: UserStrokeMode = strokeMode === 'diagonal' ? 'diagonal' : 'ortho';
+
+      // Usar EXACTAMENTE `finished.startImg` y `finished.guidedEndImg` que el usuario veía en pantalla
+      // (solo cae a `endRaw` si se disparó `pointerup` sin `pointermove` previo)
+      let endPt = finished.guidedEndImg;
+      let endU = finished.guidedEndU;
+      let endV = finished.guidedEndV;
+      if (Math.hypot(endPt.x - finished.startImg.x, endPt.y - finished.startImg.y) < 1) {
+        const fallbackGuide = computeSmoothOrthoGuide(
+          finished.startU,
+          finished.startV,
+          endRaw,
+          committedHomography.toUnit,
+          committedHomography.toCanvas,
+          eMm,
+          xf,
+          yf,
+          effectiveMode,
+          finished.lockedAxis,
+          scaleX,
+          scaleY,
+          finished.startImg,
+        );
+        endPt = effectiveMode === 'diagonal' ? endRaw : fallbackGuide.guidedImg;
+        endU = fallbackGuide.u;
+        endV = fallbackGuide.v;
       }
 
+      // En 'ortho': autoExtend = 0.012 (solo toca pared si soltó a ≤ 1.2 %; con Alt: ~0)
+      // En 'diagonal': autoExtend = false (exactamente donde soltaste, cero teletransporte)
       const stroke = vectorizeUserStroke(
         finished.startImg,
         endPt,
@@ -1465,8 +1465,8 @@ export function useCanvasPointerController({
         materializedBase.hShelves,
         params.boardThickness,
         params.targetDimensions,
-        e.altKey ? 0.001 : 0.018,
-        strokeMode,
+        effectiveMode === 'diagonal' ? false : e.altKey ? 0.0001 : 0.012,
+        effectiveMode,
       );
       if (!stroke) {
         onSetStatusMsg('Trazo demasiado corto. Arrastra una línea recta o diagonal sobre la foto.');
@@ -1474,37 +1474,58 @@ export function useCanvasPointerController({
       }
 
       if (stroke.kind === 'vDivider') {
+        // Preservar posición exacta en [0.015, 0.985] para evitar salto hacia [0.04, 0.96] cerca de bordes
+        const exactPos = round4(clampNum(finished.startU, 0.015, 0.985));
+        const finalSeg: NormalizedSegment = { ...stroke.segment, position: exactPos };
+        const posMm = Math.round(eMm + exactPos * xInt);
         onCommitTracedVectors(
-          [...materializedBase.vDividers, stroke.segment],
+          [...materializedBase.vDividers, finalSeg],
           materializedBase.hShelves,
           topology.diagonalDividers ?? [],
           { recordUndo: true },
         );
-        onSetSelectedLine({ kind: 'vDivider', id: stroke.segment.id });
+        onSetSelectedLine({ kind: 'vDivider', id: finalSeg.id });
         onSetStatusMsg(
-          `Divisor vertical creado en X = ${stroke.positionMm} mm (largo ${stroke.spanMm} mm).`,
+          `Divisor vertical creado en X = ${posMm} mm (largo ${stroke.spanMm} mm).`,
         );
       } else if (stroke.kind === 'hShelf') {
+        // Preservar posición exacta en [0.015, 0.985] para evitar salto hacia [0.04, 0.96] cerca de bordes
+        const exactPos = round4(clampNum(finished.startV, 0.015, 0.985));
+        const finalSeg: NormalizedSegment = { ...stroke.segment, position: exactPos };
+        const posMm = Math.round(eMm + exactPos * yInt);
         onCommitTracedVectors(
           materializedBase.vDividers,
-          [...materializedBase.hShelves, stroke.segment],
+          [...materializedBase.hShelves, finalSeg],
           topology.diagonalDividers ?? [],
           { recordUndo: true },
         );
-        onSetSelectedLine({ kind: 'hShelf', id: stroke.segment.id });
+        onSetSelectedLine({ kind: 'hShelf', id: finalSeg.id });
         onSetStatusMsg(
-          `Repisa horizontal creada en Y = ${stroke.positionMm} mm (luz ${stroke.spanMm} mm).`,
+          `Repisa horizontal creada en Y = ${posMm} mm (luz ${stroke.spanMm} mm).`,
         );
       } else {
+        // En diagonal: conservar extremos EXACTOS donde inició y soltó (cero snap 4.5 %)
+        const u1 = round4(clampNum(finished.startU, 0, 1));
+        const v1 = round4(clampNum(finished.startV, 0, 1));
+        const u2 = round4(clampNum(endU, 0, 1));
+        const v2 = round4(clampNum(endV, 0, 1));
+        const fdx = (u2 - u1) * xInt;
+        const fdy = (v2 - v1) * yInt;
+        const exactLenMm = Math.round(Math.hypot(fdx, fdy));
+        const exactAngleDeg = Math.round((Math.atan2(fdy, fdx) * 180) / Math.PI);
+        const finalDiag: DiagonalSegment =
+          exactLenMm >= Math.max(30, eMm * 1.5)
+            ? { ...stroke.segment, u1, v1, u2, v2 }
+            : stroke.segment;
         onCommitTracedVectors(
           materializedBase.vDividers,
           materializedBase.hShelves,
-          [...(topology.diagonalDividers ?? []), stroke.segment],
+          [...(topology.diagonalDividers ?? []), finalDiag],
           { recordUndo: true },
         );
-        onSetSelectedLine({ kind: 'diagonal', id: stroke.segment.id });
+        onSetSelectedLine({ kind: 'diagonal', id: finalDiag.id });
         onSetStatusMsg(
-          `División diagonal creada (${Math.abs(stroke.angleDeg)}° · largo ${stroke.spanMm} mm).`,
+          `División diagonal creada (${Math.abs(exactLenMm >= 30 ? exactAngleDeg : stroke.angleDeg)}° · largo ${exactLenMm >= 30 ? exactLenMm : stroke.spanMm} mm).`,
         );
       }
       return;

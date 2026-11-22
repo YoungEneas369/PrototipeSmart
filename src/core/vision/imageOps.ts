@@ -335,6 +335,228 @@ export function sampleExteriorBgRgb(
   return [Math.round(median(rs)), Math.round(median(gs)), Math.round(median(bs))];
 }
 
+export interface LocalExteriorBgSamples {
+  globalBgRgb: [number, number, number];
+  rightWallBgRgb?: [number, number, number];
+  leftWallBgRgb?: [number, number, number];
+  topRightBgRgb?: [number, number, number];
+  topLeftBgRgb?: [number, number, number];
+  /** True si la esquina superior derecha del quad no tiene borde sólido de melamina (pared continua). */
+  topRightBorderOpen?: boolean;
+  /** True si la esquina superior izquierda del quad no tiene borde sólido de melamina (pared continua). */
+  topLeftBorderOpen?: boolean;
+}
+
+/**
+ * Muestrea el color de fondo exterior LOCAL justo por fuera de las aristas derecha, izquierda
+ * y superior del `quad` en la foto original, y evalúa si las esquinas superiores (TR/TL) son
+ * continuas con la pared exterior (señal geométrica real de recorte escalonado `void_outside`).
+ */
+export function sampleLocalExteriorBgRgb(
+  rgba: Uint8ClampedArray,
+  imgW: number,
+  imgH: number,
+  quad: readonly [Point2D, Point2D, Point2D, Point2D],
+  globalBgRgb?: [number, number, number],
+): LocalExteriorBgSamples {
+  const globalBg = globalBgRgb ?? sampleExteriorBgRgb(rgba, imgW, imgH);
+  if (imgW < 24 || imgH < 24 || rgba.length < imgW * imgH * 4) {
+    return { globalBgRgb: globalBg };
+  }
+
+  const [tl, tr, br, bl] = quad;
+  const centroid: Point2D = {
+    x: (tl.x + tr.x + br.x + bl.x) * 0.25,
+    y: (tl.y + tr.y + br.y + bl.y) * 0.25,
+  };
+  const bodyW = 0.5 * (Math.hypot(tr.x - tl.x, tr.y - tl.y) + Math.hypot(br.x - bl.x, br.y - bl.y));
+  const bodyH = 0.5 * (Math.hypot(bl.x - tl.x, bl.y - tl.y) + Math.hypot(br.x - tr.x, br.y - tr.y));
+  const stepDist = clamp(Math.round(Math.min(bodyW, bodyH) * 0.024), 6, 22);
+  const dists = [stepDist, Math.round(stepDist * 1.7), Math.round(stepDist * 2.5)];
+
+  const sampleOutsideStrip = (
+    pA: Point2D,
+    pB: Point2D,
+    outNx: number,
+    outNy: number,
+  ): [number, number, number] | undefined => {
+    const rs: number[] = [];
+    const gs: number[] = [];
+    const bs: number[] = [];
+    for (let k = 2; k <= 18; k++) {
+      const t = k / 20;
+      const bx = pA.x + (pB.x - pA.x) * t;
+      const by = pA.y + (pB.y - pA.y) * t;
+      for (const d of dists) {
+        const sx = Math.round(bx + outNx * d);
+        const sy = Math.round(by + outNy * d);
+        if (sx < 1 || sx >= imgW - 1 || sy < 1 || sy >= imgH - 1) continue;
+        const p = (sy * imgW + sx) * 4;
+        if (rgba[p + 3] < 128) continue;
+        rs.push(rgba[p]);
+        gs.push(rgba[p + 1]);
+        bs.push(rgba[p + 2]);
+      }
+    }
+    if (rs.length < 8) return undefined;
+    return [Math.round(median(rs)), Math.round(median(gs)), Math.round(median(bs))];
+  };
+
+  // Evalúa continuidad sin borde de melamina a través de un sub-tramo de arista lateral exterior
+  const isSideEdgeOpenToWall = (
+    pA: Point2D,
+    pB: Point2D,
+    inNx: number,
+    inNy: number,
+    refWall?: [number, number, number],
+  ): boolean => {
+    if (!refWall) return false;
+    const probeIn = Math.max(4, Math.round(stepDist * 0.9));
+    const probeOut = Math.max(6, Math.round(stepDist * 1.2));
+    let smoothHits = 0;
+    let total = 0;
+    for (let k = 2; k <= 14; k++) {
+      const t = k / 16;
+      const bx = pA.x + (pB.x - pA.x) * t;
+      const by = pA.y + (pB.y - pA.y) * t;
+      const inX = Math.round(bx + inNx * probeIn);
+      const inY = Math.round(by + inNy * probeIn);
+      const outX = Math.round(bx - inNx * probeOut);
+      const outY = Math.round(by - inNy * probeOut);
+      if (
+        inX < 1 ||
+        inX >= imgW - 1 ||
+        inY < 1 ||
+        inY >= imgH - 1 ||
+        outX < 1 ||
+        outX >= imgW - 1 ||
+        outY < 1 ||
+        outY >= imgH - 1
+      ) {
+        continue;
+      }
+      const pIn = (inY * imgW + inX) * 4;
+      const pOut = (outY * imgW + outX) * 4;
+      const pOn = (clamp(Math.round(by), 0, imgH - 1) * imgW + clamp(Math.round(bx), 0, imgW - 1)) * 4;
+      if (rgba[pIn + 3] < 128 || rgba[pOut + 3] < 128) continue;
+      const dCross = Math.hypot(
+        rgba[pIn] - rgba[pOut],
+        rgba[pIn + 1] - rgba[pOut + 1],
+        rgba[pIn + 2] - rgba[pOut + 2],
+      );
+      const dOnWall = Math.hypot(
+        rgba[pOn] - refWall[0],
+        rgba[pOn + 1] - refWall[1],
+        rgba[pOn + 2] - refWall[2],
+      );
+      const dInWall = Math.hypot(
+        rgba[pIn] - refWall[0],
+        rgba[pIn + 1] - refWall[1],
+        rgba[pIn + 2] - refWall[2],
+      );
+      if (dCross < 22 && dOnWall < 24 && dInWall < 24) smoothHits++;
+      total++;
+    }
+    return total >= 6 && smoothHits / total >= 0.7;
+  };
+
+  // Evalúa si el interior inmediato bajo la arista superior en la esquina es pared pura
+  // (inmune a plantas colgantes u objetos decorativos que asomen POR FUERA arriba del quad)
+  const isTopInsideMatchingWall = (
+    pA: Point2D,
+    pB: Point2D,
+    inNx: number,
+    inNy: number,
+    refWall?: [number, number, number],
+  ): boolean => {
+    if (!refWall) return false;
+    const probeIn = Math.max(4, Math.round(stepDist * 0.9));
+    let wallHits = 0;
+    let total = 0;
+    for (let k = 2; k <= 14; k++) {
+      const t = k / 16;
+      const bx = pA.x + (pB.x - pA.x) * t;
+      const by = pA.y + (pB.y - pA.y) * t;
+      const inX = Math.round(bx + inNx * probeIn);
+      const inY = Math.round(by + inNy * probeIn);
+      if (inX < 1 || inX >= imgW - 1 || inY < 1 || inY >= imgH - 1) continue;
+      const pIn = (inY * imgW + inX) * 4;
+      if (rgba[pIn + 3] < 128) continue;
+      const dInWall = Math.hypot(
+        rgba[pIn] - refWall[0],
+        rgba[pIn + 1] - refWall[1],
+        rgba[pIn + 2] - refWall[2],
+      );
+      if (dInWall < 24) wallHits++;
+      total++;
+    }
+    return total >= 6 && wallHits / total >= 0.72;
+  };
+
+  const [topInX, topInY] = edgeInwardUnitNormal(tl, tr, centroid);
+  const [rightInX, rightInY] = edgeInwardUnitNormal(tr, br, centroid);
+  const [leftInX, leftInY] = edgeInwardUnitNormal(bl, tl, centroid);
+
+  const lerpPt = (a: Point2D, b: Point2D, t: number): Point2D => ({
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+  });
+
+  const rightUpperEnd = lerpPt(tr, br, 0.34);
+  const leftUpperEnd = lerpPt(tl, bl, 0.34);
+  const topRightStart = lerpPt(tl, tr, 0.72);
+  const topLeftEnd = lerpPt(tl, tr, 0.28);
+
+  const rightWallBgRgb = sampleOutsideStrip(tr, rightUpperEnd, -rightInX, -rightInY);
+  const leftWallBgRgb = sampleOutsideStrip(tl, leftUpperEnd, -leftInX, -leftInY);
+  const topRightBgRgb = sampleOutsideStrip(topRightStart, tr, -topInX, -topInY);
+  const topLeftBgRgb = sampleOutsideStrip(tl, topLeftEnd, -topInX, -topInY);
+
+  const trRef = rightWallBgRgb ?? topRightBgRgb;
+  const tlRef = leftWallBgRgb ?? topLeftBgRgb;
+
+  // En una esquina escalonada real (`void_outside`), la arista lateral superior es pared continua
+  // sin tablero lateral Y el interior inmediato del borde superior de esa esquina coincide con la pared.
+  const trTopOpen = isTopInsideMatchingWall(
+    lerpPt(tl, tr, 0.76),
+    lerpPt(tl, tr, 0.96),
+    topInX,
+    topInY,
+    trRef,
+  );
+  const trSideOpen = isSideEdgeOpenToWall(
+    lerpPt(tr, br, 0.04),
+    lerpPt(tr, br, 0.24),
+    rightInX,
+    rightInY,
+    trRef,
+  );
+  const tlTopOpen = isTopInsideMatchingWall(
+    lerpPt(tl, tr, 0.04),
+    lerpPt(tl, tr, 0.24),
+    topInX,
+    topInY,
+    tlRef,
+  );
+  const tlSideOpen = isSideEdgeOpenToWall(
+    lerpPt(tl, bl, 0.04),
+    lerpPt(tl, bl, 0.24),
+    leftInX,
+    leftInY,
+    tlRef,
+  );
+
+  return {
+    globalBgRgb: globalBg,
+    rightWallBgRgb,
+    leftWallBgRgb,
+    topRightBgRgb,
+    topLeftBgRgb,
+    topRightBorderOpen: trTopOpen && trSideOpen,
+    topLeftBorderOpen: tlTopOpen && tlSideOpen,
+  };
+}
+
 /**
  * Convierte un punto en espacio INTERIOR normalizado `(uInt, vInt) ∈ [0,1]^2`
  * a coordenadas EXTERIORES `(uExt, vExt) ∈ [0,1]^2` de la imagen rectificada.

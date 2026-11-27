@@ -185,6 +185,7 @@ export function VectorCanvas({
   );
 
   const [selectedLine, setSelectedLine] = useState<LineRef | null>(null);
+  const [selectedPlaneLineId, setSelectedPlaneLineId] = useState<string | null>(null);
 
   // Estado de fotografía y visión
   const [frontBitmap, setFrontBitmap] = useState<WorkingBitmap | null>(null);
@@ -839,6 +840,15 @@ export function VectorCanvas({
     onCommitTracedVectors: commitTracedVectors,
     planeLinesXZ,
     planeLinesZY,
+    selectedPlaneLineId,
+    onSetSelectedPlaneLineId: setSelectedPlaneLineId,
+    onUpdatePlaneLine: (plane, updated) => {
+      if (plane === 'xz') {
+        setPlaneLinesXZ((prev) => prev.map((ln) => (ln.id === updated.id ? updated : ln)));
+      } else {
+        setPlaneLinesZY((prev) => prev.map((ln) => (ln.id === updated.id ? updated : ln)));
+      }
+    },
     onCommitPlaneLine: (plane, seg) => {
       if (plane === 'xz') setPlaneLinesXZ((prev) => [...prev, seg]);
       else setPlaneLinesZY((prev) => [...prev, seg]);
@@ -853,6 +863,7 @@ export function VectorCanvas({
     clearDrafts();
     resetViewport();
     setSelectedLine(null);
+    setSelectedPlaneLineId(null);
     setPickingCorners(null);
     setSubRegions([]);
     setCalibPts([]);
@@ -999,6 +1010,7 @@ export function VectorCanvas({
     }
     pushSnapshot();
     setSelectedLine(null);
+    setSelectedPlaneLineId(null);
     setPlaneLinesXZ([]);
     setPlaneLinesZY([]);
     const singleZone: FrontZone = {
@@ -1663,6 +1675,24 @@ export function VectorCanvas({
     setSelectedLine(null);
   }, [selectedLine, materializedBase, topology.diagonalDividers, commitTracedVectors]);
 
+  const handleUpdatePlaneLine = useCallback((plane: 'xz' | 'zy', updated: DiagonalSegment) => {
+    if (plane === 'xz') {
+      setPlaneLinesXZ((prev) => prev.map((ln) => (ln.id === updated.id ? updated : ln)));
+    } else {
+      setPlaneLinesZY((prev) => prev.map((ln) => (ln.id === updated.id ? updated : ln)));
+    }
+  }, []);
+
+  const handleDeletePlaneLine = useCallback((plane: 'xz' | 'zy', id: string) => {
+    if (plane === 'xz') {
+      setPlaneLinesXZ((prev) => prev.filter((ln) => ln.id !== id));
+    } else {
+      setPlaneLinesZY((prev) => prev.filter((ln) => ln.id !== id));
+    }
+    setSelectedPlaneLineId(null);
+    setStatusMsg('Línea eliminada de vista Arriba / Lado.');
+  }, []);
+
   // Atajos de teclado del lienzo (solo activos cuando isVisible !== false y sin foco en inputs)
   useEffect(() => {
     if (!isVisible) return;
@@ -1694,12 +1724,29 @@ export function VectorCanvas({
           setSelectedLine(null);
           return;
         }
+        if (selectedPlaneLineId) {
+          e.preventDefault();
+          setSelectedPlaneLineId(null);
+          return;
+        }
         if (traceStep === 'lines' && linesSubMode === 'regions') {
           e.preventDefault();
           setLinesSubMode('smart');
           setStatusMsg('Modo Editar / Trazar restaurado.');
           return;
         }
+      }
+
+      if (
+        traceStep === 'lines' &&
+        viewTab !== 'frontal' &&
+        selectedPlaneLineId &&
+        subTool === 'none' &&
+        (e.key === 'Delete' || e.key === 'Backspace')
+      ) {
+        e.preventDefault();
+        handleDeletePlaneLine(viewTab === 'superior' ? 'xz' : 'zy', selectedPlaneLineId);
+        return;
       }
 
       if (traceStep === 'lines' && selectedLine && subTool === 'none') {
@@ -1798,6 +1845,8 @@ export function VectorCanvas({
     subTool,
     pickingCorners,
     selectedLine,
+    selectedPlaneLineId,
+    viewTab,
     traceStep,
     linesSubMode,
     params.targetDimensions,
@@ -1807,6 +1856,7 @@ export function VectorCanvas({
     setLoupeFocusPt,
     exitSubTool,
     handleDeleteSelectedLine,
+    handleDeletePlaneLine,
     handleUpdateVDivider,
     handleUpdateHShelf,
     handleUpdateDiagonal,
@@ -1826,6 +1876,22 @@ export function VectorCanvas({
   const activeDiagonals = pointer.draftLines
     ? pointer.draftLines.diagonalDividers
     : (topology.diagonalDividers ?? []);
+  const activePlaneLinesXZ =
+    pointer.draftPlaneLines?.plane === 'xz' ? pointer.draftPlaneLines.lines : planeLinesXZ;
+  const activePlaneLinesZY =
+    pointer.draftPlaneLines?.plane === 'zy' ? pointer.draftPlaneLines.lines : planeLinesZY;
+  const activeSelectedPlaneLine =
+    viewTab === 'superior'
+      ? (() => {
+          const ln = activePlaneLinesXZ.find((l) => l.id === selectedPlaneLineId);
+          return ln ? { plane: 'xz' as const, line: ln } : null;
+        })()
+      : viewTab === 'lateral'
+        ? (() => {
+            const ln = activePlaneLinesZY.find((l) => l.id === selectedPlaneLineId);
+            return ln ? { plane: 'zy' as const, line: ln } : null;
+          })()
+        : null;
   const activeDisplayQuad =
     viewTab === 'frontal'
       ? (pointer.draftQuad ?? quad)
@@ -1914,6 +1980,7 @@ export function VectorCanvas({
           setSubTool('none');
           setPickingCorners(null);
           setSelectedLine(null);
+          setSelectedPlaneLineId(null);
           setViewTab(tab);
         }}
         onSetPlaneTraceStep={(step) => setTraceStep(step)}
@@ -1921,7 +1988,10 @@ export function VectorCanvas({
           setViewTab('frontal');
           setSubTool('none');
           if (step !== 'frame') setPickingCorners(null);
-          if (step !== 'lines') setSelectedLine(null);
+          if (step !== 'lines') {
+            setSelectedLine(null);
+            setSelectedPlaneLineId(null);
+          }
           setTraceStep(step);
           setStatusMsg(
             step === 'frame'
@@ -2041,8 +2111,9 @@ export function VectorCanvas({
         hShelves={activeHShelves}
         diagonalDividers={activeDiagonals}
         curvedCuts={topology.curvedCuts}
-        planeLinesXZ={planeLinesXZ}
-        planeLinesZY={planeLinesZY}
+        planeLinesXZ={activePlaneLinesXZ}
+        planeLinesZY={activePlaneLinesZY}
+        selectedPlaneLineId={selectedPlaneLineId}
         frontZones={zones}
         subRegions={subRegions}
         draftRegion={pointer.draftRegion}
@@ -2100,9 +2171,10 @@ export function VectorCanvas({
         onLoadSample={() => loadFrontalFromUrl(generateSampleFurnitureDataUrl(), true, false)}
       />
 
-      {hasPhoto && viewTab === 'frontal' && traceStep === 'lines' && selectedLine && (
+      {((hasPhoto && viewTab === 'frontal' && traceStep === 'lines' && selectedLine) ||
+        (viewTab !== 'frontal' && traceStep === 'lines' && activeSelectedPlaneLine)) && (
         <LineSelectionBar
-          selectedLine={selectedLine}
+          selectedLine={viewTab === 'frontal' ? selectedLine : null}
           topology={{
             ...topology,
             vDividers: materializedBase.vDividers,
@@ -2114,6 +2186,10 @@ export function VectorCanvas({
           onUpdateDiagonal={handleUpdateDiagonal}
           onDeleteSelected={handleDeleteSelectedLine}
           onDeselect={() => setSelectedLine(null)}
+          selectedPlaneLine={activeSelectedPlaneLine}
+          onUpdatePlaneLine={handleUpdatePlaneLine}
+          onDeletePlaneLine={handleDeletePlaneLine}
+          onDeselectPlaneLine={() => setSelectedPlaneLineId(null)}
         />
       )}
 

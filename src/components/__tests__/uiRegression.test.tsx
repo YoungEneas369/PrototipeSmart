@@ -48,6 +48,7 @@ import {
   getZoneInteriorDimsMm,
   hitTestFrameScreenPx,
   hitTestLinesScreenPx,
+  hitTestPlaneLinesScreenPx,
   makeAxisAlignedQuad,
   matchZoneIdByCentroid,
   mergeZoneWithNeighbor,
@@ -1236,6 +1237,68 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
       }
     }
     expect(isHandDrawnSketchImage(graphRgba, gw, gh).isSketch).toBe(true);
+
+    // 10. Tocar una línea la selecciona (incluso cerca de la punta con includeUnselectedEndsForTap),
+    //     y al estar seleccionada sus puntas permiten achicar o alargar (both XY & XZ/ZY)
+    const tapNearEnd = hitTestLinesScreenPx(
+      cornerPx,
+      [],
+      [shelf1],
+      [],
+      hom.toCanvas,
+      e,
+      xf,
+      yf,
+      1,
+      1,
+      null,
+      false,
+      true,
+    );
+    expect(tapNearEnd).toEqual({ kind: 'hShelf', id: 'rep_1', part: 'end', distPx: expect.any(Number) });
+
+    const resizeSelectedEnd = hitTestLinesScreenPx(
+      { x: cornerPx.x + 2, y: cornerPx.y - 2 },
+      [],
+      [shelf1],
+      [],
+      hom.toCanvas,
+      e,
+      xf,
+      yf,
+      1,
+      1,
+      { kind: 'hShelf', id: 'rep_1' },
+      false,
+      false,
+    );
+    expect(resizeSelectedEnd?.part).toBe('end');
+    expect(resizeSelectedEnd?.id).toBe('rep_1');
+
+    const xzLine = { id: 'pln_xz_1', u1: 0, v1: 0.5, u2: 0.7, v2: 0.5 };
+    const xzEndImg = {
+      x: quad[3].x + (quad[2].x - quad[3].x) * 0.7,
+      y: quad[3].y + (quad[0].y - quad[3].y) * 0.5,
+    };
+    const xzTap = hitTestPlaneLinesScreenPx(xzEndImg, [xzLine], hom.toCanvas, 1, 1, null, false, true);
+    expect(xzTap?.id).toBe('pln_xz_1');
+    const xzResizeSel = hitTestPlaneLinesScreenPx(xzEndImg, [xzLine], hom.toCanvas, 1, 1, 'pln_xz_1', false, false);
+    expect(xzResizeSel?.part).toBe('end');
+
+    const barWithResizeHtml = renderToStaticMarkup(
+      <LineSelectionBar
+        selectedLine={{ kind: 'hShelf', id: 'rep_1' }}
+        topology={{ ...clonePreset('estanteria').topology, hShelves: [shelf1] }}
+        params={{ ...clonePreset('estanteria').params, targetDimensions: { x: xf, y: yf, z: 400 } }}
+        onUpdateVDivider={() => undefined}
+        onUpdateHShelf={() => undefined}
+        onUpdateDiagonal={() => undefined}
+        onDeleteSelected={() => undefined}
+        onDeselect={() => undefined}
+      />,
+    );
+    expect(barWithResizeHtml).toContain('−10 largo');
+    expect(barWithResizeHtml).toContain('+10 largo');
   });
 
   it('edición directa en 3D mueve/quita repisas y divisores, divide zonas y soporta ala L retorno', () => {

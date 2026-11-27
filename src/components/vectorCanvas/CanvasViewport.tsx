@@ -101,6 +101,7 @@ export interface CanvasViewportProps {
   curvedCuts?: CurvedCutSpec[];
   planeLinesXZ?: readonly DiagonalSegment[];
   planeLinesZY?: readonly DiagonalSegment[];
+  selectedPlaneLineId?: string | null;
   frontZones: FrontZone[];
   subRegions: SelectedSubRegion[];
   draftRegion: { uStart: number; uEnd: number; vStart: number; vEnd: number } | null;
@@ -163,6 +164,7 @@ export function CanvasViewport({
   curvedCuts = [],
   planeLinesXZ = [],
   planeLinesZY = [],
+  selectedPlaneLineId = null,
   frontZones,
   subRegions,
   draftRegion,
@@ -947,23 +949,48 @@ export function CanvasViewport({
           const pA = applyHomography(planeHom.toCanvas, { x: ln.u1, y: ln.v1 });
           const pB = applyHomography(planeHom.toCanvas, { x: ln.u2, y: ln.v2 });
           if (!pA || !pB) continue;
+          const isSel = selectedPlaneLineId === ln.id;
+          const isHov =
+            (hoverTarget.kind === 'lineBody' || hoverTarget.kind === 'lineEnd') &&
+            hoverTarget.lineRef?.id === ln.id;
           ctx.save();
-          ctx.strokeStyle = '#0284c7';
-          ctx.lineWidth = Math.max(3.2, cw / 260);
+          if (isSel || isHov) {
+            ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.58)' : 'rgba(56, 189, 248, 0.35)';
+            ctx.lineWidth = Math.max(9, cw / 110);
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(pA.x, pA.y);
+            ctx.lineTo(pB.x, pB.y);
+            ctx.stroke();
+          }
+          ctx.strokeStyle = isSel ? '#38bdf8' : isHov ? '#0ea5e9' : '#0284c7';
+          ctx.lineWidth = Math.max(isSel ? 4.4 : 3.2, cw / (isSel ? 215 : 260));
           ctx.lineCap = 'round';
           ctx.beginPath();
           ctx.moveTo(pA.x, pA.y);
           ctx.lineTo(pB.x, pB.y);
           ctx.stroke();
-          for (const ep of [pA, pB]) {
+          const rBase = Math.max(4.5, cw / 185);
+          [
+            { ep: pA, part: 'start' as const },
+            { ep: pB, part: 'end' as const },
+          ].forEach(({ ep, part }) => {
+            const hotEnd = isHov && hoverTarget.linePart === part;
+            const endR = isSel ? rBase * 1.45 : hotEnd ? rBase * 1.3 : rBase;
+            if (isSel || hotEnd) {
+              ctx.beginPath();
+              ctx.arc(ep.x, ep.y, endR + 3.5, 0, Math.PI * 2);
+              ctx.fillStyle = 'rgba(56, 189, 248, 0.35)';
+              ctx.fill();
+            }
             ctx.beginPath();
-            ctx.arc(ep.x, ep.y, Math.max(4, cw / 195), 0, Math.PI * 2);
-            ctx.fillStyle = '#f8fafc';
+            ctx.arc(ep.x, ep.y, endR, 0, Math.PI * 2);
+            ctx.fillStyle = isSel ? '#ffffff' : '#f8fafc';
             ctx.fill();
-            ctx.strokeStyle = '#0284c7';
-            ctx.lineWidth = 2;
+            ctx.strokeStyle = isSel ? '#0284c7' : '#0369a1';
+            ctx.lineWidth = 2.2;
             ctx.stroke();
-          }
+          });
           ctx.restore();
         }
       }
@@ -1267,6 +1294,7 @@ export function CanvasViewport({
     curvedCuts,
     planeLinesXZ,
     planeLinesZY,
+    selectedPlaneLineId,
     frontZones,
     subRegions,
     draftRegion,

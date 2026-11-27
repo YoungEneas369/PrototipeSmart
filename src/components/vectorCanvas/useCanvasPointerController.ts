@@ -47,6 +47,7 @@ import {
   dragQuadEdge,
   hitTestFrameScreenPx,
   hitTestLinesScreenPx,
+  hitTestPlaneLinesScreenPx,
   makeAxisAlignedQuad,
   resizeBoxCorner,
   round4,
@@ -119,6 +120,7 @@ type ActiveDrag =
       plane: CurvePlane;
       startClient: Point2D;
       clickFallbackLine: LineRef | null;
+      clickFallbackPlaneLineId?: string | null;
       pointerId: number;
     }
   | {
@@ -134,6 +136,15 @@ type ActiveDrag =
       startU: number;
       startV: number;
       baseLines: DraftLinesState;
+      pointerId: number;
+    }
+  | {
+      kind: 'editPlaneLine';
+      plane: 'xz' | 'zy';
+      hit: { id: string; part: 'start' | 'end' | 'body'; distPx: number };
+      startU: number;
+      startV: number;
+      baseLines: DiagonalSegment[];
       pointerId: number;
     }
   | {
@@ -198,6 +209,9 @@ export interface UseCanvasPointerControllerOptions {
   ) => void;
   planeLinesXZ?: readonly DiagonalSegment[];
   planeLinesZY?: readonly DiagonalSegment[];
+  selectedPlaneLineId?: string | null;
+  onSetSelectedPlaneLineId?: (id: string | null) => void;
+  onUpdatePlaneLine?: (plane: 'xz' | 'zy', updated: DiagonalSegment) => void;
   onCommitPlaneLine?: (plane: 'xz' | 'zy', seg: DiagonalSegment) => void;
   onCommitCurvedCut?: (cut: CurvedCutSpec) => void;
   onSetStatusMsg: (msg: string) => void;
@@ -243,6 +257,9 @@ export function useCanvasPointerController({
   onCommitTracedVectors,
   planeLinesXZ = [],
   planeLinesZY = [],
+  selectedPlaneLineId = null,
+  onSetSelectedPlaneLineId,
+  onUpdatePlaneLine,
   onCommitPlaneLine,
   onCommitCurvedCut,
   onSetStatusMsg,
@@ -259,6 +276,10 @@ export function useCanvasPointerController({
     null,
   );
   const [draftLines, setDraftLines] = useState<DraftLinesState | null>(null);
+  const [draftPlaneLines, setDraftPlaneLines] = useState<{
+    plane: 'xz' | 'zy';
+    lines: DiagonalSegment[];
+  } | null>(null);
   const [draftRegion, setDraftRegion] = useState<DraftSubRegion | null>(null);
   const displayHomography = useMemo(
     () => computeQuadToUnitHomography(draftQuad ?? quad),
@@ -278,6 +299,10 @@ export function useCanvasPointerController({
   const draftTopQuadRef = useRef<[Point2D, Point2D, Point2D, Point2D] | null>(null);
   const draftSideQuadRef = useRef<[Point2D, Point2D, Point2D, Point2D] | null>(null);
   const draftLinesRef = useRef<DraftLinesState | null>(null);
+  const draftPlaneLinesRef = useRef<{
+    plane: 'xz' | 'zy';
+    lines: DiagonalSegment[];
+  } | null>(null);
   const draftRegionRef = useRef<DraftSubRegion | null>(null);
   const activeTouchMapRef = useRef<Map<number, Point2D>>(new Map());
   const pinchBaseRef = useRef<{
@@ -323,6 +348,7 @@ export function useCanvasPointerController({
     draftTopQuadRef.current = null;
     draftSideQuadRef.current = null;
     draftLinesRef.current = null;
+    draftPlaneLinesRef.current = null;
     draftRegionRef.current = null;
     pinchBaseRef.current = null;
     activeTouchMapRef.current.clear();
@@ -330,6 +356,7 @@ export function useCanvasPointerController({
     setDraftTopQuad(null);
     setDraftSideQuad(null);
     setDraftLines(null);
+    setDraftPlaneLines(null);
     setDraftRegion(null);
     setLiveStroke(null);
     setSnapIndicator(null);
@@ -721,11 +748,71 @@ export function useCanvasPointerController({
         }
       }
 
-      // Dibujo con snap a esquinas, vértices y papel milimetrado en Arriba (XZ) o Lado (ZY)
+      // Selección o achicar/alargar de líneas trazadas en Arriba (XZ) o Lado (ZY)
       const nonFrontPlane: CurvePlane = viewTab === 'superior' ? 'xz' : 'zy';
       const planeW = nonFrontPlane === 'xz' ? params.targetDimensions.x : params.targetDimensions.z;
       const planeH = nonFrontPlane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
+      const plines = nonFrontPlane === 'xz' ? planeLinesXZ : planeLinesZY;
       const planeHom = computeQuadToUnitHomography(targetQuad);
+      const pHit = planeHom
+        ? hitTestPlaneLinesScreenPx(
+            rawPt,
+            plines,
+            planeHom.toCanvas,
+            scaleX,
+            scaleY,
+            selectedPlaneLineId,
+            isTouch,
+            false,
+          )
+        : null;
+      const pTapHit =
+        pHit ??
+        (planeHom
+          ? hitTestPlaneLinesScreenPx(
+              rawPt,
+              plines,
+              planeHom.toCanvas,
+              scaleX,
+              scaleY,
+              selectedPlaneLineId,
+              isTouch,
+              true,
+            )
+          : null);
+      const isSelPlaneEnd =
+        pHit !== null &&
+        selectedPlaneLineId === pHit.id &&
+        (pHit.part === 'start' || pHit.part === 'end');
+
+      if (
+        planeHom &&
+        pHit &&
+        strokeMode !== 'curve' &&
+        (linesSubMode === 'smart' || isSelPlaneEnd)
+      ) {
+        const unit = applyHomography(planeHom.toUnit, rawPt);
+        if (unit) {
+          const baseCopy = plines.map((ln) => ({ ...ln }));
+          onSetSelectedPlaneLineId?.(pHit.id);
+          draftPlaneLinesRef.current = { plane: nonFrontPlane, lines: baseCopy };
+          setDraftPlaneLines(draftPlaneLinesRef.current);
+          dragRef.current = {
+            kind: 'editPlaneLine',
+            plane: nonFrontPlane,
+            hit: pHit,
+            startU: clampNum(unit.x, 0, 1),
+            startV: clampNum(unit.y, 0, 1),
+            baseLines: baseCopy,
+            pointerId: e.pointerId,
+          };
+          setIsDraggingState(true);
+          setLoupeFocusPt(rawPt);
+          canvas.setPointerCapture(e.pointerId);
+          return;
+        }
+      }
+
       const unitSnap =
         planeHom && !e.altKey
           ? snapPointInUnitQuad(
@@ -759,6 +846,7 @@ export function useCanvasPointerController({
         plane: nonFrontPlane,
         startClient: { x: e.clientX, y: e.clientY },
         clickFallbackLine: null,
+        clickFallbackPlaneLineId: pTapHit?.id ?? null,
         pointerId: e.pointerId,
       };
       setIsDraggingState(true);
@@ -911,12 +999,39 @@ export function useCanvasPointerController({
         scaleY,
         selectedLine,
         isTouch,
+        false,
       );
+      const tapHit =
+        hit ??
+        hitTestLinesScreenPx(
+          rawPt,
+          vDivs,
+          hShs,
+          diags,
+          displayHomography.toCanvas,
+          eMm,
+          xf,
+          yf,
+          scaleX,
+          scaleY,
+          selectedLine,
+          isTouch,
+          true,
+        );
 
-      // En 'smart': editar cuerpo o extremos de una línea YA seleccionada; las puntas sin seleccionar
-      // quedan libres como esquinas para conectar la línea siguiente. En 'draw_only' o 'curve' siempre dibuja.
+      // En 'smart': editar cuerpo o extremos. En 'draw_only': al tocar los extremos de la línea YA
+      // seleccionada (`isSelectedEndpointHit`), se permite achicar o alargar sin afectar las esquinas libres.
+      const isSelectedEndpointHit =
+        hit !== null &&
+        selectedLine !== null &&
+        hit.kind === selectedLine.kind &&
+        hit.id === selectedLine.id &&
+        (hit.part === 'start' || hit.part === 'end');
+
       const shouldEditLine =
-        hit !== null && linesSubMode === 'smart' && strokeMode !== 'curve';
+        hit !== null &&
+        strokeMode !== 'curve' &&
+        (linesSubMode === 'smart' || isSelectedEndpointHit);
 
       if (shouldEditLine && hit) {
         const unit = applyHomography(displayHomography.toUnit, rawPt);
@@ -973,7 +1088,7 @@ export function useCanvasPointerController({
         points: [startPt],
         plane: 'xy',
         startClient: { x: e.clientX, y: e.clientY },
-        clickFallbackLine: hit ? { kind: hit.kind, id: hit.id } : null,
+        clickFallbackLine: tapHit ? { kind: tapHit.kind, id: tapHit.id } : null,
         pointerId: e.pointerId,
       };
       setIsDraggingState(true);
@@ -1069,6 +1184,33 @@ export function useCanvasPointerController({
         const nonFrontPlane: CurvePlane = viewTab === 'superior' ? 'xz' : 'zy';
         const pWMm = nonFrontPlane === 'xz' ? params.targetDimensions.x : params.targetDimensions.z;
         const pHMm = nonFrontPlane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
+        const plines = nonFrontPlane === 'xz' ? planeLinesXZ : planeLinesZY;
+        if (planeHom && strokeMode !== 'curve') {
+          const pHit = hitTestPlaneLinesScreenPx(
+            rawPt,
+            plines,
+            planeHom.toCanvas,
+            scaleX,
+            scaleY,
+            selectedPlaneLineId,
+            isTouch,
+            false,
+          );
+          const showPlaneHover =
+            pHit !== null &&
+            (linesSubMode === 'smart' ||
+              (selectedPlaneLineId === pHit.id && pHit.part !== 'body'));
+          if (showPlaneHover && pHit) {
+            setHoverTarget({
+              kind: pHit.part === 'body' ? 'lineBody' : 'lineEnd',
+              lineRef: { kind: 'diagonal', id: pHit.id },
+              linePart: pHit.part,
+            });
+            setSnapIndicator(null);
+            setLoupeFocusPt(null);
+            return;
+          }
+        }
         const unitSnap =
           planeHom && !e.altKey
             ? snapPointInUnitQuad(
@@ -1105,7 +1247,7 @@ export function useCanvasPointerController({
           return;
         }
 
-        if (linesSubMode === 'smart' && strokeMode !== 'curve') {
+        if (strokeMode !== 'curve' && (linesSubMode === 'smart' || selectedLine !== null)) {
           const hit = hitTestLinesScreenPx(
             rawPt,
             materializedBase.vDividers,
@@ -1119,8 +1261,16 @@ export function useCanvasPointerController({
             scaleY,
             selectedLine,
             isTouch,
+            false,
           );
-          if (hit) {
+          const showLineHover =
+            hit !== null &&
+            (linesSubMode === 'smart' ||
+              (selectedLine !== null &&
+                hit.kind === selectedLine.kind &&
+                hit.id === selectedLine.id &&
+                hit.part !== 'body'));
+          if (showLineHover && hit) {
             setHoverTarget({
               kind: hit.part === 'body' ? 'lineBody' : 'lineEnd',
               lineRef: { kind: hit.kind, id: hit.id },
@@ -1524,6 +1674,75 @@ export function useCanvasPointerController({
         draftLinesRef.current = nextDraft;
         setDraftLines(nextDraft);
       }
+      return;
+    }
+
+    if (active.kind === 'editPlaneLine') {
+      const targetQuad = active.plane === 'xz' ? topQuad : sideQuad;
+      const planeHom = computeQuadToUnitHomography(targetQuad);
+      if (!planeHom) return;
+      const pWMm = active.plane === 'xz' ? params.targetDimensions.x : params.targetDimensions.z;
+      const pHMm = active.plane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
+      const otherVertices: Point2D[] = [];
+      for (const ln of active.baseLines) {
+        if (ln.id === active.hit.id) continue;
+        otherVertices.push({ x: ln.u1, y: ln.v1 }, { x: ln.u2, y: ln.v2 });
+      }
+      const unitSnap =
+        active.hit.part === 'body'
+          ? null
+          : snapPointInUnitQuad(
+              rawPt,
+              planeHom.toUnit,
+              planeHom.toCanvas,
+              otherVertices,
+              scaleX,
+              scaleY,
+              isTouch ? 16 : 12,
+              { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey },
+            );
+      const rawUnit = applyHomography(planeHom.toUnit, rawPt);
+      if (!rawUnit && !unitSnap) return;
+      const u = clampNum(unitSnap?.unitPt.x ?? rawUnit!.x, 0, 1);
+      const v = clampNum(unitSnap?.unitPt.y ?? rawUnit!.y, 0, 1);
+      setSnapIndicator(unitSnap?.indicator ?? null);
+      setLoupeFocusPt(unitSnap?.snappedImg ?? rawPt);
+
+      const nextLines = active.baseLines.map((ln) => {
+        if (ln.id !== active.hit.id) return ln;
+        if (active.hit.part === 'start') {
+          const nu1 = round4(u);
+          const nv1 = round4(v);
+          if (Math.hypot(ln.u2 - nu1, ln.v2 - nv1) < 0.03) return ln;
+          return { ...ln, u1: nu1, v1: nv1 };
+        }
+        if (active.hit.part === 'end') {
+          const nu2 = round4(u);
+          const nv2 = round4(v);
+          if (Math.hypot(nu2 - ln.u1, nv2 - ln.v1) < 0.03) return ln;
+          return { ...ln, u2: nu2, v2: nv2 };
+        }
+        const effDu = clampNum(
+          u - active.startU,
+          -Math.min(ln.u1, ln.u2),
+          1 - Math.max(ln.u1, ln.u2),
+        );
+        const effDv = clampNum(
+          v - active.startV,
+          -Math.min(ln.v1, ln.v2),
+          1 - Math.max(ln.v1, ln.v2),
+        );
+        return {
+          ...ln,
+          u1: round4(ln.u1 + effDu),
+          v1: round4(ln.v1 + effDv),
+          u2: round4(ln.u2 + effDu),
+          v2: round4(ln.v2 + effDv),
+        };
+      });
+      draftPlaneLinesRef.current = { plane: active.plane, lines: nextLines };
+      setDraftPlaneLines(draftPlaneLinesRef.current);
+      return;
     }
   };
 
@@ -1690,10 +1909,23 @@ export function useCanvasPointerController({
         e.clientY - finished.startClient.y,
       );
       if (distScreen < 5) {
+        if (finished.plane !== 'xy') {
+          if (finished.clickFallbackPlaneLineId) {
+            onSetSelectedPlaneLineId?.(finished.clickFallbackPlaneLineId);
+            onSetStatusMsg(
+              'Línea seleccionada: arrastra los círculos en las puntas para achicar o alargar, o ajusta abajo.',
+            );
+          } else {
+            onSetSelectedPlaneLineId?.(null);
+          }
+          return;
+        }
         if (finished.clickFallbackLine) {
           onSetSelectedLine(finished.clickFallbackLine);
-          onSetStatusMsg('Línea seleccionada: muévela, edita sus medidas o pulsa "Borrar línea".');
-        } else if (linesSubMode === 'smart') {
+          onSetStatusMsg(
+            'Línea seleccionada: arrastra los círculos en las puntas para achicar o alargar, o ajusta abajo.',
+          );
+        } else {
           onSetSelectedLine(null);
         }
         return;
@@ -1919,11 +2151,27 @@ export function useCanvasPointerController({
             finalLines.diagonalDividers,
             { recordUndo: true },
           );
-          onSetStatusMsg('Línea actualizada en 2D y 3D (Ctrl+Z para deshacer).');
+          onSetStatusMsg('Línea actualizada (Ctrl+Z para deshacer). Arrastra las puntas si quieres achicar o alargar más.');
         } else {
-          onSetStatusMsg('Línea seleccionada: muévela, edita sus medidas o pulsa "✕ Borrar línea".');
+          onSetStatusMsg('Línea seleccionada: arrastra los círculos en las puntas para achicar o alargar.');
         }
       }
+      return;
+    }
+
+    if (finished.kind === 'editPlaneLine') {
+      const finalPlaneDraft = draftPlaneLinesRef.current;
+      draftPlaneLinesRef.current = null;
+      setDraftPlaneLines(null);
+      if (finalPlaneDraft && onUpdatePlaneLine) {
+        const updated = finalPlaneDraft.lines.find((l) => l.id === finished.hit.id);
+        const orig = finished.baseLines.find((l) => l.id === finished.hit.id);
+        if (updated && orig && JSON.stringify(updated) !== JSON.stringify(orig)) {
+          onUpdatePlaneLine(finished.plane, updated);
+          onSetStatusMsg('Línea actualizada en vista Arriba / Lado.');
+        }
+      }
+      return;
     }
   };
 
@@ -1950,16 +2198,18 @@ export function useCanvasPointerController({
       if (hoverTarget.kind === 'frameInterior') return strokeMode === 'curve' ? 'crosshair' : 'move';
       return frameMode === 'box' || strokeMode === 'curve' ? 'crosshair' : 'default';
     }
-    if (viewTab !== 'frontal') return 'crosshair';
+    if (viewTab !== 'frontal') {
+      if (traceStep === 'lines' && hoverTarget.kind === 'lineEnd') return 'grab';
+      if (traceStep === 'lines' && hoverTarget.kind === 'lineBody') return 'move';
+      return 'crosshair';
+    }
     if (traceStep === 'lines') {
       if (linesSubMode === 'regions') return 'crosshair';
-      if (linesSubMode === 'smart') {
-        if (hoverTarget.kind === 'lineEnd') return 'grab';
-        if (hoverTarget.kind === 'lineBody') {
-          if (hoverTarget.lineRef?.kind === 'vDivider') return 'ew-resize';
-          if (hoverTarget.lineRef?.kind === 'hShelf') return 'ns-resize';
-          return 'move';
-        }
+      if (hoverTarget.kind === 'lineEnd') return 'grab';
+      if (linesSubMode === 'smart' && hoverTarget.kind === 'lineBody') {
+        if (hoverTarget.lineRef?.kind === 'vDivider') return 'ew-resize';
+        if (hoverTarget.lineRef?.kind === 'hShelf') return 'ns-resize';
+        return 'move';
       }
       return 'crosshair';
     }
@@ -1989,6 +2239,7 @@ export function useCanvasPointerController({
     draftTopQuad,
     draftSideQuad,
     draftLines,
+    draftPlaneLines,
     draftRegion,
     liveStroke,
     snapIndicator,

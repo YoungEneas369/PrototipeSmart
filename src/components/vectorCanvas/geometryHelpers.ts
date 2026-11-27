@@ -554,8 +554,10 @@ export function hitTestLinesScreenPx(
   scaleY: number,
   selectedLine: LineRef | null = null,
   isTouch = false,
+  includeUnselectedEndsForTap = false,
 ): LineHitResult | null {
-  const endTol = isTouch ? 17 : 12;
+  const endTol = isTouch ? 18 : 13;
+  const selEndTol = isTouch ? 22 : 16;
   const cornerReserveTol = isTouch ? 18 : 14;
   const bodyTol = isTouch ? 14 : 9;
 
@@ -569,22 +571,21 @@ export function hitTestLinesScreenPx(
   ) => {
     if (!proj) return;
     const isSel = selectedLine?.kind === kind && selectedLine.id === id;
-    const selBonus = isSel ? 2.5 : 0;
+    const activeEndTol = isSel ? selEndTol : endTol;
 
     const d0 = distScreenPx(ptImg, proj.p0, scaleX, scaleY);
     const d1 = distScreenPx(ptImg, proj.p1, scaleX, scaleY);
 
-    // Solo arrastrar puntas cuando la línea ya está seleccionada expresamente;
-    // en líneas no seleccionadas, las puntas quedan libres como esquinas para conectar la línea siguiente.
-    if (isSel) {
-      if (d0 <= endTol + selBonus) {
-        const score = d0 - 3;
+    // Arrastrar puntas para achicar/alargar cuando ya está seleccionada (o al evaluar un toque rápido)
+    if (isSel || includeUnselectedEndsForTap) {
+      if (d0 <= activeEndTol) {
+        const score = d0 - (isSel ? 4 : 1);
         if (!bestEnd || score < bestEnd.distPx) {
           bestEnd = { kind, id, part: 'start', distPx: score };
         }
       }
-      if (d1 <= endTol + selBonus) {
-        const score = d1 - 3;
+      if (d1 <= activeEndTol) {
+        const score = d1 - (isSel ? 4 : 1);
         if (!bestEnd || score < bestEnd.distPx) {
           bestEnd = { kind, id, part: 'end', distPx: score };
         }
@@ -593,11 +594,12 @@ export function hitTestLinesScreenPx(
 
     const segPx = distScreenPx(proj.p0, proj.p1, scaleX, scaleY);
     const effectiveReserve = Math.min(cornerReserveTol, segPx * 0.36);
-    const nearUnselectedEndpoint = !isSel && (d0 <= effectiveReserve || d1 <= effectiveReserve);
+    const nearUnselectedEndpoint =
+      !isSel && !includeUnselectedEndsForTap && (d0 <= effectiveReserve || d1 <= effectiveReserve);
     if (nearUnselectedEndpoint) return;
 
     const db = pointToSegmentDistScreenPx(ptImg, proj.p0, proj.p1, scaleX, scaleY);
-    if (db <= bodyTol + selBonus * 0.5) {
+    if (db <= bodyTol + (isSel ? 2 : 0)) {
       const score = db - (isSel ? 2 : 0);
       if (!bestBody || score < bestBody.distPx) {
         bestBody = { kind, id, part: 'body', distPx: score };
@@ -613,6 +615,70 @@ export function hitTestLinesScreenPx(
   }
   for (const dg of diagonalDividers) {
     evalSeg('diagonal', dg.id, projectDiagonal(dg, toCanvas, e, xf, yf));
+  }
+
+  return bestEnd ?? bestBody;
+}
+
+/**
+ * Hit-testing en píxeles reales de pantalla para líneas en Arriba (XZ) y Lado (ZY).
+ */
+export function hitTestPlaneLinesScreenPx(
+  ptImg: Point2D,
+  planeLines: readonly DiagonalSegment[],
+  toCanvas: Matrix3x3,
+  scaleX: number,
+  scaleY: number,
+  selectedPlaneLineId: string | null = null,
+  isTouch = false,
+  includeUnselectedEndsForTap = false,
+): { id: string; part: 'start' | 'end' | 'body'; distPx: number } | null {
+  const endTol = isTouch ? 18 : 13;
+  const selEndTol = isTouch ? 22 : 16;
+  const cornerReserveTol = isTouch ? 18 : 14;
+  const bodyTol = isTouch ? 14 : 9;
+
+  let bestEnd: { id: string; part: 'start' | 'end' | 'body'; distPx: number } | null = null;
+  let bestBody: { id: string; part: 'start' | 'end' | 'body'; distPx: number } | null = null;
+
+  for (const ln of planeLines) {
+    const p0 = applyHomography(toCanvas, { x: ln.u1, y: ln.v1 });
+    const p1 = applyHomography(toCanvas, { x: ln.u2, y: ln.v2 });
+    if (!p0 || !p1) continue;
+
+    const isSel = selectedPlaneLineId === ln.id;
+    const activeEndTol = isSel ? selEndTol : endTol;
+    const d0 = distScreenPx(ptImg, p0, scaleX, scaleY);
+    const d1 = distScreenPx(ptImg, p1, scaleX, scaleY);
+
+    if (isSel || includeUnselectedEndsForTap) {
+      if (d0 <= activeEndTol) {
+        const score = d0 - (isSel ? 4 : 1);
+        if (!bestEnd || score < bestEnd.distPx) {
+          bestEnd = { id: ln.id, part: 'start', distPx: score };
+        }
+      }
+      if (d1 <= activeEndTol) {
+        const score = d1 - (isSel ? 4 : 1);
+        if (!bestEnd || score < bestEnd.distPx) {
+          bestEnd = { id: ln.id, part: 'end', distPx: score };
+        }
+      }
+    }
+
+    const segPx = distScreenPx(p0, p1, scaleX, scaleY);
+    const effectiveReserve = Math.min(cornerReserveTol, segPx * 0.36);
+    if (!isSel && !includeUnselectedEndsForTap && (d0 <= effectiveReserve || d1 <= effectiveReserve)) {
+      continue;
+    }
+
+    const db = pointToSegmentDistScreenPx(ptImg, p0, p1, scaleX, scaleY);
+    if (db <= bodyTol + (isSel ? 2 : 0)) {
+      const score = db - (isSel ? 2 : 0);
+      if (!bestBody || score < bestBody.distPx) {
+        bestBody = { id: ln.id, part: 'body', distPx: score };
+      }
+    }
   }
 
   return bestEnd ?? bestBody;

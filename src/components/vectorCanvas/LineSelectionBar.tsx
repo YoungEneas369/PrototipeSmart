@@ -22,7 +22,7 @@ import { NumericInput } from '../NumericInput';
 import { clampNum, round4, type LineRef } from './geometryHelpers';
 
 export interface LineSelectionBarProps {
-  selectedLine: LineRef;
+  selectedLine: LineRef | null;
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
   onUpdateVDivider: (id: string, next: NormalizedSegment) => void;
@@ -30,6 +30,10 @@ export interface LineSelectionBarProps {
   onUpdateDiagonal: (id: string, next: DiagonalSegment) => void;
   onDeleteSelected: () => void;
   onDeselect: () => void;
+  selectedPlaneLine?: { plane: 'xz' | 'zy'; line: DiagonalSegment } | null;
+  onUpdatePlaneLine?: (plane: 'xz' | 'zy', next: DiagonalSegment) => void;
+  onDeletePlaneLine?: (plane: 'xz' | 'zy', id: string) => void;
+  onDeselectPlaneLine?: () => void;
 }
 
 const NUDGE_STEPS = [-10, -1, 1, 10] as const;
@@ -43,13 +47,124 @@ export function LineSelectionBar({
   onUpdateDiagonal,
   onDeleteSelected,
   onDeselect,
+  selectedPlaneLine = null,
+  onUpdatePlaneLine,
+  onDeletePlaneLine,
+  onDeselectPlaneLine,
 }: LineSelectionBarProps) {
   const e = params.boardThickness;
   const xf = params.targetDimensions.x;
   const yf = params.targetDimensions.y;
+  const zf = params.targetDimensions.z;
   const xInt = Math.max(1, xf - 2 * e);
   const yInt = Math.max(1, yf - 2 * e);
   const minInnerMm = Math.max(20, Math.round(e * 1.2));
+
+  if (!selectedLine && selectedPlaneLine && onUpdatePlaneLine && onDeletePlaneLine) {
+    const { plane, line } = selectedPlaneLine;
+    const planeW = plane === 'xz' ? xf : zf;
+    const planeH = plane === 'xz' ? zf : yf;
+    const x1Mm = Math.round(line.u1 * planeW);
+    const y1Mm = Math.round(line.v1 * planeH);
+    const x2Mm = Math.round(line.u2 * planeW);
+    const y2Mm = Math.round(line.v2 * planeH);
+    const dxMm = x2Mm - x1Mm;
+    const dyMm = y2Mm - y1Mm;
+    const lenMm = Math.round(Math.hypot(dxMm, dyMm));
+
+    const resizePlaneLength = (deltaMm: number) => {
+      const curLen = Math.hypot(dxMm, dyMm);
+      if (curLen < 1) return;
+      const nextLen = clampNum(curLen + deltaMm, 30, Math.hypot(planeW, planeH));
+      const scale = nextLen / curLen;
+      const nx2 = clampNum(x1Mm + dxMm * scale, 0, planeW);
+      const ny2 = clampNum(y1Mm + dyMm * scale, 0, planeH);
+      onUpdatePlaneLine(plane, {
+        ...line,
+        u2: round4(nx2 / planeW),
+        v2: round4(ny2 / planeH),
+      });
+    };
+
+    return (
+      <div
+        className="vc-line-bar"
+        role="region"
+        aria-label={`Propiedades de línea en vista ${plane.toUpperCase()}`}
+      >
+        <div className="vc-line-bar-head">
+          <span className="vc-line-tag vc-line-tag-v">
+            Línea {plane === 'xz' ? 'Arriba (XZ)' : 'Lado (ZY)'}
+          </span>
+          <span className="vc-line-meta">
+            Largo: <strong>{lenMm} mm</strong>
+          </span>
+          <span className="vc-line-hint">
+            Arrastra los círculos azules en las puntas para achicar o alargar · Supr borrar
+          </span>
+          {onDeselectPlaneLine && (
+            <button
+              type="button"
+              className="vc-icon-btn"
+              onClick={onDeselectPlaneLine}
+              title="Deseleccionar (Esc)"
+              aria-label="Cerrar barra de línea"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
+        <div className="vc-line-bar-body">
+          <div className="vc-nudge-group" role="group" aria-label="Achicar o alargar línea">
+            <button
+              type="button"
+              className="vc-chip vc-chip-mini"
+              onClick={() => resizePlaneLength(-20)}
+              title="Achicar línea 20 mm"
+            >
+              −20 largo
+            </button>
+            <button
+              type="button"
+              className="vc-chip vc-chip-mini"
+              onClick={() => resizePlaneLength(-10)}
+              title="Achicar línea 10 mm"
+            >
+              −10 largo
+            </button>
+            <button
+              type="button"
+              className="vc-chip vc-chip-mini"
+              onClick={() => resizePlaneLength(10)}
+              title="Alargar línea 10 mm"
+            >
+              +10 largo
+            </button>
+            <button
+              type="button"
+              className="vc-chip vc-chip-mini"
+              onClick={() => resizePlaneLength(20)}
+              title="Alargar línea 20 mm"
+            >
+              +20 largo
+            </button>
+          </div>
+          <div className="vc-line-actions">
+            <button
+              type="button"
+              className="vc-chip vc-chip-danger-soft"
+              onClick={() => onDeletePlaneLine(plane, line.id)}
+              title="Eliminar esta línea (Supr)"
+            >
+              <X size={12} /> Borrar línea
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!selectedLine) return null;
 
   // Divisores verticales y repisas horizontales comparten el mismo editor parametrizado
   if (selectedLine.kind === 'vDivider' || selectedLine.kind === 'hShelf') {
@@ -87,6 +202,30 @@ export function LineSelectionBar({
       onCommitSeg(seg.id, { ...seg, end: round4(clampedEnd / spanAxisInt) });
     };
 
+    const resizeLengthMm = (deltaMm: number) => {
+      if (deltaMm < 0) {
+        const nextEnd = Math.max(startMm + 25, endMm + deltaMm);
+        const shrunk = endMm - nextEnd;
+        const rem = -deltaMm - shrunk;
+        const nextStart = rem > 0 ? Math.min(nextEnd - 25, startMm + rem) : startMm;
+        onCommitSeg(seg.id, {
+          ...seg,
+          start: round4(clampNum(nextStart, 0, spanAxisInt - 25) / spanAxisInt),
+          end: round4(clampNum(nextEnd, 25, spanAxisInt) / spanAxisInt),
+        });
+        return;
+      }
+      const addEnd = Math.min(deltaMm, spanAxisInt - endMm);
+      const rem = deltaMm - addEnd;
+      const nextEnd = endMm + addEnd;
+      const nextStart = Math.max(0, startMm - rem);
+      onCommitSeg(seg.id, {
+        ...seg,
+        start: round4(nextStart / spanAxisInt),
+        end: round4(nextEnd / spanAxisInt),
+      });
+    };
+
     return (
       <div
         className="vc-line-bar"
@@ -108,7 +247,9 @@ export function LineSelectionBar({
           <span className="vc-line-meta">
             {isV ? 'Largo real:' : 'Luz real:'} <strong>{lengthMm} mm</strong>
           </span>
-          <span className="vc-line-hint">Flechas ±1 mm · Shift ±10 mm · Supr borrar</span>
+          <span className="vc-line-hint">
+            Arrastra los círculos en las puntas para achicar o alargar · Supr borrar
+          </span>
           <button
             type="button"
             className="vc-icon-btn"
@@ -188,6 +329,25 @@ export function LineSelectionBar({
             <span>mm</span>
           </label>
 
+          <div className="vc-nudge-group" role="group" aria-label="Achicar o alargar línea">
+            <button
+              type="button"
+              className="vc-chip vc-chip-mini"
+              onClick={() => resizeLengthMm(-10)}
+              title="Achicar línea 10 mm"
+            >
+              −10 largo
+            </button>
+            <button
+              type="button"
+              className="vc-chip vc-chip-mini"
+              onClick={() => resizeLengthMm(10)}
+              title="Alargar línea 10 mm"
+            >
+              +10 largo
+            </button>
+          </div>
+
           <div className="vc-line-actions">
             <button
               type="button"
@@ -262,6 +422,14 @@ export function LineSelectionBar({
     updateDiagMm(x1Mm + eff, y1Mm, x2Mm + eff, y2Mm);
   };
 
+  const resizeDiagLength = (deltaMm: number) => {
+    const curLen = Math.hypot(dxMm, dyMm);
+    if (curLen < 1) return;
+    const nextLen = clampNum(curLen + deltaMm, Math.max(25, e * 1.5), Math.hypot(xInt, yInt));
+    const scale = nextLen / curLen;
+    updateDiagMm(x1Mm, y1Mm, x1Mm + dxMm * scale, y1Mm + dyMm * scale);
+  };
+
   return (
     <div className="vc-line-bar" role="region" aria-label="Propiedades de la división diagonal">
       <div className="vc-line-bar-head">
@@ -271,7 +439,9 @@ export function LineSelectionBar({
         <span className="vc-line-meta">
           Largo: <strong>{lengthMm} mm</strong> · Ángulo: <strong>{angleDeg}°</strong>
         </span>
-        <span className="vc-line-hint">Flechas mueven · Arrastra extremos en la foto</span>
+        <span className="vc-line-hint">
+          Arrastra los círculos en las puntas para achicar o alargar · Supr borrar
+        </span>
         <button
           type="button"
           className="vc-icon-btn"
@@ -346,6 +516,25 @@ export function LineSelectionBar({
               {delta > 0 ? `+${delta}` : delta}
             </button>
           ))}
+        </div>
+
+        <div className="vc-nudge-group" role="group" aria-label="Achicar o alargar diagonal">
+          <button
+            type="button"
+            className="vc-chip vc-chip-mini"
+            onClick={() => resizeDiagLength(-10)}
+            title="Achicar diagonal 10 mm"
+          >
+            −10 largo
+          </button>
+          <button
+            type="button"
+            className="vc-chip vc-chip-mini"
+            onClick={() => resizeDiagLength(10)}
+            title="Alargar diagonal 10 mm"
+          >
+            +10 largo
+          </button>
         </div>
 
         <div className="vc-line-actions">

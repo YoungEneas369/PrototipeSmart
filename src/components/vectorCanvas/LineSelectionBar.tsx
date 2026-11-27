@@ -1,8 +1,8 @@
 /**
  * SMARTFURNITURE v8.0 — BARRA CONTEXTUAL DE PRECISIÓN PARA LÍNEAS (PASO 2)
- * Permite editar por teclado en milímetros cualquier divisor vertical, repisa horizontal
- * o división diagonal seleccionada, con centrado rápido, ajuste a bordes 0–100%,
- * micro-desplazamiento (±1 / ±10 mm), inversión de diagonal (`/` ↔ `\`) y eliminación.
+ * Edita en milímetros divisores verticales, repisas horizontales y divisiones diagonales,
+ * con centrado rápido, ajuste 0–100%, micro-desplazamiento (±1 / ±10 mm), inversión de
+ * diagonal (`/` ↔ `\`) y botón único `Borrar línea` (sin duplicar `Deshacer`).
  */
 import {
   FlipHorizontal2,
@@ -10,7 +10,6 @@ import {
   Slash,
   StretchHorizontal,
   StretchVertical,
-  Undo2,
   X,
 } from 'lucide-react';
 import type {
@@ -26,8 +25,6 @@ export interface LineSelectionBarProps {
   selectedLine: LineRef;
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
-  canUndo?: boolean;
-  onUndo?: () => void;
   onUpdateVDivider: (id: string, next: NormalizedSegment) => void;
   onUpdateHShelf: (id: string, next: NormalizedSegment) => void;
   onUpdateDiagonal: (id: string, next: DiagonalSegment) => void;
@@ -35,12 +32,12 @@ export interface LineSelectionBarProps {
   onDeselect: () => void;
 }
 
+const NUDGE_STEPS = [-10, -1, 1, 10] as const;
+
 export function LineSelectionBar({
   selectedLine,
   topology,
   params,
-  canUndo = false,
-  onUndo,
   onUpdateVDivider,
   onUpdateHShelf,
   onUpdateDiagonal,
@@ -54,41 +51,62 @@ export function LineSelectionBar({
   const yInt = Math.max(1, yf - 2 * e);
   const minInnerMm = Math.max(20, Math.round(e * 1.2));
 
-  if (selectedLine.kind === 'vDivider') {
-    const seg = topology.vDividers.find((d) => d.id === selectedLine.id);
+  // Divisores verticales y repisas horizontales comparten el mismo editor parametrizado
+  if (selectedLine.kind === 'vDivider' || selectedLine.kind === 'hShelf') {
+    const isV = selectedLine.kind === 'vDivider';
+    const seg = isV
+      ? topology.vDividers.find((d) => d.id === selectedLine.id)
+      : topology.hShelves.find((s) => s.id === selectedLine.id);
     if (!seg) return null;
 
-    const posMm = Math.round(e + seg.position * xInt);
-    const startMm = Math.round(seg.start * yInt);
-    const endMm = Math.round(seg.end * yInt);
+    const posAxisOuter = isV ? xf : yf;
+    const posAxisInt = isV ? xInt : yInt;
+    const spanAxisInt = isV ? yInt : xInt;
+    const onCommitSeg = isV ? onUpdateVDivider : onUpdateHShelf;
+
+    const posMm = Math.round(e + seg.position * posAxisInt);
+    const startMm = Math.round(seg.start * spanAxisInt);
+    const endMm = Math.round(seg.end * spanAxisInt);
     const lengthMm = Math.max(0, endMm - startMm);
     const minPosMm = Math.round(e + minInnerMm);
-    const maxPosMm = Math.max(minPosMm, Math.round(xf - e - minInnerMm));
+    const maxPosMm = Math.max(minPosMm, Math.round(posAxisOuter - e - minInnerMm));
 
     const commitPosMm = (nextMm: number) => {
       const clampedMm = clampNum(nextMm, minPosMm, maxPosMm);
-      const nextU = round4(clampNum((clampedMm - e) / xInt, 0.015, 0.985));
-      onUpdateVDivider(seg.id, { ...seg, position: nextU });
+      const nextNorm = round4(clampNum((clampedMm - e) / posAxisInt, 0.03, 0.97));
+      onCommitSeg(seg.id, { ...seg, position: nextNorm });
     };
 
     const commitStartMm = (nextStartMm: number) => {
       const clampedStart = clampNum(nextStartMm, 0, Math.max(0, endMm - 25));
-      onUpdateVDivider(seg.id, { ...seg, start: round4(clampedStart / yInt) });
+      onCommitSeg(seg.id, { ...seg, start: round4(clampedStart / spanAxisInt) });
     };
 
     const commitEndMm = (nextEndMm: number) => {
-      const clampedEnd = clampNum(nextEndMm, Math.min(yInt, startMm + 25), yInt);
-      onUpdateVDivider(seg.id, { ...seg, end: round4(clampedEnd / yInt) });
+      const clampedEnd = clampNum(nextEndMm, Math.min(spanAxisInt, startMm + 25), spanAxisInt);
+      onCommitSeg(seg.id, { ...seg, end: round4(clampedEnd / spanAxisInt) });
     };
 
     return (
-      <div className="vc-line-bar" role="region" aria-label="Propiedades del divisor vertical">
+      <div
+        className="vc-line-bar"
+        role="region"
+        aria-label={isV ? 'Propiedades del divisor vertical' : 'Propiedades de la repisa horizontal'}
+      >
         <div className="vc-line-bar-head">
-          <span className="vc-line-tag vc-line-tag-v">
-            <StretchVertical size={13} /> Divisor vertical
+          <span className={`vc-line-tag ${isV ? 'vc-line-tag-v' : 'vc-line-tag-h'}`}>
+            {isV ? (
+              <>
+                <StretchVertical size={13} /> Divisor vertical
+              </>
+            ) : (
+              <>
+                <StretchHorizontal size={13} /> Repisa horizontal
+              </>
+            )}
           </span>
           <span className="vc-line-meta">
-            Largo real: <strong>{lengthMm} mm</strong>
+            {isV ? 'Largo real:' : 'Luz real:'} <strong>{lengthMm} mm</strong>
           </span>
           <span className="vc-line-hint">Flechas ±1 mm · Shift ±10 mm · Supr borrar</span>
           <button
@@ -104,7 +122,7 @@ export function LineSelectionBar({
 
         <div className="vc-line-bar-body">
           <label className="vc-mm-field">
-            <span>Desde izq.:</span>
+            <span>{isV ? 'Desde izq.:' : 'Desde base:'}</span>
             <NumericInput
               value={posMm}
               min={minPosMm}
@@ -112,156 +130,21 @@ export function LineSelectionBar({
               step={1}
               onCommit={commitPosMm}
               className="vc-mm-input"
-              ariaLabel="Posición del divisor desde el borde izquierdo en mm"
+              ariaLabel={
+                isV
+                  ? 'Posición del divisor desde el borde izquierdo en mm'
+                  : 'Altura de la repisa desde la base en mm'
+              }
             />
             <span>mm</span>
           </label>
 
-          <div className="vc-nudge-group" role="group" aria-label="Ajuste fino posición">
-            {[-10, -1, 1, 10].map((delta) => (
-              <button
-                key={delta}
-                type="button"
-                className="vc-chip vc-chip-mini"
-                onClick={() => commitPosMm(posMm + delta)}
-              >
-                {delta > 0 ? `+${delta}` : delta}
-              </button>
-            ))}
-          </div>
-
-          <label className="vc-mm-field">
-            <span>Inicio Y:</span>
-            <NumericInput
-              value={startMm}
-              min={0}
-              max={Math.max(0, endMm - 25)}
-              step={5}
-              onCommit={commitStartMm}
-              className="vc-mm-input vc-mm-input-sm"
-              ariaLabel="Inicio vertical del divisor en mm"
-            />
-          </label>
-          <label className="vc-mm-field">
-            <span>Fin Y:</span>
-            <NumericInput
-              value={endMm}
-              min={Math.min(yInt, startMm + 25)}
-              max={yInt}
-              step={5}
-              onCommit={commitEndMm}
-              className="vc-mm-input vc-mm-input-sm"
-              ariaLabel="Fin vertical del divisor en mm"
-            />
-            <span>mm</span>
-          </label>
-
-          <div className="vc-line-actions">
-            <button
-              type="button"
-              className="vc-chip"
-              onClick={() => onUpdateVDivider(seg.id, { ...seg, position: 0.5 })}
-              title="Centrar exactamente al 50% del ancho interior"
-            >
-              Centrar
-            </button>
-            <button
-              type="button"
-              className="vc-chip"
-              onClick={() => onUpdateVDivider(seg.id, { ...seg, start: 0, end: 1 })}
-              title="Extender desde base (0%) hasta cubierta (100%)"
-            >
-              <Maximize2 size={12} /> 0–100%
-            </button>
-            {canUndo && onUndo && (
-              <button
-                type="button"
-                className="vc-chip vc-chip-undo"
-                onClick={onUndo}
-                title="Deshacer último cambio (Ctrl+Z)"
-              >
-                <Undo2 size={12} /> Deshacer
-              </button>
-            )}
-            <button
-              type="button"
-              className="vc-chip vc-chip-danger-soft"
-              onClick={onDeleteSelected}
-              title="Eliminar este divisor (Supr)"
-            >
-              <X size={12} /> Borrar línea
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (selectedLine.kind === 'hShelf') {
-    const seg = topology.hShelves.find((s) => s.id === selectedLine.id);
-    if (!seg) return null;
-
-    const posMm = Math.round(e + seg.position * yInt);
-    const startMm = Math.round(seg.start * xInt);
-    const endMm = Math.round(seg.end * xInt);
-    const lengthMm = Math.max(0, endMm - startMm);
-    const minPosMm = Math.round(e + minInnerMm);
-    const maxPosMm = Math.max(minPosMm, Math.round(yf - e - minInnerMm));
-
-    const commitPosMm = (nextMm: number) => {
-      const clampedMm = clampNum(nextMm, minPosMm, maxPosMm);
-      const nextV = round4(clampNum((clampedMm - e) / yInt, 0.015, 0.985));
-      onUpdateHShelf(seg.id, { ...seg, position: nextV });
-    };
-
-    const commitStartMm = (nextStartMm: number) => {
-      const clampedStart = clampNum(nextStartMm, 0, Math.max(0, endMm - 25));
-      onUpdateHShelf(seg.id, { ...seg, start: round4(clampedStart / xInt) });
-    };
-
-    const commitEndMm = (nextEndMm: number) => {
-      const clampedEnd = clampNum(nextEndMm, Math.min(xInt, startMm + 25), xInt);
-      onUpdateHShelf(seg.id, { ...seg, end: round4(clampedEnd / xInt) });
-    };
-
-    return (
-      <div className="vc-line-bar" role="region" aria-label="Propiedades de la repisa horizontal">
-        <div className="vc-line-bar-head">
-          <span className="vc-line-tag vc-line-tag-h">
-            <StretchHorizontal size={13} /> Repisa horizontal
-          </span>
-          <span className="vc-line-meta">
-            Luz real: <strong>{lengthMm} mm</strong>
-          </span>
-          <span className="vc-line-hint">Flechas ±1 mm · Shift ±10 mm · Supr borrar</span>
-          <button
-            type="button"
-            className="vc-icon-btn"
-            onClick={onDeselect}
-            title="Deseleccionar (Esc)"
-            aria-label="Cerrar barra de línea"
+          <div
+            className="vc-nudge-group"
+            role="group"
+            aria-label={isV ? 'Ajuste fino posición' : 'Ajuste fino altura'}
           >
-            <X size={14} />
-          </button>
-        </div>
-
-        <div className="vc-line-bar-body">
-          <label className="vc-mm-field">
-            <span>Desde base:</span>
-            <NumericInput
-              value={posMm}
-              min={minPosMm}
-              max={maxPosMm}
-              step={1}
-              onCommit={commitPosMm}
-              className="vc-mm-input"
-              ariaLabel="Altura de la repisa desde la base en mm"
-            />
-            <span>mm</span>
-          </label>
-
-          <div className="vc-nudge-group" role="group" aria-label="Ajuste fino altura">
-            {[-10, -1, 1, 10].map((delta) => (
+            {NUDGE_STEPS.map((delta) => (
               <button
                 key={delta}
                 type="button"
@@ -274,7 +157,7 @@ export function LineSelectionBar({
           </div>
 
           <label className="vc-mm-field">
-            <span>Inicio X:</span>
+            <span>{isV ? 'Inicio Y:' : 'Inicio X:'}</span>
             <NumericInput
               value={startMm}
               min={0}
@@ -282,19 +165,25 @@ export function LineSelectionBar({
               step={5}
               onCommit={commitStartMm}
               className="vc-mm-input vc-mm-input-sm"
-              ariaLabel="Inicio horizontal de la repisa en mm"
+              ariaLabel={
+                isV
+                  ? 'Inicio vertical del divisor en mm'
+                  : 'Inicio horizontal de la repisa en mm'
+              }
             />
           </label>
           <label className="vc-mm-field">
-            <span>Fin X:</span>
+            <span>{isV ? 'Fin Y:' : 'Fin X:'}</span>
             <NumericInput
               value={endMm}
-              min={Math.min(xInt, startMm + 25)}
-              max={xInt}
+              min={Math.min(spanAxisInt, startMm + 25)}
+              max={spanAxisInt}
               step={5}
               onCommit={commitEndMm}
               className="vc-mm-input vc-mm-input-sm"
-              ariaLabel="Fin horizontal de la repisa en mm"
+              ariaLabel={
+                isV ? 'Fin vertical del divisor en mm' : 'Fin horizontal de la repisa en mm'
+              }
             />
             <span>mm</span>
           </label>
@@ -303,34 +192,32 @@ export function LineSelectionBar({
             <button
               type="button"
               className="vc-chip"
-              onClick={() => onUpdateHShelf(seg.id, { ...seg, position: 0.5 })}
-              title="Centrar exactamente al 50% de la altura interior"
+              onClick={() => onCommitSeg(seg.id, { ...seg, position: 0.5 })}
+              title={
+                isV
+                  ? 'Centrar exactamente al 50% del ancho interior'
+                  : 'Centrar exactamente al 50% de la altura interior'
+              }
             >
               Centrar
             </button>
             <button
               type="button"
               className="vc-chip"
-              onClick={() => onUpdateHShelf(seg.id, { ...seg, start: 0, end: 1 })}
-              title="Extender desde lateral izq. (0%) hasta derecho (100%)"
+              onClick={() => onCommitSeg(seg.id, { ...seg, start: 0, end: 1 })}
+              title={
+                isV
+                  ? 'Extender desde base (0%) hasta cubierta (100%)'
+                  : 'Extender desde lateral izq. (0%) hasta derecho (100%)'
+              }
             >
               <Maximize2 size={12} /> 0–100%
             </button>
-            {canUndo && onUndo && (
-              <button
-                type="button"
-                className="vc-chip vc-chip-undo"
-                onClick={onUndo}
-                title="Deshacer último cambio (Ctrl+Z)"
-              >
-                <Undo2 size={12} /> Deshacer
-              </button>
-            )}
             <button
               type="button"
               className="vc-chip vc-chip-danger-soft"
               onClick={onDeleteSelected}
-              title="Eliminar esta repisa (Supr)"
+              title={isV ? 'Eliminar este divisor (Supr)' : 'Eliminar esta repisa (Supr)'}
             >
               <X size={12} /> Borrar línea
             </button>
@@ -340,7 +227,7 @@ export function LineSelectionBar({
     );
   }
 
-  // Diagonal
+  // División diagonal
   const diag = (topology.diagonalDividers ?? []).find((dg) => dg.id === selectedLine.id);
   if (!diag) return null;
 
@@ -448,7 +335,7 @@ export function LineSelectionBar({
         </label>
 
         <div className="vc-nudge-group" role="group" aria-label="Desplazar diagonal en X">
-          {[-10, -1, 1, 10].map((delta) => (
+          {NUDGE_STEPS.map((delta) => (
             <button
               key={delta}
               type="button"
@@ -476,16 +363,6 @@ export function LineSelectionBar({
           >
             <FlipHorizontal2 size={12} /> Invertir / ↔ \
           </button>
-          {canUndo && onUndo && (
-            <button
-              type="button"
-              className="vc-chip vc-chip-undo"
-              onClick={onUndo}
-              title="Deshacer último cambio (Ctrl+Z)"
-            >
-              <Undo2 size={12} /> Deshacer
-            </button>
-          )}
           <button
             type="button"
             className="vc-chip vc-chip-danger-soft"

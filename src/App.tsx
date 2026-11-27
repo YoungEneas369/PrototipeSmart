@@ -5,7 +5,7 @@
  *   2. Plano 2D y Partes (V₀ vs V_f + ZoneInspector unificado)
  *   3. Taller (Unidad 3, Alertas DIN, Matrices n×3/n×5, Herrajes + Presupuesto CLP editable y Corte 2D)
  */
-import { useMemo, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Box,
@@ -13,10 +13,8 @@ import {
   Eye,
   EyeOff,
   Lock,
-  Pipette,
   Ruler,
   Unlock,
-  Wrench,
   ZoomIn,
 } from 'lucide-react';
 import type {
@@ -25,19 +23,25 @@ import type {
   FrontZone,
   FurnitureTopology,
   HardwareItem,
+  LShapeSide,
   MelamineMaterial,
-  Point2D,
   ScaleAndBoardParams,
+  WingRole,
 } from './types/contracts';
 import {
   CHILE_DUROLAC_SHEET,
   CHILE_MELAMINE_SHEET,
   PRESETS,
+  applyReturnWingTopology,
+  buildCornerFilletCutSpec,
+  buildDefaultLShapeConfig,
+  buildReturnWingParams,
   calculateDespiece,
   calculateShelfProgression,
   clonePreset,
   compareShapeAspect,
   computeUnitDirectionVector,
+  extractReturnWingTopology,
   resolveBaseSupport,
   type PresetKey,
 } from './core/mathEngine';
@@ -62,11 +66,20 @@ const DIM_XY_MIN = 300;
 const DIM_XY_MAX = 2600;
 const DIM_Z_MIN = 180;
 const DIM_Z_MAX = 900;
+const STRAIGHT_PRESET_KEYS: PresetKey[] = ['estanteria', 'rack_tv', 'closet'];
+const LSHAPE_PRESET_KEYS: PresetKey[] = ['escritorio_l', 'cocina_l', 'closet_l'];
+const DEPTH_PRESET_MM = [320, 400, 500, 550] as const;
 
-const MATERIAL_OPTIONS: Array<{ key: MelamineMaterial; label: string }> = [
-  { key: 'blanco', label: 'Blanco' },
-  { key: 'roble', label: 'Roble' },
-  { key: 'grafito', label: 'Grafito' },
+const MATERIAL_LABELS: Record<MelamineMaterial, string> = {
+  blanco: 'Blanco',
+  roble: 'Roble',
+  grafito: 'Grafito',
+};
+
+const MATERIAL_OPTIONS: ReadonlyArray<{ key: MelamineMaterial; label: string }> = [
+  { key: 'blanco', label: MATERIAL_LABELS.blanco },
+  { key: 'roble', label: MATERIAL_LABELS.roble },
+  { key: 'grafito', label: MATERIAL_LABELS.grafito },
 ];
 
 function clampDims(dims: { x: number; y: number; z: number }): { x: number; y: number; z: number } {
@@ -98,11 +111,6 @@ export default function App() {
   const initial = useMemo(() => clonePreset('estanteria'), []);
   const [activePreset, setActivePreset] = useState<PresetKey | null>('estanteria');
   const [activeCatalogId, setActiveCatalogId] = useState<string>('');
-  const [externalPhotoUrl, setExternalPhotoUrl] = useState<string | null>(null);
-  const [externalPhotoLabel, setExternalPhotoLabel] = useState<string | null>(null);
-  const [externalInitialQuadNorm, setExternalInitialQuadNorm] = useState<
-    [Point2D, Point2D, Point2D, Point2D] | null
-  >(null);
   const [topology, setTopology] = useState<FurnitureTopology>(initial.topology);
   const [params, setParams] = useState<ScaleAndBoardParams>(initial.params);
   const [explodeFactor, setExplodeFactor] = useState<number>(0);
@@ -120,20 +128,26 @@ export default function App() {
   const [lockedRatioXY, setLockedRatioXY] = useState<number>(initial.topology.aspectRatioXY);
   const [modelKey, setModelKey] = useState<string>('preset_estanteria');
 
-  // Estado bidireccional compartido 2D ↔ 3D para zonas frontales
+  // Estado bidireccional compartido 2D ↔ 3D para zonas frontales y ala activa en L
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
   const [hoveredZoneId, setHoveredZoneId] = useState<string | null>(null);
-
-  // Disparo del selector de color desde la foto (`VectorCanvas.eyedropperTrigger`) y control de tapa trasera
-  const [eyedropperTrigger, setEyedropperTrigger] = useState<number>(0);
-  const [hasLoadedPhoto, setHasLoadedPhoto] = useState<boolean>(false);
-  const photoSessionRef = useRef<boolean>(false);
-  const userBackPanelOverrideRef = useRef<boolean | null>(null);
+  const [editingWing, setEditingWing] = useState<WingRole>('main');
 
   // Confirmación no bloqueante al sobrescribir acabados mixtos por zona
   const [pendingFrontMaterialChoice, setPendingFrontMaterialChoice] = useState<
     MelamineMaterial | 'same' | null
   >(null);
+
+  const activeCatalogSpec = useMemo(
+    () =>
+      activeCatalogId
+        ? (CATALOG_14_MUEBLES.find((m) => m.id === activeCatalogId) ?? null)
+        : null,
+    [activeCatalogId],
+  );
+  const externalPhotoUrl = activeCatalogSpec ? `./ejemplos/${activeCatalogSpec.photoFile}` : null;
+  const externalPhotoLabel = activeCatalogSpec?.name ?? null;
+  const externalInitialQuadNorm = activeCatalogSpec?.initialQuadNorm ?? null;
 
   const despiece = useMemo(() => calculateDespiece(topology, params), [topology, params]);
 
@@ -157,8 +171,8 @@ export default function App() {
     [topology.aspectRatioXY, params.targetDimensions.x, params.targetDimensions.y],
   );
 
-  const quickTotalClp = useMemo(
-    () => estimateProjectBomAndCost(despiece, cuttingPlan, params).totalClp,
+  const bomCost = useMemo(
+    () => estimateProjectBomAndCost(despiece, cuttingPlan, params),
     [despiece, cuttingPlan, params],
   );
 
@@ -180,16 +194,11 @@ export default function App() {
     if (params.costConfig) {
       cloned.params.costConfig = { ...params.costConfig };
     }
-    photoSessionRef.current = false;
-    userBackPanelOverrideRef.current = null;
-    setHasLoadedPhoto(false);
     setActivePreset(key);
     setActiveCatalogId('');
-    setExternalPhotoUrl(null);
-    setExternalPhotoLabel(null);
-    setExternalInitialQuadNorm(null);
     setSelectedZoneId(null);
     setHoveredZoneId(null);
+    setEditingWing('main');
     setPendingFrontMaterialChoice(null);
     setTopology(cloned.topology);
     setParams(cloned.params);
@@ -219,19 +228,13 @@ export default function App() {
       cloned.params.targetDimensions.y > 0
         ? cloned.params.targetDimensions.x / cloned.params.targetDimensions.y
         : cloned.topology.aspectRatioXY;
-    photoSessionRef.current = true;
-    userBackPanelOverrideRef.current = null;
-    setHasLoadedPhoto(true);
     setActivePreset(null);
     setActiveCatalogId(catalogId);
-    // Activa tapa trasera por defecto en muebles reales del catálogo (respeta `leg_void` y `void_outside`)
-    setTopology({ ...cloned.topology, aspectRatioXY: catalogRatio, hasBackPanel: true });
+    setTopology({ ...cloned.topology, aspectRatioXY: catalogRatio });
     setParams(cloned.params);
-    setExternalPhotoUrl(`./ejemplos/${cloned.spec.photoFile}`);
-    setExternalPhotoLabel(cloned.spec.name);
-    setExternalInitialQuadNorm(cloned.spec.initialQuadNorm ?? null);
     setSelectedZoneId(null);
     setHoveredZoneId(null);
+    setEditingWing('main');
     setPendingFrontMaterialChoice(null);
     setModelApproved(false);
     setLockProportion(false);
@@ -242,39 +245,26 @@ export default function App() {
     setStudioMode('split');
   };
 
+  const handleSelectExample = (encoded: string) => {
+    if (encoded.startsWith('preset:')) {
+      handleLoadPreset(encoded.slice(7) as PresetKey);
+    } else if (encoded.startsWith('catalog:')) {
+      handleLoadCatalogFurniture(encoded.slice(8));
+    }
+  };
+
   const handleUpdateTopology = (next: FurnitureTopology) => {
     setActivePreset(null);
     setModelApproved(false);
     setPendingFrontMaterialChoice(null);
-
-    const isPhotoBacked =
-      photoSessionRef.current ||
-      activeCatalogId !== '' ||
-      Boolean(externalPhotoUrl) ||
-      Boolean(next.quadCorners) ||
-      next.detectionSource === 'auto';
-    if (isPhotoBacked) {
-      photoSessionRef.current = true;
-      if (!hasLoadedPhoto) setHasLoadedPhoto(true);
-    }
-
-    const resolvedHasBackPanel =
-      userBackPanelOverrideRef.current !== null
-        ? userBackPanelOverrideRef.current
-        : isPhotoBacked
-          ? true
-          : next.hasBackPanel;
-
     // En muebles del catálogo QA con dimensiones reales verificadas, conserva su proporción
     // de referencia para que una perspectiva 3/4 de la foto nunca dispare falsas alertas (~245%).
     const catalogRefRatio =
       activeCatalogId !== '' && params.referenceDimensions.y > 0
         ? params.referenceDimensions.x / params.referenceDimensions.y
         : null;
-    const normalizedNext: FurnitureTopology = {
-      ...(catalogRefRatio !== null ? { ...next, aspectRatioXY: catalogRefRatio } : next),
-      hasBackPanel: resolvedHasBackPanel,
-    };
+    const normalizedNext: FurnitureTopology =
+      catalogRefRatio !== null ? { ...next, aspectRatioXY: catalogRefRatio } : next;
 
     // Si cambia aspectRatioXY tras ajustar contorno, sincroniza lockedRatioXY limpiamente
     if (
@@ -283,8 +273,17 @@ export default function App() {
     ) {
       setLockedRatioXY(normalizedNext.aspectRatioXY);
     }
-    if (selectedZoneId && !(normalizedNext.frontZones ?? []).some((z) => z.id === selectedZoneId)) {
-      setSelectedZoneId(null);
+    if (!normalizedNext.lShape?.enabled && editingWing !== 'main') {
+      setEditingWing('main');
+    }
+    if (selectedZoneId) {
+      const hasZone =
+        (normalizedNext.frontZones ?? []).some((z) => z.id === selectedZoneId) ||
+        Boolean(
+          normalizedNext.lShape?.enabled &&
+            (normalizedNext.lShape.frontZones ?? []).some((z) => z.id === selectedZoneId),
+        );
+      if (!hasZone) setSelectedZoneId(null);
     }
     setTopology(normalizedNext);
   };
@@ -320,31 +319,48 @@ export default function App() {
         : Math.max(DIM_XY_MIN, Math.min(DIM_XY_MAX, Math.round(valueMm)));
 
     setModelApproved(false);
+    const prevY = params.targetDimensions.y;
+
+    const syncReturnHeightIfMatched = (nextY: number) => {
+      if (!topology.lShape?.enabled) return;
+      const curRetH = topology.lShape.returnHeightMm;
+      if (curRetH === undefined || Math.abs(curRetH - prevY) <= 1) {
+        setTopology((prev) =>
+          prev.lShape
+            ? { ...prev, lShape: { ...prev.lShape, returnHeightMm: nextY } }
+            : prev,
+        );
+      }
+    };
 
     if (lockProportion && (axis === 'x' || axis === 'y') && lockedRatioXY > 0.05) {
-      setParams((prev) => {
-        if (axis === 'x') {
-          const nextY = Math.max(
-            DIM_XY_MIN,
-            Math.min(DIM_XY_MAX, Math.round(clamped / lockedRatioXY)),
-          );
-          return {
-            ...prev,
-            targetDimensions: { ...prev.targetDimensions, x: clamped, y: nextY },
-          };
-        }
+      if (axis === 'x') {
+        const nextY = Math.max(
+          DIM_XY_MIN,
+          Math.min(DIM_XY_MAX, Math.round(clamped / lockedRatioXY)),
+        );
+        syncReturnHeightIfMatched(nextY);
+        setParams((prev) => ({
+          ...prev,
+          targetDimensions: { ...prev.targetDimensions, x: clamped, y: nextY },
+        }));
+      } else {
         const nextX = Math.max(
           DIM_XY_MIN,
           Math.min(DIM_XY_MAX, Math.round(clamped * lockedRatioXY)),
         );
-        return {
+        syncReturnHeightIfMatched(clamped);
+        setParams((prev) => ({
           ...prev,
           targetDimensions: { ...prev.targetDimensions, x: nextX, y: clamped },
-        };
-      });
+        }));
+      }
       return;
     }
 
+    if (axis === 'y') {
+      syncReturnHeightIfMatched(clamped);
+    }
     setParams((prev) => ({
       ...prev,
       targetDimensions: { ...prev.targetDimensions, [axis]: clamped },
@@ -397,10 +413,6 @@ export default function App() {
     rawDims: { x: number; y: number; z: number },
     detectedMaterial?: MelamineMaterial,
   ) => {
-    photoSessionRef.current = true;
-    setHasLoadedPhoto(true);
-    const desiredBackPanel = userBackPanelOverrideRef.current ?? true;
-
     // Si el usuario está editando un mueble del catálogo QA, conserva sus dimensiones actuales
     // y sincroniza lockedRatioXY con la silueta vigente sin activar candado ni alertas falsas.
     if (activeCatalogId !== '') {
@@ -410,14 +422,6 @@ export default function App() {
           : topology.aspectRatioXY;
       setLockedRatioXY(curRatio);
       setModelApproved(false);
-      if (detectedMaterial) {
-        setParams((p) => (p.material === detectedMaterial ? p : { ...p, material: detectedMaterial }));
-      }
-      setTopology((prev) =>
-        prev.hasBackPanel === desiredBackPanel
-          ? prev
-          : { ...prev, hasBackPanel: desiredBackPanel },
-      );
       setStudioMode((cur) => (cur === 'photo' ? 'split' : cur));
       return;
     }
@@ -435,7 +439,6 @@ export default function App() {
     setTopology((prev) => ({
       ...prev,
       aspectRatioXY: nextRatio,
-      hasBackPanel: desiredBackPanel,
     }));
     setStudioMode((cur) => (cur === 'photo' ? 'split' : cur));
   };
@@ -445,28 +448,131 @@ export default function App() {
     setParams((p) => ({ ...p, material }));
   };
 
-  const handleSetShelfMode = (mode: 'equidistant' | 'custom') => {
-    if (topology.shelfMode === mode) return;
+  const isLShape = Boolean(topology.lShape?.enabled);
+  const activeWing: WingRole = isLShape ? editingWing : 'main';
+
+  const updateActiveWingTopology = (
+    updater: (wingTop: FurnitureTopology, wingParams: ScaleAndBoardParams) => FurnitureTopology,
+  ) => {
     setActivePreset(null);
     setModelApproved(false);
     setTopology((prev) => {
-      if (mode === 'equidistant') {
-        const nextCount =
-          prev.equalShelfCount > 0
-            ? prev.equalShelfCount
-            : Math.max(1, Math.min(8, prev.hShelves.length || 3));
+      if (prev.lShape?.enabled && editingWing === 'return') {
+        const wingTop = extractReturnWingTopology(prev);
+        const wingParams = buildReturnWingParams(prev, params);
+        const nextWing = updater(wingTop, wingParams);
+        return applyReturnWingTopology(prev, nextWing);
+      }
+      return updater(prev, params);
+    });
+  };
+
+  const handleSetFurnitureShape = (shape: 'straight' | LShapeSide) => {
+    setActivePreset(null);
+    setModelApproved(false);
+    if (shape === 'straight') {
+      setEditingWing('main');
+      setTopology((prev) => {
+        const cleanedCuts = (prev.curvedCuts ?? []).filter(
+          (c) => c.cornerTarget !== 'l_inner' && c.cornerTarget !== 'l_outer',
+        );
         return {
           ...prev,
+          lShape: prev.lShape ? { ...prev.lShape, enabled: false } : undefined,
+          curvedCuts: cleanedCuts.length > 0 ? cleanedCuts : undefined,
+        };
+      });
+      return;
+    }
+    setTopology((prev) => ({
+      ...prev,
+      lShape: buildDefaultLShapeConfig(shape, prev, params),
+    }));
+  };
+
+  const lInnerCurveCut = useMemo(
+    () => (topology.curvedCuts ?? []).find((c) => c.cornerTarget === 'l_inner') ?? null,
+    [topology.curvedCuts],
+  );
+
+  const handleToggleLInnerCurve = (
+    enabled: boolean,
+    radiusMm = lInnerCurveCut?.radiusMm ?? 160,
+  ) => {
+    setActivePreset(null);
+    setModelApproved(false);
+    setTopology((prev) => {
+      const rest = (prev.curvedCuts ?? []).filter((c) => c.cornerTarget !== 'l_inner');
+      if (!enabled) {
+        return {
+          ...prev,
+          curvedCuts: rest.length > 0 ? rest : undefined,
+        };
+      }
+      const nextCut = buildCornerFilletCutSpec({
+        id: lInnerCurveCut?.id ?? 'curva_esquina_interior_l',
+        cornerTarget: 'l_inner',
+        radiusMm,
+        label: `Empalme curvo L (R=${Math.round(radiusMm)} mm)`,
+      });
+      return {
+        ...prev,
+        curvedCuts: [...rest, nextCut],
+      };
+    });
+  };
+
+  const updateLShapeDim = (
+    field: 'returnLengthMm' | 'returnDepthMm' | 'returnHeightMm' | 'openCorner',
+    val: number | boolean,
+  ) => {
+    setActivePreset(null);
+    setModelApproved(false);
+    setTopology((prev) => {
+      if (!prev.lShape) return prev;
+      if (field === 'openCorner') {
+        return { ...prev, lShape: { ...prev.lShape, openCorner: Boolean(val) } };
+      }
+      const num = Number(val);
+      const nextVal =
+        field === 'returnDepthMm'
+          ? Math.max(DIM_Z_MIN, Math.min(DIM_Z_MAX, Math.round(num)))
+          : field === 'returnHeightMm'
+            ? Math.max(DIM_XY_MIN, Math.min(DIM_XY_MAX, Math.round(num)))
+            : Math.max(params.targetDimensions.z + 180, Math.min(DIM_XY_MAX, Math.round(num)));
+      return {
+        ...prev,
+        lShape: {
+          ...prev.lShape,
+          [field]: nextVal,
+        },
+      };
+    });
+  };
+
+  const handleSetShelfMode = (mode: 'equidistant' | 'custom') => {
+    updateActiveWingTopology((wingTop, wingParams) => {
+      if (wingTop.shelfMode === mode) return wingTop;
+      if (mode === 'equidistant') {
+        const nextCount =
+          wingTop.equalShelfCount > 0
+            ? wingTop.equalShelfCount
+            : Math.max(1, Math.min(8, wingTop.hShelves.length || 3));
+        return {
+          ...wingTop,
           shelfMode: 'equidistant',
           equalShelfCount: nextCount,
         };
       }
-      // Al pasar de equidistant a custom, conserva visualmente las repisas actuales si hShelves está vacío
-      let nextCustom = prev.hShelves;
-      if (nextCustom.length === 0 && prev.equalShelfCount > 0) {
-        const e = params.boardThickness;
-        const yInt = Math.max(1, params.targetDimensions.y - 2 * e);
-        const prog = calculateShelfProgression(params.targetDimensions.y, e, prev.equalShelfCount);
+      let nextCustom = wingTop.hShelves;
+      if (nextCustom.length === 0 && wingTop.equalShelfCount > 0) {
+        const e = wingParams.boardThickness;
+        const yInt = Math.max(1, wingParams.targetDimensions.y - 2 * e);
+        const prog = calculateShelfProgression(
+          wingParams.targetDimensions.y,
+          e,
+          wingTop.equalShelfCount,
+        );
         nextCustom = prog.terms.map((an, idx) => {
           const cy = an + e / 2;
           const v = Math.max(0.05, Math.min(0.95, (cy - e) / yInt));
@@ -479,7 +585,7 @@ export default function App() {
         });
       }
       return {
-        ...prev,
+        ...wingTop,
         shelfMode: 'custom',
         hShelves: nextCustom,
       };
@@ -487,16 +593,14 @@ export default function App() {
   };
 
   const handleAddQuickCustomShelf = () => {
-    setActivePreset(null);
-    setModelApproved(false);
-    setTopology((prev) => {
-      const existing = prev.hShelves;
+    updateActiveWingTopology((wingTop) => {
+      const existing = wingTop.hShelves;
       const candidates = [0.5, 0.33, 0.67, 0.25, 0.75, 0.2, 0.8, 0.4, 0.6];
       const chosenV =
         candidates.find((v) => existing.every((s) => Math.abs(s.position - v) > 0.08)) ??
         Math.min(0.9, 0.15 + ((existing.length * 0.17) % 0.75));
       return {
-        ...prev,
+        ...wingTop,
         shelfMode: 'custom',
         hShelves: [
           ...existing,
@@ -512,35 +616,22 @@ export default function App() {
   };
 
   const handleToggleCenterDivider = () => {
-    setActivePreset(null);
-    setModelApproved(false);
-    setTopology((prev) => {
-      const hasCenter = prev.vDividers.some((d) => Math.abs(d.position - 0.5) < 0.03);
+    updateActiveWingTopology((wingTop) => {
+      const hasCenter = wingTop.vDividers.some((d) => Math.abs(d.position - 0.5) < 0.03);
       if (hasCenter) {
         return {
-          ...prev,
-          vDividers: prev.vDividers.filter((d) => Math.abs(d.position - 0.5) >= 0.03),
+          ...wingTop,
+          vDividers: wingTop.vDividers.filter((d) => Math.abs(d.position - 0.5) >= 0.03),
         };
       }
       return {
-        ...prev,
+        ...wingTop,
         vDividers: [
-          ...prev.vDividers,
-          { id: 'div_central_rapido', position: 0.5, start: 0, end: 1 },
+          ...wingTop.vDividers,
+          { id: `div_central_rapido_${Date.now()}`, position: 0.5, start: 0, end: 1 },
         ],
       };
     });
-  };
-
-  const handleToggleExternalLegs = (checked: boolean, heightMm?: number, count?: number) => {
-    setTopology((prev) => ({
-      ...prev,
-      baseSupportType: checked ? 'legs' : 'none',
-      hasExternalLegs: checked,
-      externalLegHeightMm: heightMm ?? prev.externalLegHeightMm ?? 150,
-      externalLegCount: count ?? prev.externalLegCount ?? 4,
-      toeKickHeightMm: checked ? 0 : prev.toeKickHeightMm,
-    }));
   };
 
   const handleSetBaseSupport = (type: BaseSupportType, heightMm?: number, count?: number) => {
@@ -578,11 +669,11 @@ export default function App() {
 
   const applyAllFrontsMaterial = (choice: MelamineMaterial | 'same') => {
     setPendingFrontMaterialChoice(null);
-    setTopology((prev) => {
-      const zones = prev.frontZones ?? [];
-      if (zones.length === 0) return prev;
+    updateActiveWingTopology((wingTop) => {
+      const zones = wingTop.frontZones ?? [];
+      if (zones.length === 0) return wingTop;
       return {
-        ...prev,
+        ...wingTop,
         frontZones: zones.map((z) => {
           if (
             z.kind === 'open' ||
@@ -610,8 +701,8 @@ export default function App() {
   };
 
   const handleSetCubiertaMaterial = (choice: MelamineMaterial | 'same') => {
-    setTopology((prev) => ({
-      ...prev,
+    updateActiveWingTopology((wingTop) => ({
+      ...wingTop,
       cubiertaMaterialOverride: choice === 'same' ? undefined : choice,
     }));
   };
@@ -645,7 +736,23 @@ export default function App() {
   };
 
   const activeSupport = resolveBaseSupport(topology);
-  const closedFrontZones = (topology.frontZones ?? []).filter(
+  const effectiveWingTop =
+    activeWing === 'return' && isLShape ? extractReturnWingTopology(topology) : topology;
+  const effectiveWingParams =
+    activeWing === 'return' && isLShape ? buildReturnWingParams(topology, params) : params;
+  const wingShelfProgression = useMemo(
+    () =>
+      effectiveWingTop.shelfMode === 'equidistant'
+        ? calculateShelfProgression(
+            effectiveWingParams.targetDimensions.y,
+            effectiveWingParams.boardThickness,
+            effectiveWingTop.equalShelfCount,
+          )
+        : despiece.shelfProgression,
+    [effectiveWingTop, effectiveWingParams, despiece.shelfProgression],
+  );
+
+  const closedFrontZones = (effectiveWingTop.frontZones ?? []).filter(
     (z) =>
       z.kind !== 'open' &&
       z.kind !== 'leg_void' &&
@@ -660,21 +767,25 @@ export default function App() {
       : 'mixed';
   })();
   const activeCubiertaOverride: MelamineMaterial | 'same' =
-    topology.cubiertaMaterialOverride ?? 'same';
+    effectiveWingTop.cubiertaMaterialOverride ?? 'same';
 
-  const hasCenterDivider = topology.vDividers.some((d) => Math.abs(d.position - 0.5) < 0.03);
+  const hasCenterDivider = effectiveWingTop.vDividers.some(
+    (d) => Math.abs(d.position - 0.5) < 0.03,
+  );
   const isPhotoVisible = activeView === 'studio' && studioMode !== '3d';
-  const hasPhotoAvailable = Boolean(activeCatalogId || externalPhotoUrl || hasLoadedPhoto);
-  const depthPresetMm = [320, 400, 500, 550];
+  const selectedExampleValue = activePreset
+    ? `preset:${activePreset}`
+    : activeCatalogId
+      ? `catalog:${activeCatalogId}`
+      : '';
+  const shelfStructureSummary =
+    effectiveWingTop.shelfMode === 'equidistant'
+      ? `${effectiveWingTop.equalShelfCount} rep.`
+      : `${effectiveWingTop.hShelves.length} rep. · ${effectiveWingTop.vDividers.length} div.`;
 
-  const choiceLabel = (choice: MelamineMaterial | 'same'): string =>
-    choice === 'same'
-      ? 'Igual a carcasa'
-      : choice === 'blanco'
-        ? 'Blanco'
-        : choice === 'roble'
-          ? 'Roble'
-          : 'Grafito';
+  const handleEnsureCenterDivider = () => {
+    if (!hasCenterDivider) handleToggleCenterDivider();
+  };
 
   return (
     <div className="app-shell">
@@ -687,29 +798,35 @@ export default function App() {
           <span className="brand-sub">100% Offline · 3D · Corte 2D · CLP</span>
         </div>
         <div className="preset-bar">
-          {(Object.keys(PRESETS) as PresetKey[]).map((k) => (
-            <button
-              key={k}
-              type="button"
-              className={activePreset === k ? 'preset-btn active' : 'preset-btn'}
-              onClick={() => handleLoadPreset(k)}
-            >
-              {PRESETS[k].label}
-            </button>
-          ))}
           <select
             className="catalog-select"
-            value={activeCatalogId}
-            onChange={(e) => handleLoadCatalogFurniture(e.target.value)}
-            aria-label="Catálogo QA de 14 muebles reales con foto"
-            title="Cargar cualquiera de los 14 muebles reales de prueba con su foto original"
+            value={selectedExampleValue}
+            onChange={(e) => handleSelectExample(e.target.value)}
+            aria-label="Seleccionar preset oficial o catálogo de 14 fotos reales"
+            title="Cargar un Preset Oficial INACAP (Unidad 3) o cualquiera de las 14 fotos reales de prueba"
           >
-            <option value="">Catálogo 14 Fotos Reales…</option>
-            {CATALOG_14_MUEBLES.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.name}
-              </option>
-            ))}
+            <option value="">Ejemplos y Presets…</option>
+            <optgroup label="Presets Oficiales INACAP (Unidad 3)">
+              {STRAIGHT_PRESET_KEYS.map((k) => (
+                <option key={k} value={`preset:${k}`}>
+                  {PRESETS[k].label}
+                </option>
+              ))}
+            </optgroup>
+            <optgroup label="Presets Muebles en L (Planta 3D 90°)">
+              {LSHAPE_PRESET_KEYS.map((k) => (
+                <option key={k} value={`preset:${k}`}>
+                  {PRESETS[k].label}
+                </option>
+              ))}
+            </optgroup>
+            <optgroup label="Catálogo 14 Fotos Reales QA">
+              {CATALOG_14_MUEBLES.map((m) => (
+                <option key={m.id} value={`catalog:${m.id}`}>
+                  {m.name}
+                </option>
+              ))}
+            </optgroup>
           </select>
         </div>
       </header>
@@ -742,8 +859,11 @@ export default function App() {
 
         <div className="stepper-kpi-strip">
           <span className="kpi-chip mono" title="Dimensiones actuales del cuerpo de melamina">
-            <Ruler size={13} /> {formatDimsSummary(params.targetDimensions, displayUnit)} · e=
-            {params.boardThickness} mm
+            <Ruler size={13} /> {formatDimsSummary(params.targetDimensions, displayUnit)}
+            {isLShape && topology.lShape
+              ? ` · L ${topology.lShape.side === 'right' ? 'Der' : 'Izq'} ${formatSingleDim(topology.lShape.returnLengthMm, displayUnit)}`
+              : ''}{' '}
+            · e={params.boardThickness} mm
           </span>
           <button
             type="button"
@@ -759,7 +879,7 @@ export default function App() {
             onClick={() => jumpToWorkshopTab('herrajes')}
             title="Ver presupuesto detallado y editar tarifas CLP"
           >
-            {formatClp(quickTotalClp)}
+            {formatClp(bomCost.totalClp)}
           </button>
           {despiece.alerts.length > 0 && (
             <button
@@ -775,14 +895,12 @@ export default function App() {
       </nav>
 
       <div className="workspace-grid">
-        {/* PANEL LATERAL STICKY DE CÁLCULOS Y PARÁMETROS */}
-        <aside className="sidebar-controls" aria-label="Parámetros de cálculo del mueble">
-          {/* 1. DIMENSIONES Y UNIDAD GLOBAL */}
+        {/* PANEL LATERAL STICKY PROGRESIVO */}
+        <aside className="sidebar-controls" aria-label="Parámetros del mueble">
+          {/* 1. MEDIDAS PRINCIPALES */}
           <div className="control-group">
             <div className="card-header-row">
-              <h3>
-                Dimensiones V<sub>f</sub> ({displayUnit})
-              </h3>
+              <h3>Medidas ({displayUnit})</h3>
               <div className="header-mini-controls">
                 <div className="unit-toggle" role="group" aria-label="Unidad de medida global">
                   <button
@@ -804,18 +922,13 @@ export default function App() {
                   type="button"
                   className={lockProportion ? 'chip-btn active' : 'chip-btn'}
                   onClick={handleToggleLockProportion}
-                  title="Bloquea la proporción frontal û_XY para escalar Ancho y Alto juntos sin deformar la silueta"
+                  title="Bloquea la proporción frontal para escalar Ancho y Alto juntos sin deformar la silueta"
                   aria-pressed={lockProportion}
                 >
                   {lockProportion ? <Lock size={12} /> : <Unlock size={12} />}
-                  {lockProportion ? 'û_XY fijo' : 'Proporción'}
+                  Proporción
                 </button>
               </div>
-            </div>
-
-            <div className="mono small-note muted">
-              û<sub>XY</sub> = ({unitVec.unitXY[0].toFixed(3)}, {unitVec.unitXY[1].toFixed(3)}) · r
-              = {unitVec.aspectRatioXY.toFixed(2)}
             </div>
 
             {shapeComp?.warn && (
@@ -916,192 +1029,207 @@ export default function App() {
                 min={DIM_Z_MIN}
                 max={DIM_Z_MAX}
                 step={10}
+                list="depth-presets-mm"
                 value={params.targetDimensions.z}
                 onChange={(e) => updateTargetDim('z', Number(e.target.value))}
                 aria-label="Control deslizante Profundidad Z"
               />
-              <div className="chip-row">
-                {depthPresetMm.map((d) => (
-                  <button
-                    key={d}
-                    type="button"
-                    className={params.targetDimensions.z === d ? 'chip-btn active' : 'chip-btn'}
-                    onClick={() => updateTargetDim('z', d)}
-                  >
-                    {formatSingleDim(d, displayUnit)}
-                  </button>
+              <datalist id="depth-presets-mm">
+                {DEPTH_PRESET_MM.map((d) => (
+                  <option key={d} value={d} />
                 ))}
-              </div>
-            </div>
-          </div>
-
-          {/* 2. ESPESORES DE TABLERO Y FONDO */}
-          <div className="control-group">
-            <h3>Espesores de Tablero</h3>
-            <div className="thickness-row">
-              <span className="small-note muted">Melamina (e):</span>
-              <div className="chip-row">
-                {[15, 18, 25].map((th) => (
-                  <button
-                    key={`board_${th}`}
-                    type="button"
-                    className={params.boardThickness === th ? 'chip-btn active' : 'chip-btn'}
-                    onClick={() => {
-                      setModelApproved(false);
-                      setParams((p) => ({ ...p, boardThickness: th }));
-                    }}
-                  >
-                    {th} mm
-                  </button>
-                ))}
-              </div>
+              </datalist>
             </div>
 
-            <label
-              className={
-                topology.hasBackPanel
-                  ? 'toggle-label toggle-backpanel active'
-                  : 'toggle-label toggle-backpanel'
-              }
-              title="Coloca una plancha trasera sólida de Durolac/MDF detrás del mueble (respeta automáticamente huecos de piernas y escalones)"
-            >
-              <input
-                type="checkbox"
-                checked={topology.hasBackPanel}
-                onChange={(e) => {
-                  const checked = e.target.checked;
-                  userBackPanelOverrideRef.current = checked;
-                  setModelApproved(false);
-                  setTopology((prev) => ({ ...prev, hasBackPanel: checked }));
-                }}
-              />
-              <span>
-                <strong>Tapa / Fondo trasero (Durolac {params.backPanelThickness} mm)</strong>
-              </span>
-            </label>
-
-            <div className="thickness-row">
-              <span className="small-note muted">Espesor fondo:</span>
-              <div className="chip-row">
-                {[3, 5.5].map((bth) => (
-                  <button
-                    key={`back_${bth}`}
-                    type="button"
-                    className={
-                      Math.abs(params.backPanelThickness - bth) < 0.05
-                        ? 'chip-btn active'
-                        : 'chip-btn'
-                    }
-                    onClick={() => {
-                      setModelApproved(false);
-                      setParams((p) => ({ ...p, backPanelThickness: bth }));
-                    }}
-                  >
-                    {bth} mm
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* 3. ESTRUCTURA INTERNA Y APOYO INFERIOR */}
-          <div className="control-group">
-            <h3>Estructura Interna y Apoyo</h3>
-
-            <div className="small-note muted">Modo de repisas:</div>
-            <div className="segmented-2">
+            <div className="small-note muted">Planta en L (90°):</div>
+            <div className="segmented-3" role="group" aria-label="Forma del mueble en planta">
               <button
                 type="button"
-                className={topology.shelfMode === 'equidistant' ? 'seg-btn active' : 'seg-btn'}
-                onClick={() => handleSetShelfMode('equidistant')}
+                className={!isLShape ? 'seg-btn active' : 'seg-btn'}
+                onClick={() => handleSetFurnitureShape('straight')}
               >
-                Equidistantes (N)
+                Recto
               </button>
               <button
                 type="button"
-                className={topology.shelfMode === 'custom' ? 'seg-btn active' : 'seg-btn'}
-                onClick={() => handleSetShelfMode('custom')}
+                className={isLShape && topology.lShape?.side === 'right' ? 'seg-btn active' : 'seg-btn'}
+                onClick={() => handleSetFurnitureShape('right')}
               >
-                Personalizadas ({topology.hShelves.length})
+                L Der
+              </button>
+              <button
+                type="button"
+                className={isLShape && topology.lShape?.side === 'left' ? 'seg-btn active' : 'seg-btn'}
+                onClick={() => handleSetFurnitureShape('left')}
+              >
+                L Izq
               </button>
             </div>
 
-            {topology.shelfMode === 'equidistant' ? (
-              <div className="slider-row">
-                <div className="slider-head">
-                  <label htmlFor="shelf-count-input">Repisas equidistantes (N)</label>
-                  <NumericInput
-                    id="shelf-count-input"
-                    min={0}
-                    max={8}
-                    step={1}
-                    value={topology.equalShelfCount}
-                    onCommit={(v) => {
-                      setActivePreset(null);
-                      setModelApproved(false);
-                      setTopology((prev) => ({ ...prev, equalShelfCount: v }));
-                    }}
-                    style={{ width: 58 }}
-                    ariaLabel="Cantidad de repisas equidistantes"
+            {isLShape && topology.lShape && (
+              <div className="lshape-wing-card">
+                <div className="slider-row">
+                  <div className="slider-head">
+                    <label htmlFor="dim-l2-input">
+                      Largo Ala B L2 ({formatSingleDim(topology.lShape.returnLengthMm, displayUnit)})
+                    </label>
+                    <NumericInput
+                      id="dim-l2-input"
+                      min={isCm ? (params.targetDimensions.z + 180) / 10 : params.targetDimensions.z + 180}
+                      max={isCm ? DIM_XY_MAX / 10 : DIM_XY_MAX}
+                      step={isCm ? 1 : 10}
+                      allowDecimals={isCm}
+                      unitSuffix={displayUnit}
+                      value={toDisplayVal(topology.lShape.returnLengthMm)}
+                      onCommit={(v) => updateLShapeDim('returnLengthMm', fromDisplayVal(v))}
+                      style={{ width: 92 }}
+                      ariaLabel={`Largo Ala B en ${displayUnit}`}
+                    />
+                  </div>
+                  <input
+                    type="range"
+                    min={params.targetDimensions.z + 180}
+                    max={DIM_XY_MAX}
+                    step={10}
+                    value={topology.lShape.returnLengthMm}
+                    onChange={(e) => updateLShapeDim('returnLengthMm', Number(e.target.value))}
+                    aria-label="Control deslizante Largo L2"
                   />
                 </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={8}
-                  value={topology.equalShelfCount}
-                  onChange={(e) => {
-                    setActivePreset(null);
-                    setModelApproved(false);
-                    setTopology((prev) => ({
-                      ...prev,
-                      equalShelfCount: Number(e.target.value),
-                    }));
-                  }}
-                  aria-label="Control deslizante cantidad de repisas"
-                />
-                {topology.equalShelfCount > 0 && despiece.shelfProgression.clearSpanMm > 0 && (
-                  <span className="small-note muted mono">
-                    Luz vertical s<sub>libre</sub> ={' '}
-                    {formatSingleDim(despiece.shelfProgression.clearSpanMm, displayUnit)}
-                  </span>
+
+                <div className="slider-row">
+                  <div className="slider-head">
+                    <label htmlFor="dim-z2-input">
+                      Prof. Ala B Z2 ({formatSingleDim(topology.lShape.returnDepthMm, displayUnit)})
+                    </label>
+                    <NumericInput
+                      id="dim-z2-input"
+                      min={isCm ? DIM_Z_MIN / 10 : DIM_Z_MIN}
+                      max={isCm ? DIM_Z_MAX / 10 : DIM_Z_MAX}
+                      step={isCm ? 1 : 10}
+                      allowDecimals={isCm}
+                      unitSuffix={displayUnit}
+                      value={toDisplayVal(topology.lShape.returnDepthMm)}
+                      onCommit={(v) => updateLShapeDim('returnDepthMm', fromDisplayVal(v))}
+                      style={{ width: 92 }}
+                      ariaLabel={`Profundidad Ala B en ${displayUnit}`}
+                    />
+                  </div>
+                  <input
+                    type="range"
+                    min={DIM_Z_MIN}
+                    max={DIM_Z_MAX}
+                    step={10}
+                    value={topology.lShape.returnDepthMm}
+                    onChange={(e) => updateLShapeDim('returnDepthMm', Number(e.target.value))}
+                    aria-label="Control deslizante Profundidad Ala B"
+                  />
+                </div>
+
+                <div className="slider-row">
+                  <div className="slider-head">
+                    <label htmlFor="dim-y2-input">
+                      Alto Ala B (
+                      {formatSingleDim(
+                        topology.lShape.returnHeightMm ?? params.targetDimensions.y,
+                        displayUnit,
+                      )}
+                      )
+                    </label>
+                    <NumericInput
+                      id="dim-y2-input"
+                      min={isCm ? DIM_XY_MIN / 10 : DIM_XY_MIN}
+                      max={isCm ? DIM_XY_MAX / 10 : DIM_XY_MAX}
+                      step={isCm ? 1 : 10}
+                      allowDecimals={isCm}
+                      unitSuffix={displayUnit}
+                      value={toDisplayVal(
+                        topology.lShape.returnHeightMm ?? params.targetDimensions.y,
+                      )}
+                      onCommit={(v) => updateLShapeDim('returnHeightMm', fromDisplayVal(v))}
+                      style={{ width: 92 }}
+                      ariaLabel={`Alto Ala B en ${displayUnit}`}
+                    />
+                  </div>
+                </div>
+
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(topology.lShape.openCorner)}
+                    onChange={(e) => updateLShapeDim('openCorner', e.target.checked)}
+                  />
+                  Esquina abierta continua (escritorio sin lateral interior)
+                </label>
+
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(lInnerCurveCut)}
+                    onChange={(e) => handleToggleLInnerCurve(e.target.checked)}
+                  />
+                  Esquina interior curva (Diferencial R ={' '}
+                  {Math.round(lInnerCurveCut?.radiusMm ?? 160)} mm)
+                </label>
+
+                {lInnerCurveCut && (
+                  <div className="slider-row" style={{ marginTop: 4 }}>
+                    <div className="slider-head">
+                      <label htmlFor="dim-lcurve-r-input">
+                        Radio curva L (
+                        {formatSingleDim(lInnerCurveCut.radiusMm ?? 160, displayUnit)})
+                      </label>
+                      <NumericInput
+                        id="dim-lcurve-r-input"
+                        min={isCm ? 4 : 40}
+                        max={isCm ? 38 : 380}
+                        step={isCm ? 1 : 10}
+                        allowDecimals={isCm}
+                        unitSuffix={displayUnit}
+                        value={toDisplayVal(lInnerCurveCut.radiusMm ?? 160)}
+                        onCommit={(v) => handleToggleLInnerCurve(true, fromDisplayVal(v))}
+                        style={{ width: 92 }}
+                        ariaLabel={`Radio de curvatura L en ${displayUnit}`}
+                      />
+                    </div>
+                    <input
+                      type="range"
+                      min={40}
+                      max={380}
+                      step={10}
+                      value={lInnerCurveCut.radiusMm ?? 160}
+                      onChange={(e) => handleToggleLInnerCurve(true, Number(e.target.value))}
+                      aria-label="Control deslizante Radio Curva L"
+                    />
+                  </div>
                 )}
               </div>
-            ) : (
-              <div className="custom-shelves-box">
-                <span className="small-note muted">
-                  {topology.hShelves.length} repisa(s) en modo libre (edita líneas en el lienzo o
-                  agrega aquí).
-                </span>
-                <div className="chip-row">
-                  <button type="button" className="btn-small" onClick={handleAddQuickCustomShelf}>
-                    + Agregar repisa
-                  </button>
-                  {topology.hShelves.length > 0 && (
-                    <button
-                      type="button"
-                      className="btn-danger-sm"
-                      onClick={() => {
-                        setActivePreset(null);
-                        setModelApproved(false);
-                        setTopology((prev) => ({ ...prev, hShelves: [] }));
-                      }}
-                    >
-                      Limpiar
-                    </button>
-                  )}
-                </div>
-              </div>
             )}
+          </div>
 
-            <button type="button" className="btn-secondary" onClick={handleToggleCenterDivider}>
-              {hasCenterDivider
-                ? 'Quitar divisor vertical central'
-                : '+ Agregar divisor vertical central'}
-            </button>
+          {/* 2. COLOR Y APOYO INFERIOR */}
+          <div className="control-group">
+            <h3>Color y Apoyo</h3>
+
+            <div className="small-note muted">Color principal:</div>
+            <div className="chip-row">
+              {MATERIAL_OPTIONS.map(({ key, label }) => (
+                <button
+                  key={`carcass_${key}`}
+                  type="button"
+                  className={
+                    params.material === key ? 'chip-btn swatch-btn active' : 'chip-btn swatch-btn'
+                  }
+                  onClick={() => handleUpdateMaterialOnly(key)}
+                >
+                  <i className={`swatch-dot swatch-${key}`} />
+                  {label}
+                </button>
+              ))}
+            </div>
 
             <div className="small-note muted" style={{ marginTop: 2 }}>
-              <strong>Apoyo inferior:</strong>
+              Apoyo inferior:
             </div>
             <div className="support-seg-grid">
               {(
@@ -1174,148 +1302,285 @@ export default function App() {
             )}
           </div>
 
-          {/* 4. ACABADOS BICOLOR (CARCASA, CUBIERTA Y FRENTES) */}
-          <div className="control-group">
-            <h3>Acabados Bicolor &amp; Vista 3D</h3>
-
-            <div className="small-note muted">Carcasa / estructura:</div>
-            <div className="chip-row">
-              {MATERIAL_OPTIONS.map(({ key, label }) => (
+          {/* 3. DESPLEGABLE: REPISAS Y ESTRUCTURA */}
+          <details className="control-group advanced-drawer">
+            <summary>Repisas y estructura ({shelfStructureSummary})</summary>
+            <div className="advanced-drawer-body">
+              {isLShape && (
+                <>
+                  <div className="small-note muted">Editando ala:</div>
+                  <div className="segmented-2">
+                    <button
+                      type="button"
+                      className={activeWing === 'main' ? 'seg-btn active' : 'seg-btn'}
+                      onClick={() => setEditingWing('main')}
+                    >
+                      Ala Principal (A)
+                    </button>
+                    <button
+                      type="button"
+                      className={activeWing === 'return' ? 'seg-btn active' : 'seg-btn'}
+                      onClick={() => setEditingWing('return')}
+                    >
+                      Ala Retorno (B)
+                    </button>
+                  </div>
+                </>
+              )}
+              <div className="small-note muted">Modo de repisas:</div>
+              <div className="segmented-2">
                 <button
-                  key={`carcass_${key}`}
                   type="button"
-                  className={
-                    params.material === key ? 'chip-btn swatch-btn active' : 'chip-btn swatch-btn'
-                  }
-                  onClick={() => handleUpdateMaterialOnly(key)}
+                  className={effectiveWingTop.shelfMode === 'equidistant' ? 'seg-btn active' : 'seg-btn'}
+                  onClick={() => handleSetShelfMode('equidistant')}
                 >
-                  <i className={`swatch-dot swatch-${key}`} />
-                  {label}
+                  Equidistantes (N)
                 </button>
-              ))}
-            </div>
-
-            {hasPhotoAvailable && (
-              <button
-                type="button"
-                className="btn-eyedropper-photo"
-                onClick={() => {
-                  if (activeView !== 'studio') setActiveView('studio');
-                  if (studioMode === '3d') setStudioMode('split');
-                  setEyedropperTrigger((n) => n + 1);
-                }}
-                title="Haz clic sobre cualquier parte del mueble en la foto para copiar su color automáticamente"
-              >
-                <Pipette size={13} /> Copiar color desde la foto
-              </button>
-            )}
-
-            <div className="small-note muted">Cubierta superior (opcional):</div>
-            <div className="chip-row">
-              <button
-                type="button"
-                className={activeCubiertaOverride === 'same' ? 'chip-btn active' : 'chip-btn'}
-                onClick={() => handleSetCubiertaMaterial('same')}
-              >
-                Igual
-              </button>
-              {MATERIAL_OPTIONS.map(({ key, label }) => (
                 <button
-                  key={`cub_${key}`}
                   type="button"
-                  className={
-                    activeCubiertaOverride === key
-                      ? 'chip-btn swatch-btn active'
-                      : 'chip-btn swatch-btn'
-                  }
-                  onClick={() => handleSetCubiertaMaterial(key)}
+                  className={effectiveWingTop.shelfMode === 'custom' ? 'seg-btn active' : 'seg-btn'}
+                  onClick={() => handleSetShelfMode('custom')}
                 >
-                  <i className={`swatch-dot swatch-${key}`} />
-                  {label}
+                  Personalizadas ({effectiveWingTop.hShelves.length})
                 </button>
-              ))}
-            </div>
+              </div>
 
-            {closedFrontZones.length > 0 && (
-              <>
-                <div className="card-header-row">
-                  <span className="small-note muted">Frentes (puertas / cajones):</span>
-                  {activeFrontOverride === 'mixed' && (
-                    <span className="mixed-badge">Mixto (por zona)</span>
+              {effectiveWingTop.shelfMode === 'equidistant' ? (
+                <div className="slider-row">
+                  <div className="slider-head">
+                    <label htmlFor="shelf-count-input">Repisas equidistantes (N)</label>
+                    <NumericInput
+                      id="shelf-count-input"
+                      min={0}
+                      max={8}
+                      step={1}
+                      value={effectiveWingTop.equalShelfCount}
+                      onCommit={(v) =>
+                        updateActiveWingTopology((wingTop) => ({
+                          ...wingTop,
+                          equalShelfCount: v,
+                        }))
+                      }
+                      style={{ width: 58 }}
+                      ariaLabel="Cantidad de repisas equidistantes"
+                    />
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={8}
+                    value={effectiveWingTop.equalShelfCount}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      updateActiveWingTopology((wingTop) => ({
+                        ...wingTop,
+                        equalShelfCount: val,
+                      }));
+                    }}
+                    aria-label="Control deslizante cantidad de repisas"
+                  />
+                  {effectiveWingTop.equalShelfCount > 0 && wingShelfProgression.clearSpanMm > 0 && (
+                    <span className="small-note muted mono">
+                      Luz vertical s<sub>libre</sub> ={' '}
+                      {formatSingleDim(wingShelfProgression.clearSpanMm, displayUnit)}
+                    </span>
                   )}
                 </div>
+              ) : (
+                <div className="custom-shelves-box">
+                  <span className="small-note muted">
+                    {effectiveWingTop.hShelves.length} repisa(s) en modo libre (edita líneas en el lienzo o
+                    agrega aquí).
+                  </span>
+                  <div className="chip-row">
+                    <button type="button" className="btn-small" onClick={handleAddQuickCustomShelf}>
+                      + Agregar repisa
+                    </button>
+                    {effectiveWingTop.hShelves.length > 0 && (
+                      <button
+                        type="button"
+                        className="btn-danger-sm"
+                        onClick={() =>
+                          updateActiveWingTopology((wingTop) => ({
+                            ...wingTop,
+                            hShelves: [],
+                          }))
+                        }
+                      >
+                        Limpiar
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <button type="button" className="btn-secondary" onClick={handleToggleCenterDivider}>
+                {hasCenterDivider
+                  ? 'Quitar divisor vertical central'
+                  : '+ Agregar divisor vertical central'}
+              </button>
+            </div>
+          </details>
+
+          {/* 4. DESPLEGABLE: TABLEROS, FONDO Y BICOLOR */}
+          <details className="control-group advanced-drawer">
+            <summary>Tableros, Fondo y Bicolor ({params.boardThickness} mm)</summary>
+            <div className="advanced-drawer-body">
+              <div className="thickness-row">
+                <span className="small-note muted">Melamina (e):</span>
                 <div className="chip-row">
-                  <button
-                    type="button"
-                    className={activeFrontOverride === 'same' ? 'chip-btn active' : 'chip-btn'}
-                    onClick={() => requestAllFrontsMaterial('same')}
-                  >
-                    Igual
-                  </button>
-                  {MATERIAL_OPTIONS.map(({ key, label }) => (
+                  {[15, 18, 25].map((th) => (
                     <button
-                      key={`front_${key}`}
+                      key={`board_${th}`}
                       type="button"
-                      className={
-                        activeFrontOverride === key
-                          ? 'chip-btn swatch-btn active'
-                          : 'chip-btn swatch-btn'
-                      }
-                      onClick={() => requestAllFrontsMaterial(key)}
+                      className={params.boardThickness === th ? 'chip-btn active' : 'chip-btn'}
+                      onClick={() => {
+                        setModelApproved(false);
+                        setParams((p) => ({ ...p, boardThickness: th }));
+                      }}
                     >
-                      <i className={`swatch-dot swatch-${key}`} />
-                      {label}
+                      {th} mm
                     </button>
                   ))}
                 </div>
-                {pendingFrontMaterialChoice !== null && (
-                  <div className="mixed-confirm-box">
-                    <span>
-                      Hay zonas con colores distintos. ¿Aplicar{' '}
-                      <strong>{choiceLabel(pendingFrontMaterialChoice)}</strong> a los{' '}
-                      {closedFrontZones.length} frentes?
-                    </span>
-                    <div className="chip-row">
-                      <button
-                        type="button"
-                        className="btn-primary"
-                        onClick={() => applyAllFrontsMaterial(pendingFrontMaterialChoice)}
-                      >
-                        Sí, sobrescribir
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-small"
-                        onClick={() => setPendingFrontMaterialChoice(null)}
-                      >
-                        Cancelar
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </>
-            )}
-
-            <div className="slider-row">
-              <div className="slider-head">
-                <label htmlFor="explode-range">Separar piezas (Explotada)</label>
-                <strong>{Math.round(explodeFactor * 100)}%</strong>
               </div>
-              <input
-                id="explode-range"
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={explodeFactor}
-                onChange={(e) => setExplodeFactor(Number(e.target.value))}
-              />
+
+              <label className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={effectiveWingTop.hasBackPanel}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    updateActiveWingTopology((wingTop) => ({
+                      ...wingTop,
+                      hasBackPanel: checked,
+                    }));
+                  }}
+                />
+                Fondo trasero Durolac / MDF ({params.backPanelThickness} mm)
+                {isLShape ? (activeWing === 'return' ? ' · Ala B' : ' · Ala A') : ''}
+              </label>
+
+              {effectiveWingTop.hasBackPanel && (
+                <div className="thickness-row">
+                  <span className="small-note muted">Espesor fondo:</span>
+                  <div className="chip-row">
+                    {[3, 5.5].map((bth) => (
+                      <button
+                        key={`back_${bth}`}
+                        type="button"
+                        className={
+                          Math.abs(params.backPanelThickness - bth) < 0.05
+                            ? 'chip-btn active'
+                            : 'chip-btn'
+                        }
+                        onClick={() => {
+                          setModelApproved(false);
+                          setParams((p) => ({ ...p, backPanelThickness: bth }));
+                        }}
+                      >
+                        {bth} mm
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="small-note muted">Cubierta superior (bicolor):</div>
+              <div className="chip-row">
+                <button
+                  type="button"
+                  className={activeCubiertaOverride === 'same' ? 'chip-btn active' : 'chip-btn'}
+                  onClick={() => handleSetCubiertaMaterial('same')}
+                >
+                  Igual
+                </button>
+                {MATERIAL_OPTIONS.map(({ key, label }) => (
+                  <button
+                    key={`cub_${key}`}
+                    type="button"
+                    className={
+                      activeCubiertaOverride === key
+                        ? 'chip-btn swatch-btn active'
+                        : 'chip-btn swatch-btn'
+                    }
+                    onClick={() => handleSetCubiertaMaterial(key)}
+                  >
+                    <i className={`swatch-dot swatch-${key}`} />
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              {closedFrontZones.length > 0 && (
+                <>
+                  <div className="card-header-row">
+                    <span className="small-note muted">Frentes (puertas / cajones):</span>
+                    {activeFrontOverride === 'mixed' && (
+                      <span className="mixed-badge">Mixto (por zona)</span>
+                    )}
+                  </div>
+                  <div className="chip-row">
+                    <button
+                      type="button"
+                      className={activeFrontOverride === 'same' ? 'chip-btn active' : 'chip-btn'}
+                      onClick={() => requestAllFrontsMaterial('same')}
+                    >
+                      Igual
+                    </button>
+                    {MATERIAL_OPTIONS.map(({ key, label }) => (
+                      <button
+                        key={`front_${key}`}
+                        type="button"
+                        className={
+                          activeFrontOverride === key
+                            ? 'chip-btn swatch-btn active'
+                            : 'chip-btn swatch-btn'
+                        }
+                        onClick={() => requestAllFrontsMaterial(key)}
+                      >
+                        <i className={`swatch-dot swatch-${key}`} />
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  {pendingFrontMaterialChoice !== null && (
+                    <div className="mixed-confirm-box">
+                      <span>
+                        Hay zonas con colores distintos. ¿Aplicar{' '}
+                        <strong>
+                          {pendingFrontMaterialChoice === 'same'
+                            ? 'Igual a carcasa'
+                            : MATERIAL_LABELS[pendingFrontMaterialChoice]}
+                        </strong>{' '}
+                        a los {closedFrontZones.length} frentes?
+                      </span>
+                      <div className="chip-row">
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          onClick={() => applyAllFrontsMaterial(pendingFrontMaterialChoice)}
+                        >
+                          Sí, sobrescribir
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-small"
+                          onClick={() => setPendingFrontMaterialChoice(null)}
+                        >
+                          Cancelar
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
-          </div>
+          </details>
 
           {/* 5. AJUSTES AVANZADOS DE TALLER Y SIERRA */}
           <details className="control-group advanced-drawer">
-            <summary>Ajustes de Taller y Sierra (Opcional)</summary>
+            <summary>Taller y Sierra (Avanzado)</summary>
             <div className="advanced-drawer-body">
               <label className="small-note">
                 Formato de plancha:
@@ -1498,7 +1763,10 @@ export default function App() {
                     key={`mob_th_${th}`}
                     type="button"
                     className={params.boardThickness === th ? 'chip-btn active' : 'chip-btn'}
-                    onClick={() => setParams((p) => ({ ...p, boardThickness: th }))}
+                    onClick={() => {
+                      setModelApproved(false);
+                      setParams((p) => ({ ...p, boardThickness: th }));
+                    }}
                   >
                     e={th} mm
                   </button>
@@ -1507,7 +1775,7 @@ export default function App() {
             </div>
           </details>
 
-          {/* Barra contextual de vista Estudio: Ampliar Foto / Dividido / Solo 3D */}
+          {/* Barra delgada de vista Estudio: Foto / Dividido / 3D */}
           {activeView === 'studio' && (
             <div className="studio-mode-bar">
               <div className="studio-mode-group" role="group" aria-label="Disposición del estudio">
@@ -1519,50 +1787,28 @@ export default function App() {
                       : 'mode-btn mode-btn-photo'
                   }
                   onClick={() => setStudioMode('photo')}
-                  title="Ampliar la foto al ancho completo para trazar esquinas y divisiones con máxima comodidad"
+                  title="Ver la foto al ancho completo para trazar esquinas y divisiones"
                   aria-pressed={studioMode === 'photo'}
                 >
-                  <ZoomIn size={13} /> {studioMode === 'photo' ? 'Foto Ampliada' : 'Ampliar Foto'}
+                  <ZoomIn size={13} /> Foto
                 </button>
                 <button
                   type="button"
-                  className={
-                    studioMode === 'split'
-                      ? 'mode-btn active'
-                      : studioMode === 'photo'
-                        ? 'mode-btn mode-btn-return'
-                        : 'mode-btn'
-                  }
+                  className={studioMode === 'split' ? 'mode-btn active' : 'mode-btn'}
                   onClick={() => setStudioMode('split')}
-                  title="Ver la foto de trazado junto al modelo 3D en vivo"
+                  title="Ver foto de trazado junto al modelo 3D en vivo"
                   aria-pressed={studioMode === 'split'}
                 >
-                  <Columns2 size={13} /> {studioMode === 'photo' ? 'Volver a Dividido' : 'Dividido'}
+                  <Columns2 size={13} /> Dividido
                 </button>
                 <button
                   type="button"
                   className={studioMode === '3d' ? 'mode-btn active' : 'mode-btn'}
                   onClick={() => setStudioMode('3d')}
-                  title="Ver el visor 3D a pantalla completa del estudio"
+                  title="Ver el visor 3D a ancho completo"
                   aria-pressed={studioMode === '3d'}
                 >
-                  <Box size={13} /> Solo 3D
-                </button>
-              </div>
-              <div className="studio-shortcuts">
-                <button
-                  type="button"
-                  className="btn-secondary studio-shortcut-btn"
-                  onClick={() => setActiveView('blueprint')}
-                >
-                  2. Revisar Plano 2D →
-                </button>
-                <button
-                  type="button"
-                  className="btn-primary studio-shortcut-btn"
-                  onClick={() => setActiveView('workshop')}
-                >
-                  <Wrench size={13} /> 3. Taller y Corte
+                  <Box size={13} /> 3D
                 </button>
               </div>
             </div>
@@ -1597,9 +1843,10 @@ export default function App() {
                 onApplyCalibratedDims={handleApplyCalibratedDims}
                 onAutoPhotoReconstructed={handleAutoPhotoReconstructed}
                 onUpdateMaterialOnly={handleUpdateMaterialOnly}
-                onToggleExternalLegs={handleToggleExternalLegs}
+                onToggleExternalLegs={(checked, heightMm, count) =>
+                  handleSetBaseSupport(checked ? 'legs' : 'none', heightMm, count)
+                }
                 onSelectDepthMm={(z) => updateTargetDim('z', z)}
-                eyedropperTrigger={eyedropperTrigger}
               />
             </div>
 
@@ -1609,15 +1856,15 @@ export default function App() {
                 topology={topology}
                 params={params}
                 explodeFactor={explodeFactor}
+                displayUnit={displayUnit}
                 variant={studioMode === '3d' ? 'solo' : 'default'}
                 modelKey={modelKey}
                 selectedZoneId={selectedZoneId}
                 hoveredZoneId={hoveredZoneId}
                 onSelectZone={setSelectedZoneId}
                 onHoverZone={setHoveredZoneId}
-                onAddCenterDivider={() => {
-                  if (!hasCenterDivider) handleToggleCenterDivider();
-                }}
+                onExplodeChange={setExplodeFactor}
+                onAddCenterDivider={handleEnsureCenterDivider}
               />
             )}
           </div>
@@ -1633,6 +1880,8 @@ export default function App() {
               displayUnit={displayUnit}
               selectedZoneId={selectedZoneId}
               hoveredZoneId={hoveredZoneId}
+              editingWing={activeWing}
+              onChangeEditingWing={setEditingWing}
               onSelectZone={setSelectedZoneId}
               onHoverZone={setHoveredZoneId}
               onUpdateDim={updateTargetDim}
@@ -1649,20 +1898,14 @@ export default function App() {
           {activeView === 'workshop' && (
             <div className="workshop-stage">
               <div className="workshop-header-bar">
-                <div>
-                  <strong>Taller de Ingeniería, Corte y Presupuesto</strong>
-                  <span className="small-note muted" style={{ marginLeft: 8 }}>
-                    {despiece.matrizDespiece.length} placas físicas ·{' '}
-                    {cuttingPlan.totalSheetsCount} plancha(s) · {formatClp(quickTotalClp)}
-                  </span>
-                </div>
+                <strong>Taller de Ingeniería, Corte y Presupuesto</strong>
                 <button
                   type="button"
                   className={showWorkshop3D ? 'chip-btn active' : 'chip-btn'}
                   onClick={() => setShowWorkshop3D((v) => !v)}
                 >
                   {showWorkshop3D ? <EyeOff size={13} /> : <Eye size={13} />}
-                  {showWorkshop3D ? 'Ocultar vista 3D compacta' : 'Mostrar vista 3D compacta'}
+                  {showWorkshop3D ? 'Ocultar vista 3D' : 'Vista 3D compacta'}
                 </button>
               </div>
 
@@ -1672,15 +1915,15 @@ export default function App() {
                   topology={topology}
                   params={params}
                   explodeFactor={explodeFactor}
+                  displayUnit={displayUnit}
                   variant="compact"
                   modelKey={modelKey}
                   selectedZoneId={selectedZoneId}
                   hoveredZoneId={hoveredZoneId}
                   onSelectZone={setSelectedZoneId}
                   onHoverZone={setHoveredZoneId}
-                  onAddCenterDivider={() => {
-                    if (!hasCenterDivider) handleToggleCenterDivider();
-                  }}
+                  onExplodeChange={setExplodeFactor}
+                  onAddCenterDivider={handleEnsureCenterDivider}
                 />
               )}
 
@@ -1691,6 +1934,7 @@ export default function App() {
                 params={params}
                 unitVec={unitVec}
                 shapeComp={shapeComp}
+                bomCost={bomCost}
                 requestedTab={workshopRequestedTab}
                 onFixReferenceV0={() => {
                   const nextRatio =
@@ -1704,9 +1948,7 @@ export default function App() {
                     referenceDimensions: { ...p.targetDimensions },
                   }));
                 }}
-                onAddCenterDivider={() => {
-                  if (!hasCenterDivider) handleToggleCenterDivider();
-                }}
+                onAddCenterDivider={handleEnsureCenterDivider}
                 onAddHardwareItem={handleAddHardwareItem}
                 onUpdateHardwareItem={handleUpdateHardwareItem}
                 onRemoveHardwareItem={handleRemoveHardwareItem}

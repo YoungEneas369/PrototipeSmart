@@ -5,6 +5,7 @@
  * unificado sobre `classifyMelamineMaterialFromRgb` (cero duplicación RGB).
  */
 import type {
+  CanvasViewTab,
   DiagonalSegment,
   FrontModuleKind,
   FrontZone,
@@ -36,7 +37,13 @@ export type LinesSubMode = 'smart' | 'draw_only' | 'regions';
 export type SubTool = 'none' | 'calibA4' | 'eyedropper';
 export type VisualLayerMode = 'traced_zones' | 'vectors_only' | 'photo' | 'edges';
 
-export type OrthoGuideAxis = 'horizontal' | 'vertical' | 'diagonal' | null;
+export type OrthoGuideAxis =
+  | 'horizontal'
+  | 'vertical'
+  | 'near_horizontal'
+  | 'near_vertical'
+  | 'diagonal'
+  | null;
 
 export interface SelectedSubRegion {
   id: string;
@@ -63,7 +70,7 @@ export type LineHitResult =
   | { kind: 'hShelf'; id: string; part: 'body' | 'start' | 'end'; distPx: number }
   | { kind: 'diagonal'; id: string; part: 'body' | 'start' | 'end'; distPx: number };
 
-export type FrameHitResult =
+type FrameHitResult =
   | { kind: 'corner'; idx: number }
   | { kind: 'edge'; edgeIdx: 0 | 1 | 2 | 3 }
   | { kind: 'interior' }
@@ -75,7 +82,7 @@ export interface SnapIndicator {
   label: string;
 }
 
-export interface MergeableNeighbor {
+interface MergeableNeighbor {
   neighbor: FrontZone;
   neighborIndex: number;
   side: 'left' | 'right' | 'top' | 'bottom';
@@ -90,7 +97,13 @@ export const CORNER_STEP_NAMES = [
   'Esquina 4 de 4: Abajo-Izquierda',
 ] as const;
 
-export const MAX_WORK_DIM = 1400;
+const MAX_WORK_DIM = 1400;
+
+export function isEditableElement(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
+}
 
 export const ZONE_LABELS: Record<FrontModuleKind, string> = {
   open: 'Nicho abierto',
@@ -386,7 +399,7 @@ export function distScreenPx(
   return Math.hypot((a.x - b.x) * scaleX, (a.y - b.y) * scaleY);
 }
 
-export function pointToSegmentDistScreenPx(
+function pointToSegmentDistScreenPx(
   p: Point2D,
   a: Point2D,
   b: Point2D,
@@ -475,8 +488,8 @@ export function projectZoneQuad(
 
 /**
  * Hit-testing exclusivo de Paso 1 (Contorno Exterior) en píxeles de pantalla:
- *   1) Cualquiera de las 4 esquinas (radio 18 px mouse / 24 px táctil)
- *   2) Cualquiera de las 4 aristas (tolerancia 12 px / 16 px táctil)
+ *   1) Cualquiera de las 4 esquinas (radio 18 px mouse / 26 px táctil)
+ *   2) Cualquiera de las 4 aristas (tolerancia 18 px mouse / 26 px táctil — priorizada sobre interior)
  *   3) Interior del marco (para trasladar el contorno completo)
  */
 export function hitTestFrameScreenPx(
@@ -486,8 +499,8 @@ export function hitTestFrameScreenPx(
   scaleY: number,
   isTouch = false,
 ): FrameHitResult {
-  const cornerTol = isTouch ? 24 : 18;
-  const edgeTol = isTouch ? 16 : 12;
+  const cornerTol = isTouch ? 26 : 18;
+  const edgeTol = isTouch ? 26 : 18;
 
   let bestCorner = -1;
   let bestCornerDist = cornerTol;
@@ -542,8 +555,8 @@ export function hitTestLinesScreenPx(
   selectedLine: LineRef | null = null,
   isTouch = false,
 ): LineHitResult | null {
-  const endTol = isTouch ? 18 : 13;
-  const bodyTol = isTouch ? 15 : 11;
+  const endTol = isTouch ? 17 : 12;
+  const bodyTol = isTouch ? 14 : 9;
 
   let bestEnd: LineHitResult | null = null;
   let bestBody: LineHitResult | null = null;
@@ -595,8 +608,26 @@ export function hitTestLinesScreenPx(
 }
 
 /**
+ * Calcula una tolerancia adaptativa `autoExtend` para `vectorizeUserStroke` acorde al tamaño real
+ * del mueble en píxeles de pantalla (~16 px de imán a bordes exteriores/uniones T, acotada en
+ * `[0.06, 0.18]`), evitando líneas incompletas en muebles bajos como racks de TV (~110 px de alto).
+ */
+export function computeAdaptiveAutoExtend(
+  quad: readonly [Point2D, Point2D, Point2D, Point2D],
+  scaleX: number,
+  scaleY: number,
+): number {
+  const topW = distScreenPx(quad[0], quad[1], scaleX, scaleY);
+  const botW = distScreenPx(quad[3], quad[2], scaleX, scaleY);
+  const leftH = distScreenPx(quad[0], quad[3], scaleX, scaleY);
+  const rightH = distScreenPx(quad[1], quad[2], scaleX, scaleY);
+  const minSidePx = Math.max(40, Math.min(topW, botW, leftH, rightH));
+  return clampNum(16 / minSidePx, 0.06, 0.18);
+}
+
+/**
  * Ajusta un punto interior (u, v) a bordes exteriores (0/1) o a líneas perpendiculares existentes
- * (uniones T) usando tolerancia suave en píxeles de pantalla (por defecto `6 px`).
+ * (uniones T) usando tolerancia suave en píxeles de pantalla (por defecto `11 px`).
  * `axisLock` permite anclar solo el eje perpendicular al trazo activo (`'uOnly'` o `'vOnly'`)
  * para no jalar violentamente hacia bordes paralelos mientras se dibuja.
  */
@@ -611,7 +642,7 @@ export function snapPointToStructuralAnchors(
   yf: number,
   scaleX: number,
   scaleY: number,
-  snapTolPx = 6,
+  snapTolPx = 11,
   excludeId?: string,
   axisLock: 'both' | 'uOnly' | 'vOnly' = 'both',
 ): { snappedImg: Point2D; u: number; v: number; indicator: SnapIndicator | null } | null {
@@ -718,12 +749,11 @@ export function snapPointToStructuralAnchors(
 }
 
 /**
- * Guía ortogonal CERO-SALTOS para trazado en vivo (`liveStroke`):
- *  - En modo `'diagonal'`: devuelve `rawEndPt` 100 % exacto pixel a pixel (0 saltos, 0 snapping).
- *  - En modo `'ortho'` (Recta H/V, modo por defecto): determina el eje dominante suavemente
- *    (`|du * xInt| >= |dv * yInt|`) con histéresis de `6 px` de pantalla para evitar titileo en
- *    diagonales cercanas a 45°, y proyecta `rawEndPt` directamente sobre el riel en perspectiva
- *    (`u = rawU, v = startV` si horizontal; `u = startU, v = rawV` si vertical).
+ * Guía ortogonal suave (estilo Figma/Canva) para trazado en vivo (`liveStroke`):
+ *  - En modo `'auto'` u `'ortho'`, si el trazo está a `≤ 12°` de horizontal o vertical en espacio
+ *    rectificado, suaviza el extremo proyectado para mostrar una línea recta y firme sin temblor.
+ *  - Si se inclina `≥ 18°` (y `≤ 72°`) en modo `'auto'` (o siempre en `'diagonal'`), transiciona
+ *    limpiamente a diagonal real.
  */
 export function computeSmoothOrthoGuide(
   startU: number,
@@ -734,17 +764,12 @@ export function computeSmoothOrthoGuide(
   e: number,
   xf: number,
   yf: number,
-  strokeMode: 'auto' | 'ortho' | 'diagonal',
-  prevAxis: 'horizontal' | 'vertical' | null = null,
-  scaleX = 1,
-  scaleY = 1,
-  startImg?: Point2D,
+  strokeMode: 'auto' | 'ortho' | 'diagonal' | 'curve',
 ): {
   axis: OrthoGuideAxis;
   u: number;
   v: number;
   guidedImg: Point2D;
-  angleFromHorizDeg: number;
 } {
   const unit = applyHomography(toUnit, rawEndPt);
   if (!unit) {
@@ -753,73 +778,69 @@ export function computeSmoothOrthoGuide(
       u: startU,
       v: startV,
       guidedImg: rawEndPt,
-      angleFromHorizDeg: 0,
     };
   }
-  const rawU = exteriorToInterior(unit.x, e, xf);
-  const rawV = exteriorToInterior(unit.y, e, yf);
+  const u2 = exteriorToInterior(unit.x, e, xf);
+  const v2 = exteriorToInterior(unit.y, e, yf);
   const xInt = Math.max(1, xf - 2 * e);
   const yInt = Math.max(1, yf - 2 * e);
-  const dxMm = Math.abs((rawU - startU) * xInt);
-  const dyMm = Math.abs((rawV - startV) * yInt);
+  const dxMm = Math.abs((u2 - startU) * xInt);
+  const dyMm = Math.abs((v2 - startV) * yInt);
   const lenMm = Math.hypot(dxMm, dyMm);
-  const angleFromHorizDeg = lenMm > 1e-3 ? (Math.atan2(dyMm, dxMm) * 180) / Math.PI : 0;
 
-  // Modo Diagonal / Libre: puntero 100 % exacto pixel a pixel, cero snapping ni saltos
-  if (strokeMode === 'diagonal') {
-    return { axis: 'diagonal', u: rawU, v: rawV, guidedImg: rawEndPt, angleFromHorizDeg };
+  if (lenMm < 8) {
+    return { axis: null, u: u2, v: v2, guidedImg: rawEndPt };
   }
 
-  // Modo Recta H/V ('ortho', o fallback limpio): proyección directa sobre riel en perspectiva
-  const clampedU = clampNum(rawU, 0, 1);
-  const clampedV = clampNum(rawV, 0, 1);
-  const projH =
-    applyHomography(toCanvas, {
-      x: interiorToExterior(clampedU, e, xf),
-      y: interiorToExterior(startV, e, yf),
-    }) ?? rawEndPt;
-  const projV =
-    applyHomography(toCanvas, {
-      x: interiorToExterior(startU, e, xf),
-      y: interiorToExterior(clampedV, e, yf),
-    }) ?? rawEndPt;
+  const angleFromHorizDeg = (Math.atan2(dyMm, dxMm) * 180) / Math.PI;
 
-  const originImg =
-    startImg ??
-    applyHomography(toCanvas, {
-      x: interiorToExterior(startU, e, xf),
-      y: interiorToExterior(startV, e, yf),
-    }) ??
-    rawEndPt;
-  const screenDist = distScreenPx(originImg, rawEndPt, scaleX, scaleY);
+  if (strokeMode === 'diagonal' || strokeMode === 'curve') {
+    return { axis: 'diagonal', u: u2, v: v2, guidedImg: rawEndPt };
+  }
 
-  if (screenDist < 3 && lenMm < 6) {
-    if (prevAxis === 'horizontal') {
-      return { axis: 'horizontal', u: clampedU, v: startV, guidedImg: projH, angleFromHorizDeg };
+  if (strokeMode === 'ortho') {
+    if (dxMm >= dyMm) {
+      const proj =
+        applyHomography(toCanvas, {
+          x: interiorToExterior(u2, e, xf),
+          y: interiorToExterior(startV, e, yf),
+        }) ?? rawEndPt;
+      return { axis: 'horizontal', u: u2, v: startV, guidedImg: proj };
     }
-    if (prevAxis === 'vertical') {
-      return { axis: 'vertical', u: startU, v: clampedV, guidedImg: projV, angleFromHorizDeg };
-    }
-    return { axis: null, u: rawU, v: rawV, guidedImg: rawEndPt, angleFromHorizDeg };
+    const proj =
+      applyHomography(toCanvas, {
+        x: interiorToExterior(startU, e, xf),
+        y: interiorToExterior(v2, e, yf),
+      }) ?? rawEndPt;
+    return { axis: 'vertical', u: startU, v: v2, guidedImg: proj };
   }
 
-  // Histéresis de 6 px reales de pantalla convertida al espacio físico del mueble
-  const mmPerPx = screenDist > 1e-3 ? lenMm / screenDist : 1;
-  const hystMm = 6 * mmPerPx;
-
-  let chosenAxis: 'horizontal' | 'vertical';
-  if (prevAxis === 'horizontal') {
-    chosenAxis = dyMm > dxMm + hystMm ? 'vertical' : 'horizontal';
-  } else if (prevAxis === 'vertical') {
-    chosenAxis = dxMm > dyMm + hystMm ? 'horizontal' : 'vertical';
-  } else {
-    chosenAxis = dxMm >= dyMm ? 'horizontal' : 'vertical';
+  // Modo 'auto': guía firme ≤ 12°; zona transición 12°..18°; diagonal limpia entre 18°..72°
+  if (angleFromHorizDeg <= 12) {
+    const proj =
+      applyHomography(toCanvas, {
+        x: interiorToExterior(u2, e, xf),
+        y: interiorToExterior(startV, e, yf),
+      }) ?? rawEndPt;
+    return { axis: 'horizontal', u: u2, v: startV, guidedImg: proj };
   }
-
-  if (chosenAxis === 'horizontal') {
-    return { axis: 'horizontal', u: clampedU, v: startV, guidedImg: projH, angleFromHorizDeg };
+  if (angleFromHorizDeg >= 78) {
+    const proj =
+      applyHomography(toCanvas, {
+        x: interiorToExterior(startU, e, xf),
+        y: interiorToExterior(v2, e, yf),
+      }) ?? rawEndPt;
+    return { axis: 'vertical', u: startU, v: v2, guidedImg: proj };
   }
-  return { axis: 'vertical', u: startU, v: clampedV, guidedImg: projV, angleFromHorizDeg };
+  if (angleFromHorizDeg >= 18 && angleFromHorizDeg <= 72) {
+    return { axis: 'diagonal', u: u2, v: v2, guidedImg: rawEndPt };
+  }
+  return {
+    axis: angleFromHorizDeg < 45 ? 'near_horizontal' : 'near_vertical',
+    u: u2,
+    v: v2,
+    guidedImg: rawEndPt,
+  };
 }
 
 // ============================================================================
@@ -979,8 +1000,7 @@ export function ensureFrontZonesFromTopology(
 function makeUniqueSegmentId(prefix: string, existing: ReadonlySet<string>): string {
   let n = 1;
   while (existing.has(`${prefix}_${n}`)) n++;
-  const id = `${prefix}_${n}`;
-  return id;
+  return `${prefix}_${n}`;
 }
 
 /**
@@ -1567,4 +1587,67 @@ export function generateSampleFurnitureDataUrl(): string {
   }
 
   return c.toDataURL('image/png');
+}
+
+/**
+ * Crea un lienzo cuadriculado arquitectónico 100% offline para dibujar a mano alzada
+ * cualquiera de las 3 vistas (`Frente XY`, `Arriba XZ`, `Lado ZY`) sin necesidad de subir foto.
+ */
+export function createBlankSketchBitmap(
+  viewTab: CanvasViewTab,
+  w = 900,
+  h = 680,
+): WorkingBitmap {
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    ctx.fillStyle = '#f8fafc';
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.lineWidth = 1;
+    for (let x = 25; x < w; x += 25) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+    for (let y = 25; y < h; y += 25) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+
+    ctx.strokeStyle = '#cbd5e1';
+    ctx.lineWidth = 1.2;
+    for (let x = 100; x < w; x += 100) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+    for (let y = 100; y < h; y += 100) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+
+    const viewLabel =
+      viewTab === 'frontal'
+        ? 'VISTA FRONTAL (XY) — DIBUJO LIBRE'
+        : viewTab === 'superior'
+          ? 'VISTA SUPERIOR / ARRIBA (XZ) — PLANTA'
+          : 'VISTA LATERAL (ZY) — PERFIL';
+    ctx.fillStyle = '#64748b';
+    ctx.font = '700 13px system-ui, sans-serif';
+    ctx.fillText(viewLabel, 18, 26);
+  }
+  const rgba = ctx
+    ? new Uint8ClampedArray(ctx.getImageData(0, 0, w, h).data)
+    : new Uint8ClampedArray(w * h * 4);
+  return { canvas, rgba, w, h };
 }

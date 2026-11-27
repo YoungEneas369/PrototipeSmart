@@ -2,16 +2,25 @@
  * SMARTFURNITURE — GENERADOR DE PLANOS VECTORIALES 2D TÉCNICOS (v8.0)
  * 100% offline, SVG XML-safe (`escapeXml` compartido), con alzado frontal acotado,
  * perfil lateral ZY con zócalo y frentes de altura parcial `[vStart, vEnd]`, escalones
- * `void_outside` (incluso sin fondo trasero), simbología real de puertas/vidrios/cajones/canastos
- * y cartela técnica con formato dinámico de plancha (`250×183 cm` Chile, `244×122 cm`, etc.).
+ * `void_outside` (incluso sin fondo trasero), simbología real de puertas/vidrios/cajones/canastos,
+ * vista en planta superior XZ + alzados A/B para muebles en L (90°), y cartela técnica dinámica.
  */
 import type {
+  BoardPiece,
   CuttingPlanResult,
   DespieceResult,
+  FrontZone,
   FurnitureTopology,
+  Point2D,
   ScaleAndBoardParams,
 } from '../../types/contracts';
-import { resolveBaseSupport } from '../mathEngine';
+import {
+  computePieceWorldAABB,
+  evaluateBezierDifferential,
+  extractReturnWingTopology,
+  resolveBaseSupport,
+  resolveLShapePlan,
+} from '../mathEngine';
 import { escapeXml } from '../utils/xml';
 
 export { CATALOG_14_MUEBLES, cloneCatalogFurniture } from './catalog14';
@@ -23,83 +32,67 @@ export interface BlueprintRenderOptions {
   cuttingPlan?: CuttingPlanResult;
 }
 
-/**
- * Genera el Plano Vectorial 2D técnico completo en SVG (Alzado Frontal + Perfil Lateral ZY + Cotas + Cartela).
- */
-export function renderFurnitureVectorBlueprintSvg(
-  topology: FurnitureTopology,
-  params: ScaleAndBoardParams,
-  despiece: DespieceResult,
-  opts: BlueprintRenderOptions = {},
-): string {
-  const { x: xf, y: yf, z: zf } = params.targetDimensions;
-  const e = params.boardThickness;
-  const support = resolveBaseSupport(topology);
-  const legH = support.type === 'legs' || support.type === 'wheels' ? support.heightMm : 0;
-  const toeH = support.type === 'toe_kick' ? support.heightMm : 0;
-  const isWheels = support.type === 'wheels';
-  const baseLiftH = legH + toeH;
-  const totalH = yf + baseLiftH;
+interface ElevationViewParams {
+  lines: string[];
+  topology: FurnitureTopology;
+  wingPieces: readonly BoardPiece[];
+  xf: number;
+  yf: number;
+  xLeftStart: number;
+  xRightEnd: number;
+  e: number;
+  frontX: number;
+  frontY: number;
+  sc: number;
+  legH: number;
+  toeH: number;
+  isWheels: boolean;
+  supportCount: number;
+  wingLegCount?: number;
+  headingText: string;
+  widthDimLabel: string;
+  heightDimLabel?: string;
+  localCenterX: (p: BoardPiece) => number;
+}
 
-  const svgW = 920;
-  const svgH = 540;
-  const drawLeft = 92;
-  const drawTop = 78;
-  const maxFrontW = 510;
-  const maxSideW = 190;
-  const maxBodyH = 320;
-
-  // Escala uniforme compartida entre alzado (xf) y perfil lateral (zf)
-  const scaleX = maxFrontW / Math.max(300, xf);
-  const scaleSide = maxSideW / Math.max(200, zf);
-  const scaleY = maxBodyH / Math.max(300, totalH);
-  const sc = Math.min(scaleX, scaleSide, scaleY);
+function drawElevationView(cfg: ElevationViewParams): void {
+  const {
+    lines,
+    topology,
+    wingPieces,
+    xf,
+    yf,
+    xLeftStart,
+    xRightEnd,
+    e,
+    frontX,
+    frontY,
+    sc,
+    legH,
+    toeH,
+    isWheels,
+    supportCount,
+    headingText,
+    widthDimLabel,
+    heightDimLabel,
+    localCenterX,
+  } = cfg;
 
   const fw = xf * sc;
   const fh = yf * sc;
+  const baseLiftH = legH + toeH;
   const liftPx = baseLiftH * sc;
-  const sw = zf * sc;
   const ep = Math.max(2, e * sc);
-
-  const frontX = drawLeft + (maxFrontW - fw) / 2;
-  const frontY = drawTop + (maxBodyH - (fh + liftPx)) / 2;
-  const sideX = drawLeft + maxFrontW + 64;
-  const sideY = frontY;
-
-  const xInt = Math.max(1, xf - 2 * e);
+  const xInt = Math.max(1, xRightEnd - xLeftStart);
   const yInt = Math.max(1, yf - 2 * e);
 
-  const mapU = (u: number): number => frontX + (e + u * xInt) * sc;
+  const mapU = (u: number): number => frontX + (xLeftStart + u * xInt) * sc;
   const mapV = (v: number): number => frontY + fh - (e + v * yInt) * sc;
 
-  const lines: string[] = [];
-  const title = opts.title ?? topology.furnitureProfileLabel ?? 'Modelo Vectorial SmartFurniture';
-  const stage = opts.stageLabel ?? 'MODELO VECTORIAL 2D ACOTADO';
-
-  // Encabezado del plano
-  lines.push(`<rect width="${svgW}" height="${svgH}" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" />`);
-  lines.push(`<rect x="0" y="0" width="${svgW}" height="44" fill="#0f2b4c" />`);
   lines.push(
-    `<text x="18" y="20" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="700" fill="#ffffff">${escapeXml(title)}</text>`,
-  );
-  lines.push(
-    `<text x="18" y="36" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" fill="#7dd3fc">${escapeXml(stage)} · Cuerpo Melamina ${Math.round(xf)}×${Math.round(yf)}×${Math.round(zf)} mm (e=${e} mm)</text>`,
-  );
-  lines.push(
-    `<text x="${svgW - 18}" y="27" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#38bdf8">ESCALA 1:${Math.max(1, Math.round(1 / sc))}</text>`,
+    `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">${escapeXml(headingText)}</text>`,
   );
 
-  // Grilla técnica suave de fondo
-  lines.push(`<rect x="18" y="54" width="${svgW - 36}" height="384" fill="url(#bpGrid)" stroke="#e2e8f0" />`);
-
-  // =========================================================================
-  // 1. ALZADO FRONTAL (XY)
-  // =========================================================================
-  lines.push(
-    `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(frontY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">ALZADO FRONTAL (PLANO XY)</text>`,
-  );
-
-  // Fondo interior general respetando recortes `void_outside` incluso cuando `hasBackPanel === false`
   const zones = topology.frontZones ?? [];
   const stepVoidZones = zones.filter((z) => z.kind === 'void_outside');
   const hasStepVoid = stepVoidZones.length > 0;
@@ -109,10 +102,10 @@ export function renderFurnitureVectorBlueprintSvg(
       `<rect x="${frontX.toFixed(2)}" y="${frontY.toFixed(2)}" width="${fw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#0f172a" stroke-width="1.8" />`,
     );
   } else {
-    const backPieces = despiece.matrizDespiece.filter((p) => p.tipo === 'fondo');
+    const backPieces = wingPieces.filter((p) => p.tipo === 'fondo');
     if (backPieces.length > 0) {
       for (const bp of backPieces) {
-        const bx0 = frontX + (bp.posicion3D[0] - bp.dimensiones3D[0] / 2) * sc;
+        const bx0 = frontX + (localCenterX(bp) - bp.dimensiones3D[0] / 2) * sc;
         const by0 = frontY + fh - (bp.posicion3D[1] + bp.dimensiones3D[1] / 2) * sc;
         const bw = bp.dimensiones3D[0] * sc;
         const bh = bp.dimensiones3D[1] * sc;
@@ -121,7 +114,6 @@ export function renderFurnitureVectorBlueprintSvg(
         );
       }
     } else {
-      // Mueble escalonado SIN fondo trasero: silueta base + recorte limpio de cada esquina `void_outside`
       lines.push(
         `<rect x="${frontX.toFixed(2)}" y="${frontY.toFixed(2)}" width="${fw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" />`,
       );
@@ -137,10 +129,10 @@ export function renderFurnitureVectorBlueprintSvg(
     }
   }
 
-  // Patas externas / Ruedas giratorias / Zócalo inferior (Alzado Frontal)
+  // Patas externas / Ruedas / Zócalo
   if (legH > 0) {
     const legW = Math.max(5, Math.min(12, fw * 0.032));
-    const nLegs = Math.max(2, Math.min(6, support.count || 4));
+    const nLegs = Math.max(2, Math.min(12, supportCount || 4));
     const legXs =
       nLegs >= 5
         ? [frontX + fw * 0.06, frontX + fw * 0.5 - legW / 2, frontX + fw * 0.94 - legW]
@@ -179,7 +171,7 @@ export function renderFurnitureVectorBlueprintSvg(
     );
   }
 
-  // Zonas frontales (puertas, cajones, canastos metálicos, vidrios, nichos abiertos, hueco de piernas, vacío exterior)
+  // Zonas frontales
   for (const z of zones) {
     const zx0 = mapU(z.uStart);
     const zx1 = mapU(z.uEnd);
@@ -237,16 +229,18 @@ export function renderFurnitureVectorBlueprintSvg(
       lines.push(
         `<rect x="${zx0.toFixed(2)}" y="${zy0.toFixed(2)}" width="${zw.toFixed(2)}" height="${fhPx.toFixed(2)}" fill="#f1f5f9" stroke="#64748b" stroke-width="1" />`,
       );
-      lines.push(
-        `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh * 0.72).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#64748b">HUECO PIERNAS</text>`,
-      );
+      if (zw > 48) {
+        lines.push(
+          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh * 0.72).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8.5" fill="#64748b">HUECO PIERNAS</text>`,
+        );
+      }
     } else if (z.kind === 'open') {
       lines.push(
         `<rect x="${zx0.toFixed(2)}" y="${zy0.toFixed(2)}" width="${zw.toFixed(2)}" height="${zh.toFixed(2)}" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="0.8" />`,
       );
       if (z.label && zw > 34 && zh > 24) {
         lines.push(
-          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh / 2 + 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#64748b">${escapeXml(z.label)}</text>`,
+          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy0 + zh / 2 + 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8.5" fill="#64748b">${escapeXml(z.label)}</text>`,
         );
       }
     } else if (z.kind === 'door_left' || z.kind === 'door_right' || z.kind === 'door_glass') {
@@ -276,7 +270,7 @@ export function renderFurnitureVectorBlueprintSvg(
       );
       if (zw > 34 && zh > 24) {
         lines.push(
-          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy1 - 8).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8.5" fill="#0f2b4c">${escapeXml(z.label ?? 'Puerta')}</text>`,
+          `<text x="${(zx0 + zw / 2).toFixed(1)}" y="${(zy1 - 8).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8" fill="#0f2b4c">${escapeXml(z.label ?? 'Puerta')}</text>`,
         );
       }
     } else if (z.kind === 'door_double') {
@@ -316,15 +310,15 @@ export function renderFurnitureVectorBlueprintSvg(
         );
         if (zw > 42 && dh > 22) {
           lines.push(
-            `<text x="${cx.toFixed(1)}" y="${(dy + dh - 5).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8" fill="#9a3412">Cajón ${k + 1} (5 pzas)</text>`,
+            `<text x="${cx.toFixed(1)}" y="${(dy + dh - 5).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="7.5" fill="#9a3412">Cajón ${k + 1} (5 pzas)</text>`,
           );
         }
       }
     }
   }
 
-  // Tableros estructurales directamente desde `despiece.matrizDespiece` (paridad 100% con 3D)
-  for (const p of despiece.matrizDespiece) {
+  // Tableros estructurales directamente desde `despiece`
+  for (const p of wingPieces) {
     if (
       p.tipo !== 'cubierta' &&
       p.tipo !== 'base' &&
@@ -334,7 +328,8 @@ export function renderFurnitureVectorBlueprintSvg(
     ) {
       continue;
     }
-    const px0 = frontX + (p.posicion3D[0] - p.dimensiones3D[0] / 2) * sc;
+    const cxMm = localCenterX(p);
+    const px0 = frontX + (cxMm - p.dimensiones3D[0] / 2) * sc;
     const py0 = frontY + fh - (p.posicion3D[1] + p.dimensiones3D[1] / 2) * sc;
     const pw = Math.max(1.5, p.dimensiones3D[0] * sc);
     const ph = Math.max(1.5, p.dimensiones3D[1] * sc);
@@ -344,7 +339,7 @@ export function renderFurnitureVectorBlueprintSvg(
     );
   }
 
-  // Divisores diagonales / oblicuos
+  // Divisores diagonales
   for (const diag of topology.diagonalDividers ?? []) {
     const x1 = mapU(diag.u1);
     const y1 = mapV(diag.v1);
@@ -356,38 +351,104 @@ export function renderFurnitureVectorBlueprintSvg(
     );
   }
 
-  // Cotas exteriores Alzado Frontal
+  // Trazos y cortes curvos diferenciales en plano XY
+  for (const c of topology.curvedCuts ?? []) {
+    if (c.plane !== 'xy') continue;
+    const [p0, p1, p2, p3] = c.controlPoints;
+    const cPts = [p0, p1, p2, p3].map((p) => ({ x: mapU(p.x), y: mapV(p.y) }));
+    const dAttr = `M ${cPts[0].x.toFixed(2)} ${cPts[0].y.toFixed(2)} C ${cPts[1].x.toFixed(2)} ${cPts[1].y.toFixed(2)}, ${cPts[2].x.toFixed(2)} ${cPts[2].y.toFixed(2)}, ${cPts[3].x.toFixed(2)} ${cPts[3].y.toFixed(2)}`;
+    lines.push(
+      `<path class="svg-diff-curve" d="${dAttr}" fill="none" stroke="#0f172a" stroke-width="${(ep + 1.2).toFixed(2)}" stroke-linecap="round" />`,
+      `<path d="${dAttr}" fill="none" stroke="#d946ef" stroke-width="${Math.max(1.6, ep - 0.5).toFixed(2)}" stroke-linecap="round" />`,
+    );
+    const diff =
+      c.arcLengthMm !== undefined
+        ? null
+        : evaluateBezierDifferential([
+            { x: p0.x * xf, y: p0.y * yf },
+            { x: p1.x * xf, y: p1.y * yf },
+            { x: p2.x * xf, y: p2.y * yf },
+            { x: p3.x * xf, y: p3.y * yf },
+          ]);
+    const arcLabel = c.arcLengthMm ?? diff?.arcLengthMm ?? 0;
+    if (arcLabel > 0) {
+      lines.push(
+        `<text x="${((cPts[1].x + cPts[2].x) / 2).toFixed(1)}" y="${((cPts[1].y + cPts[2].y) / 2 - 4).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8" font-weight="700" fill="#a21caf">s=${Math.round(arcLabel)}mm</text>`,
+      );
+    }
+  }
+
+  // Cotas exteriores
   const dimTopY = frontY - 12;
   lines.push(
     `<line x1="${frontX.toFixed(1)}" y1="${dimTopY.toFixed(1)}" x2="${(frontX + fw).toFixed(1)}" y2="${dimTopY.toFixed(1)}" stroke="#0284c7" stroke-width="1.3" />`,
   );
   lines.push(
-    `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(dimTopY - 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" font-weight="700" fill="#0284c7">Ancho X = ${Math.round(xf)} mm</text>`,
+    `<text x="${(frontX + fw / 2).toFixed(1)}" y="${(dimTopY - 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" font-weight="700" fill="#0284c7">${escapeXml(widthDimLabel)}</text>`,
   );
 
-  const dimLeftX = frontX - 18;
-  lines.push(
-    `<line x1="${dimLeftX.toFixed(1)}" y1="${frontY.toFixed(1)}" x2="${dimLeftX.toFixed(1)}" y2="${(frontY + fh).toFixed(1)}" stroke="#059669" stroke-width="1.3" />`,
-  );
-  lines.push(
-    `<text x="${(dimLeftX - 5).toFixed(1)}" y="${(frontY + fh / 2).toFixed(1)}" text-anchor="middle" transform="rotate(-90 ${(dimLeftX - 5).toFixed(1)} ${(frontY + fh / 2).toFixed(1)})" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" font-weight="700" fill="#059669">Alto Y = ${Math.round(yf)} mm</text>`,
-  );
+  if (heightDimLabel) {
+    const dimLeftX = frontX - 18;
+    lines.push(
+      `<line x1="${dimLeftX.toFixed(1)}" y1="${frontY.toFixed(1)}" x2="${dimLeftX.toFixed(1)}" y2="${(frontY + fh).toFixed(1)}" stroke="#059669" stroke-width="1.3" />`,
+    );
+    lines.push(
+      `<text x="${(dimLeftX - 5).toFixed(1)}" y="${(frontY + fh / 2).toFixed(1)}" text-anchor="middle" transform="rotate(-90 ${(dimLeftX - 5).toFixed(1)} ${(frontY + fh / 2).toFixed(1)})" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" font-weight="700" fill="#059669">${escapeXml(heightDimLabel)}</text>`,
+    );
+  }
+}
 
-  // =========================================================================
-  // 2. PERFIL LATERAL (PLANO ZY)
-  // =========================================================================
+function drawSideProfileView(cfg: {
+  lines: string[];
+  zones: readonly FrontZone[];
+  hasBackPanel: boolean;
+  zf: number;
+  yf: number;
+  e: number;
+  sideX: number;
+  sideY: number;
+  sc: number;
+  legH: number;
+  toeH: number;
+  isWheels: boolean;
+  dimTopY: number;
+  headingText?: string;
+}): void {
+  const {
+    lines,
+    zones,
+    hasBackPanel,
+    zf,
+    yf,
+    e,
+    sideX,
+    sideY,
+    sc,
+    legH,
+    toeH,
+    isWheels,
+    dimTopY,
+    headingText = 'PERFIL LATERAL (ZY)',
+  } = cfg;
+  const sw = zf * sc;
+  const fh = yf * sc;
+  const ep = Math.max(2, e * sc);
+  const liftPx = (legH + toeH) * sc;
+  const yInt = Math.max(1, yf - 2 * e);
+  const mapV = (v: number): number => sideY + fh - (e + v * yInt) * sc;
+  const stepVoidZones = zones.filter((z) => z.kind === 'void_outside');
+
   lines.push(
-    `<text x="${(sideX + sw / 2).toFixed(1)}" y="${(sideY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">PERFIL LATERAL (ZY)</text>`,
+    `<text x="${(sideX + sw / 2).toFixed(1)}" y="${(sideY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">${escapeXml(headingText)}</text>`,
   );
   lines.push(
     `<rect x="${sideX.toFixed(2)}" y="${sideY.toFixed(2)}" width="${sw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#0f172a" stroke-width="1.8" />`,
   );
-  if (topology.hasBackPanel) {
+  if (hasBackPanel) {
     lines.push(
       `<rect x="${(sideX - 3).toFixed(2)}" y="${sideY.toFixed(2)}" width="3" height="${fh.toFixed(2)}" fill="#b45309" />`,
     );
   }
-  // Línea de nivel escalonado en perfil lateral cuando existe recorte `void_outside`
   for (const vz of stepVoidZones) {
     const stepV = vz.vEnd >= 0.98 ? vz.vStart : vz.vEnd;
     if (stepV > 0.04 && stepV < 0.96) {
@@ -397,7 +458,6 @@ export function renderFurnitureVectorBlueprintSvg(
       );
     }
   }
-  // Apoyo inferior en perfil lateral ZY: ruedas, patas externas o zócalo retranqueado (`toe_kick`)
   if (legH > 0) {
     if (isWheels) {
       const rW = Math.max(4, Math.min(10, liftPx * 0.4));
@@ -424,13 +484,7 @@ export function renderFurnitureVectorBlueprintSvg(
     );
   }
 
-  // Frentes sobrepuestos en perfil lateral ZY respetando la altura parcial exacta `[vStart, vEnd]`
-  const sideFrontBands: Array<{
-    v0: number;
-    v1: number;
-    fill: string;
-    stroke: string;
-  }> = [];
+  const sideFrontBands: Array<{ v0: number; v1: number; fill: string; stroke: string }> = [];
   for (const z of zones) {
     if (
       z.kind === 'open' ||
@@ -468,9 +522,333 @@ export function renderFurnitureVectorBlueprintSvg(
   lines.push(
     `<text x="${(sideX + sw / 2).toFixed(1)}" y="${(dimTopY - 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" font-weight="700" fill="#7c3aed">Z = ${Math.round(zf)} mm</text>`,
   );
+}
+
+/**
+ * Genera el Plano Vectorial 2D técnico completo en SVG:
+ * - Mueble recto: Alzado Frontal XY + Perfil Lateral ZY + Cartela.
+ * - Mueble en L (90°): Planta Superior XZ acotada + Alzado Ala Principal (A) + Alzado Ala Retorno (B) + Perfil ZY + Cartela.
+ */
+export function renderFurnitureVectorBlueprintSvg(
+  topology: FurnitureTopology,
+  params: ScaleAndBoardParams,
+  despiece: DespieceResult,
+  opts: BlueprintRenderOptions = {},
+): string {
+  const { x: xf, y: yf, z: zf } = params.targetDimensions;
+  const e = params.boardThickness;
+  const support = resolveBaseSupport(topology);
+  const legH = support.type === 'legs' || support.type === 'wheels' ? support.heightMm : 0;
+  const toeH = support.type === 'toe_kick' ? support.heightMm : 0;
+  const isWheels = support.type === 'wheels';
+  const baseLiftH = legH + toeH;
+  const totalH = yf + baseLiftH;
+
+  const lPlan = resolveLShapePlan(topology, params);
+  const isL = Boolean(lPlan?.enabled);
+
+  const svgW = 920;
+  const svgH = isL ? 720 : 540;
+  const lines: string[] = [];
+  const title = opts.title ?? topology.furnitureProfileLabel ?? 'Modelo Vectorial SmartFurniture';
+  const stage = opts.stageLabel ?? 'MODELO VECTORIAL 2D ACOTADO';
+
+  const mainPieces = despiece.matrizDespiece.filter((p) => p.wing !== 'return');
+  const returnPieces = despiece.matrizDespiece.filter((p) => p.wing === 'return');
+
+  let scHeader = 0.25;
+  let cartelaY = 446;
+
+  if (!isL || !lPlan) {
+    const drawLeft = 92;
+    const drawTop = 78;
+    const maxFrontW = 510;
+    const maxSideW = 190;
+    const maxBodyH = 320;
+
+    const scaleX = maxFrontW / Math.max(300, xf);
+    const scaleSide = maxSideW / Math.max(200, zf);
+    const scaleY = maxBodyH / Math.max(300, totalH);
+    const sc = Math.min(scaleX, scaleSide, scaleY);
+    scHeader = sc;
+
+    const fw = xf * sc;
+    const fh = yf * sc;
+    const liftPx = baseLiftH * sc;
+    const frontX = drawLeft + (maxFrontW - fw) / 2;
+    const frontY = drawTop + (maxBodyH - (fh + liftPx)) / 2;
+    const sideX = drawLeft + maxFrontW + 64;
+
+    lines.push(`<rect width="${svgW}" height="${svgH}" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" />`);
+    lines.push(`<rect x="0" y="0" width="${svgW}" height="44" fill="#0f2b4c" />`);
+    lines.push(
+      `<text x="18" y="20" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="700" fill="#ffffff">${escapeXml(title)}</text>`,
+    );
+    lines.push(
+      `<text x="18" y="36" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" fill="#7dd3fc">${escapeXml(stage)} · Cuerpo Melamina ${Math.round(xf)}×${Math.round(yf)}×${Math.round(zf)} mm (e=${e} mm)</text>`,
+    );
+    lines.push(
+      `<text x="${svgW - 18}" y="27" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#38bdf8">ESCALA 1:${Math.max(1, Math.round(1 / scHeader))}</text>`,
+    );
+    lines.push(`<rect x="18" y="54" width="${svgW - 36}" height="384" fill="url(#bpGrid)" stroke="#e2e8f0" />`);
+
+    drawElevationView({
+      lines,
+      topology,
+      wingPieces: mainPieces,
+      xf,
+      yf,
+      xLeftStart: e,
+      xRightEnd: xf - e,
+      e,
+      frontX,
+      frontY,
+      sc,
+      legH,
+      toeH,
+      isWheels,
+      supportCount: support.count || 4,
+      headingText: 'ALZADO FRONTAL (PLANO XY)',
+      widthDimLabel: `Ancho X = ${Math.round(xf)} mm`,
+      heightDimLabel: `Alto Y = ${Math.round(yf)} mm`,
+      localCenterX: (p) => p.posicion3D[0],
+    });
+
+    drawSideProfileView({
+      lines,
+      zones: topology.frontZones ?? [],
+      hasBackPanel: topology.hasBackPanel,
+      zf,
+      yf,
+      e,
+      sideX,
+      sideY: frontY,
+      sc,
+      legH,
+      toeH,
+      isWheels,
+      dimTopY: frontY - 12,
+    });
+  } else {
+    // MODO MUEBLE EN L (90° EN XZ): Planta Superior + Alzado Ala Principal + Alzado Ala Retorno + Perfil ZY
+    let zStartB = lPlan.zStartB;
+    let netLenB = lPlan.netLengthMm;
+    if (returnPieces.length > 0) {
+      let minZ = Infinity;
+      let maxZ = -Infinity;
+      for (const rp of returnPieces) {
+        if (rp.tipo === 'puerta' || rp.tipo === 'frente_cajon') continue;
+        const box = computePieceWorldAABB(rp);
+        minZ = Math.min(minZ, box.minZ);
+        maxZ = Math.max(maxZ, box.maxZ);
+      }
+      if (Number.isFinite(minZ) && Number.isFinite(maxZ) && maxZ > minZ) {
+        zStartB = minZ;
+        netLenB = maxZ - minZ;
+      }
+    }
+    const totalL2 = zStartB + netLenB;
+    const ry = lPlan.heightMm;
+    const rz = lPlan.depthMm;
+
+    // Escala compartida para Alzados A/B y Perfil Lateral en fila inferior (y = 330..595)
+    const maxBotFrontW = 470;
+    const maxBotSideW = 165;
+    const maxBotH = 210;
+    const scElev = Math.min(
+      maxBotFrontW / Math.max(300, xf),
+      maxBotSideW / Math.max(200, zf),
+      maxBotH / Math.max(300, Math.max(yf, ry) + baseLiftH),
+    );
+    scHeader = scElev;
+
+    lines.push(`<rect width="${svgW}" height="${svgH}" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" />`);
+    lines.push(`<rect x="0" y="0" width="${svgW}" height="44" fill="#0f2b4c" />`);
+    lines.push(
+      `<text x="18" y="20" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="700" fill="#ffffff">${escapeXml(title)}</text>`,
+    );
+    lines.push(
+      `<text x="18" y="36" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" fill="#7dd3fc">${escapeXml(stage)} · En L (${lPlan.side === 'right' ? 'Derecha' : 'Izquierda'}): Ala A ${Math.round(xf)}×${Math.round(yf)}×${Math.round(zf)} + Ala B ${Math.round(totalL2)}×${Math.round(ry)}×${Math.round(rz)} mm</text>`,
+    );
+    lines.push(
+      `<text x="${svgW - 18}" y="27" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#38bdf8">ESCALA ALZ. 1:${Math.max(1, Math.round(1 / scElev))}</text>`,
+    );
+
+    lines.push(`<rect x="18" y="54" width="${svgW - 36}" height="564" fill="url(#bpGrid)" stroke="#e2e8f0" />`);
+
+    // --- VISTA 1 (SUPERIOR IZQUIERDA): PLANTA SUPERIOR (PLANO XZ) ---
+    const planBoxX = 56;
+    const planBoxY = 82;
+    const planMaxW = 315;
+    const planMaxH = 190;
+    const scPlan = Math.min(planMaxW / Math.max(300, xf), planMaxH / Math.max(300, totalL2));
+    const planW = xf * scPlan;
+    const planH = totalL2 * scPlan;
+    const pxOrigin = planBoxX + (planMaxW - planW) / 2;
+    const pyOrigin = planBoxY + (planMaxH - planH) / 2 + 10;
+
+    lines.push(
+      `<text x="${(pxOrigin + planW / 2).toFixed(1)}" y="${(pyOrigin - 24).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">PLANTA SUPERIOR (PLANO XZ — MUEBLE EN L 90°)</text>`,
+    );
+
+    const pMainW = xf * scPlan;
+    const pMainD = zf * scPlan;
+    const pRetXMm = lPlan.side === 'right' ? xf - rz : 0;
+    const pRetX = pxOrigin + pRetXMm * scPlan;
+    const pRetY = pyOrigin + zStartB * scPlan;
+    const pRetW = rz * scPlan;
+    const pRetD = netLenB * scPlan;
+
+    // Fondo Durolac en planta (Ala A y Ala B)
+    const returnTop = extractReturnWingTopology(topology);
+    if (topology.hasBackPanel) {
+      lines.push(
+        `<rect x="${pxOrigin.toFixed(2)}" y="${(pyOrigin - 3).toFixed(2)}" width="${pMainW.toFixed(2)}" height="3" fill="#b45309" />`,
+      );
+    }
+    if (returnTop.hasBackPanel) {
+      const bxRet = lPlan.side === 'right' ? pRetX + pRetW : pRetX - 3;
+      lines.push(
+        `<rect x="${bxRet.toFixed(2)}" y="${pRetY.toFixed(2)}" width="3" height="${pRetD.toFixed(2)}" fill="#b45309" />`,
+      );
+    }
+
+    // Rectángulo Ala A y Ala B en planta XZ
+    lines.push(
+      `<rect class="plan-wing-main" x="${pxOrigin.toFixed(2)}" y="${pyOrigin.toFixed(2)}" width="${pMainW.toFixed(2)}" height="${pMainD.toFixed(2)}" fill="#eff6ff" stroke="#0f172a" stroke-width="1.6" />`,
+      `<text x="${(pxOrigin + pMainW / 2).toFixed(1)}" y="${(pyOrigin + pMainD / 2 + 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="700" fill="#1e3a8a">ALA A (${Math.round(xf)}×${Math.round(zf)})</text>`,
+    );
+    lines.push(
+      `<rect class="plan-wing-return" x="${pRetX.toFixed(2)}" y="${pRetY.toFixed(2)}" width="${pRetW.toFixed(2)}" height="${pRetD.toFixed(2)}" fill="#ecfdf5" stroke="#0f172a" stroke-width="1.6" />`,
+      `<text x="${(pRetX + pRetW / 2).toFixed(1)}" y="${(pRetY + pRetD / 2 + 3).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8.5" font-weight="700" fill="#065f46">ALA B (${Math.round(rz)}×${Math.round(netLenB)})</text>`,
+    );
+
+    if (lPlan.openCorner) {
+      lines.push(
+        `<line x1="${(pRetX + 2).toFixed(1)}" y1="${pRetY.toFixed(1)}" x2="${(pRetX + pRetW - 2).toFixed(1)}" y2="${pRetY.toFixed(1)}" stroke="#10b981" stroke-width="1.4" stroke-dasharray="4,3" />`,
+      );
+    }
+
+    // Dibujar perfiles curvos XZ (empalmes diferenciales L / cubiertas curvas) en planta superior
+    for (const rp of despiece.matrizDespiece) {
+      if (!rp.curveProfile || rp.curveProfile.extrudePlane !== 'xz') continue;
+      const ptsWorld: Point2D[] = rp.curveProfile.pointsMm.map((pt) => ({
+        x: pxOrigin + (rp.posicion3D[0] + pt.x) * scPlan,
+        y: pyOrigin + (rp.posicion3D[2] + pt.y) * scPlan,
+      }));
+      if (ptsWorld.length >= 3) {
+        const dPoly =
+          ptsWorld
+            .map((pt, i) => `${i === 0 ? 'M' : 'L'} ${pt.x.toFixed(2)} ${pt.y.toFixed(2)}`)
+            .join(' ') + ' Z';
+        lines.push(
+          `<path class="plan-curve-piece" d="${dPoly}" fill="rgba(217, 70, 239, 0.14)" stroke="#a21caf" stroke-width="1.6" />`,
+        );
+      }
+    }
+
+    // Cotas Planta XZ: L1 arriba, L2 en costado exterior del retorno, Z2 abajo del retorno
+    lines.push(
+      `<line x1="${pxOrigin.toFixed(1)}" y1="${(pyOrigin - 10).toFixed(1)}" x2="${(pxOrigin + pMainW).toFixed(1)}" y2="${(pyOrigin - 10).toFixed(1)}" stroke="#0284c7" stroke-width="1.2" />`,
+      `<text x="${(pxOrigin + pMainW / 2).toFixed(1)}" y="${(pyOrigin - 13).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9.5" font-weight="700" fill="#0284c7">L1 = ${Math.round(xf)} mm</text>`,
+    );
+    const l2DimX = lPlan.side === 'right' ? pxOrigin + pMainW + 14 : pxOrigin - 14;
+    lines.push(
+      `<line x1="${l2DimX.toFixed(1)}" y1="${pyOrigin.toFixed(1)}" x2="${l2DimX.toFixed(1)}" y2="${(pyOrigin + planH).toFixed(1)}" stroke="#059669" stroke-width="1.2" />`,
+      `<text x="${(l2DimX + (lPlan.side === 'right' ? 6 : -6)).toFixed(1)}" y="${(pyOrigin + planH / 2).toFixed(1)}" text-anchor="middle" transform="rotate(-90 ${(l2DimX + (lPlan.side === 'right' ? 6 : -6)).toFixed(1)} ${(pyOrigin + planH / 2).toFixed(1)})" font-family="system-ui, -apple-system, sans-serif" font-size="9.5" font-weight="700" fill="#059669">L2 = ${Math.round(totalL2)} mm</text>`,
+    );
+    lines.push(
+      `<text x="${(pRetX + pRetW / 2).toFixed(1)}" y="${(pyOrigin + planH + 13).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="700" fill="#7c3aed">Z2 = ${Math.round(rz)} mm</text>`,
+    );
+
+    // --- VISTA 2 (SUPERIOR DERECHA): ALZADO ALA RETORNO (B) ---
+    const maxRetW = 390;
+    const maxRetH = 185;
+    const scRet = Math.min(
+      maxRetW / Math.max(300, netLenB),
+      maxRetH / Math.max(300, ry + baseLiftH),
+    );
+    const retFw = netLenB * scRet;
+    const retFh = ry * scRet;
+    const retLiftPx = baseLiftH * scRet;
+    const retFrontX = 468 + (maxRetW - retFw) / 2;
+    const retFrontY = 92 + (maxRetH - (retFh + retLiftPx)) / 2;
+
+    drawElevationView({
+      lines,
+      topology: returnTop,
+      wingPieces: returnPieces,
+      xf: netLenB,
+      yf: ry,
+      xLeftStart: lPlan.omitLeftLateral ? 0 : e,
+      xRightEnd: lPlan.omitRightLateral ? netLenB : netLenB - e,
+      e,
+      frontX: retFrontX,
+      frontY: retFrontY,
+      sc: scRet,
+      legH,
+      toeH,
+      isWheels,
+      supportCount: 2,
+      headingText: `ALZADO ALA RETORNO (B · ${lPlan.openCorner ? 'ESQUINA ABIERTA' : 'TOPE 90°'})`,
+      widthDimLabel: `Tramo Neto B = ${Math.round(netLenB)} mm (Total L2=${Math.round(totalL2)})`,
+      heightDimLabel: `Alto B = ${Math.round(ry)} mm`,
+      localCenterX: (p) =>
+        lPlan.side === 'right' ? p.posicion3D[2] - zStartB : zStartB + netLenB - p.posicion3D[2],
+    });
+
+    // --- VISTA 3 (INFERIOR IZQUIERDA): ALZADO ALA PRINCIPAL (A) ---
+    const mainFw = xf * scElev;
+    const mainFh = yf * scElev;
+    const mainLiftPx = baseLiftH * scElev;
+    const mainFrontX = 80 + (maxBotFrontW - mainFw) / 2;
+    const mainFrontY = 368 + (maxBotH - (mainFh + mainLiftPx)) / 2;
+
+    drawElevationView({
+      lines,
+      topology,
+      wingPieces: mainPieces,
+      xf,
+      yf,
+      xLeftStart: e,
+      xRightEnd: xf - e,
+      e,
+      frontX: mainFrontX,
+      frontY: mainFrontY,
+      sc: scElev,
+      legH,
+      toeH,
+      isWheels,
+      supportCount: support.count || 4,
+      headingText: 'ALZADO FRONTAL (PLANO XY · ALA PRINCIPAL A)',
+      widthDimLabel: `Ancho X = ${Math.round(xf)} mm`,
+      heightDimLabel: `Alto Y = ${Math.round(yf)} mm`,
+      localCenterX: (p) => p.posicion3D[0],
+    });
+
+    // --- VISTA 4 (INFERIOR DERECHA): PERFIL LATERAL ALA PRINCIPAL (ZY) ---
+    drawSideProfileView({
+      lines,
+      zones: topology.frontZones ?? [],
+      hasBackPanel: topology.hasBackPanel,
+      zf,
+      yf,
+      e,
+      sideX: 625,
+      sideY: mainFrontY,
+      sc: scElev,
+      legH,
+      toeH,
+      isWheels,
+      dimTopY: mainFrontY - 12,
+      headingText: 'PERFIL LATERAL (ZY · ALA A)',
+    });
+
+    cartelaY = 626;
+  }
 
   // =========================================================================
-  // 3. CARTELA TÉCNICA INFERIOR (DESPIECE, PLANCHAS DINÁMICAS Y HERRAJES)
+  // CARTELA TÉCNICA INFERIOR (DESPIECE, PLANCHAS DINÁMICAS Y HERRAJES)
   // =========================================================================
   const doorCount = despiece.matrizDespiece.filter((p) => p.tipo === 'puerta').length;
   const drawerCount = despiece.matrizDespiece.filter((p) => p.tipo === 'frente_cajon').length;
@@ -486,19 +864,22 @@ export function renderFurnitureVectorBlueprintSvg(
     : `Área neta: ${despiece.totalNetAreaM2.toFixed(2)} m² · Tapacanto: ${despiece.totalEdgeBandingMeters.toFixed(1)} m`;
 
   lines.push(
-    `<rect x="18" y="446" width="${svgW - 36}" height="80" fill="#f8fafc" stroke="#0f2b4c" stroke-width="1.2" rx="4" />`,
+    `<rect x="18" y="${cartelaY}" width="${svgW - 36}" height="80" fill="#f8fafc" stroke="#0f2b4c" stroke-width="1.2" rx="4" />`,
+  );
+  const curveInfo = despiece.differentialMetrics
+    ? ` · Curvas: ${despiece.differentialMetrics.curvedCutCount} (arco ${despiece.differentialMetrics.totalArcLengthMm.toFixed(0)} mm, R_mín ${despiece.differentialMetrics.minCurvatureRadiusMm.toFixed(0)} mm)`
+    : '';
+  lines.push(
+    `<text x="30" y="${cartelaY + 20}" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">RESUMEN DE DESPIECE: ${melPieces} piezas melamina (${e} mm) · ${backPieces} piezas fondo ${params.backPanelThickness} mm · ${doorCount} puerta(s) · ${drawerCount} cajón(es)${escapeXml(curveInfo)}</text>`,
   );
   lines.push(
-    `<text x="30" y="466" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">RESUMEN DE DESPIECE: ${melPieces} piezas melamina (${e} mm) · ${backPieces} piezas fondo ${params.backPanelThickness} mm · ${doorCount} puerta(s) · ${drawerCount} cajón(es) [5 pzas/cajón]</text>`,
+    `<text x="30" y="${cartelaY + 40}" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" fill="#0369a1">${escapeXml(planText)} · Escala k=(${despiece.scaleFactors.kx.toFixed(2)}, ${despiece.scaleFactors.ky.toFixed(2)}, ${despiece.scaleFactors.kz.toFixed(2)})</text>`,
   );
   lines.push(
-    `<text x="30" y="486" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" fill="#0369a1">${escapeXml(planText)} · Escala k=(${despiece.scaleFactors.kx.toFixed(2)}, ${despiece.scaleFactors.ky.toFixed(2)}, ${despiece.scaleFactors.kz.toFixed(2)})</text>`,
+    `<text x="30" y="${cartelaY + 60}" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#92400e">HERRAJES (NO MELAMINA): ${escapeXml(hwText)}</text>`,
   );
   lines.push(
-    `<text x="30" y="506" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#92400e">HERRAJES (NO MELAMINA): ${escapeXml(hwText)}</text>`,
-  );
-  lines.push(
-    `<text x="${svgW - 30}" y="518" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#64748b">Alertas estructurales: ${despiece.alerts.length} · 100% Offline SmartFurniture v8.0</text>`,
+    `<text x="${svgW - 30}" y="${cartelaY + 72}" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#64748b">Alertas estructurales: ${despiece.alerts.length} · 100% Offline SmartFurniture v8.0</text>`,
   );
 
   return [

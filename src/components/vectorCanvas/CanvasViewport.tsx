@@ -8,8 +8,10 @@
  *   `activeDiagonals`) sin recalcular 3D ni despiece durante `pointermove`.
  */
 import { useEffect, useRef } from 'react';
-import { Camera, Sparkles, Undo2, Upload, X } from 'lucide-react';
+import { Camera, Sparkles, Upload } from 'lucide-react';
 import type {
+  CanvasViewTab,
+  CurvedCutSpec,
   DiagonalSegment,
   FrontZone,
   MelamineMaterial,
@@ -19,17 +21,22 @@ import type {
 } from '../../types/contracts';
 import {
   applyHomography,
+  computeQuadToUnitHomography,
   interiorToExterior,
   type Matrix3x3,
 } from '../../core/mathEngine';
-import type { VectorLine2D } from '../../core/vision';
+import {
+  vectorizeUserStroke,
+  type UserStrokeMode,
+  type VectorLine2D,
+} from '../../core/vision';
 import {
   CORNER_LABELS,
   MELAMINE_LABELS,
   VECTOR_ROLE_COLORS,
   ZONE_COLORS,
   ZONE_SHORT_LABELS,
-  clampNum,
+  computeAdaptiveAutoExtend,
   projectDiagonal,
   projectHShelf,
   projectVDivider,
@@ -65,10 +72,7 @@ export interface ActiveHoverTarget {
 export interface LiveStrokeDrawState {
   startImg: Point2D;
   currentImg: Point2D;
-  startU: number;
-  startV: number;
-  currentU: number;
-  currentV: number;
+  points?: Point2D[];
   orthoGuide?: OrthoGuideAxis;
 }
 
@@ -80,17 +84,19 @@ export interface EyedropperPreview {
 export interface CanvasViewportProps {
   activeBmp: WorkingBitmap | null;
   sobelCanvas: HTMLCanvasElement | null;
-  viewTab: 'frontal' | 'lateral';
+  viewTab: CanvasViewTab;
   traceStep: TraceStep;
   frameMode: FrameMode;
   linesSubMode: LinesSubMode;
   subTool: SubTool;
   visualLayer: VisualLayerMode;
+  strokeMode: UserStrokeMode;
   activeQuad: [Point2D, Point2D, Point2D, Point2D];
   homography: { toUnit: Matrix3x3; toCanvas: Matrix3x3 } | null;
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
   diagonalDividers: DiagonalSegment[];
+  curvedCuts?: CurvedCutSpec[];
   frontZones: FrontZone[];
   subRegions: SelectedSubRegion[];
   draftRegion: { uStart: number; uEnd: number; vStart: number; vEnd: number } | null;
@@ -111,16 +117,13 @@ export interface CanvasViewportProps {
   zoom: number;
   pan: Point2D;
   isPanning: boolean;
+  panToolActive: boolean;
   isSpacePan: boolean;
   isDragging: boolean;
   isDragOver: boolean;
-  canUndo: boolean;
-  undoCount: number;
   canvasCursor: string;
   canvasRef: React.RefObject<HTMLCanvasElement>;
   stageRef: React.RefObject<HTMLDivElement>;
-  onUndo: () => void;
-  onDeleteSelectedLine: () => void;
   onPointerDown: (e: React.PointerEvent<HTMLCanvasElement>) => void;
   onPointerMove: (e: React.PointerEvent<HTMLCanvasElement>) => void;
   onPointerUp: (e: React.PointerEvent<HTMLCanvasElement>) => void;
@@ -130,6 +133,7 @@ export interface CanvasViewportProps {
   onDragLeave: () => void;
   onDrop: (e: React.DragEvent<HTMLDivElement>) => void;
   onTriggerUpload: () => void;
+  onStartBlankSketch?: () => void;
   onLoadSample: () => void;
 }
 
@@ -145,11 +149,13 @@ export function CanvasViewport({
   linesSubMode,
   subTool,
   visualLayer,
+  strokeMode,
   activeQuad,
   homography,
   vDividers,
   hShelves,
   diagonalDividers,
+  curvedCuts = [],
   frontZones,
   subRegions,
   draftRegion,
@@ -170,16 +176,13 @@ export function CanvasViewport({
   zoom,
   pan,
   isPanning,
+  panToolActive,
   isSpacePan,
   isDragging,
   isDragOver,
-  canUndo,
-  undoCount,
   canvasCursor,
   canvasRef,
   stageRef,
-  onUndo,
-  onDeleteSelectedLine,
   onPointerDown,
   onPointerMove,
   onPointerUp,
@@ -189,6 +192,7 @@ export function CanvasViewport({
   onDragLeave,
   onDrop,
   onTriggerUpload,
+  onStartBlankSketch,
   onLoadSample,
 }: CanvasViewportProps) {
   const loupeCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -498,18 +502,28 @@ export function CanvasViewport({
         ctx.restore();
       };
 
-      // Divisores verticales
-      for (const div of vDividers) {
-        const proj = projectVDivider(div, toCanvas, e, xf, yf);
-        if (!proj) continue;
-        const isSel = selectedLine?.kind === 'vDivider' && selectedLine.id === div.id;
+      const drawStructuralLine = (
+        kind: LineRef['kind'],
+        id: string,
+        proj: { p0: Point2D; p1: Point2D } | null,
+        colors: {
+          base: string;
+          hover: string;
+          hoverHalo: string;
+          endAccent: string;
+          badgeBg: string;
+        },
+        badgeText: string,
+      ) => {
+        if (!proj) return;
+        const isSel = selectedLine?.kind === kind && selectedLine.id === id;
         const isHov =
           (hoverTarget.kind === 'lineBody' || hoverTarget.kind === 'lineEnd') &&
-          hoverTarget.lineRef?.kind === 'vDivider' &&
-          hoverTarget.lineRef.id === div.id;
+          hoverTarget.lineRef?.kind === kind &&
+          hoverTarget.lineRef.id === id;
 
         if (isSel || isHov) {
-          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.58)' : 'rgba(74, 222, 128, 0.52)';
+          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.58)' : colors.hoverHalo;
           ctx.lineWidth = Math.max(9, cw / 110);
           ctx.beginPath();
           ctx.moveTo(proj.p0.x, proj.p0.y);
@@ -517,213 +531,234 @@ export function CanvasViewport({
           ctx.stroke();
         }
 
-        ctx.strokeStyle = isSel ? '#38bdf8' : isHov ? '#4ade80' : '#22c55e';
-        ctx.lineWidth = Math.max(isSel ? 4.4 : isHov ? 4.0 : 3, cw / (isSel || isHov ? 215 : 290));
-        ctx.beginPath();
-        ctx.moveTo(proj.p0.x, proj.p0.y);
-        ctx.lineTo(proj.p1.x, proj.p1.y);
-        ctx.stroke();
-
-        if (traceStep === 'lines') {
-          drawEndpointHandle(
-            proj.p0,
-            isSel,
-            isHov && hoverTarget.linePart === 'start',
-            '#16a34a',
-          );
-          drawEndpointHandle(
-            proj.p1,
-            isSel,
-            isHov && hoverTarget.linePart === 'end',
-            '#16a34a',
-          );
-          const xMm = Math.round(e + div.position * xInt);
-          drawLineBadge(
-            (proj.p0.x + proj.p1.x) / 2,
-            (proj.p0.y + proj.p1.y) / 2,
-            `${xMm}mm`,
-            'rgba(21, 128, 61, 0.88)',
-            isSel,
-          );
-        }
-      }
-
-      // Repisas horizontales
-      for (const sh of hShelves) {
-        const proj = projectHShelf(sh, toCanvas, e, xf, yf);
-        if (!proj) continue;
-        const isSel = selectedLine?.kind === 'hShelf' && selectedLine.id === sh.id;
-        const isHov =
-          (hoverTarget.kind === 'lineBody' || hoverTarget.kind === 'lineEnd') &&
-          hoverTarget.lineRef?.kind === 'hShelf' &&
-          hoverTarget.lineRef.id === sh.id;
-
-        if (isSel || isHov) {
-          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.58)' : 'rgba(251, 191, 36, 0.52)';
-          ctx.lineWidth = Math.max(9, cw / 110);
-          ctx.beginPath();
-          ctx.moveTo(proj.p0.x, proj.p0.y);
-          ctx.lineTo(proj.p1.x, proj.p1.y);
-          ctx.stroke();
-        }
-
-        ctx.strokeStyle = isSel ? '#38bdf8' : isHov ? '#fbbf24' : '#f59e0b';
-        ctx.lineWidth = Math.max(isSel ? 4.4 : isHov ? 4.0 : 3, cw / (isSel || isHov ? 215 : 290));
-        ctx.beginPath();
-        ctx.moveTo(proj.p0.x, proj.p0.y);
-        ctx.lineTo(proj.p1.x, proj.p1.y);
-        ctx.stroke();
-
-        if (traceStep === 'lines') {
-          drawEndpointHandle(
-            proj.p0,
-            isSel,
-            isHov && hoverTarget.linePart === 'start',
-            '#d97706',
-          );
-          drawEndpointHandle(
-            proj.p1,
-            isSel,
-            isHov && hoverTarget.linePart === 'end',
-            '#d97706',
-          );
-          const yMm = Math.round(e + sh.position * yInt);
-          drawLineBadge(
-            (proj.p0.x + proj.p1.x) / 2,
-            (proj.p0.y + proj.p1.y) / 2,
-            `${yMm}mm`,
-            'rgba(180, 83, 9, 0.88)',
-            isSel,
-          );
-        }
-      }
-
-      // Divisiones diagonales (seleccionables, arrastrables completas o por sus 2 extremos)
-      for (const diag of diagonalDividers) {
-        const proj = projectDiagonal(diag, toCanvas, e, xf, yf);
-        if (!proj) continue;
-        const isSel = selectedLine?.kind === 'diagonal' && selectedLine.id === diag.id;
-        const isHov =
-          (hoverTarget.kind === 'lineBody' || hoverTarget.kind === 'lineEnd') &&
-          hoverTarget.lineRef?.kind === 'diagonal' &&
-          hoverTarget.lineRef.id === diag.id;
-
-        if (isSel || isHov) {
-          ctx.strokeStyle = isSel ? 'rgba(56, 189, 248, 0.58)' : 'rgba(232, 121, 249, 0.52)';
-          ctx.lineWidth = Math.max(9, cw / 110);
-          ctx.beginPath();
-          ctx.moveTo(proj.p0.x, proj.p0.y);
-          ctx.lineTo(proj.p1.x, proj.p1.y);
-          ctx.stroke();
-        }
-
-        ctx.strokeStyle = isSel ? '#38bdf8' : isHov ? '#e879f9' : '#d946ef';
-        ctx.lineWidth = Math.max(isSel ? 4.5 : isHov ? 4.1 : 3.2, cw / (isSel || isHov ? 210 : 275));
-        ctx.beginPath();
-        ctx.moveTo(proj.p0.x, proj.p0.y);
-        ctx.lineTo(proj.p1.x, proj.p1.y);
-        ctx.stroke();
-
-        if (traceStep === 'lines') {
-          drawEndpointHandle(
-            proj.p0,
-            isSel,
-            isHov && hoverTarget.linePart === 'start',
-            '#a21caf',
-          );
-          drawEndpointHandle(
-            proj.p1,
-            isSel,
-            isHov && hoverTarget.linePart === 'end',
-            '#a21caf',
-          );
-          const dxD = (diag.u2 - diag.u1) * xInt;
-          const dyD = (diag.v2 - diag.v1) * yInt;
-          const lenMm = Math.round(Math.hypot(dxD, dyD));
-          const deg = Math.round(Math.abs((Math.atan2(dyD, dxD) * 180) / Math.PI));
-          drawLineBadge(
-            (proj.p0.x + proj.p1.x) / 2,
-            (proj.p0.y + proj.p1.y) / 2,
-            `${deg}° · ${lenMm}mm`,
-            'rgba(134, 25, 143, 0.90)',
-            isSel,
-          );
-        }
-      }
-
-      // 4C. Vista previa EN VIVO del nuevo trazo (100 % continua 1:1, cero snapping en movimiento)
-      if (liveStroke) {
-        ctx.save();
-        const pA = liveStroke.startImg;
-        const pB = liveStroke.currentImg;
-        const dxMm = (liveStroke.currentU - liveStroke.startU) * xInt;
-        const dyMm = (liveStroke.currentV - liveStroke.startV) * yInt;
-        const lenMm = Math.round(Math.hypot(dxMm, dyMm));
-
-        let strokeCol = '#38bdf8';
-        let lbl = '';
-        const isOrthoLocked =
-          liveStroke.orthoGuide === 'horizontal' || liveStroke.orthoGuide === 'vertical';
-
-        if (liveStroke.orthoGuide === 'diagonal') {
-          strokeCol = '#e879f9';
-          const angleDeg = Math.round(Math.abs((Math.atan2(dyMm, dxMm) * 180) / Math.PI));
-          if (lenMm >= 15) {
-            lbl = `⟋ Diagonal ${angleDeg}° · ${lenMm} mm`;
-          }
-        } else if (liveStroke.orthoGuide === 'horizontal') {
-          strokeCol = '#fbbf24';
-          const yMm = Math.round(e + clampNum(liveStroke.startV, 0.015, 0.985) * yInt);
-          const spanMm = Math.round(Math.abs(dxMm));
-          if (spanMm >= 15) {
-            lbl = `→ Repisa Y=${yMm} mm (luz ${spanMm} mm)`;
-          }
-        } else if (liveStroke.orthoGuide === 'vertical') {
-          strokeCol = '#4ade80';
-          const xMm = Math.round(e + clampNum(liveStroke.startU, 0.015, 0.985) * xInt);
-          const spanMm = Math.round(Math.abs(dyMm));
-          if (spanMm >= 15) {
-            lbl = `↓ Divisor X=${xMm} mm (alto ${spanMm} mm)`;
-          }
-        }
-
-        ctx.strokeStyle = strokeCol;
+        ctx.strokeStyle = isSel ? '#38bdf8' : isHov ? colors.hover : colors.base;
         ctx.lineWidth = Math.max(
-          isOrthoLocked || liveStroke.orthoGuide === 'diagonal' ? 4 : 2.5,
-          cw / 220,
+          isSel ? 4.4 : isHov ? 4.0 : 3.0,
+          cw / (isSel || isHov ? 215 : 285),
         );
-        ctx.setLineDash(isOrthoLocked ? [] : [8, 5]);
         ctx.beginPath();
-        ctx.moveTo(pA.x, pA.y);
-        ctx.lineTo(pB.x, pB.y);
+        ctx.moveTo(proj.p0.x, proj.p0.y);
+        ctx.lineTo(proj.p1.x, proj.p1.y);
         ctx.stroke();
-        ctx.setLineDash([]);
 
-        // Marcadores nítidos en ambos extremos del trazo en vivo
-        const endDotR = Math.max(4, cw / 210);
-        for (const pt of [pA, pB]) {
-          ctx.beginPath();
-          ctx.arc(pt.x, pt.y, endDotR, 0, Math.PI * 2);
-          ctx.fillStyle = '#ffffff';
-          ctx.fill();
-          ctx.strokeStyle = strokeCol;
-          ctx.lineWidth = 2;
-          ctx.stroke();
+        if (traceStep === 'lines') {
+          drawEndpointHandle(
+            proj.p0,
+            isSel,
+            isHov && hoverTarget.linePart === 'start',
+            colors.endAccent,
+          );
+          drawEndpointHandle(
+            proj.p1,
+            isSel,
+            isHov && hoverTarget.linePart === 'end',
+            colors.endAccent,
+          );
+          if (isSel || isHov) {
+            drawLineBadge(
+              (proj.p0.x + proj.p1.x) / 2,
+              (proj.p0.y + proj.p1.y) / 2,
+              badgeText,
+              colors.badgeBg,
+              isSel,
+            );
+          }
         }
+      };
 
-        if (lbl) {
+      for (const div of vDividers) {
+        drawStructuralLine(
+          'vDivider',
+          div.id,
+          projectVDivider(div, toCanvas, e, xf, yf),
+          {
+            base: '#22c55e',
+            hover: '#4ade80',
+            hoverHalo: 'rgba(74, 222, 128, 0.52)',
+            endAccent: '#16a34a',
+            badgeBg: 'rgba(21, 128, 61, 0.88)',
+          },
+          `${Math.round(e + div.position * xInt)}mm`,
+        );
+      }
+
+      for (const sh of hShelves) {
+        drawStructuralLine(
+          'hShelf',
+          sh.id,
+          projectHShelf(sh, toCanvas, e, xf, yf),
+          {
+            base: '#f59e0b',
+            hover: '#fbbf24',
+            hoverHalo: 'rgba(251, 191, 36, 0.52)',
+            endAccent: '#d97706',
+            badgeBg: 'rgba(180, 83, 9, 0.88)',
+          },
+          `${Math.round(e + sh.position * yInt)}mm`,
+        );
+      }
+
+      for (const diag of diagonalDividers) {
+        const dxD = (diag.u2 - diag.u1) * xInt;
+        const dyD = (diag.v2 - diag.v1) * yInt;
+        const lenMm = Math.round(Math.hypot(dxD, dyD));
+        const deg = Math.round(Math.abs((Math.atan2(dyD, dxD) * 180) / Math.PI));
+        drawStructuralLine(
+          'diagonal',
+          diag.id,
+          projectDiagonal(diag, toCanvas, e, xf, yf),
+          {
+            base: '#d946ef',
+            hover: '#e879f9',
+            hoverHalo: 'rgba(232, 121, 249, 0.52)',
+            endAccent: '#a21caf',
+            badgeBg: 'rgba(134, 25, 143, 0.90)',
+          },
+          `${deg}° · ${lenMm}mm`,
+        );
+      }
+
+      // 4C. Vista previa EN VIVO del nuevo trazo (`liveStroke` soporta trazos rectos guiados y curva libre)
+      if (liveStroke) {
+        const pts = liveStroke.points ?? [liveStroke.startImg, liveStroke.currentImg];
+        const chordDx = liveStroke.currentImg.x - liveStroke.startImg.x;
+        const chordDy = liveStroke.currentImg.y - liveStroke.startImg.y;
+        const chordLenPx = Math.hypot(chordDx, chordDy);
+        let maxDevPx = 0;
+        if (chordLenPx > 12 && pts.length >= 3) {
+          for (const p of pts) {
+            const dev =
+              Math.abs(
+                (p.x - liveStroke.startImg.x) * chordDy -
+                  (p.y - liveStroke.startImg.y) * chordDx,
+              ) / chordLenPx;
+            if (dev > maxDevPx) maxDevPx = dev;
+          }
+        }
+        const renderAsFreeCurve =
+          pts.length >= 4 &&
+          (strokeMode === 'curve' || maxDevPx >= Math.max(12, chordLenPx * 0.065));
+
+        if (renderAsFreeCurve) {
+          ctx.save();
+          ctx.strokeStyle = '#d946ef';
+          ctx.lineWidth = Math.max(4, cw / 220);
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.beginPath();
+          pts.forEach((pt, idx) => (idx === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y)));
+          ctx.stroke();
+          const midPt = pts[Math.floor(pts.length / 2)];
           drawLineBadge(
-            (pA.x + pB.x) / 2,
-            (pA.y + pB.y) / 2,
-            lbl,
-            'rgba(15, 23, 42, 0.92)',
+            midPt.x,
+            midPt.y - 12,
+            '⟿ Curva libre (diferencial)',
+            'rgba(134, 25, 143, 0.92)',
             true,
           );
+          ctx.restore();
+        } else {
+        const previewVec = vectorizeUserStroke(
+          liveStroke.startImg,
+          liveStroke.currentImg,
+          homography.toUnit,
+          vDividers,
+          hShelves,
+          e,
+          params.targetDimensions,
+          computeAdaptiveAutoExtend(activeQuad, screenScaleX, screenScaleY),
+          strokeMode,
+        );
+        ctx.save();
+        if (previewVec) {
+          let pA: Point2D | null = null;
+          let pB: Point2D | null = null;
+          let strokeCol = '#4ade80';
+          let lbl = '';
+          const isOrthoLocked =
+            liveStroke.orthoGuide === 'horizontal' || liveStroke.orthoGuide === 'vertical';
+
+          if (previewVec.kind === 'diagonal') {
+            pA = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.u1, e, xf),
+              y: interiorToExterior(previewVec.segment.v1, e, yf),
+            });
+            pB = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.u2, e, xf),
+              y: interiorToExterior(previewVec.segment.v2, e, yf),
+            });
+            strokeCol = '#e879f9';
+            lbl = `⟋ Diagonal ${Math.abs(previewVec.angleDeg)}° · ${previewVec.spanMm} mm`;
+          } else if (previewVec.kind === 'hShelf') {
+            pA = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.start, e, xf),
+              y: interiorToExterior(previewVec.segment.position, e, yf),
+            });
+            pB = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.end, e, xf),
+              y: interiorToExterior(previewVec.segment.position, e, yf),
+            });
+            strokeCol = '#fbbf24';
+            lbl = `→ Repisa Y=${previewVec.positionMm} mm (luz ${previewVec.spanMm} mm)${isOrthoLocked ? ' · Recta' : ''}`;
+          } else {
+            pA = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.position, e, xf),
+              y: interiorToExterior(previewVec.segment.start, e, yf),
+            });
+            pB = applyHomography(toCanvas, {
+              x: interiorToExterior(previewVec.segment.position, e, xf),
+              y: interiorToExterior(previewVec.segment.end, e, yf),
+            });
+            strokeCol = '#4ade80';
+            lbl = `↓ Divisor X=${previewVec.positionMm} mm (alto ${previewVec.spanMm} mm)${isOrthoLocked ? ' · Recta' : ''}`;
+          }
+
+          if (pA && pB) {
+            // Si está en transición 7°–18°, mostrar guía tenue de la mano real + línea proyectada limpia
+            if (
+              liveStroke.orthoGuide === 'near_horizontal' ||
+              liveStroke.orthoGuide === 'near_vertical'
+            ) {
+              ctx.strokeStyle = 'rgba(226, 232, 240, 0.45)';
+              ctx.lineWidth = 1.6;
+              ctx.setLineDash([4, 4]);
+              ctx.beginPath();
+              ctx.moveTo(liveStroke.startImg.x, liveStroke.startImg.y);
+              ctx.lineTo(liveStroke.currentImg.x, liveStroke.currentImg.y);
+              ctx.stroke();
+            }
+
+            ctx.strokeStyle = strokeCol;
+            ctx.lineWidth = Math.max(4, cw / 220);
+            ctx.setLineDash(isOrthoLocked ? [] : [10, 6]);
+            ctx.beginPath();
+            ctx.moveTo(pA.x, pA.y);
+            ctx.lineTo(pB.x, pB.y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            drawLineBadge(
+              (pA.x + pB.x) / 2,
+              (pA.y + pB.y) / 2,
+              lbl,
+              'rgba(15, 23, 42, 0.92)',
+              true,
+            );
+          }
+        } else {
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 2.5;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(liveStroke.startImg.x, liveStroke.startImg.y);
+          ctx.lineTo(liveStroke.currentImg.x, liveStroke.currentImg.y);
+          ctx.stroke();
         }
         ctx.restore();
+        }
       }
 
-      // 4E. Secciones seleccionadas para auto-detección multi-sección (`S1`, `S2`, `S3`...)
+      // 4D. Secciones seleccionadas para auto-detección multi-sección (`S1`, `S2`, `S3`...)
       if (traceStep === 'lines' && (subRegions.length > 0 || draftRegion)) {
         const drawSubRegionOverlay = (
           reg: { uStart: number; uEnd: number; vStart: number; vEnd: number },
@@ -794,7 +829,7 @@ export function CanvasViewport({
         }
       }
 
-      // 4D. Calibración A4
+      // 4E. Calibración A4
       if (calibPts.length >= 1) {
         const markerR = Math.max(7, cw / 115);
         ctx.save();
@@ -826,9 +861,64 @@ export function CanvasViewport({
       }
     }
 
-    // 5. Contorno exterior (siempre nítido; manijas interactivas SOLO en Paso 1 o Vista Lateral)
+    // 4F. Renderizar curvas diferenciales comprometidas + trazo libre en curso en Arriba / Lado / Frente
+    const activePlane = viewTab === 'frontal' ? 'xy' : viewTab === 'superior' ? 'xz' : 'zy';
+    const planeHom = viewTab === 'frontal' ? homography : computeQuadToUnitHomography(activeQuad);
+    if (planeHom) {
+      const planeCurves = curvedCuts.filter((c) => c.plane === activePlane);
+      for (const c of planeCurves) {
+        const mapped = c.controlPoints.map((pt) =>
+          applyHomography(
+            planeHom.toCanvas,
+            viewTab === 'frontal'
+              ? {
+                  x: interiorToExterior(pt.x, e, xf),
+                  y: interiorToExterior(pt.y, e, yf),
+                }
+              : pt,
+          ),
+        );
+        if (mapped.every((m): m is Point2D => m !== null)) {
+          ctx.save();
+          ctx.strokeStyle = '#0f172a';
+          ctx.lineWidth = Math.max(5.5, cw / 185);
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(mapped[0].x, mapped[0].y);
+          ctx.bezierCurveTo(
+            mapped[1].x,
+            mapped[1].y,
+            mapped[2].x,
+            mapped[2].y,
+            mapped[3].x,
+            mapped[3].y,
+          );
+          ctx.stroke();
+
+          ctx.strokeStyle = '#d946ef';
+          ctx.lineWidth = Math.max(3.2, cw / 270);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+    }
+    if (viewTab !== 'frontal' && liveStroke?.points && liveStroke.points.length >= 2) {
+      ctx.save();
+      ctx.strokeStyle = '#d946ef';
+      ctx.lineWidth = Math.max(3.6, cw / 230);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      liveStroke.points.forEach((pt, idx) =>
+        idx === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y),
+      );
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 5. Contorno exterior (siempre nítido; manijas interactivas en Paso 1 o Arriba/Lado)
     ctx.save();
-    ctx.strokeStyle = traceStep === 'frame' || viewTab === 'lateral' ? '#38bdf8' : '#00e5ff';
+    ctx.strokeStyle = traceStep === 'frame' || viewTab !== 'frontal' ? '#38bdf8' : '#00e5ff';
     ctx.lineWidth = Math.max(traceStep === 'frame' ? 3.2 : 2.2, cw / 300);
     ctx.beginPath();
     activeQuad.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
@@ -838,7 +928,7 @@ export function CanvasViewport({
     // Resaltar arista hovered en Paso 1 y mostrar manijas en los 4 bordes
     const showFrameHandles =
       (viewTab === 'frontal' && traceStep === 'frame' && subTool === 'none') ||
-      viewTab === 'lateral';
+      viewTab !== 'frontal';
 
     if (showFrameHandles && pickingCorners === null) {
       // Guías sutiles de perspectiva al arrastrar el marco en Paso 1
@@ -868,14 +958,14 @@ export function CanvasViewport({
         ctx.restore();
       }
 
-      // Manijas en el punto medio de cada una de las 4 aristas (para arrastrar borde completo)
+      // Manijas visibles en el punto medio de cada una de las 4 aristas (para arrastrar borde completo sin mover la caja)
       for (let edgeIdx = 0; edgeIdx < 4; edgeIdx++) {
         const a = activeQuad[edgeIdx];
         const b = activeQuad[(edgeIdx + 1) % 4];
         const isEdgeHovered = hoverTarget.kind === 'edge' && hoverTarget.edgeIdx === edgeIdx;
         if (isEdgeHovered) {
           ctx.strokeStyle = '#facc15';
-          ctx.lineWidth = Math.max(5.5, cw / 170);
+          ctx.lineWidth = Math.max(6, cw / 155);
           ctx.beginPath();
           ctx.moveTo(a.x, a.y);
           ctx.lineTo(b.x, b.y);
@@ -884,17 +974,28 @@ export function CanvasViewport({
         const mx = (a.x + b.x) / 2;
         const my = (a.y + b.y) / 2;
         const angle = Math.atan2(b.y - a.y, b.x - a.x);
-        const pillW = Math.max(20, cw / 42);
-        const pillH = Math.max(7, cw / 130);
+        const pillW = Math.max(30, cw / 28);
+        const pillH = Math.max(11, cw / 86);
         ctx.save();
         ctx.translate(mx, my);
         ctx.rotate(angle);
         ctx.fillStyle = isEdgeHovered ? '#facc15' : '#ffffff';
-        ctx.strokeStyle = '#0284c7';
-        ctx.lineWidth = 2;
+        ctx.strokeStyle = isEdgeHovered ? '#0f172a' : '#0284c7';
+        ctx.lineWidth = 2.4;
         ctx.beginPath();
         ctx.roundRect(-pillW / 2, -pillH / 2, pillW, pillH, pillH / 2);
         ctx.fill();
+        ctx.stroke();
+
+        // Líneas de agarre (grip) en el centro del pill para señalizar arrastre del borde
+        ctx.strokeStyle = isEdgeHovered ? '#0f172a' : '#0284c7';
+        ctx.lineWidth = 1.6;
+        const gripSpan = pillW * 0.24;
+        ctx.beginPath();
+        ctx.moveTo(-gripSpan, -pillH * 0.16);
+        ctx.lineTo(gripSpan, -pillH * 0.16);
+        ctx.moveTo(-gripSpan, pillH * 0.16);
+        ctx.lineTo(gripSpan, pillH * 0.16);
         ctx.stroke();
         ctx.restore();
       }
@@ -1033,11 +1134,13 @@ export function CanvasViewport({
     linesSubMode,
     subTool,
     visualLayer,
+    strokeMode,
     activeQuad,
     homography,
     vDividers,
     hShelves,
     diagonalDividers,
+    curvedCuts,
     frontZones,
     subRegions,
     draftRegion,
@@ -1188,16 +1291,19 @@ export function CanvasViewport({
   ]);
 
   const effectiveTouchAction =
-    traceStep === 'zones' && !isPanning && !isSpacePan && zoom <= 1.02 && subTool === 'none'
+    traceStep === 'zones' &&
+    !isPanning &&
+    !panToolActive &&
+    !isSpacePan &&
+    zoom <= 1.02 &&
+    subTool === 'none'
       ? 'pan-y'
       : 'none';
 
   return (
     <div
       ref={stageRef}
-      className={`vc-viewport-stage${isDragOver ? ' drag-over' : ''}${
-        zoom > 1.02 ? ' is-zoomed' : ''
-      }`}
+      className={`vc-viewport-stage${isDragOver ? ' drag-over' : ''}`}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
@@ -1221,49 +1327,6 @@ export function CanvasViewport({
               onPointerLeave={onPointerLeave}
             />
           </div>
-
-          {/* Píldora flotante rápida en esquina superior izquierda: Deshacer y Borrar línea */}
-          {!(loupeFocusPt && loupeSide === 'left') &&
-            (canUndo ||
-              (pickingCorners !== null && pickingCorners.length > 0) ||
-              (viewTab === 'frontal' &&
-                traceStep === 'lines' &&
-                selectedLine !== null &&
-                subTool === 'none')) && (
-              <div className="vc-float-actions-tl">
-                {(canUndo || (pickingCorners !== null && pickingCorners.length > 0)) && (
-                  <button
-                    type="button"
-                    className="vc-float-pill vc-float-undo"
-                    onClick={onUndo}
-                    title="Deshacer la última acción (Ctrl+Z)"
-                  >
-                    <Undo2 size={13} />
-                    <span>
-                      {pickingCorners !== null && pickingCorners.length > 0
-                        ? 'Deshacer toque (Ctrl+Z)'
-                        : undoCount > 1
-                          ? `Deshacer (${undoCount}) · Ctrl+Z`
-                          : 'Deshacer (Ctrl+Z)'}
-                    </span>
-                  </button>
-                )}
-                {viewTab === 'frontal' &&
-                  traceStep === 'lines' &&
-                  selectedLine !== null &&
-                  subTool === 'none' && (
-                    <button
-                      type="button"
-                      className="vc-float-pill vc-float-delete"
-                      onClick={onDeleteSelectedLine}
-                      title="Eliminar la línea seleccionada (Supr)"
-                    >
-                      <X size={13} />
-                      <span>Borrar línea</span>
-                    </button>
-                  )}
-              </div>
-            )}
 
           {/* Lupa 4× fija dentro del viewport visible (nunca cortada fuera del scroll) */}
           {loupeFocusPt && (
@@ -1307,21 +1370,30 @@ export function CanvasViewport({
           <Upload size={34} />
           <strong>
             {viewTab === 'frontal'
-              ? 'Sube la foto de tu mueble y calca sus márgenes para generar el 3D exacto'
-              : 'Sube una foto lateral (perfil) para estimar la profundidad Z'}
+              ? 'Sube 1–3 fotos (Frente, Arriba, Lado) o dibuja en lienzo libre para crear el 3D'
+              : viewTab === 'superior'
+                ? 'Sube la foto o dibujo desde Arriba (XZ) para detectar planta recta, en L o curva'
+                : 'Sube una foto o dibujo lateral (ZY) para estimar la profundidad Z'}
           </strong>
           <p className="vc-dropzone-desc">
             {viewTab === 'frontal'
-              ? '1) Ajusta contorno exterior (4 esquinas o bordes) · 2) Traza o mueve líneas rectas y diagonales · 3) Define puertas, cajones, canastos o recortes.'
-              : 'Ajusta las 4 esquinas sobre el costado del mueble y el sistema calculará la profundidad Z en milímetros.'}
+              ? 'Reconoce fotos reales y dibujos a mano (líneas rectas, diagonales o curvas suaves) y reconcilia las 3 vistas.'
+              : viewTab === 'superior'
+                ? 'Desde Arriba se detectan contornos en L, profundidades y esquinas curvas no ortogonales.'
+                : 'Ajusta el contorno de costado o dibuja sobre la cuadrícula para definir la profundidad Z.'}
           </p>
           <div className="vc-dropzone-actions">
             <button type="button" className="vc-btn vc-btn-primary" onClick={onTriggerUpload}>
-              <Camera size={14} /> Elegir foto (o arrastra aquí)
+              <Camera size={14} /> Elegir foto o dibujo
             </button>
+            {onStartBlankSketch && (
+              <button type="button" className="vc-btn vc-btn-secondary" onClick={onStartBlankSketch}>
+                <Sparkles size={14} /> Dibujar en lienzo libre ({viewTab === 'frontal' ? '3 vistas' : viewTab === 'superior' ? 'Arriba' : 'Lado'})
+              </button>
+            )}
             {viewTab === 'frontal' && (
               <button type="button" className="vc-btn vc-btn-secondary" onClick={onLoadSample}>
-                <Sparkles size={14} /> Probar con escritorio de muestra
+                Probar escritorio de muestra
               </button>
             )}
           </div>

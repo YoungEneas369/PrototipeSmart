@@ -286,9 +286,15 @@ export function resolveVoidCutouts(
   };
 }
 
+export interface HorizontalSupportSpan {
+  x0: number;
+  x1: number;
+}
+
 /**
  * Emite los muros de cierre de torre (`lateral_escalon_*`) y cubiertas/bases de escalón
  * (`cubierta_escalon_*`, `base_escalon_*`) respetando tanto `topOverSides` como `topBetweenSides`,
+ * apoyos inferiores reales (`baseSpans` en `leg_void`) y divisores parciales existentes,
  * con 0.000 mm de solapamiento 3D.
  */
 export function emitStepCutoutStructures(options: {
@@ -301,6 +307,8 @@ export function emitStepCutoutStructures(options: {
   cubiertaMat: PieceMaterial;
   joint: ScaleAndBoardParams['cornerJointType'];
   edgeMode: ScaleAndBoardParams['edgeBandingMode'];
+  baseSpans?: readonly HorizontalSupportSpan[];
+  cubiertaSpans?: readonly HorizontalSupportSpan[];
   activeDividers: ActiveDividerSpan[];
   placedShelves: PlacedShelfSpan[];
   pieces: BoardPiece[];
@@ -315,6 +323,8 @@ export function emitStepCutoutStructures(options: {
     cubiertaMat,
     joint,
     edgeMode,
+    baseSpans,
+    cubiertaSpans,
     activeDividers,
     placedShelves,
     pieces,
@@ -322,52 +332,83 @@ export function emitStepCutoutStructures(options: {
 
   const { topRight, topLeft, bottomRight, bottomLeft } = cutouts;
 
+  const hasSpanCoveringX = (
+    xCenter: number,
+    spans: readonly HorizontalSupportSpan[] | undefined,
+    fallback: boolean,
+  ): boolean => {
+    if (!spans) return fallback;
+    return spans.some(
+      (s) => s.x0 < xCenter + e / 2 - GEOM_EPS && s.x1 > xCenter - e / 2 + GEOM_EPS,
+    );
+  };
+
+  /**
+   * Emite tramos de muro vertical en `[yMin, yMax]` a `x = step.x` restando cualquier
+   * divisor parcial ya presente en la misma franja X (`|d.cx - step.x| < e`), evitando
+   * cualquier solapamiento 3D.
+   */
+  const emitMissingTowerWalls = (
+    baseId: string,
+    nombre: string,
+    step: StepCutout,
+    yMin: number,
+    yMax: number,
+  ): void => {
+    if (yMax - yMin <= GEOM_EPS) return;
+    const occupiedY: Array<[number, number]> = activeDividers
+      .filter((d) => Math.abs(d.cx - step.x) < e - GEOM_EPS)
+      .map((d) => [d.y0, d.y1]);
+    const missingSpans = subtractIntervals([yMin, yMax], occupiedY, GEOM_EPS);
+    missingSpans.forEach(([sy0, sy1], idx) => {
+      const twH = sy1 - sy0;
+      if (twH <= GEOM_EPS) return;
+      const wallId = missingSpans.length === 1 ? baseId : `${baseId}_${idx + 1}`;
+      activeDividers.push({
+        id: wallId,
+        u: step.u,
+        cx: step.x,
+        y0: sy0,
+        y1: sy1,
+      });
+      pieces.push({
+        id: wallId,
+        nombre: missingSpans.length === 1 ? nombre : `${nombre} ${idx + 1}`,
+        tipo: 'lateral',
+        ancho: twH,
+        alto: zf,
+        espesor: e,
+        cantidad: 1,
+        respectGrain: true,
+        edges: resolveEdgeBanding('lateral', joint, edgeMode),
+        posicion3D: [step.x, (sy0 + sy1) / 2, zf / 2],
+        dimensiones3D: [e, twH, zf],
+        rotacion3D: [0, 0, 0],
+        material: mat,
+      });
+    });
+  };
+
   // --- ESCALÓN SUPERIOR DERECHO ---
   if (topRight) {
-    const twTop = joint === 'topOverSides' ? yf - e : yf;
-    const hasTowerWallR = activeDividers.some(
-      (d) =>
-        Math.abs(d.u - topRight.u) <= SEGMENT_TOUCH_TOL &&
-        d.y0 <= topRight.yTop + GEOM_EPS &&
-        d.y1 >= twTop - GEOM_EPS,
-    );
-    if (!hasTowerWallR) {
-      const twH = twTop - topRight.yTop;
-      if (twH > GEOM_EPS) {
-        activeDividers.push({
-          id: 'lateral_escalon_der',
-          u: topRight.u,
-          cx: topRight.x,
-          y0: topRight.yTop,
-          y1: twTop,
-        });
-        pieces.push({
-          id: 'lateral_escalon_der',
-          nombre: 'Lateral Escalón Der',
-          tipo: 'lateral',
-          ancho: twH,
-          alto: zf,
-          espesor: e,
-          cantidad: 1,
-          respectGrain: true,
-          edges: resolveEdgeBanding('lateral', joint, edgeMode),
-          posicion3D: [topRight.x, (topRight.yTop + twTop) / 2, zf / 2],
-          dimensiones3D: [e, twH, zf],
-          rotacion3D: [0, 0, 0],
-          material: mat,
-        });
-      }
-    }
+    const twTop = hasSpanCoveringX(topRight.x, cubiertaSpans, joint === 'topOverSides')
+      ? yf - e
+      : yf;
+    emitMissingTowerWalls('lateral_escalon_der', 'Lateral Escalón Der', topRight, topRight.yTop, twTop);
 
-    const divCrossesR = activeDividers.some(
+    const crossingR = activeDividers.filter(
       (d) =>
-        Math.abs(d.u - topRight.u) <= SEGMENT_TOUCH_TOL &&
+        (Math.abs(d.u - topRight.u) <= SEGMENT_TOUCH_TOL ||
+          Math.abs(d.cx - topRight.x) < e - GEOM_EPS) &&
         d.y0 < topRight.yTop - GEOM_EPS &&
         d.y1 > topRight.yBot + GEOM_EPS,
     );
     // Siempre apoya completamente bajo `lateral_escalon_der` si no cruza divisor;
     // las repisas adyacentes a la izquierda se recortan limpiamente contra `xStepR0` sin borrarse.
-    const xStepR0 = divCrossesR ? topRight.x + e / 2 : topRight.x - e / 2;
+    const xStepR0 =
+      crossingR.length > 0
+        ? Math.max(topRight.x + e / 2, ...crossingR.map((d) => d.cx + e / 2))
+        : topRight.x - e / 2;
     const xStepR1 = joint === 'topOverSides' ? xf : xf - e;
     const wStepR = xStepR1 - xStepR0;
     if (wStepR > GEOM_EPS) {
@@ -395,49 +436,23 @@ export function emitStepCutoutStructures(options: {
 
   // --- ESCALÓN SUPERIOR IZQUIERDO ---
   if (topLeft) {
-    const twTop = joint === 'topOverSides' ? yf - e : yf;
-    const hasTowerWallL = activeDividers.some(
-      (d) =>
-        Math.abs(d.u - topLeft.u) <= SEGMENT_TOUCH_TOL &&
-        d.y0 <= topLeft.yTop + GEOM_EPS &&
-        d.y1 >= twTop - GEOM_EPS,
-    );
-    if (!hasTowerWallL) {
-      const twH = twTop - topLeft.yTop;
-      if (twH > GEOM_EPS) {
-        activeDividers.push({
-          id: 'lateral_escalon_izq',
-          u: topLeft.u,
-          cx: topLeft.x,
-          y0: topLeft.yTop,
-          y1: twTop,
-        });
-        pieces.push({
-          id: 'lateral_escalon_izq',
-          nombre: 'Lateral Escalón Izq',
-          tipo: 'lateral',
-          ancho: twH,
-          alto: zf,
-          espesor: e,
-          cantidad: 1,
-          respectGrain: true,
-          edges: resolveEdgeBanding('lateral', joint, edgeMode),
-          posicion3D: [topLeft.x, (topLeft.yTop + twTop) / 2, zf / 2],
-          dimensiones3D: [e, twH, zf],
-          rotacion3D: [0, 0, 0],
-          material: mat,
-        });
-      }
-    }
+    const twTop = hasSpanCoveringX(topLeft.x, cubiertaSpans, joint === 'topOverSides')
+      ? yf - e
+      : yf;
+    emitMissingTowerWalls('lateral_escalon_izq', 'Lateral Escalón Izq', topLeft, topLeft.yTop, twTop);
 
-    const divCrossesL = activeDividers.some(
+    const crossingL = activeDividers.filter(
       (d) =>
-        Math.abs(d.u - topLeft.u) <= SEGMENT_TOUCH_TOL &&
+        (Math.abs(d.u - topLeft.u) <= SEGMENT_TOUCH_TOL ||
+          Math.abs(d.cx - topLeft.x) < e - GEOM_EPS) &&
         d.y0 < topLeft.yTop - GEOM_EPS &&
         d.y1 > topLeft.yBot + GEOM_EPS,
     );
     const xStepL0 = joint === 'topOverSides' ? 0 : e;
-    const xStepL1 = divCrossesL ? topLeft.x - e / 2 : topLeft.x + e / 2;
+    const xStepL1 =
+      crossingL.length > 0
+        ? Math.min(topLeft.x - e / 2, ...crossingL.map((d) => d.cx - e / 2))
+        : topLeft.x + e / 2;
     const wStepL = xStepL1 - xStepL0;
     if (wStepL > GEOM_EPS) {
       placedShelves.push({ x0: xStepL0, x1: xStepL1, cy: topLeft.cy, isStepCap: true });
@@ -464,48 +479,26 @@ export function emitStepCutoutStructures(options: {
 
   // --- ESCALÓN INFERIOR DERECHO ---
   if (bottomRight) {
-    const twBot = joint === 'topOverSides' ? e : 0;
-    const hasTowerWallBR = activeDividers.some(
-      (d) =>
-        Math.abs(d.u - bottomRight.u) <= SEGMENT_TOUCH_TOL &&
-        d.y0 <= twBot + GEOM_EPS &&
-        d.y1 >= bottomRight.yBot - GEOM_EPS,
+    const twBot = hasSpanCoveringX(bottomRight.x, baseSpans, joint === 'topOverSides') ? e : 0;
+    emitMissingTowerWalls(
+      'lateral_escalon_inf_der',
+      'Lateral Escalón Inf Der',
+      bottomRight,
+      twBot,
+      bottomRight.yBot,
     );
-    if (!hasTowerWallBR) {
-      const twH = bottomRight.yBot - twBot;
-      if (twH > GEOM_EPS) {
-        activeDividers.push({
-          id: 'lateral_escalon_inf_der',
-          u: bottomRight.u,
-          cx: bottomRight.x,
-          y0: twBot,
-          y1: bottomRight.yBot,
-        });
-        pieces.push({
-          id: 'lateral_escalon_inf_der',
-          nombre: 'Lateral Escalón Inf Der',
-          tipo: 'lateral',
-          ancho: twH,
-          alto: zf,
-          espesor: e,
-          cantidad: 1,
-          respectGrain: true,
-          edges: resolveEdgeBanding('lateral', joint, edgeMode),
-          posicion3D: [bottomRight.x, (twBot + bottomRight.yBot) / 2, zf / 2],
-          dimensiones3D: [e, twH, zf],
-          rotacion3D: [0, 0, 0],
-          material: mat,
-        });
-      }
-    }
 
-    const divCrossesBR = activeDividers.some(
+    const crossingBR = activeDividers.filter(
       (d) =>
-        Math.abs(d.u - bottomRight.u) <= SEGMENT_TOUCH_TOL &&
+        (Math.abs(d.u - bottomRight.u) <= SEGMENT_TOUCH_TOL ||
+          Math.abs(d.cx - bottomRight.x) < e - GEOM_EPS) &&
         d.y0 < bottomRight.yTop - GEOM_EPS &&
         d.y1 > bottomRight.yBot + GEOM_EPS,
     );
-    const xStepBR0 = divCrossesBR ? bottomRight.x + e / 2 : bottomRight.x - e / 2;
+    const xStepBR0 =
+      crossingBR.length > 0
+        ? Math.max(bottomRight.x + e / 2, ...crossingBR.map((d) => d.cx + e / 2))
+        : bottomRight.x - e / 2;
     const xStepBR1 = joint === 'topOverSides' ? xf : xf - e;
     const wStepBR = xStepBR1 - xStepBR0;
     if (wStepBR > GEOM_EPS) {
@@ -533,49 +526,27 @@ export function emitStepCutoutStructures(options: {
 
   // --- ESCALÓN INFERIOR IZQUIERDO ---
   if (bottomLeft) {
-    const twBot = joint === 'topOverSides' ? e : 0;
-    const hasTowerWallBL = activeDividers.some(
-      (d) =>
-        Math.abs(d.u - bottomLeft.u) <= SEGMENT_TOUCH_TOL &&
-        d.y0 <= twBot + GEOM_EPS &&
-        d.y1 >= bottomLeft.yBot - GEOM_EPS,
+    const twBot = hasSpanCoveringX(bottomLeft.x, baseSpans, joint === 'topOverSides') ? e : 0;
+    emitMissingTowerWalls(
+      'lateral_escalon_inf_izq',
+      'Lateral Escalón Inf Izq',
+      bottomLeft,
+      twBot,
+      bottomLeft.yBot,
     );
-    if (!hasTowerWallBL) {
-      const twH = bottomLeft.yBot - twBot;
-      if (twH > GEOM_EPS) {
-        activeDividers.push({
-          id: 'lateral_escalon_inf_izq',
-          u: bottomLeft.u,
-          cx: bottomLeft.x,
-          y0: twBot,
-          y1: bottomLeft.yBot,
-        });
-        pieces.push({
-          id: 'lateral_escalon_inf_izq',
-          nombre: 'Lateral Escalón Inf Izq',
-          tipo: 'lateral',
-          ancho: twH,
-          alto: zf,
-          espesor: e,
-          cantidad: 1,
-          respectGrain: true,
-          edges: resolveEdgeBanding('lateral', joint, edgeMode),
-          posicion3D: [bottomLeft.x, (twBot + bottomLeft.yBot) / 2, zf / 2],
-          dimensiones3D: [e, twH, zf],
-          rotacion3D: [0, 0, 0],
-          material: mat,
-        });
-      }
-    }
 
-    const divCrossesBL = activeDividers.some(
+    const crossingBL = activeDividers.filter(
       (d) =>
-        Math.abs(d.u - bottomLeft.u) <= SEGMENT_TOUCH_TOL &&
+        (Math.abs(d.u - bottomLeft.u) <= SEGMENT_TOUCH_TOL ||
+          Math.abs(d.cx - bottomLeft.x) < e - GEOM_EPS) &&
         d.y0 < bottomLeft.yTop - GEOM_EPS &&
         d.y1 > bottomLeft.yBot + GEOM_EPS,
     );
     const xStepBL0 = joint === 'topOverSides' ? 0 : e;
-    const xStepBL1 = divCrossesBL ? bottomLeft.x - e / 2 : bottomLeft.x + e / 2;
+    const xStepBL1 =
+      crossingBL.length > 0
+        ? Math.min(bottomLeft.x - e / 2, ...crossingBL.map((d) => d.cx - e / 2))
+        : bottomLeft.x + e / 2;
     const wStepBL = xStepBL1 - xStepBL0;
     if (wStepBL > GEOM_EPS) {
       placedShelves.push({ x0: xStepBL0, x1: xStepBL1, cy: bottomLeft.cy, isStepCap: true });
@@ -700,58 +671,24 @@ export interface BackPanelRect {
 }
 
 /**
- * Convierte zonas `leg_void` (huecos de piernas de escritorios/mesas) en rectángulos exteriores mm
- * a excluir del fondo trasero 3 mm, manteniendo tapa trasera sólida detrás de cajoneras y puertas.
- */
-export function computeLegVoidBackExcludedBoxes(
-  frontZones: readonly FrontZone[],
-  xf: number,
-  yf: number,
-  e: number,
-): Array<{ x0: number; x1: number; y0: number; y1: number }> {
-  const xInt = xf - 2 * e;
-  const yInt = yf - 2 * e;
-  const boxes: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
-
-  for (const z of frontZones) {
-    if (z.kind !== 'leg_void') continue;
-    const u0 = clamp01(Math.min(z.uStart, z.uEnd));
-    const u1 = clamp01(Math.max(z.uStart, z.uEnd));
-    const v0 = clamp01(Math.min(z.vStart, z.vEnd));
-    const v1 = clamp01(Math.max(z.vStart, z.vEnd));
-    if (u1 - u0 <= 0.02 || v1 - v0 <= 0.02) continue;
-
-    boxes.push({
-      x0: u0 <= 0.02 ? 0 : e + u0 * xInt,
-      x1: u1 >= 0.98 ? xf : e + u1 * xInt,
-      y0: v0 <= 0.02 ? 0 : e + v0 * yInt,
-      y1: v1 >= 0.98 ? yf : e + v1 * yInt,
-    });
-  }
-
-  return boxes;
-}
-
-/**
  * Descompone el rectángulo exterior `[0, xf] × [0, yf]` en rectángulos exactos de fondo 3 mm
- * excluyendo todas las zonas `void_outside` (4 esquinas o múltiples) y cualquier exclusión adicional
- * (como `leg_void` en escritorios), sin superposición 3D.
+ * excluyendo todas las zonas `void_outside` (4 esquinas o múltiples) y regiones adicionales
+ * (como huecos de piernas `leg_void`) sin superposición.
  */
 export function computeBackPanelNonVoidRects(
   xf: number,
   yf: number,
   cutouts: VoidCutoutPlan,
-  extraExcludedBoxes: ReadonlyArray<{ x0: number; x1: number; y0: number; y1: number }> = [],
+  extraBackVoids: ReadonlyArray<{ x0: number; x1: number; y0: number; y1: number }> = [],
 ): BackPanelRect[] {
   const boxes =
-    extraExcludedBoxes.length > 0
-      ? [...cutouts.backVoidMmBoxes, ...extraExcludedBoxes]
+    extraBackVoids.length > 0
+      ? [...cutouts.backVoidMmBoxes, ...extraBackVoids]
       : cutouts.backVoidMmBoxes;
   if (boxes.length === 0) {
     return [{ x0: 0, x1: xf, y0: 0, y1: yf, label: '' }];
   }
 
-  const hasStepVoid = cutouts.backVoidMmBoxes.length > 0;
   const rawXs = [0, xf];
   for (const b of boxes) {
     if (b.x0 > GEOM_EPS && b.x0 < xf - GEOM_EPS) rawXs.push(b.x0);
@@ -766,11 +703,10 @@ export function computeBackPanelNonVoidRects(
     }
   }
 
-  const rawRects: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
+  const rects: BackPanelRect[] = [];
   for (let i = 0; i < uniqueXs.length - 1; i++) {
     const sx0 = uniqueXs[i];
     const sx1 = uniqueXs[i + 1];
-    if (sx1 - sx0 <= 0.5) continue;
     const midX = (sx0 + sx1) / 2;
 
     const blockedY: Array<[number, number]> = [];
@@ -782,39 +718,15 @@ export function computeBackPanelNonVoidRects(
 
     const ySpans = subtractIntervals([0, yf], blockedY, 0.5);
     for (const [sy0, sy1] of ySpans) {
-      rawRects.push({ x0: sx0, x1: sx1, y0: sy0, y1: sy1 });
-    }
-  }
-
-  // Fusiona franjas horizontalmente adyacentes que comparten exactamente el mismo tramo vertical `[y0, y1]`
-  const mergedRects: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
-  for (const r of rawRects) {
-    const adj = mergedRects.find(
-      (prev) =>
-        Math.abs(prev.x1 - r.x0) <= 0.5 &&
-        Math.abs(prev.y0 - r.y0) <= 0.5 &&
-        Math.abs(prev.y1 - r.y1) <= 0.5,
-    );
-    if (adj) {
-      adj.x1 = r.x1;
-    } else {
-      mergedRects.push({ ...r });
-    }
-  }
-
-  return mergedRects.map((r) => {
-    let label = hasStepVoid ? 'Cuerpo Alto' : 'Módulo';
-    if (hasStepVoid) {
-      if (r.y1 - r.y0 < yf - 1) {
-        if (r.x0 <= 0.5) label = 'Escalón Izq';
-        else if (r.x1 >= xf - 0.5) label = 'Escalón Der';
+      let label = 'Cuerpo Alto';
+      if (sy1 - sy0 < yf - 1) {
+        if (sx0 <= 0.5) label = 'Escalón Izq';
+        else if (sx1 >= xf - 0.5) label = 'Escalón Der';
         else label = 'Cuerpo Central';
       }
-    } else if (mergedRects.length > 1) {
-      if (r.x0 <= 0.5) label = 'Módulo Izq';
-      else if (r.x1 >= xf - 0.5) label = 'Módulo Der';
-      else label = 'Módulo Central';
+      rects.push({ x0: sx0, x1: sx1, y0: sy0, y1: sy1, label });
     }
-    return { ...r, label };
-  });
+  }
+
+  return rects;
 }

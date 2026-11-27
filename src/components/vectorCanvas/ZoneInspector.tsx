@@ -1,7 +1,11 @@
 /**
  * SMARTFURNITURE v8.0 — INSPECTOR UNIFICADO DE PARTES DEL MUEBLE (`ZoneInspector`)
- * Componente reutilizable montado tanto en `VectorCanvas` (Paso 3) como en `VectorBlueprintPanel`.
- * Sincronizado bidireccionalmente con Canvas 2D y Visor 3D mediante `selectedZoneId` y `hoveredZoneId`.
+ * Montado en `VectorCanvas` (Paso 3) y `VectorBlueprintPanel`, sincronizado 2D ↔ 3D.
+ * Revelación progresiva:
+ *  - Visible de inmediato: selector de partes (Z1..Zn), paleta de 9 tipos, cantidad de
+ *    cajones/canastos, color bicolor y acciones rápidas `+ 2 col.` / `+ 2 filas` / `Unir`.
+ *  - Plegado en `<details>` ("Ajustes avanzados de esta parte"): medidas exactas en mm,
+ *    repisas interiores (0..5), dividir en 3–5 y etiqueta personalizada.
  */
 import { useMemo, useState } from 'react';
 import {
@@ -12,6 +16,7 @@ import {
   Merge,
   Rows2,
   ShoppingBasket,
+  SlidersHorizontal,
   Sparkles,
   Square,
 } from 'lucide-react';
@@ -47,7 +52,6 @@ export interface ZoneInspectorProps {
   onHoverZone?: (zoneId: string | null) => void;
   onUpdateTopology: (next: FurnitureTopology) => void;
   onUpdateFrontZones: (zones: FrontZone[]) => void;
-  compact?: boolean;
 }
 
 interface PartPaletteOption {
@@ -91,7 +95,6 @@ export function ZoneInspector({
   onHoverZone,
   onUpdateTopology,
   onUpdateFrontZones,
-  compact = false,
 }: ZoneInspectorProps) {
   const [splitCount, setSplitCount] = useState<number>(3);
   const zones = topology.frontZones ?? [];
@@ -111,16 +114,15 @@ export function ZoneInspector({
   // Estado cuando un Preset oficial todavía no tiene `frontZones` inicializadas
   if (zones.length === 0 || !activeZone) {
     return (
-      <div className={`zi-card${compact ? ' zi-compact' : ''}`}>
+      <div className="zi-card">
         <div className="zi-empty">
           <div className="zi-empty-text">
             <strong>
               <LayoutGrid size={15} /> Inspector de partes del mueble
             </strong>
             <p>
-              Este diseño usa estructura base sin zonas frontales editables todavía. Genera las
-              celdas automáticamente para asignar puertas, cajones, canastos, vitrinas o acabados
-              bicolor.
+              Genera las zonas frontales desde la estructura actual para asignar puertas, cajones,
+              canastos, vitrinas o acabados bicolor.
             </p>
           </div>
           <button
@@ -215,7 +217,7 @@ export function ZoneInspector({
   };
 
   return (
-    <div className={`zi-card${compact ? ' zi-compact' : ''}`}>
+    <div className="zi-card">
       {/* Cabecera: chips espaciales Z1..Zn con sincronización hover/selección 2D ↔ 3D */}
       <div className="zi-header">
         <div className="zi-chips-wrap" role="tablist" aria-label="Zonas del mueble">
@@ -269,7 +271,7 @@ export function ZoneInspector({
         </div>
       </div>
 
-      {/* Paleta visual de 1 clic (>= 40px) */}
+      {/* Paleta visual de 1 clic */}
       <div className="zi-palette-grid" role="group" aria-label="Tipo de parte del mueble">
         {PART_PALETTE.map((opt) => {
           const isActive = activeZone.kind === opt.kind;
@@ -302,125 +304,8 @@ export function ZoneInspector({
         })}
       </div>
 
-      {/* Medidas directas en mm + Estructura (Dividir / Unir) */}
+      {/* Fila directa: opciones clave del tipo elegido + dividir/unir rápido */}
       <div className="zi-controls-row">
-        <div className="zi-control-cluster">
-          <span className="zi-cluster-label">Medidas celda (int.):</span>
-          <label className="zi-mm-field">
-            <span>Ancho</span>
-            {canResizeWidth ? (
-              <NumericInput
-                value={dims.widthMm}
-                min={minCellMm}
-                max={Math.max(minCellMm, dims.xInt - minCellMm)}
-                step={5}
-                onCommit={(val) => handleResizeMm('width', val)}
-                className="zi-mm-input"
-                ariaLabel="Ancho interior de la celda en mm"
-              />
-            ) : (
-              <span className="zi-mm-static" title="Esta celda ocupa todo el ancho interior del mueble">
-                {dims.widthMm}
-              </span>
-            )}
-            <span className="zi-unit">mm</span>
-          </label>
-          <label className="zi-mm-field">
-            <span>Alto</span>
-            {canResizeHeight ? (
-              <NumericInput
-                value={dims.heightMm}
-                min={minCellMm}
-                max={Math.max(minCellMm, dims.yInt - minCellMm)}
-                step={5}
-                onCommit={(val) => handleResizeMm('height', val)}
-                className="zi-mm-input"
-                ariaLabel="Alto interior de la celda en mm"
-              />
-            ) : (
-              <span className="zi-mm-static" title="Esta celda ocupa todo el alto interior del mueble">
-                {dims.heightMm}
-              </span>
-            )}
-            <span className="zi-unit">mm</span>
-          </label>
-        </div>
-
-        <div className="zi-control-cluster">
-          <span className="zi-cluster-label">Estructura:</span>
-          <button
-            type="button"
-            className="vc-chip"
-            onClick={() => handleSplit('cols', 2)}
-            title="Divide esta celda en 2 columnas iguales agregando un divisor vertical"
-          >
-            <Columns2 size={13} /> + 2 col.
-          </button>
-          <button
-            type="button"
-            className="vc-chip"
-            onClick={() => handleSplit('rows', 2)}
-            title="Divide esta celda en 2 filas iguales agregando una repisa horizontal"
-          >
-            <Rows2 size={13} /> + 2 filas
-          </button>
-          <span className="zi-split-n">
-            <select
-              className="zi-mini-select"
-              value={splitCount}
-              onChange={(e) => setSplitCount(Number(e.target.value))}
-              aria-label="Número de partes para dividir celda"
-            >
-              <option value={2}>2</option>
-              <option value={3}>3</option>
-              <option value={4}>4</option>
-              <option value={5}>5</option>
-            </select>
-            <button
-              type="button"
-              className="vc-chip"
-              onClick={() => handleSplit('cols', splitCount)}
-              title={`Dividir en ${splitCount} columnas`}
-            >
-              Col
-            </button>
-            <button
-              type="button"
-              className="vc-chip"
-              onClick={() => handleSplit('rows', splitCount)}
-              title={`Dividir en ${splitCount} filas`}
-            >
-              Filas
-            </button>
-          </span>
-
-          {mergeNeighbors.length === 0 ? (
-            <button
-              type="button"
-              className="vc-chip"
-              disabled
-              title="No hay una celda vecina del mismo ancho o alto para fusionar"
-            >
-              <Merge size={13} /> Unir con vecina
-            </button>
-          ) : (
-            mergeNeighbors.map((m) => (
-              <button
-                key={m.neighbor.id}
-                type="button"
-                className="vc-chip vc-chip-merge"
-                onClick={() => handleMerge(m.neighbor.id)}
-                title={`Elimina el tabique compartido y une Z${activeIdx + 1} con Z${m.neighborIndex + 1}`}
-              >
-                <Merge size={13} /> Unir con Z{m.neighborIndex + 1} ({m.sideLabel})
-              </button>
-            ))
-          )}
-        </div>
-      </div>
-
-      {/* Opciones finas de la parte seleccionada */}
-      <div className="zi-options-row">
         {activeZone.kind === 'drawers' && (
           <div className="zi-option-group">
             <span className="zi-cluster-label">Cajones:</span>
@@ -453,33 +338,15 @@ export function ZoneInspector({
           </div>
         )}
 
-        {supportsInternalShelves && (
-          <div className="zi-option-group">
-            <span className="zi-cluster-label">Repisas interiores:</span>
-            {[0, 1, 2, 3, 4, 5].map((n) => (
-              <button
-                key={n}
-                type="button"
-                className={(activeZone.internalShelves ?? 0) === n ? 'vc-chip active' : 'vc-chip'}
-                onClick={() =>
-                  patchActiveZone((z) => ({ ...z, internalShelves: n <= 0 ? undefined : n }))
-                }
-              >
-                {n}
-              </button>
-            ))}
-          </div>
-        )}
-
         {isClosedFront && (
           <div className="zi-option-group">
-            <span className="zi-cluster-label">Acabado frente (bicolor):</span>
+            <span className="zi-cluster-label">Color frente:</span>
             <button
               type="button"
               className={!activeZone.materialOverride ? 'vc-chip active' : 'vc-chip'}
               onClick={() => patchActiveZone((z) => ({ ...z, materialOverride: undefined }))}
             >
-              Igual a carcasa
+              Igual a mueble
             </button>
             {(['blanco', 'roble', 'grafito'] as MelamineMaterial[]).map((mat) => (
               <button
@@ -495,23 +362,154 @@ export function ZoneInspector({
           </div>
         )}
 
-        <label className="zi-label-field">
-          <span className="zi-cluster-label">Etiqueta:</span>
-          <input
-            type="text"
-            className="zi-text-input"
-            value={activeZone.label ?? ''}
-            maxLength={32}
-            placeholder={ZONE_LABELS[activeZone.kind]}
-            onChange={(e) =>
-              patchActiveZone((z) => ({
-                ...z,
-                label: e.target.value.trim().length > 0 ? e.target.value : undefined,
-              }))
-            }
-          />
-        </label>
+        <div className="zi-control-cluster">
+          <button
+            type="button"
+            className="vc-chip"
+            onClick={() => handleSplit('cols', 2)}
+            title="Divide esta celda en 2 columnas iguales"
+          >
+            <Columns2 size={13} /> + 2 col.
+          </button>
+          <button
+            type="button"
+            className="vc-chip"
+            onClick={() => handleSplit('rows', 2)}
+            title="Divide esta celda en 2 filas iguales"
+          >
+            <Rows2 size={13} /> + 2 filas
+          </button>
+          {mergeNeighbors.map((m) => (
+            <button
+              key={m.neighbor.id}
+              type="button"
+              className="vc-chip vc-chip-merge"
+              onClick={() => handleMerge(m.neighbor.id)}
+              title={`Elimina el tabique compartido y une Z${activeIdx + 1} con Z${m.neighborIndex + 1}`}
+            >
+              <Merge size={13} /> Unir con Z{m.neighborIndex + 1} ({m.sideLabel})
+            </button>
+          ))}
+        </div>
       </div>
+
+      {/* Ajustes avanzados plegados por defecto: medidas en mm, repisas interiores, dividir en 3–5 y etiqueta */}
+      <details className="zi-advanced-details">
+        <summary className="zi-advanced-summary">
+          <SlidersHorizontal size={12} /> Ajustes avanzados de esta parte
+          {activeZone.internalShelves ? ` · ${activeZone.internalShelves} repisa(s)` : ''}
+        </summary>
+        <div className="zi-options-row">
+          <div className="zi-control-cluster">
+            <span className="zi-cluster-label">Medidas celda (int.):</span>
+            <label className="zi-mm-field">
+              <span>Ancho</span>
+              {canResizeWidth ? (
+                <NumericInput
+                  value={dims.widthMm}
+                  min={minCellMm}
+                  max={Math.max(minCellMm, dims.xInt - minCellMm)}
+                  step={5}
+                  onCommit={(val) => handleResizeMm('width', val)}
+                  className="zi-mm-input"
+                  ariaLabel="Ancho interior de la celda en mm"
+                />
+              ) : (
+                <span className="zi-mm-static" title="Esta celda ocupa todo el ancho interior del mueble">
+                  {dims.widthMm}
+                </span>
+              )}
+              <span className="zi-unit">mm</span>
+            </label>
+            <label className="zi-mm-field">
+              <span>Alto</span>
+              {canResizeHeight ? (
+                <NumericInput
+                  value={dims.heightMm}
+                  min={minCellMm}
+                  max={Math.max(minCellMm, dims.yInt - minCellMm)}
+                  step={5}
+                  onCommit={(val) => handleResizeMm('height', val)}
+                  className="zi-mm-input"
+                  ariaLabel="Alto interior de la celda en mm"
+                />
+              ) : (
+                <span className="zi-mm-static" title="Esta celda ocupa todo el alto interior del mueble">
+                  {dims.heightMm}
+                </span>
+              )}
+              <span className="zi-unit">mm</span>
+            </label>
+          </div>
+
+          {supportsInternalShelves && (
+            <div className="zi-option-group">
+              <span className="zi-cluster-label">Repisas interiores:</span>
+              {[0, 1, 2, 3, 4, 5].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  className={(activeZone.internalShelves ?? 0) === n ? 'vc-chip active' : 'vc-chip'}
+                  onClick={() =>
+                    patchActiveZone((z) => ({ ...z, internalShelves: n <= 0 ? undefined : n }))
+                  }
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="zi-control-cluster">
+            <span className="zi-cluster-label">Dividir en varias:</span>
+            <span className="zi-split-n">
+              <select
+                className="zi-mini-select"
+                value={splitCount}
+                onChange={(e) => setSplitCount(Number(e.target.value))}
+                aria-label="Número de partes para dividir celda"
+              >
+                <option value={3}>3</option>
+                <option value={4}>4</option>
+                <option value={5}>5</option>
+              </select>
+              <button
+                type="button"
+                className="vc-chip"
+                onClick={() => handleSplit('cols', splitCount)}
+                title={`Dividir en ${splitCount} columnas`}
+              >
+                Col
+              </button>
+              <button
+                type="button"
+                className="vc-chip"
+                onClick={() => handleSplit('rows', splitCount)}
+                title={`Dividir en ${splitCount} filas`}
+              >
+                Filas
+              </button>
+            </span>
+          </div>
+
+          <label className="zi-label-field">
+            <span className="zi-cluster-label">Etiqueta:</span>
+            <input
+              type="text"
+              className="zi-text-input"
+              value={activeZone.label ?? ''}
+              maxLength={32}
+              placeholder={ZONE_LABELS[activeZone.kind]}
+              onChange={(e) =>
+                patchActiveZone((z) => ({
+                  ...z,
+                  label: e.target.value.trim().length > 0 ? e.target.value : undefined,
+                }))
+              }
+            />
+          </label>
+        </div>
+      </details>
     </div>
   );
 }

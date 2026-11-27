@@ -1,7 +1,7 @@
 # SmartFurniture — Especificación Técnica y Plan de Ejecución (v8.0)
 
 > Documento maestro de alineación del equipo y especificación de arquitectura vigente.  
-> **Sincronización (SmartFurniture v8.0):** 100 % alineado con [`src/types/contracts.ts`](./src/types/contracts.ts), la documentación UML en [`docs/architecture/README.md`](./docs/architecture/README.md), el guion actualizado en [`docs/GUION_VIDEO_INACAP.md`](./docs/GUION_VIDEO_INACAP.md), el ecosistema de 10 skills en [`.agents/skills/`](./.agents/skills/) y el registro histórico en [`docs/archive/`](./docs/archive/). Mantiene cumplimiento íntegro de los requisitos académicos de INACAP Etapa 2 y Etapa 3.
+> **Sincronización (SmartFurniture v8.0):** 100 % alineado con [`src/types/contracts.ts`](./src/types/contracts.ts), la documentación UML en [`docs/architecture/README.md`](./docs/architecture/README.md), el guion actualizado en [`docs/GUION_VIDEO_INACAP.md`](./docs/GUION_VIDEO_INACAP.md), el ecosistema de 12 skills en [`.agents/skills/`](./.agents/skills/) y el registro histórico en [`docs/archive/`](./docs/archive/). Mantiene cumplimiento íntegro de los requisitos académicos de INACAP Etapa 2 y Etapa 3.
 
 ---
 
@@ -125,7 +125,7 @@ public/
 |---|---|---|
 | **Fase 1 (20–22 nov)** | Motor matemático v8.0 (`contracts.ts`, Hartley homography, presets, DIN 68874-1, carpintería `FrontZone`) + optimizador 2D bicolor, BOM CLP y exportadores `.xls`/`.csv`/`.svg`. | `vitest` verde (`mathEngine` + `cuttingStock`): Etapa 2 exacta, cero solapamientos 3D, separación espesor+material y kerf exacto. |
 | **Fase 2 (23–25 nov)** | Motor de Visión modular offline (`src/core/vision/`: rectificación, CIE-Lab, XY-Cut, `dEdge` `18°–72°`, `zoneClassifier`) + Catálogo QA 14 fotos reales y Plano Vectorial 2D (`V0` vs `Vf`). | `vitest` verde (`vision` + `vectorBlueprint`) + benchmark validado sobre las 14 fotos reales en `public/ejemplos/`. |
-| **Fase 3 (26–28 nov)** | Integración completa v8.0 (`Viewer3D` bicolor sin reset de cámara, `MathPanel` memoizado con CLP editable, `VectorCanvas` 3 pasos sin secuestros + Undo/Redo, PWA `sw.js`, 5 diagramas UML y 10 skills). | `npm test`, `npm run typecheck`, `npm run build` + auditoría offline + smoke-test en navegador Desktop con Network Offline. |
+| **Fase 3 (26–28 nov)** | Integración completa v8.0 (`Viewer3D` bicolor sin reset de cámara, `MathPanel` memoizado con CLP editable, `VectorCanvas` 3 pasos sin secuestros + Undo/Redo, PWA `sw.js`, 5 diagramas UML y 12 skills). | `npm test`, `npm run typecheck`, `npm run build` + auditoría offline + smoke-test en navegador Desktop con Network Offline. |
 | **Fase 4 — Video y Cierre (29–30 nov)** | Grabación y edición del video siguiendo [`docs/GUION_VIDEO_INACAP.md`](./docs/GUION_VIDEO_INACAP.md) (Presets Unidad 3 + demo real Foto → 3D + Corte Bicolor + Exportación offline). | Video final y prototipo desplegado/local listos para la entrega oficial del **1 de diciembre de 2026**. |
 
 ---
@@ -134,7 +134,7 @@ public/
 
 - **Arquitectura UML v8.0 (5 diagramas Mermaid):** [`docs/architecture/README.md`](./docs/architecture/README.md).
 - **Guion de Video y Protocolo de Fotos v8.0:** [`docs/GUION_VIDEO_INACAP.md`](./docs/GUION_VIDEO_INACAP.md).
-- **Ecosistema de 10 Skills Operativas:** [`.agents/skills/`](./.agents/skills/).
+- **Ecosistema de 12 Skills Operativas:** [`.agents/skills/`](./.agents/skills/).
 - **Archivo Histórico de Ingeniería (v2.1 / v3.0):** [`docs/archive/ANALISIS_TECNICO_v2.1.md`](./docs/archive/ANALISIS_TECNICO_v2.1.md), [`docs/archive/AUDITORIA_Y_PROMPTS_BLINDADOS_v3.0_EQUIPO.md`](./docs/archive/AUDITORIA_Y_PROMPTS_BLINDADOS_v3.0_EQUIPO.md), [`docs/archive/RESUMEN_PARA_EL_EQUIPO.md`](./docs/archive/RESUMEN_PARA_EL_EQUIPO.md) y [`docs/archive/evidencia/zhang_sim.ts`](./docs/archive/evidencia/zhang_sim.ts).
 
 ---

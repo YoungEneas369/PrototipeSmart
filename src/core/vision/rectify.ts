@@ -1044,6 +1044,161 @@ export function autoDetectFurnitureQuad(
   let [bx0, bx1] = findMainSpan(colCounts, 1, gw - 1, colThresh);
   let [by0, by1] = findMainSpan(rowCounts, 1, gh - 1, rowThresh);
 
+  const recomputeHorizontalSpan = (yStart: number, yEnd: number): void => {
+    if (yEnd <= yStart + 8) return;
+    const trimmedColCounts = new Float32Array(gw);
+    let trimmedMaxCol = 0;
+    const trimmedH = Math.max(1, yEnd - yStart + 1);
+    for (let x = 1; x < gw - 1; x++) {
+      let cnt = 0;
+      for (let y = yStart; y <= yEnd; y++) {
+        if (fgMain[y * gw + x] === 1) cnt++;
+      }
+      trimmedColCounts[x] = cnt / trimmedH;
+      if (trimmedColCounts[x] > trimmedMaxCol) trimmedMaxCol = trimmedColCounts[x];
+    }
+    const [nx0, nx1] = findMainSpan(
+      trimmedColCounts,
+      1,
+      gw - 1,
+      Math.max(0.04, trimmedMaxCol * 0.16),
+    );
+    if (nx0 >= 0 && nx1 - nx0 >= gw * 0.14) {
+      bx0 = nx0;
+      bx1 = nx1;
+    }
+  };
+
+  // Recortar piso/alfombra continua cuando el primer plano llegó hasta el borde inferior de la foto
+  // (antes del recorte superior para no sesgar `bodySpan`, `bodyMeanRowD` ni `bx0..bx1`)
+  if (by0 >= 0 && by1 >= gh - 4 && by1 > by0 + 16 && bx1 > bx0 + 12) {
+    const origBy1 = by1;
+    const mW = Math.max(2, Math.round(gw * 0.055));
+    const cx0 = Math.max(mW + 1, Math.round(gw * 0.14));
+    const cx1 = Math.min(gw - mW - 2, Math.round(gw * 0.86));
+
+    const rowCenterSideDiff = (y: number): number => {
+      const rowOff = y * gw;
+      let mR = 0,
+        mG = 0,
+        mB = 0,
+        mc = 0;
+      for (let x = cx0; x <= cx1; x++) {
+        const gi = rowOff + x;
+        mR += seg.gR[gi];
+        mG += seg.gG[gi];
+        mB += seg.gB[gi];
+        mc++;
+      }
+      let sR = 0,
+        sG = 0,
+        sB = 0,
+        sc = 0;
+      for (let x = 0; x < mW; x++) {
+        const giL = rowOff + x;
+        const giR = rowOff + (gw - 1 - x);
+        sR += seg.gR[giL] + seg.gR[giR];
+        sG += seg.gG[giL] + seg.gG[giR];
+        sB += seg.gB[giL] + seg.gB[giR];
+        sc += 2;
+      }
+      if (mc === 0 || sc === 0) return 999;
+      return Math.hypot(mR / mc - sR / sc, mG / mc - sG / sc, mB / mc - sB / sc);
+    };
+
+    // Derivada vertical vectorial coherente `||mean_x(RGB(y+1) - RGB(y-1))||`:
+    // inmune a alfombras moteadas o textura isotrópica (el ruido +/- se cancela a lo ancho de la fila)
+    const rowCoherentVertStep = (y: number, xA: number, xB: number): number => {
+      if (y <= 1 || y >= gh - 2 || xB <= xA) return 0;
+      const upOff = (y - 1) * gw;
+      const dnOff = (y + 1) * gw;
+      let dR = 0,
+        dG = 0,
+        dB = 0,
+        cnt = 0;
+      for (let x = xA; x <= xB; x++) {
+        dR += seg.gR[dnOff + x] - seg.gR[upOff + x];
+        dG += seg.gG[dnOff + x] - seg.gG[upOff + x];
+        dB += seg.gB[dnOff + x] - seg.gB[upOff + x];
+        cnt++;
+      }
+      return cnt > 0 ? Math.hypot(dR / cnt, dG / cnt, dB / cnt) : 0;
+    };
+
+    const botCheck0 = Math.max(by0 + 6, gh - 7);
+    const botCheck1 = Math.min(gh - 2, by1);
+    let floorBottomHits = 0;
+    let floorBottomTotal = 0;
+    for (let y = botCheck0; y <= botCheck1; y++) {
+      floorBottomTotal++;
+      if (rowCounts[y] >= 0.84 && rowCenterSideDiff(y) <= 44) {
+        floorBottomHits++;
+      }
+    }
+
+    const scanMinY = by0 + Math.round((by1 - by0) * 0.22);
+    if (floorBottomTotal > 0 && floorBottomHits / floorBottomTotal >= 0.5) {
+      // Despegar piso/alfombra continua caminando hacia arriba hasta cruzar al cuerpo real del mueble:
+      // incluso si el flood-fill ya absorbió parcialmente los costados del piso liso (`rowCounts < 0.84`),
+      // mientras el centro siga coincidiendo con los márgenes laterales (`dMS <= 44`) sigue siendo piso.
+      let lastFloorY = by1;
+      let nonFloorStreak = 0;
+      for (let y = by1; y >= scanMinY; y--) {
+        const isFloorRow = rowCenterSideDiff(y) <= 44;
+        if (isFloorRow) {
+          lastFloorY = y;
+          nonFloorStreak = 0;
+        } else {
+          nonFloorStreak++;
+          if (nonFloorStreak >= 3) break;
+        }
+      }
+
+      if (lastFloorY < by1 - 2 && lastFloorY > scanMinY + 2) {
+        // Anclar exactamente al pico del salto horizontal coherente (borde inferior real del mueble)
+        const snapLo = Math.max(scanMinY, lastFloorY - 4);
+        const snapHi = Math.min(by1 - 2, lastFloorY + 3);
+        let bestSnapY = lastFloorY - 1;
+        let bestSnapScore = 0;
+        for (let y = snapLo; y <= snapHi; y++) {
+          const step = rowCoherentVertStep(y, cx0, cx1);
+          if (step >= 20 && step > bestSnapScore) {
+            bestSnapScore = step;
+            bestSnapY = y;
+          }
+        }
+        if (bestSnapY > by0 + 10 && bestSnapY < by1 - 2) {
+          by1 = bestSnapY;
+        }
+      }
+    } else if (by1 >= gh - 3) {
+      // Fallback conservador: solo en el 22% inferior (evita cortar repisas/mesones internos del mueble)
+      const fbMinY = by0 + Math.round((by1 - by0) * 0.78);
+      const fbMaxY = gh - 5;
+      let bestLineY = -1;
+      let bestStep = 0;
+      for (let y = fbMaxY; y >= fbMinY; y--) {
+        const step = rowCoherentVertStep(y, bx0 + 2, bx1 - 2);
+        if (step >= 42 && step > bestStep) {
+          bestStep = step;
+          bestLineY = y;
+        }
+      }
+      if (bestLineY > fbMinY && bestLineY < by1 - 4) {
+        by1 = bestLineY;
+      }
+    }
+
+    if (by1 < origBy1) {
+      for (let y = by1 + 1; y < gh; y++) {
+        const rowOff = y * gw;
+        for (let x = 0; x < gw; x++) fgMain[rowOff + x] = 0;
+        rowCounts[y] = 0;
+      }
+      recomputeHorizontalSpan(by0, by1);
+    }
+  }
+
   // Recortar objetos estrechos o desacoplados encima de la cubierta (jarrones, cafeteras, cuadros)
   if (by0 >= 0 && by1 > by0 + 12) {
     const bodySpan = by1 - by0;
@@ -1136,7 +1291,7 @@ export function autoDetectFurnitureQuad(
           const avgEdge = edgeSum / Math.max(1, edgeCnt);
           const looksLikeAppendage =
             (meanAboveW < bodyMeanRowD * 0.68 && colDiff >= 44 && avgEdge >= 32) ||
-            (origBy0 <= 3 && colDiff >= 48 && avgEdge >= 42);
+            (origBy0 <= 3 && meanAboveW < bodyMeanRowD * 0.88 && colDiff >= 48 && avgEdge >= 42);
           if (looksLikeAppendage) {
             const cutScore = avgEdge + colDiff * 0.7;
             if (cutScore > bestCutScore) {
@@ -1152,53 +1307,8 @@ export function autoDetectFurnitureQuad(
     }
 
     // Reajustar márgenes laterales sobre el cuerpo recortado si se removió un apéndice superior
-    if (by0 > origBy0 && by1 > by0 + 8) {
-      const trimmedColCounts = new Float32Array(gw);
-      let trimmedMaxCol = 0;
-      const trimmedH = Math.max(1, by1 - by0 + 1);
-      for (let x = 1; x < gw - 1; x++) {
-        let cnt = 0;
-        for (let y = by0; y <= by1; y++) {
-          if (fgMain[y * gw + x] === 1) cnt++;
-        }
-        trimmedColCounts[x] = cnt / trimmedH;
-        if (trimmedColCounts[x] > trimmedMaxCol) trimmedMaxCol = trimmedColCounts[x];
-      }
-      const [nx0, nx1] = findMainSpan(
-        trimmedColCounts,
-        1,
-        gw - 1,
-        Math.max(0.04, trimmedMaxCol * 0.16),
-      );
-      if (nx0 >= 0 && nx1 - nx0 >= gw * 0.14) {
-        bx0 = nx0;
-        bx1 = nx1;
-      }
-    }
-
-    // Si el primer plano llegó hasta el borde inferior (piso/alfombra sin cortar), buscar el zócalo/base real
-    if (by1 >= gh - 3 && bx1 > bx0 + 12) {
-      const scanMinY = by0 + Math.round((by1 - by0) * 0.45);
-      const scanMaxY = gh - 5;
-      let bestLineY = -1;
-      let bestEdgeScore = 0;
-      for (let y = scanMaxY; y >= scanMinY; y--) {
-        let edgeSum = 0;
-        let spanCnt = 0;
-        for (let x = bx0 + 2; x <= bx1 - 2; x++) {
-          edgeSum += seg.sobelMag[y * gw + x];
-          spanCnt++;
-        }
-        const avgEdge = edgeSum / Math.max(1, spanCnt);
-        if (avgEdge >= 38 && avgEdge > bestEdgeScore) {
-          bestEdgeScore = avgEdge;
-          bestLineY = y;
-          if (avgEdge >= 58) break;
-        }
-      }
-      if (bestLineY > scanMinY && bestLineY < by1 - 4) {
-        by1 = bestLineY;
-      }
+    if (by0 > origBy0) {
+      recomputeHorizontalSpan(by0, by1);
     }
   }
 

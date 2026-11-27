@@ -20,9 +20,9 @@ import {
 } from '../mathEngine';
 import { escapeXml } from '../utils/xml';
 import {
-  DEFAULT_COST_CONFIG,
   estimateProjectBomAndCost,
   formatClp,
+  resolveCostConfig,
 } from './costEstimator';
 
 function escapeCsvCell(value: string | number, delimiter: string): string {
@@ -122,8 +122,12 @@ function xmlRow(cells: ReadonlyArray<{ type: 'String' | 'Number'; value: string 
   const tds = cells
     .map((c) => {
       const styleAttr = c.style ? ` ss:StyleID="${c.style}"` : '';
-      const val = c.type === 'Number' ? String(c.value) : escapeXml(String(c.value));
-      return `<Cell${styleAttr}><Data ss:Type="${c.type}">${val}</Data></Cell>`;
+      if (c.type === 'Number') {
+        const numeric = typeof c.value === 'number' ? c.value : Number(c.value);
+        const safeNumeric = Number.isFinite(numeric) ? numeric : 0;
+        return `<Cell${styleAttr}><Data ss:Type="Number">${safeNumeric}</Data></Cell>`;
+      }
+      return `<Cell${styleAttr}><Data ss:Type="String">${escapeXml(String(c.value))}</Data></Cell>`;
     })
     .join('');
   return `      <Row>${tds}</Row>`;
@@ -190,9 +194,8 @@ export function generateExcelSpreadsheetML(
     ]),
   ];
 
-  const extHwById = new Map(bomCost.externalHardware.map((item) => [item.id, item]));
   despiece.hardwareSummary.forEach((hw, idx) => {
-    const costLine = extHwById.get(`cost_${hw.id}`) ?? bomCost.externalHardware[idx];
+    const costLine = bomCost.externalHardware[idx];
     const unitClp = costLine?.costoUnitarioClp ?? 0;
     const subtotalClp = costLine?.subtotalClp ?? 0;
     const noteWithCost = `${hw.notaCompra} · Est. ${formatClp(subtotalClp)} (${formatClp(unitClp)} c/u)`;
@@ -225,18 +228,20 @@ export function generateExcelSpreadsheetML(
     );
   }
 
-  const edgeUnitClp =
-    params.costConfig?.edgeBandingPerMeterClp ?? DEFAULT_COST_CONFIG.edgeBandingPerMeterClp;
+  const edgeUnitClp = resolveCostConfig(params.costConfig).edgeBandingPerMeterClp;
   h2Rows.push(
     xmlRow([
       { type: 'String', value: 'tapacanto' },
       { type: 'String', value: `Tapacanto PVC/Melamina (${params.edgeBandingMode})` },
-      { type: 'Number', value: Number(despiece.totalEdgeBandingMeters.toFixed(2)) },
-      { type: 'String', value: 'metros lineales' },
+      { type: 'Number', value: bomCost.edgeBandingMetersWithAllowance },
+      { type: 'String', value: 'm (+10% holgura)' },
       { type: 'String', value: 'calculado' },
       { type: 'Number', value: edgeUnitClp },
       { type: 'Number', value: bomCost.edgeBandingClp },
-      { type: 'String', value: `Con +10% holgura: ${bomCost.edgeBandingMetersWithAllowance} m (${formatClp(bomCost.edgeBandingClp)})` },
+      {
+        type: 'String',
+        value: `Neto: ${despiece.totalEdgeBandingMeters.toFixed(2)} m · Con +10% holgura: ${bomCost.edgeBandingMetersWithAllowance} m (${formatClp(bomCost.edgeBandingClp)})`,
+      },
     ]),
   );
 

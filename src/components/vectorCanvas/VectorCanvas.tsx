@@ -10,6 +10,8 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  CanvasViewTab,
+  CurvedCutSpec,
   DespieceResult,
   DiagonalSegment,
   FrontZone,
@@ -19,7 +21,11 @@ import type {
   Point2D,
   ScaleAndBoardParams,
 } from '../../types/contracts';
-import { applyHomography, computeQuadToUnitHomography } from '../../core/mathEngine';
+import {
+  applyHomography,
+  buildCornerFilletCutSpec,
+  computeQuadToUnitHomography,
+} from '../../core/mathEngine';
 import {
   autoDetectFurnitureQuad,
   classifyPartitionedZonesFromPhoto,
@@ -32,6 +38,10 @@ import {
   extractStructuralVectorLines,
   extrapolateDimensionsFromSingleMeasure,
   isConvexQuad,
+  makeDrawingMeasurementsReasonable,
+  recognizeHandDrawnSketch,
+  synthesize3DFromTriViews,
+  type TriViewCaptureInput,
   partitionCellsFromVectors,
   rectifyImageRGBA,
   runIterativePhotoTo3D,
@@ -48,11 +58,13 @@ import { LineSelectionBar } from './LineSelectionBar';
 import { ZoneInspector } from './ZoneInspector';
 import {
   CORNER_STEP_NAMES,
+  createBlankSketchBitmap,
   MELAMINE_LABELS,
   clampCalibratedDims,
   clampNum,
   estimateInitialDimsFromAspect,
   generateSampleFurnitureDataUrl,
+  isEditableElement,
   makeAxisAlignedQuad,
   matchZoneIdByCentroid,
   materializeTopologySegments,
@@ -100,13 +112,6 @@ export interface VectorCanvasProps {
   onUpdateMaterialOnly?: (material: MelamineMaterial) => void;
   onToggleExternalLegs?: (hasLegs: boolean, heightMm?: number, count?: number) => void;
   onSelectDepthMm?: (depthMm: number) => void;
-  eyedropperTrigger?: number;
-}
-
-function isEditableFocus(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  const tag = target.tagName;
-  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
 }
 
 export function VectorCanvas({
@@ -129,18 +134,16 @@ export function VectorCanvas({
   onUpdateMaterialOnly,
   onToggleExternalLegs,
   onSelectDepthMm,
-  eyedropperTrigger,
 }: VectorCanvasProps) {
   // Pasos y herramientas activas
-  const [viewTab, setViewTab] = useState<'frontal' | 'lateral'>('frontal');
+  const [viewTab, setViewTab] = useState<CanvasViewTab>('frontal');
   const [traceStep, setTraceStep] = useState<TraceStep>('frame');
   const [frameMode, setFrameMode] = useState<FrameMode>('quad');
   const [pickingCorners, setPickingCorners] = useState<Point2D[] | null>(null);
   const [linesSubMode, setLinesSubMode] = useState<LinesSubMode>('smart');
-  const [strokeMode, setStrokeMode] = useState<UserStrokeMode>('ortho');
+  const [strokeMode, setStrokeMode] = useState<UserStrokeMode>('auto');
   const [subTool, setSubTool] = useState<SubTool>('none');
   const returnStepRef = useRef<TraceStep>('lines');
-  const lastEyedropperTriggerRef = useRef<number>(0);
 
   // Imán APAGADO por defecto para trazado 100% fluido y sin saltos inesperados
   const [magneticSnap, setMagneticSnap] = useState<boolean>(false);
@@ -151,7 +154,10 @@ export function VectorCanvas({
   const [subRegions, setSubRegions] = useState<SelectedSubRegion[]>([]);
   const regionCounterRef = useRef<number>(1);
   const externalInitialQuadNormRef = useRef(externalInitialQuadNorm);
-  externalInitialQuadNormRef.current = externalInitialQuadNorm;
+
+  useEffect(() => {
+    externalInitialQuadNormRef.current = externalInitialQuadNorm;
+  }, [externalInitialQuadNorm]);
 
   // Selección y hover de zonas (controlado o local)
   const [internalSelectedZoneId, setInternalSelectedZoneId] = useState<string | null>(null);
@@ -181,12 +187,17 @@ export function VectorCanvas({
 
   // Estado de fotografía y visión
   const [frontBitmap, setFrontBitmap] = useState<WorkingBitmap | null>(null);
-  const [imgSize, setImgSize] = useState<{ w: number; h: number }>({ w: 900, h: 680 });
+  const imgW = frontBitmap?.w ?? 900;
+  const imgH = frontBitmap?.h ?? 680;
   const [exteriorBgRgb, setExteriorBgRgb] = useState<[number, number, number]>([242, 244, 248]);
   const [photoVectorLines, setPhotoVectorLines] = useState<VectorLine2D[]>([]);
   const [marginEval, setMarginEval] = useState<MarginEvaluationResult | null>(null);
   const [ranRealVisionOnCatalog, setRanRealVisionOnCatalog] = useState<boolean>(false);
 
+  const [topBitmap, setTopBitmap] = useState<WorkingBitmap | null>(null);
+  const [topQuad, setTopQuad] = useState<[Point2D, Point2D, Point2D, Point2D]>(
+    makeAxisAlignedQuad(165, 110, 735, 510),
+  );
   const [sideBitmap, setSideBitmap] = useState<WorkingBitmap | null>(null);
   const [sideQuad, setSideQuad] = useState<[Point2D, Point2D, Point2D, Point2D]>(
     makeAxisAlignedQuad(180, 100, 460, 520),
@@ -212,9 +223,12 @@ export function VectorCanvas({
   const stageRef = useRef<HTMLDivElement>(null);
   const rectPreviewRef = useRef<HTMLCanvasElement>(null);
   const fileFrontalInputRef = useRef<HTMLInputElement>(null);
+  const fileTopInputRef = useRef<HTMLInputElement>(null);
   const fileSideInputRef = useRef<HTMLInputElement>(null);
   const frontBlobUrlRef = useRef<string | null>(null);
+  const topBlobUrlRef = useRef<string | null>(null);
   const sideBlobUrlRef = useRef<string | null>(null);
+  const triViewRef = useRef<TriViewCaptureInput>({});
   const lastExternalUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -222,6 +236,10 @@ export function VectorCanvas({
       if (frontBlobUrlRef.current) {
         URL.revokeObjectURL(frontBlobUrlRef.current);
         frontBlobUrlRef.current = null;
+      }
+      if (topBlobUrlRef.current) {
+        URL.revokeObjectURL(topBlobUrlRef.current);
+        topBlobUrlRef.current = null;
       }
       if (sideBlobUrlRef.current) {
         URL.revokeObjectURL(sideBlobUrlRef.current);
@@ -241,26 +259,26 @@ export function VectorCanvas({
   const committedHomography = useMemo(() => computeQuadToUnitHomography(quad), [quad]);
 
   const estimatedAspectXY = useMemo(
-    () => estimateAspectRatioFixedFocal(quad, imgSize.w, imgSize.h, focal35mm),
-    [quad, imgSize.w, imgSize.h, focal35mm],
+    () => estimateAspectRatioFixedFocal(quad, imgW, imgH, focal35mm),
+    [quad, imgW, imgH, focal35mm],
   );
 
   const cameraPose = useMemo(() => {
     if (!frontBitmap || !committedHomography) return null;
     return estimateCameraPoseMeters(
       quad,
-      imgSize.w,
-      imgSize.h,
+      imgW,
+      imgH,
       knownAxis,
       knownMeasureMm,
       focal35mm,
     );
-  }, [frontBitmap, committedHomography, quad, imgSize.w, imgSize.h, knownAxis, knownMeasureMm, focal35mm]);
+  }, [frontBitmap, committedHomography, quad, imgW, imgH, knownAxis, knownMeasureMm, focal35mm]);
 
   const rectifiedPreview = useMemo(() => {
     if (!frontBitmap || frontBitmap.w === 0 || !committedHomography) return null;
     const w = 260;
-    const h = Math.max(96, Math.min(280, Math.round(w / Math.max(0.25, estimatedAspectXY))));
+    const h = Math.max(96, Math.min(480, Math.round(w / Math.max(0.25, estimatedAspectXY))));
     const rgba = rectifyImageRGBA(
       frontBitmap.rgba,
       frontBitmap.w,
@@ -301,7 +319,7 @@ export function VectorCanvas({
     return c;
   }, [visualLayer, frontBitmap]);
 
-  // BUG FIX: incluye `showRectPreview` en dependencias para pintar inmediatamente al abrir!
+  // Pinta la vista previa rectificada al abrir el desplegable o al actualizar la homografía
   useEffect(() => {
     if (!showRectPreview) return;
     const previewCanvas = rectPreviewRef.current;
@@ -330,16 +348,17 @@ export function VectorCanvas({
     [onUpdateFrontZones, onUpdateTopology, topology],
   );
 
-  // Historial Undo/Redo completo
+  // Historial Undo/Redo completo (incluye proporciones 3D sincronizadas del contorno)
   const getCurrentSnapshot = useCallback(
-    (): CanvasHistorySnapshot => buildSnapshotFromState(quad, topology),
-    [quad, topology],
+    (): CanvasHistorySnapshot =>
+      buildSnapshotFromState(quad, topology, params.targetDimensions),
+    [quad, topology, params.targetDimensions],
   );
 
   const applyHistorySnapshot = useCallback(
     (snap: CanvasHistorySnapshot, direction: 'undo' | 'redo') => {
       const hom = computeQuadToUnitHomography(snap.quad);
-      const nextRatio = estimateAspectRatioFixedFocal(snap.quad, imgSize.w, imgSize.h, focal35mm);
+      const nextRatio = estimateAspectRatioFixedFocal(snap.quad, imgW, imgH, focal35mm);
       setQuad(snap.quad);
       setSelectedLine(null);
 
@@ -361,17 +380,29 @@ export function VectorCanvas({
         diagonalDividers: snap.diagonalDividers,
         frontZones: snap.frontZones,
         cubiertaMaterialOverride: snap.cubiertaMaterialOverride,
+        curvedCuts: snap.curvedCuts,
+        lShape: snap.lShape,
       });
+      if (
+        snap.dims &&
+        (snap.dims.x !== params.targetDimensions.x ||
+          snap.dims.y !== params.targetDimensions.y ||
+          snap.dims.z !== params.targetDimensions.z)
+      ) {
+        onApplyCalibratedDims(snap.dims);
+      }
       setStatusMsg(direction === 'undo' ? 'Acción deshecha (Ctrl+Z).' : 'Acción rehecha (Ctrl+Y).');
     },
     [
-      imgSize.w,
-      imgSize.h,
+      imgW,
+      imgH,
       focal35mm,
       topology,
+      params.targetDimensions,
       effectiveSelectedZoneId,
       setSelectedZone,
       onUpdateTopology,
+      onApplyCalibratedDims,
     ],
   );
 
@@ -401,14 +432,14 @@ export function VectorCanvas({
     onUndoIntercept: handleUndoCornerPickIntercept,
   });
 
-  // Commits de contorno y vectores
+  // Commits de contorno y vectores (sincroniza automáticamente Alto Y del 3D con la relación W/H real)
   const commitOuterFrame = useCallback(
     (
       bmp: WorkingBitmap,
       nextQuad: [Point2D, Point2D, Point2D, Point2D],
       opts: {
         resetInternalLines?: boolean;
-        applyDims?: boolean;
+        syncProportionY?: boolean;
         advanceToLines?: boolean;
         recordUndo?: boolean;
         undoBaseQuad?: [Point2D, Point2D, Point2D, Point2D];
@@ -420,7 +451,9 @@ export function VectorCanvas({
         return;
       }
       if (opts.recordUndo) {
-        pushSnapshot(buildSnapshotFromState(opts.undoBaseQuad ?? quad, topology));
+        pushSnapshot(
+          buildSnapshotFromState(opts.undoBaseQuad ?? quad, topology, params.targetDimensions),
+        );
       }
 
       const ext = extractStructuralVectorLines(bmp.rgba, bmp.w, bmp.h, nextQuad);
@@ -429,14 +462,20 @@ export function VectorCanvas({
       setMarginEval(mEval);
 
       const ratio = estimateAspectRatioFixedFocal(nextQuad, bmp.w, bmp.h, focal35mm);
-      const autoDims = estimateInitialDimsFromAspect(ratio, params.targetDimensions.z);
-      const effDims = opts.applyDims ? autoDims : params.targetDimensions;
+      const safeRatio = clampNum(Number.isFinite(ratio) ? ratio : 1, 0.25, 4.0);
+      const shouldSyncY = opts.syncProportionY !== false;
+      const nextY = clampNum(Math.round(params.targetDimensions.x / safeRatio), 300, 2400);
+      const syncedDims = shouldSyncY
+        ? {
+            x: params.targetDimensions.x,
+            y: nextY,
+            z: params.targetDimensions.z,
+          }
+        : params.targetDimensions;
 
       const rw = 240;
-      const rh = Math.max(96, Math.min(260, Math.round(rw / Math.max(0.25, ratio))));
+      const rh = Math.max(96, Math.min(480, Math.round(rw / Math.max(0.25, safeRatio))));
       const rectRgba = rectifyImageRGBA(bmp.rgba, bmp.w, bmp.h, hom.toCanvas, rw, rh);
-      const estMat = sampleRectBorderMaterial(rectRgba, rw, rh, exteriorBgRgb);
-      if (opts.applyDims) onAutoPhotoReconstructed?.(autoDims, estMat);
 
       const nextVDivs = opts.resetInternalLines ? [] : materializedBase.vDividers;
       const nextHShelves = opts.resetInternalLines ? [] : materializedBase.hShelves;
@@ -448,12 +487,13 @@ export function VectorCanvas({
         rectRgba,
         rw,
         rh,
-        effDims,
-        opts.applyDims ? estMat : params.material,
+        syncedDims,
+        params.material,
         exteriorBgRgb,
         prevZones,
         params.boardThickness,
       );
+      const hasLegVoid = zones.some((z) => z.kind === 'leg_void');
       const matchedZone = matchZoneIdByCentroid(
         prevZones.find((z) => z.id === effectiveSelectedZoneId),
         zones,
@@ -472,21 +512,25 @@ export function VectorCanvas({
         hShelves: nextHShelves,
         diagonalDividers: nextDiags,
         frontZones: zones,
-        hasBackPanel: topology.hasBackPanel,
+        hasBackPanel: hasLegVoid ? false : topology.hasBackPanel,
         detectionSource: 'manual',
         detectionConfidence: Math.max(0.85, mEval.overallScore / 100),
       });
+
+      if (shouldSyncY && nextY !== params.targetDimensions.y) {
+        onApplyCalibratedDims(syncedDims);
+      }
 
       if (opts.advanceToLines) {
         setPickingCorners(null);
         setTraceStep('lines');
         setSubTool('none');
         setStatusMsg(
-          `Contorno listo (Márgenes ${mEval.overallScore}%). Líneas internas conservadas. Ajusta o traza líneas en Paso 2.`,
+          `Contorno listo (${syncedDims.x} × ${syncedDims.y} mm · Márgenes ${mEval.overallScore}%). Traza o ajusta líneas en Paso 2.`,
         );
       } else {
         setStatusMsg(
-          `Contorno sincronizado (Márgenes ${mEval.overallScore}%, relación W/H = ${ratio.toFixed(2)}).`,
+          `Contorno sincronizado con 3D (${syncedDims.x} × ${syncedDims.y} mm · relación W/H = ${ratio.toFixed(2)}).`,
         );
       }
     },
@@ -503,7 +547,7 @@ export function VectorCanvas({
       effectiveSelectedZoneId,
       setSelectedZone,
       pushSnapshot,
-      onAutoPhotoReconstructed,
+      onApplyCalibratedDims,
       onUpdateTopology,
     ],
   );
@@ -529,6 +573,7 @@ export function VectorCanvas({
         opts.preserveZones !== false ? prevZones : [],
         params.boardThickness,
       );
+      const hasLegVoid = zones.some((z) => z.kind === 'leg_void');
       const matchedZone = matchZoneIdByCentroid(
         prevZones.find((z) => z.id === effectiveSelectedZoneId),
         zones,
@@ -548,7 +593,7 @@ export function VectorCanvas({
         hShelves: nextHShelves,
         diagonalDividers: nextDiags,
         frontZones: zones,
-        hasBackPanel: topology.hasBackPanel,
+        hasBackPanel: hasLegVoid ? false : topology.hasBackPanel,
         detectionSource: 'manual',
         detectionConfidence: 0.96,
       });
@@ -573,11 +618,64 @@ export function VectorCanvas({
   const handleCommitSideQuad = useCallback(
     (nextSide: [Point2D, Point2D, Point2D, Point2D], ratioZY: number, estDepth: number) => {
       setSideQuad(nextSide);
-      onUpdateTopology({ ...topology, viewsMode: 2, aspectRatioZY: ratioZY });
+      const existingViews = triViewRef.current;
+      triViewRef.current = {
+        ...existingViews,
+        side: {
+          ...(existingViews.side ?? {}),
+          plane: 'zy',
+          aspectRatio: ratioZY,
+          quadCorners: nextSide,
+        },
+      };
+      const viewsUsed: 1 | 2 | 3 =
+        triViewRef.current.front && triViewRef.current.top ? 3 : 2;
+      onUpdateTopology({
+        ...topology,
+        viewsMode: viewsUsed,
+        aspectRatioZY: ratioZY,
+      });
       onSelectDepthMm?.(estDepth);
-      setStatusMsg(`Profundidad Z estimada desde foto lateral: ${estDepth} mm.`);
+      setStatusMsg(`Profundidad Z estimada desde vista lateral: ${estDepth} mm.`);
     },
     [topology, onUpdateTopology, onSelectDepthMm],
+  );
+
+  const handleCommitTopQuad = useCallback(
+    (nextTop: [Point2D, Point2D, Point2D, Point2D], ratioXZ: number) => {
+      setTopQuad(nextTop);
+      triViewRef.current = {
+        ...triViewRef.current,
+        top: {
+          ...(triViewRef.current.top ?? {}),
+          plane: 'xz',
+          aspectRatio: ratioXZ,
+          quadCorners: nextTop,
+        },
+      };
+      const syn = synthesize3DFromTriViews(topology, params, triViewRef.current);
+      onUpdateTopology(syn.topology);
+      onApplyCalibratedDims?.(syn.params.targetDimensions);
+      setStatusMsg(`Planta Arriba (XZ) actualizada (razón X/Z = ${ratioXZ.toFixed(2)}).`);
+    },
+    [topology, params, onUpdateTopology, onApplyCalibratedDims],
+  );
+
+  const handleCommitCurvedCut = useCallback(
+    (cut: CurvedCutSpec) => {
+      const prevCuts = topology.curvedCuts ?? [];
+      const nextCuts = [
+        ...prevCuts.filter((c) => c.id !== cut.id && !(cut.cornerTarget && c.cornerTarget === cut.cornerTarget)),
+        cut,
+      ];
+      const nextTopo: FurnitureTopology = { ...topology, curvedCuts: nextCuts };
+      pushSnapshot();
+      onUpdateTopology(nextTopo);
+      setStatusMsg(
+        `Curva diferencial agregada en plano ${cut.plane.toUpperCase()} (${cut.label ?? cut.kind}).`,
+      );
+    },
+    [topology, pushSnapshot, onUpdateTopology],
   );
 
   // Acciones de selección Multi-Sección (Paso 2 / Paso 3)
@@ -623,18 +721,6 @@ export function VectorCanvas({
   const handleClearSubRegions = useCallback(() => {
     setSubRegions([]);
     setStatusMsg('Secciones limpiadas.');
-  }, []);
-
-  const handleOpenRegionsMode = useCallback(() => {
-    setViewTab('frontal');
-    setSubTool('none');
-    setPickingCorners(null);
-    setSelectedLine(null);
-    setTraceStep('lines');
-    setLinesSubMode('regions');
-    setStatusMsg(
-      'Modo Secciones activo: arrastra 1 o más recuadros sobre el mueble (o haz clic en celdas) y pulsa "Auto-detectar líneas".',
-    );
   }, []);
 
   const handleDetectSubRegions = useCallback(() => {
@@ -708,8 +794,10 @@ export function VectorCanvas({
     magneticSnap,
     isSpacePan,
     frontBitmap,
+    topBitmap,
     sideBitmap,
     quad,
+    topQuad,
     sideQuad,
     focal35mm,
     exteriorBgRgb,
@@ -742,8 +830,10 @@ export function VectorCanvas({
     },
     onAddOrToggleSubRegion: handleAddOrToggleSubRegion,
     onCommitOuterFrame: commitOuterFrame,
+    onCommitTopQuad: handleCommitTopQuad,
     onCommitSideQuad: handleCommitSideQuad,
     onCommitTracedVectors: commitTracedVectors,
+    onCommitCurvedCut: handleCommitCurvedCut,
     onSetStatusMsg: setStatusMsg,
   });
 
@@ -788,7 +878,6 @@ export function VectorCanvas({
         frontBlobUrlRef.current = null;
       }
       setFrontBitmap(bmp);
-      setImgSize({ w: bmp.w, h: bmp.h });
       setViewTab('frontal');
       setRanRealVisionOnCatalog(false);
       resetAllTransient();
@@ -800,24 +889,10 @@ export function VectorCanvas({
       let bgRgb: [number, number, number] = [242, 244, 248];
 
       if (initNorm && initNorm.length === 4) {
-        const mapped: [Point2D, Point2D, Point2D, Point2D] = [
-          {
-            x: clampNum(initNorm[0].x * bmp.w, 2, bmp.w - 2),
-            y: clampNum(initNorm[0].y * bmp.h, 2, bmp.h - 2),
-          },
-          {
-            x: clampNum(initNorm[1].x * bmp.w, 2, bmp.w - 2),
-            y: clampNum(initNorm[1].y * bmp.h, 2, bmp.h - 2),
-          },
-          {
-            x: clampNum(initNorm[2].x * bmp.w, 2, bmp.w - 2),
-            y: clampNum(initNorm[2].y * bmp.h, 2, bmp.h - 2),
-          },
-          {
-            x: clampNum(initNorm[3].x * bmp.w, 2, bmp.w - 2),
-            y: clampNum(initNorm[3].y * bmp.h, 2, bmp.h - 2),
-          },
-        ];
+        const mapped = initNorm.map((pt) => ({
+          x: clampNum(pt.x * bmp.w, 2, bmp.w - 2),
+          y: clampNum(pt.y * bmp.h, 2, bmp.h - 2),
+        })) as [Point2D, Point2D, Point2D, Point2D];
         if (isConvexQuad(mapped)) {
           bestBox = mapped;
           bgRgb = sampleExteriorBgRgb(bmp.rgba, bmp.w, bmp.h);
@@ -884,37 +959,11 @@ export function VectorCanvas({
       setStatusMsg(
         next === 'calibA4'
           ? 'Calibración A4 activa: haz clic en los 2 extremos de tu referencia (297 mm) sobre la foto.'
-          : 'COPIAR COLOR DE FOTO: Haz clic sobre la madera del mueble para copiar su acabado al 3D.',
+          : 'Gotero de color activo: haz clic sobre la melamina para detectar su acabado sin alterar dimensiones.',
       );
     },
     [subTool, traceStep, setLoupeFocusPt, setEyedropperPreview],
   );
-
-  // Activación externa desde la barra lateral ("Copiar color de la foto") vía `eyedropperTrigger`
-  useEffect(() => {
-    if (
-      typeof eyedropperTrigger === 'number' &&
-      eyedropperTrigger > 0 &&
-      eyedropperTrigger !== lastEyedropperTriggerRef.current
-    ) {
-      lastEyedropperTriggerRef.current = eyedropperTrigger;
-      if (!frontBitmap) {
-        setStatusMsg('Sube primero una foto del mueble para copiar su color al 3D.');
-        return;
-      }
-      if (subTool === 'none') {
-        returnStepRef.current = traceStep;
-      }
-      setPickingCorners(null);
-      setSelectedLine(null);
-      setCalibPts([]);
-      setViewTab('frontal');
-      setSubTool('eyedropper');
-      setStatusMsg(
-        'COPIAR COLOR DE FOTO: Haz clic sobre la madera del mueble para copiar su acabado al 3D.',
-      );
-    }
-  }, [eyedropperTrigger, frontBitmap, subTool, traceStep]);
 
   const exitSubTool = useCallback(() => {
     setSubTool('none');
@@ -929,7 +978,8 @@ export function VectorCanvas({
     if (
       materializedBase.vDividers.length === 0 &&
       materializedBase.hShelves.length === 0 &&
-      (topology.diagonalDividers?.length ?? 0) === 0
+      (topology.diagonalDividers?.length ?? 0) === 0 &&
+      (topology.curvedCuts?.length ?? 0) === 0
     ) {
       return;
     }
@@ -951,11 +1001,12 @@ export function VectorCanvas({
       vDividers: [],
       hShelves: [],
       diagonalDividers: [],
+      curvedCuts: undefined,
       frontZones: [singleZone],
       detectionSource: 'manual',
     });
     setSelectedZone(singleZone.id);
-    setStatusMsg('Líneas internas limpiadas (Ctrl+Z para restaurar).');
+    setStatusMsg('Líneas y curvas limpiadas (Ctrl+Z para restaurar).');
   }, [materializedBase, topology, pushSnapshot, onUpdateTopology, setSelectedZone]);
 
   // REGLA ESTRICTA: tanto "Sugerir líneas en contorno" como "Ejecutar visión real" SIEMPRE
@@ -970,10 +1021,10 @@ export function VectorCanvas({
         focal35mm,
         boardThicknessMm: params.boardThickness,
         currentDepthMm: params.targetDimensions.z,
-        preferredDimsMm: {
-          x: params.targetDimensions.x,
-          y: params.targetDimensions.y,
-        },
+        preferredDimsMm:
+          origin === 'suggest_lines'
+            ? { x: params.targetDimensions.x, y: params.targetDimensions.y }
+            : undefined,
         existingBackPanel: topology.hasBackPanel,
       });
       if (!res) return;
@@ -988,6 +1039,7 @@ export function VectorCanvas({
 
       const hom = computeQuadToUnitHomography(res.usedQuad);
       const det = res.detection;
+      const hasLegVoid = det.inferredZones.some((z) => z.kind === 'leg_void');
       onAutoPhotoReconstructed?.(res.estimatedDimsMm, det.detectedMaterial);
       onUpdateTopology({
         ...topology,
@@ -999,11 +1051,27 @@ export function VectorCanvas({
         vDividers: det.vDividers,
         hShelves: det.hShelves,
         diagonalDividers: det.diagonalDividers ?? [],
+        curvedCuts: res.curvedCuts && res.curvedCuts.length > 0 ? res.curvedCuts : topology.curvedCuts,
         frontZones: det.inferredZones,
-        hasBackPanel: topology.hasBackPanel,
+        hasBackPanel: hasLegVoid ? false : topology.hasBackPanel,
         detectionSource: 'auto',
         detectionConfidence: det.confidence,
       });
+      triViewRef.current = {
+        ...triViewRef.current,
+        front: {
+          plane: 'xy',
+          isSketch: res.isSketch,
+          aspectRatio: res.estimatedAspectXY,
+          quadCorners: res.usedQuad,
+          vDividers: det.vDividers,
+          hShelves: det.hShelves,
+          diagonalDividers: det.diagonalDividers ?? [],
+          curvedCuts: res.curvedCuts ?? [],
+          frontZones: det.inferredZones,
+          confidence: det.confidence,
+        },
+      };
       if (det.inferredZones.length > 0) setSelectedZone(det.inferredZones[0].id);
 
       // Mantener en Paso 2 (no expulsar a Paso 3!) y activar modo inteligente para editar/borrar
@@ -1016,9 +1084,11 @@ export function VectorCanvas({
       }
 
       setStatusMsg(
-        origin === 'suggest_lines'
-          ? `Sugerencia dentro de tu contorno: ${det.vDividers.length} divisor(es), ${det.hShelves.length} repisa(s) y ${det.diagonalDividers?.length ?? 0} diagonal(es). Arrastra cualquier línea para ajustarla o pulsa Deshacer.`
-          : `Visión real ejecutada dentro de tu contorno (${res.selectedStrategy}): ${det.vDividers.length}V · ${det.hShelves.length}H · 3D vs Foto ${res.similarity3D.overallScore}% · ${MELAMINE_LABELS[det.detectedMaterial]}.`,
+        res.isSketch
+          ? `Boceto reconocido: ${det.vDividers.length}V · ${det.hShelves.length}H · ${res.curvedCuts?.length ?? 0} curva(s). Usa "Medidas razonables" para igualar tramos.`
+          : origin === 'suggest_lines'
+            ? `Sugerencia dentro de tu contorno: ${det.vDividers.length} divisor(es), ${det.hShelves.length} repisa(s) y ${det.diagonalDividers?.length ?? 0} diagonal(es). Arrastra cualquier línea para ajustarla o pulsa Deshacer.`
+            : `Visión real ejecutada dentro de tu contorno (${res.selectedStrategy}): ${det.vDividers.length}V · ${det.hShelves.length}H · 3D vs Foto ${res.similarity3D.overallScore}% · ${MELAMINE_LABELS[det.detectedMaterial]}.`,
       );
     },
     [
@@ -1048,7 +1118,6 @@ export function VectorCanvas({
         frontBlobUrlRef.current = isBlob ? url : null;
 
         setFrontBitmap(bmp);
-        setImgSize({ w: bmp.w, h: bmp.h });
         setViewTab('frontal');
         setFrameMode('quad');
         setRanRealVisionOnCatalog(false);
@@ -1079,7 +1148,7 @@ export function VectorCanvas({
         const autoDims = estimateInitialDimsFromAspect(ratio, params.targetDimensions.z);
         const hom = computeQuadToUnitHomography(initQuad);
         const rw = 240;
-        const rh = Math.max(96, Math.min(260, Math.round(rw / Math.max(0.25, ratio))));
+        const rh = Math.max(96, Math.min(480, Math.round(rw / Math.max(0.25, ratio))));
         const rectRgba = hom ? rectifyImageRGBA(bmp.rgba, bmp.w, bmp.h, hom.toCanvas, rw, rh) : null;
         const estMat = rectRgba
           ? sampleRectBorderMaterial(rectRgba, rw, rh, autoQ.exteriorBgRgb)
@@ -1106,7 +1175,17 @@ export function VectorCanvas({
           hShelves: [],
           diagonalDividers: [],
           frontZones: [initZone],
-          hasBackPanel: true,
+          baseSupportType: 'none',
+          hasExternalLegs: false,
+          externalLegHeightMm: undefined,
+          externalLegCount: undefined,
+          toeKickHeightMm: undefined,
+          cubiertaMaterialOverride: undefined,
+          curvedCuts: undefined,
+          lShape: undefined,
+          hardwareItems: [],
+          hasBackPanel: false,
+          furnitureProfileLabel: undefined,
           detectionSource: 'manual',
           detectionConfidence: 0.9,
         });
@@ -1116,7 +1195,7 @@ export function VectorCanvas({
         setStatusMsg(
           isSample
             ? 'Escritorio de muestra cargado. Traza o ajusta líneas en Paso 2 (clic sobre una línea la mueve; arrastrar en libre crea una nueva).'
-            : 'Paso 1: ajusta esquinas o bordes del contorno (o pulsa "Tocar 4 esquinas") y luego avanza a Paso 2.',
+            : 'Paso 1: ajusta esquinas o bordes del contorno (o pulsa "4 toques") y luego avanza a Paso 2.',
         );
       };
       img.src = url;
@@ -1133,26 +1212,268 @@ export function VectorCanvas({
     ],
   );
 
-  const loadSideFromFile = useCallback((file: File) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const bmp = prepareWorkingBitmap(img);
-      if (sideBlobUrlRef.current) URL.revokeObjectURL(sideBlobUrlRef.current);
-      sideBlobUrlRef.current = url;
-      setSideBitmap(bmp);
-      setSideQuad(
-        makeAxisAlignedQuad(
-          Math.round(bmp.w * 0.25),
-          Math.round(bmp.h * 0.14),
-          Math.round(bmp.w * 0.75),
-          Math.round(bmp.h * 0.86),
-        ),
+  const loadTopFromFile = useCallback(
+    (file: File) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const bmp = prepareWorkingBitmap(img);
+        if (topBlobUrlRef.current) URL.revokeObjectURL(topBlobUrlRef.current);
+        topBlobUrlRef.current = url;
+        setTopBitmap(bmp);
+        setViewTab('superior');
+        const sk = recognizeHandDrawnSketch(
+          bmp.rgba,
+          bmp.w,
+          bmp.h,
+          'xz',
+          params.boardThickness,
+          { x: params.targetDimensions.x, y: params.targetDimensions.z },
+        );
+        const initQuad =
+          sk.inkPixelCount > 24
+            ? sk.quadCorners
+            : makeAxisAlignedQuad(
+                Math.round(bmp.w * 0.16),
+                Math.round(bmp.h * 0.16),
+                Math.round(bmp.w * 0.84),
+                Math.round(bmp.h * 0.8),
+              );
+        setTopQuad(initQuad);
+        triViewRef.current = { ...triViewRef.current, top: sk };
+        const syn = synthesize3DFromTriViews(topology, params, triViewRef.current);
+        pushSnapshot();
+        onUpdateTopology(syn.topology);
+        onApplyCalibratedDims?.(syn.params.targetDimensions);
+        setStatusMsg(
+          sk.lShapeInference
+            ? `Planta Arriba (XZ): detectado mueble en L (${sk.lShapeInference.side === 'right' ? 'Derecha' : 'Izquierda'}) y ${sk.curvedCuts.length} curva(s).`
+            : `Vista Arriba (XZ) cargada (razón X/Z = ${sk.aspectRatio.toFixed(2)}, ${sk.curvedCuts.length} curva(s)).`,
+        );
+      };
+      img.src = url;
+    },
+    [topology, params, pushSnapshot, onUpdateTopology, onApplyCalibratedDims],
+  );
+
+  const loadSideFromFile = useCallback(
+    (file: File) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const bmp = prepareWorkingBitmap(img);
+        if (sideBlobUrlRef.current) URL.revokeObjectURL(sideBlobUrlRef.current);
+        sideBlobUrlRef.current = url;
+        setSideBitmap(bmp);
+        setViewTab('lateral');
+        const sk = recognizeHandDrawnSketch(
+          bmp.rgba,
+          bmp.w,
+          bmp.h,
+          'zy',
+          params.boardThickness,
+          { x: params.targetDimensions.z, y: params.targetDimensions.y },
+        );
+        const nextSideQuad =
+          sk.inkPixelCount > 24
+            ? sk.quadCorners
+            : makeAxisAlignedQuad(
+                Math.round(bmp.w * 0.25),
+                Math.round(bmp.h * 0.14),
+                Math.round(bmp.w * 0.75),
+                Math.round(bmp.h * 0.86),
+              );
+        setSideQuad(nextSideQuad);
+        triViewRef.current = { ...triViewRef.current, side: sk };
+        const syn = synthesize3DFromTriViews(topology, params, triViewRef.current);
+        onUpdateTopology(syn.topology);
+        onSelectDepthMm?.(syn.params.targetDimensions.z);
+        setStatusMsg(
+          sk.isSketch
+            ? `Dibujo lateral (ZY) reconocido → profundidad Z = ${syn.params.targetDimensions.z} mm.`
+            : 'Foto lateral cargada. Ajusta las 4 esquinas del perfil para actualizar la profundidad Z.',
+        );
+      };
+      img.src = url;
+    },
+    [topology, params, onUpdateTopology, onSelectDepthMm],
+  );
+
+  const handleStartBlankSketch = useCallback(() => {
+    const bmp = createBlankSketchBitmap(viewTab);
+    if (viewTab === 'frontal') {
+      if (frontBlobUrlRef.current) {
+        URL.revokeObjectURL(frontBlobUrlRef.current);
+        frontBlobUrlRef.current = null;
+      }
+      const blankQuad = makeAxisAlignedQuad(140, 100, 760, 580);
+      const hom = computeQuadToUnitHomography(blankQuad);
+      setFrontBitmap(bmp);
+      setQuad(blankQuad);
+      setFrameMode('quad');
+      setTraceStep('lines');
+      setLinesSubMode('smart');
+      setStrokeMode('ortho');
+      resetAllTransient();
+      clearHistory();
+      triViewRef.current = { ...triViewRef.current, front: undefined };
+      onUpdateTopology({
+        ...topology,
+        aspectRatioXY: params.targetDimensions.x / Math.max(1, params.targetDimensions.y),
+        quadCorners: blankQuad,
+        homographyMatrix: hom ? hom.toUnit.map((r) => [...r]) : undefined,
+        shelfMode: 'custom',
+        equalShelfCount: 0,
+        vDividers: [],
+        hShelves: [],
+        diagonalDividers: [],
+        curvedCuts: undefined,
+        frontZones: [
+          {
+            id: 'traced_zone_1',
+            uStart: 0,
+            uEnd: 1,
+            vStart: 0,
+            vEnd: 1,
+            kind: 'open',
+            label: 'Cuerpo libre',
+          },
+        ],
+        detectionSource: 'manual',
+      });
+      setStatusMsg(
+        'Lienzo de dibujo frontal (XY) listo. Arrastra líneas rectas, diagonales o selecciona "Curva (Bézier)" para cortes curvos.',
       );
-      setStatusMsg('Foto lateral cargada. Ajusta las 4 esquinas del perfil para actualizar la profundidad Z.');
-    };
-    img.src = url;
-  }, []);
+      return;
+    }
+    if (viewTab === 'superior') {
+      if (topBlobUrlRef.current) {
+        URL.revokeObjectURL(topBlobUrlRef.current);
+        topBlobUrlRef.current = null;
+      }
+      setTopBitmap(bmp);
+      setTopQuad(makeAxisAlignedQuad(160, 110, 740, 520));
+      setTraceStep('lines');
+      setStrokeMode('curve');
+      onUpdateTopology({
+        ...topology,
+        viewsMode: sideBitmap ? 3 : 2,
+      });
+      setStatusMsg(
+        'Lienzo de Planta Arriba (XZ) listo. Traza curvas de empalme con "Curva (Bézier)" o ajusta el marco.',
+      );
+      return;
+    }
+    if (sideBlobUrlRef.current) {
+      URL.revokeObjectURL(sideBlobUrlRef.current);
+      sideBlobUrlRef.current = null;
+    }
+    setSideBitmap(bmp);
+    setSideQuad(makeAxisAlignedQuad(220, 100, 680, 580));
+    setTraceStep('frame');
+    onUpdateTopology({
+      ...topology,
+      viewsMode: topBitmap ? 3 : 2,
+    });
+    setStatusMsg('Lienzo lateral (ZY) listo. Ajusta el perfil para calibrar la profundidad Z.');
+  }, [
+    viewTab,
+    topology,
+    params.targetDimensions,
+    topBitmap,
+    sideBitmap,
+    clearHistory,
+    onUpdateTopology,
+  ]);
+
+  const handleRecognizeSketchInView = useCallback(() => {
+    const bmp = viewTab === 'frontal' ? frontBitmap : viewTab === 'superior' ? topBitmap : sideBitmap;
+    if (!bmp) return;
+    const plane = viewTab === 'frontal' ? 'xy' : viewTab === 'superior' ? 'xz' : 'zy';
+    const refDims =
+      plane === 'xy'
+        ? { x: params.targetDimensions.x, y: params.targetDimensions.y }
+        : plane === 'xz'
+          ? { x: params.targetDimensions.x, y: params.targetDimensions.z }
+          : { x: params.targetDimensions.z, y: params.targetDimensions.y };
+    const sk = recognizeHandDrawnSketch(
+      bmp.rgba,
+      bmp.w,
+      bmp.h,
+      plane,
+      params.boardThickness,
+      refDims,
+    );
+    if (viewTab === 'frontal') {
+      setQuad(sk.quadCorners);
+      triViewRef.current = { ...triViewRef.current, front: sk };
+    } else if (viewTab === 'superior') {
+      setTopQuad(sk.quadCorners);
+      triViewRef.current = { ...triViewRef.current, top: sk };
+    } else {
+      setSideQuad(sk.quadCorners);
+      triViewRef.current = { ...triViewRef.current, side: sk };
+    }
+    const syn = synthesize3DFromTriViews(topology, params, triViewRef.current);
+    pushSnapshot();
+    onUpdateTopology(syn.topology);
+    onApplyCalibratedDims?.(syn.params.targetDimensions);
+    if (viewTab === 'frontal') {
+      setTraceStep('lines');
+      setLinesSubMode('smart');
+    }
+    setStatusMsg(
+      `Dibujo (${viewTab}) reconocido: ${sk.vDividers.length}V · ${sk.hShelves.length}H · ${sk.curvedCuts.length} curva(s) (confianza ${(sk.confidence * 100).toFixed(0)}%).`,
+    );
+  }, [
+    viewTab,
+    frontBitmap,
+    topBitmap,
+    sideBitmap,
+    params,
+    topology,
+    pushSnapshot,
+    onUpdateTopology,
+    onApplyCalibratedDims,
+  ]);
+
+  const handleRunReasonableMeasures = useCallback(() => {
+    pushSnapshot();
+    const res = makeDrawingMeasurementsReasonable(topology, params);
+    onUpdateTopology(res.topology);
+    onApplyCalibratedDims?.(res.params.targetDimensions);
+    setStatusMsg(
+      res.changesSummary.length > 0
+        ? `Medidas razonables aplicadas: ${res.changesSummary.slice(0, 3).join(' · ')}.`
+        : 'Las medidas, simetrías y alas L ya están normalizadas a múltiplos de 10 mm.',
+    );
+  }, [topology, params, pushSnapshot, onUpdateTopology, onApplyCalibratedDims]);
+
+  const handleToggleLInnerCurve = useCallback(() => {
+    pushSnapshot();
+    const exists = (topology.curvedCuts ?? []).some((c) => c.cornerTarget === 'l_inner');
+    const rest = (topology.curvedCuts ?? []).filter((c) => c.cornerTarget !== 'l_inner');
+    const nextCuts = exists
+      ? rest
+      : [
+          ...rest,
+          buildCornerFilletCutSpec({
+            id: 'curva_esquina_interior_l',
+            cornerTarget: 'l_inner',
+            radiusMm: 160,
+            label: 'Empalme curvo L (R=160 mm)',
+          }),
+        ];
+    onUpdateTopology({
+      ...topology,
+      curvedCuts: nextCuts.length > 0 ? nextCuts : undefined,
+    });
+    setStatusMsg(
+      exists
+        ? 'Esquina curva interior L desactivada.'
+        : 'Esquina curva interior L (R=160 mm) activada por cálculo diferencial.',
+    );
+  }, [topology, pushSnapshot, onUpdateTopology]);
 
   const handleToggleFrameMode = useCallback(
     (nextMode: FrameMode) => {
@@ -1164,7 +1485,10 @@ export function VectorCanvas({
         setFrameMode('box');
         setQuad(boxed);
         if (frontBitmap) {
-          commitOuterFrame(frontBitmap, boxed, { resetInternalLines: false, applyDims: false });
+          commitOuterFrame(frontBitmap, boxed, {
+            resetInternalLines: false,
+            syncProportionY: true,
+          });
         }
         setStatusMsg('Marco rectangular activado (Ctrl+Z para volver a 4 esquinas libres).');
       } else {
@@ -1312,7 +1636,7 @@ export function VectorCanvas({
     if (!isVisible) return;
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (isEditableFocus(e.target)) return;
+      if (isEditableElement(e.target)) return;
 
       if (e.code === 'Space' && !e.repeat && frontBitmap) {
         e.preventDefault();
@@ -1373,7 +1697,7 @@ export function VectorCanvas({
             if (dxMm !== 0) {
               handleUpdateVDivider(seg.id, {
                 ...seg,
-                position: round4(clampNum(seg.position + dxMm / xInt, 0.015, 0.985)),
+                position: round4(clampNum(seg.position + dxMm / xInt, 0.03, 0.97)),
               });
             } else if (dyMm !== 0 && (seg.start > 0.005 || seg.end < 0.995)) {
               const span = seg.end - seg.start;
@@ -1390,7 +1714,7 @@ export function VectorCanvas({
             if (dyMm !== 0) {
               handleUpdateHShelf(seg.id, {
                 ...seg,
-                position: round4(clampNum(seg.position + dyMm / yInt, 0.015, 0.985)),
+                position: round4(clampNum(seg.position + dyMm / yInt, 0.03, 0.97)),
               });
             } else if (dxMm !== 0 && (seg.start > 0.005 || seg.end < 0.995)) {
               const span = seg.end - seg.start;
@@ -1456,8 +1780,10 @@ export function VectorCanvas({
     handleUpdateDiagonal,
   ]);
 
-  const activeBmp = viewTab === 'frontal' ? frontBitmap : sideBitmap;
+  const activeBmp =
+    viewTab === 'frontal' ? frontBitmap : viewTab === 'superior' ? topBitmap : sideBitmap;
   const hasPhoto = Boolean(frontBitmap);
+  const hasAnyView = Boolean(frontBitmap || topBitmap || sideBitmap);
   const zones = topology.frontZones ?? [];
   const activeVDividers = pointer.draftLines
     ? pointer.draftLines.vDividers
@@ -1469,7 +1795,11 @@ export function VectorCanvas({
     ? pointer.draftLines.diagonalDividers
     : (topology.diagonalDividers ?? []);
   const activeDisplayQuad =
-    viewTab === 'frontal' ? (pointer.draftQuad ?? quad) : (pointer.draftSideQuad ?? sideQuad);
+    viewTab === 'frontal'
+      ? (pointer.draftQuad ?? quad)
+      : viewTab === 'superior'
+        ? (pointer.draftTopQuad ?? topQuad)
+        : (pointer.draftSideQuad ?? sideQuad);
 
   return (
     <div className="vc-root">
@@ -1481,6 +1811,17 @@ export function VectorCanvas({
         onChange={(e) => {
           const file = e.target.files?.[0];
           if (file) loadFrontalFromUrl(URL.createObjectURL(file), false, true);
+          e.target.value = '';
+        }}
+      />
+      <input
+        ref={fileTopInputRef}
+        type="file"
+        accept="image/*"
+        hidden
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) loadTopFromFile(file);
           e.target.value = '';
         }}
       />
@@ -1498,6 +1839,8 @@ export function VectorCanvas({
 
       <CanvasTopBars
         hasPhoto={hasPhoto}
+        hasTopPhoto={Boolean(topBitmap)}
+        hasSidePhoto={Boolean(sideBitmap)}
         viewTab={viewTab}
         traceStep={traceStep}
         frameMode={frameMode}
@@ -1509,8 +1852,8 @@ export function VectorCanvas({
         calibRefMm={calibRefMm}
         calibPtsCount={calibPts.length}
         internalLineCount={activeVDividers.length + activeHShelves.length + activeDiagonals.length}
+        curvedCount={topology.curvedCuts?.length ?? 0}
         zonesCount={zones.length}
-        hasSelectedLine={selectedLine !== null}
         subRegions={subRegions}
         xIntMm={Math.max(1, params.targetDimensions.x - 2 * params.boardThickness)}
         yIntMm={Math.max(1, params.targetDimensions.y - 2 * params.boardThickness)}
@@ -1526,6 +1869,14 @@ export function VectorCanvas({
         isCatalogReference={isCatalogReference}
         ranRealVisionOnCatalog={ranRealVisionOnCatalog}
         externalPhotoLabel={externalPhotoLabel}
+        isLShape={Boolean(topology.lShape?.enabled)}
+        hasLInnerCurve={Boolean((topology.curvedCuts ?? []).some((c) => c.cornerTarget === 'l_inner'))}
+        onSwitchViewTab={(tab) => {
+          setSubTool('none');
+          setPickingCorners(null);
+          setSelectedLine(null);
+          setViewTab(tab);
+        }}
         onSelectStep={(step) => {
           setViewTab('frontal');
           setSubTool('none');
@@ -1534,10 +1885,10 @@ export function VectorCanvas({
           setTraceStep(step);
           setStatusMsg(
             step === 'frame'
-              ? 'Paso 1 (Contorno): arrastra esquinas, bordes completos o el interior del marco.'
+              ? 'Paso 1 (Contorno): arrastra las esquinas o los bordes para encuadrar el mueble.'
               : step === 'lines'
-                ? 'Paso 2 (Líneas): arrastra cualquier línea existente para moverla o arrastra en espacio libre para crear una nueva.'
-                : 'Paso 3 (Partes): haz clic en cualquier celda para definir puertas, cajones, canastos o bicolor.',
+                ? 'Paso 2 (Líneas): arrastra en espacio libre para trazar una línea nueva o mueve cualquier línea existente.'
+                : 'Paso 3 (Partes): haz clic en cualquier parte para definir puertas, cajones o color.',
           );
         }}
         onUndo={() => triggerUndo()}
@@ -1547,10 +1898,17 @@ export function VectorCanvas({
         onZoomReset={pointer.resetViewport}
         onTogglePanTool={() => pointer.setPanToolActive((v) => !v)}
         onUploadFrontPhoto={() => fileFrontalInputRef.current?.click()}
+        onUploadTopPhoto={() => fileTopInputRef.current?.click()}
         onUploadSidePhoto={() => fileSideInputRef.current?.click()}
+        onStartBlankSketch={handleStartBlankSketch}
+        onRecognizeSketch={handleRecognizeSketchInView}
+        onRunReasonableMeasures={handleRunReasonableMeasures}
+        onToggleLInnerCurve={handleToggleLInnerCurve}
         onReturnToFrontal={() => setViewTab('frontal')}
+        onChangeCalibRefMm={setCalibRefMm}
         onApplyCalibA4={handleApplyCalibA4}
         onExitSubTool={exitSubTool}
+        onToggleSubTool={toggleSubTool}
         onToggleFrameMode={handleToggleFrameMode}
         onStartPickCorners={() => {
           setFrameMode('quad');
@@ -1559,7 +1917,6 @@ export function VectorCanvas({
             'Toca las 4 esquinas en orden: 1 Arriba-Izq → 2 Arriba-Der → 3 Abajo-Der → 4 Abajo-Izq.',
           );
         }}
-        onUndoPickCorner={() => handleUndoCornerPickIntercept()}
         onCancelPickCorners={() => {
           setPickingCorners(null);
           pointer.setLoupeFocusPt(null);
@@ -1577,26 +1934,24 @@ export function VectorCanvas({
           );
           commitOuterFrame(frontBitmap, ext.refinedBox ?? aq.quadCorners, {
             resetInternalLines: false,
-            applyDims: false,
+            syncProportionY: true,
             advanceToLines: false,
             recordUndo: true,
             undoBaseQuad: quad,
           });
         }}
         onClearLines={handleClearLines}
-        onDeleteSelectedLine={handleDeleteSelectedLine}
         onChangeLinesSubMode={(mode) => {
           if (mode === 'regions') setSelectedLine(null);
           setLinesSubMode(mode);
           setStatusMsg(
             mode === 'smart'
-              ? 'Modo Editar / Trazar: haz clic/arrastra una línea existente para moverla; arrastra en espacio libre para trazar.'
+              ? 'Modo Editar / Trazar: mueve una línea existente o arrastra en espacio libre para trazar.'
               : mode === 'draw_only'
-                ? 'Modo + Solo trazar: crea líneas nuevas incluso en zonas muy apretadas.'
-                : 'Modo Secciones auto: arrastra 1 o más recuadros sobre la foto (o haz clic en celdas) y pulsa Auto-detectar.',
+                ? 'Modo Solo trazar: crea líneas nuevas incluso en zonas muy apretadas.'
+                : 'Modo Secciones auto: arrastra 1 o más recuadros sobre la foto y pulsa Detectar.',
           );
         }}
-        onOpenRegionsMode={handleOpenRegionsMode}
         onRemoveSubRegion={handleRemoveSubRegion}
         onClearSubRegions={handleClearSubRegions}
         onDetectSubRegions={handleDetectSubRegions}
@@ -1617,11 +1972,13 @@ export function VectorCanvas({
         linesSubMode={linesSubMode}
         subTool={subTool}
         visualLayer={visualLayer}
+        strokeMode={strokeMode}
         activeQuad={activeDisplayQuad}
         homography={pointer.displayHomography}
         vDividers={activeVDividers}
         hShelves={activeHShelves}
         diagonalDividers={activeDiagonals}
+        curvedCuts={topology.curvedCuts}
         frontZones={zones}
         subRegions={subRegions}
         draftRegion={pointer.draftRegion}
@@ -1642,16 +1999,13 @@ export function VectorCanvas({
         zoom={pointer.zoom}
         pan={pointer.pan}
         isPanning={pointer.isPanning}
+        panToolActive={pointer.panToolActive}
         isSpacePan={isSpacePan}
         isDragging={pointer.isDraggingState}
         isDragOver={isDragOver}
-        canUndo={canUndo}
-        undoCount={undoCount}
         canvasCursor={pointer.canvasCursor}
         canvasRef={canvasRef}
         stageRef={stageRef}
-        onUndo={() => triggerUndo()}
-        onDeleteSelectedLine={handleDeleteSelectedLine}
         onPointerDown={pointer.handlePointerDown}
         onPointerMove={pointer.handlePointerMove}
         onPointerUp={pointer.handlePointerUp}
@@ -1668,13 +2022,17 @@ export function VectorCanvas({
           const file = e.dataTransfer.files?.[0];
           if (!file || !file.type.startsWith('image/')) return;
           if (viewTab === 'frontal') loadFrontalFromUrl(URL.createObjectURL(file), false, true);
+          else if (viewTab === 'superior') loadTopFromFile(file);
           else loadSideFromFile(file);
         }}
         onTriggerUpload={() =>
           viewTab === 'frontal'
             ? fileFrontalInputRef.current?.click()
-            : fileSideInputRef.current?.click()
+            : viewTab === 'superior'
+              ? fileTopInputRef.current?.click()
+              : fileSideInputRef.current?.click()
         }
+        onStartBlankSketch={handleStartBlankSketch}
         onLoadSample={() => loadFrontalFromUrl(generateSampleFurnitureDataUrl(), true, false)}
       />
 
@@ -1687,8 +2045,6 @@ export function VectorCanvas({
             hShelves: materializedBase.hShelves,
           }}
           params={params}
-          canUndo={canUndo}
-          onUndo={() => triggerUndo()}
           onUpdateVDivider={handleUpdateVDivider}
           onUpdateHShelf={handleUpdateHShelf}
           onUpdateDiagonal={handleUpdateDiagonal}
@@ -1736,34 +2092,30 @@ export function VectorCanvas({
       <CalibrationBar
         viewTab={viewTab}
         hasFrontPhoto={hasPhoto}
-        hasSidePhoto={Boolean(sideBitmap)}
         knownAxis={knownAxis}
         knownMeasureMm={knownMeasureMm}
         focal35mm={focal35mm}
         estimatedAspectXY={estimatedAspectXY}
         isCalibA4Active={subTool === 'calibA4'}
-        calibRefMm={calibRefMm}
-        calibPtsCount={calibPts.length}
         feedbackMsg={calibFeedback}
         onChangeKnownAxis={setKnownAxis}
         onChangeKnownMeasureMm={setKnownMeasureMm}
         onApplySingleMeasure={handleApplySingleMeasure}
         onChangeFocal35mm={setFocal35mm}
         onToggleCalibA4={() => toggleSubTool('calibA4')}
-        onChangeCalibRefMm={setCalibRefMm}
-        onApplyCalibA4={handleApplyCalibA4}
         onSwitchViewTab={(tab) => {
           setSubTool('none');
           setPickingCorners(null);
           setSelectedLine(null);
           setViewTab(tab);
         }}
-        onTriggerSidePhotoUpload={() => fileSideInputRef.current?.click()}
       />
 
-      <p className="vc-status-line" role="status">
-        {statusMsg}
-      </p>
+      {(hasAnyView || viewTab !== 'frontal') && (
+        <p className="vc-status-line" role="status">
+          {statusMsg}
+        </p>
+      )}
     </div>
   );
 }

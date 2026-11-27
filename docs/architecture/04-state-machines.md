@@ -1,122 +1,149 @@
 # 04 — Diagramas de Máquinas de Estados (SmartFurniture v8.0)
 
-> Especificación formal de estados para el orquestador global (`App.tsx`) y el editor interactivo de fotografía (`VectorCanvas` v8.0), garantizando transiciones predecibles y cero secuestros de herramientas.
+> Especificación formal de estados para el orquestador global (`App.tsx`) y el editor interactivo de fotografía (`VectorCanvas` v8.0), reflejando la UX simplificada con revelación progresiva, cero secuestros de herramientas y cero duplicación de controles.
 
-## Máquina de Estados A — Navegación y Aprobación de `App.tsx`
+## Máquina de Estados A — Navegación, Modos de Estudio y Aprobación de `App.tsx`
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Studio : Inicio con Preset 1 (Estantería)
+    [*] --> Studio : Inicio en activeView = studio (Preset 1 Estantería)
 
-    state "Paso Studio (Foto + 3D en vivo)" as Studio {
-        [*] --> IdleStudio
-        IdleStudio --> EditingPhoto : Carga foto propia o prueba visión en catálogo
-        IdleStudio --> PresetLoaded : Selecciona Preset U3 o Catálogo 14
-        EditingPhoto --> Synced3D : Actualiza topology y V0/Vf
-        PresetLoaded --> Synced3D : Render inmediato 3D y despiece
-        Synced3D --> EditingPhoto : Ajusta trazos o zonas
+    state "Vista Studio (activeView = studio)" as Studio {
+        [*] --> SplitMode : studioMode = split (Foto + 3D en vivo)
+        SplitMode --> PhotoMode : Cambia a studioMode = photo (Solo Foto)
+        SplitMode --> ThreeDMode : Cambia a studioMode = 3d (Solo 3D)
+        PhotoMode --> SplitMode : Cambia a studioMode = split
+        PhotoMode --> ThreeDMode : Cambia a studioMode = 3d
+        ThreeDMode --> SplitMode : Cambia a studioMode = split
+        ThreeDMode --> PhotoMode : Cambia a studioMode = photo
+
+        SplitMode --> SplitMode : Selector Presets U3, Presets L o Catálogo 14, Forma Recto/L Der/L Izq o VectorCanvas
+        ThreeDMode --> ThreeDMode : Control Explotar integrado en Viewer3D (explodeFactor) y hover 2D-3D ambas alas
     }
 
-    state "Paso Blueprint (Plano Vectorial 2D V0 vs Vf)" as Blueprint {
+    state "Vista Blueprint (activeView = blueprint · Plano 2D V0 vs Vf)" as Blueprint {
         [*] --> PendingApproval : modelApproved = false
-        PendingApproval --> PendingApproval : Edita dimensiones Vf o FrontZones
-        PendingApproval --> Approved : Usuario pulsa Aprobar Modelo
+        PendingApproval --> PendingApproval : Edita Vf / Ala L y zonas FrontZones A/B (ZoneInspector)
+        PendingApproval --> Approved : Usuario pulsa Aprobar Modelo (opcional)
         Approved --> PendingApproval : Modifica topología o cotas Vf
     }
 
-    state "Paso Workshop (Taller: Unidad 3, Corte 2D y BOM CLP)" as Workshop {
+    state "Vista Workshop (activeView = workshop · Taller Offline)" as Workshop {
         [*] --> TabUnidad3
         TabUnidad3 --> TabAlertas : Revisa pandeo DIN 68874-1
         TabAlertas --> TabMatrices : Revisa n x 3 y n x 5
         TabMatrices --> TabHerrajes : Ajusta herrajes y precios CLP
         TabHerrajes --> TabCorte : Inspecciona planchas bicolor y exporta XLS/CSV/SVG
         TabCorte --> TabUnidad3 : Vuelve a fórmulas Unidad 3
+        TabUnidad3 --> TabUnidad3 : Alterna vista 3D lateral opcional (showWorkshop3D)
     }
 
-    Studio --> Blueprint : Cambia a Plano 2D (activeStep = blueprint)
-    Blueprint --> Workshop : Aprueba o pasa a Taller (activeStep = workshop)
-    Studio --> Workshop : Acceso directo a Taller (activeStep = workshop)
-    Blueprint --> Studio : Regresa a Estudio (activeStep = studio)
-    Workshop --> Studio : Regresa a Estudio (activeStep = studio)
-    Workshop --> Blueprint : Regresa a Plano 2D (activeStep = blueprint)
+    Studio --> Blueprint : Cambia a Plano 2D (activeView = blueprint)
+    Studio --> Workshop : Acceso directo a Taller sin bloqueo (activeView = workshop)
+    Blueprint --> Workshop : Pasa a Taller con o sin aprobación (activeView = workshop)
+    Blueprint --> Studio : Regresa a Estudio (activeView = studio)
+    Workshop --> Studio : Regresa a Estudio (activeView = studio)
+    Workshop --> Blueprint : Regresa a Plano 2D (activeView = blueprint)
 
     note right of Studio
-        Banderas ortogonales en App:
-        lockProportion (mantiene lockedRatioXY al escalar X o Y)
-        modelApproved (se reinicia a false ante cambios estructurales)
+        Controles ortogonales en App:
+        - Selector unificado Presets U3 y Catálogo 14 (preset:* / catalog:*)
+        - Sidebar progresivo con 3 desplegables colapsados por defecto:
+          Repisas y estructura · Tableros, Fondo y Bicolor · Taller y Sierra
+        - Control Explotar (explodeFactor) integrado en Viewer3D
+        - lockProportion, selectedZoneId, hoveredZoneId y modelApproved
     end note
 ```
 
-## Máquina de Estados B — `VectorCanvas` v8.0 (3 Pasos Exclusivos + Subherramientas + Undo/Redo)
+## Máquina de Estados B — `VectorCanvas` v8.0 (3 Vistas Ortogonales, Dibujo Libre con Curvas Diferenciales y Undo/Redo)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> NoPhoto : Sin imagen cargada
+    [*] --> NoPhoto : Sin vista frontal cargada (selector de 3 vistas siempre accesible)
 
-    NoPhoto --> Step1Frame : Carga foto local, ejemplo o croquis procedural
+    NoPhoto --> Step1Frame : Sube foto o boceto en papel (Frente XY, Arriba XZ o Lado ZY)
+    NoPhoto --> Step2Lines : Pulsa Dibujar en lienzo libre (createBlankSketchBitmap con cuadrícula)
 
-    state "Paso 1 — frame (Contorno Exterior)" as Step1Frame {
-        [*] --> FrameBox : Submodo por defecto (rectángulo rápido)
-        FrameBox --> FrameQuad : Activa perspectiva 4 esquinas (H 3x3)
-        FrameBox --> Frame4Tap : Activa marcado 4-tap secuencial (TL, TR, BR, BL)
-        FrameQuad --> FrameBox : Vuelve a marco recto
-        Frame4Tap --> FrameQuad : Completa 4to punto (calcula H y H^-1)
+    state "Vista Activa (viewTab: frontal XY | superior XZ | lateral ZY)" as ViewTabs {
+        state "frontal (Alzado XY · líneas, diagonales, curvas top/arco)" as TabFront
+        state "superior (Planta XZ · L derecha/izquierda y empalme curvo L)" as TabTop
+        state "lateral (Perfil ZY · calibración profundidad Z)" as TabSide
+        TabFront --> TabTop : Pestaña 2. Arriba (XZ)
+        TabTop --> TabSide : Pestaña 3. Lado (ZY)
+        TabSide --> TabFront : Pestaña 1. Frente (XY)
+    }
 
+    state "Paso 1 — frame (Contorno Exterior · Inicia en quad)" as Step1Frame {
+        [*] --> FrameQuad : Submodo por defecto (4 esquinas + handles de borde ampliados)
+        FrameQuad --> FrameBox : Activa marco recto en menú plegado Opciones
+        FrameQuad --> Frame4Tap : Activa marcado guiado 4-tap (TL, TR, BR, BL)
+        FrameBox --> FrameQuad : Vuelve a perspectiva 4 esquinas
+        Frame4Tap --> FrameQuad : Completa 4to punto (calcula H y sincroniza Alto Y)
+
+        FrameQuad --> DraggingFrame : PointerDown en esquina, borde ampliado o interior
         FrameBox --> DraggingFrame : PointerDown en esquina, borde o interior
-        FrameQuad --> DraggingFrame : PointerDown en esquina, borde o marco
-        DraggingFrame --> FrameQuad : PointerUp (commit en UndoStack)
-        DraggingFrame --> FrameBox : PointerUp (commit en UndoStack)
+        DraggingFrame --> FrameQuad : PointerUp (commit UndoStack + sincroniza Alto Y 3D / XZ)
+        DraggingFrame --> FrameBox : PointerUp (commit UndoStack + sincroniza Alto Y 3D / XZ)
     }
 
-    state "Paso 2 — lines (Trazado Interno H/V/Diagonal)" as Step2Lines {
-        [*] --> SelectMove : Seleccionar, mover segmento o editar extremos
-        SelectMove --> DrawOrtho : Activa trazo H/V (auto-orienta + snap T-junctions)
-        SelectMove --> DrawDiagonal : Activa trazo diagonal (dEdge / inglete)
-        DrawOrtho --> SelectMove : PointerUp (vectoriza, cotas mm, commit UndoStack)
-        DrawDiagonal --> SelectMove : PointerUp (crea DiagonalSegment, commit UndoStack)
-        SelectMove --> AutoSuggesting : Pulsa Sugerir líneas auto
-        AutoSuggesting --> SelectMove : Aplica candidatos y commit UndoStack
+    state "Paso 2 — lines (Trazado en Vivo + Curvas Diferenciales Bézier)" as Step2Lines {
+        [*] --> SmartEditDraw : linesSubMode = smart y strokeMode = auto (Editar / Trazar)
+        SmartEditDraw --> DrawStroke : Arrastra en vacío (recta, diagonal o polilínea curve en tiempo real)
+        SmartEditDraw --> DragSegment : Arrastra cuerpo o extremo de segmento existente
+        DrawStroke --> SmartEditDraw : PointerUp (vectorizeUserStroke o fitDifferentialCurveFromStroke + UndoStack)
+        DragSegment --> SmartEditDraw : PointerUp (actualiza segmento, commit UndoStack)
+        SmartEditDraw --> AutoSuggesting : Pulsa Sugerir líneas o Reconocer boceto (sketchRecognizer + photoPipeline)
+        AutoSuggesting --> SmartEditDraw : Aplica candidatos, curvas e inferencia L + commit UndoStack
+        SmartEditDraw --> ReasonableNorm : Pulsa Medidas razonables (simetría, colinealidad, alas L iguales, 10 mm)
+        ReasonableNorm --> SmartEditDraw : Commit UndoStack con cotas y topología normalizadas
+        SmartEditDraw --> AdvancedModes : Abre menú plegado Opciones (Solo trazar, Secciones auto, Auto/Recta/Diagonal/Curva, Imán OFF)
+        AdvancedModes --> SmartEditDraw : Vuelve a modo inteligente Editar / Trazar
     }
 
-    state "Paso 3 — zones (Clasificación de Zonas)" as Step3Zones {
-        [*] --> ZoneInspector : Selecciona celda (hover sincronizado con 3D)
-        ZoneInspector --> ZoneInspector : Cambia kind, cajones, canastos o material bicolor
-        ZoneInspector --> MergingZones : Selecciona celda adyacente para fusionar (merge)
-        ZoneInspector --> SplittingZone : Divide celda en subzonas (split)
-        MergingZones --> ZoneInspector : Commit UndoStack
-        SplittingZone --> ZoneInspector : Commit UndoStack
+    state "Paso 3 — zones (ZoneInspector Simplificado con Revelación Progresiva)" as Step3Zones {
+        [*] --> ZoneInspector : Selecciona celda (hover sincronizado 2D-3D)
+        ZoneInspector --> ZoneInspector : Cambia kind (9 tipos), cajones/canastos, color bicolor o acciones +2 col / +2 filas / Unir
+        ZoneInspector --> ZoneAdvanced : Despliega Ajustes avanzados de esta parte (mm exactos, repisas internas, 3-5 divisiones, etiqueta)
+        ZoneAdvanced --> ZoneInspector : Commit UndoStack
     }
 
-    state "Subherramientas Temporales (No secuestran el paso activo)" as SubTools {
-        state "calibA4 (Calibración A4 297 mm o 1 Medida)" as CalibA4
+    state "Subherramientas Exclusivas en Barra 2 (CalibrationBar oculto para cero duplicados)" as SubTools {
+        state "calibA4 (Hoja A4 297 mm en Barra 2)" as CalibA4
         state "eyedropper (Gotero 1 clic color melamina)" as Eyedropper
+        state "viewTab = lateral (Vista Lateral ZY desde Avanzado)" as LateralZY
     }
 
     Step1Frame --> Step2Lines : Siguiente paso (contorno válido)
     Step2Lines --> Step3Zones : Siguiente paso (partición planar lista)
-    Step3Zones --> Step2Lines : Volver a ajustar líneas
-    Step2Lines --> Step1Frame : Volver a ajustar contorno
-    Step3Zones --> Step1Frame : Volver a contorno
+    Step3Zones --> Step2Lines : Volver a Líneas
+    Step2Lines --> Step1Frame : Volver a Contorno
+    Step3Zones --> Step1Frame : Volver a Contorno
 
-    Step1Frame --> CalibA4 : Activa calibración métrica
-    Step2Lines --> CalibA4 : Activa calibración métrica
-    Step3Zones --> CalibA4 : Activa calibración métrica
-    CalibA4 --> Step1Frame : Completa o cancela (retorna al paso origen)
+    Step1Frame --> CalibA4 : Activa calibración A4 desde CalibrationBar
+    Step2Lines --> CalibA4 : Activa calibración A4 desde CalibrationBar
+    Step3Zones --> CalibA4 : Activa calibración A4 desde CalibrationBar
+    CalibA4 --> Step1Frame : Aplica escala o cancela (retorna al paso origen)
 
     Step1Frame --> Eyedropper : Activa gotero 1 clic
-    Step2Lines --> Eyedropper : Activa gotero 1 clic
-    Step3Zones --> Eyedropper : Activa gotero 1 clic
+    Step2Lines --> Eyedropper : Activa gotero 1 clic (en Opciones)
+    Step3Zones --> Eyedropper : Activa Color (Gotero)
     Eyedropper --> Step2Lines : Muestrea píxel o cancela (retorna al paso origen)
 
+    Step1Frame --> LateralZY : Abre Vista Lateral ZY (Avanzado en CalibrationBar)
+    Step2Lines --> LateralZY : Abre Vista Lateral ZY (Avanzado en CalibrationBar)
+    LateralZY --> Step1Frame : Vuelve a Vista Frontal XY (estima profundidad Z)
+
     note right of Step2Lines
-        Pila Undo / Redo activa en los 3 pasos:
-        Ctrl+Z / Ctrl+Y restaura snapshot inmutable de
-        (quadCorners, vDividers, hShelves, diagonalDividers, frontZones)
+        Pila Undo / Redo activa en las 3 vistas y los 3 pasos (Ctrl+Z / Ctrl+Y):
+        Restaura snapshot inmutable de
+        (quad, vDividers, hShelves, diagonalDividers, curvedCuts, lShape,
+        frontZones, cubiertaMaterialOverride, shelfMode, equalShelfCount y dims)
     end note
 ```
 
 ## Invariantes de Interacción v8.0
 
-1. **Exclusividad de Paso:** En todo instante el usuario opera exactamente en uno de los 3 pasos (`frame`, `lines` o `zones`), evitando interacciones accidentales (por ejemplo, arrastrar una esquina del marco mientras intenta seleccionar una puerta en `zones`).
-2. **Retorno Limpio de Subherramientas:** Activar `calibA4` o `eyedropper` memoriza el paso previo y, al finalizar el clic/trazo o pulsar `Escape`, devuelve el control automáticamente al paso anterior sin dejar la herramienta bloqueada.
-3. **Historial Unificado (`Undo/Redo`):** Toda mutación confirmada (al soltar el puntero en drag, completar un trazo, ejecutar auto-sugerencia, fusionar/dividir zonas o cambiar tipo/color) inserta exactamente un estado en la pila `Undo` y limpia `Redo`.
+1. **Lienzo Limpio sin Barras Innecesarias + Barra Superior de 3 Vistas:** Sin vista cargada en `frontal`, solo se muestran las pestañas `1. Frente (XY)`, `2. Arriba (XZ)`, `3. Lado (ZY)`, `"Medidas razonables"` y el acceso directo `"Dibujar en lienzo libre"`.
+2. **Sincronización Automática 3-Vistas y Cálculo Diferencial:** Ajustar `quad` (XY), `topQuad` (XZ) o `sideQuad` (ZY) ejecuta `synthesize3DFromTriViews`, sincronizando proporción `Alto Y`, profundidad `Z`, topología en L y curvas Bézier (`s = ∫ds`, `κ = 1/R`) en tiempo real.
+3. **Revelación Progresiva y Cero Duplicación:** En Paso 2 (`lines`), el modo `Editar / Trazar` convive con el botón rápido `"Curva"` / `"Curva interior L"` y el botón `"Medidas razonables"`; las opciones secundarias viven bajo `Opciones`.
+4. **Historial Unificado (`Undo/Redo`):** Toda mutación confirmada guarda un snapshot inmutable completo que incluye `dims`, `cubiertaMaterialOverride`, `curvedCuts` y `lShape`.

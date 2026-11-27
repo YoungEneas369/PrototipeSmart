@@ -75,6 +75,98 @@ export type FrontModuleKind =
 
 export type BaseSupportType = 'none' | 'legs' | 'wheels' | 'toe_kick';
 
+export type LShapeSide = 'right' | 'left';
+export type LShapeCornerJoint = 'butt_joint';
+export type WingRole = 'main' | 'return';
+export type CanvasViewTab = 'frontal' | 'superior' | 'lateral';
+export type CurvePlane = 'xz' | 'xy' | 'zy';
+export type CurveContourKind = 'corner_fillet' | 'top_arc' | 'free_bezier';
+
+/**
+ * Corte o contorno curvo definido paramétricamente mediante Bézier cúbica C¹ en un plano ortogonal,
+ * evaluado con cálculo diferencial (vector tangente r'(t), curvatura κ(t) = 1/R y longitud de arco ∫ds).
+ */
+export interface CurvedCutSpec {
+  id: string;
+  plane: CurvePlane;
+  kind: CurveContourKind;
+  /** 4 puntos de control normalizados [0, 1]^2 [P0, P1, P2, P3] en el plano `plane`. */
+  controlPoints: [Point2D, Point2D, Point2D, Point2D];
+  /** Radio nominal de empalme (mm) cuando corresponde a esquina/filete radial. */
+  radiusMm?: number;
+  /** Ubicación estructural del corte curvo sobre el mueble. */
+  cornerTarget?:
+    | 'l_outer'
+    | 'l_inner'
+    | 'front_top_left'
+    | 'front_top_right'
+    | 'top_arch';
+  label?: string;
+  /** Métricas derivadas por integración numérica y cálculo diferencial. */
+  arcLengthMm?: number;
+  minRadiusMm?: number;
+  maxCurvature?: number;
+}
+
+/**
+ * Geometría 2D extruida para tableros con perfil curvo en 3D y cálculo exacto de tapacanto por arco.
+ */
+export interface BoardCurveProfile {
+  /** Polígono cerrado en coordenadas locales del tablero (mm) en su plano principal (XZ o XY). */
+  pointsMm: Point2D[];
+  /** Plano de extrusión respecto al centro local de la pieza. */
+  extrudePlane: 'xz' | 'xy';
+  /** Espesor de extrusión en mm. */
+  extrudeDepthMm: number;
+  /** Longitud diferencial total del borde curvo s = ∫ ||r'(t)|| dt (mm). */
+  arcLengthMm: number;
+  /** Radio mínimo de curvatura R_min = 1 / κ_max (mm). */
+  minRadiusMm: number;
+  /** Si es true, solo la longitud de arco lleva tapacanto (bordes rectos quedan embebidos/tocando alas). */
+  useOnlyArcEdge?: boolean;
+  /** Si es true, la longitud de arco reemplaza el canto recto `top` en el cálculo de tapacanto. */
+  replaceTopEdgeWithArc?: boolean;
+}
+
+/**
+ * Resumen de métricas de cálculo diferencial aplicadas al modelo completo.
+ */
+export interface DifferentialMetrics {
+  curvedCutCount: number;
+  totalArcLengthMm: number;
+  minCurvatureRadiusMm: number;
+  maxCurvature: number;
+}
+
+/**
+ * Ala secundaria perpendicular a 90° (planta XZ) para modelar muebles en L
+ * (escritorios en L, cocinas en L, clósets esquineros).
+ * Su topología interna (`vDividers`, `hShelves`, `diagonalDividers`, `frontZones`)
+ * vive en su propio espacio INTERIOR normalizado [0, 1]^2 visto desde el interior de la L.
+ */
+export interface LShapeWingConfig {
+  enabled: boolean;
+  side: LShapeSide;
+  /** Largo TOTAL del lado en L desde la pared trasera (z = 0) hasta el extremo del retorno (mm). */
+  returnLengthMm: number;
+  /** Profundidad del ala de retorno (mm). */
+  returnDepthMm: number;
+  /** Altura opcional del ala de retorno (mm). Si se omite, hereda `targetDimensions.y`. */
+  returnHeightMm?: number;
+  /** Encuentro constructivo en esquina ('butt_joint' = unión recta a tope / esquinero ciego 90°). */
+  cornerJoint?: LShapeCornerJoint;
+  /** Omite el lateral interior del retorno en esquinas abiertas de escritorio continuo en L. */
+  openCorner?: boolean;
+  vDividers: NormalizedSegment[];
+  hShelves: NormalizedSegment[];
+  diagonalDividers?: DiagonalSegment[];
+  shelfMode: 'equidistant' | 'custom';
+  equalShelfCount: number;
+  hasBackPanel?: boolean;
+  frontZones?: FrontZone[];
+  cubiertaMaterialOverride?: MelamineMaterial;
+}
+
 /**
  * Zona funcional frontal en espacio INTERIOR normalizado [0, 1]^2.
  * Permite modelar muebles abiertos, cerrados, mixtos (puertas + cajones + canastos + nichos),
@@ -144,7 +236,7 @@ export interface DiagonalSegment {
 }
 
 export interface FurnitureTopology {
-  viewsMode: 1 | 2;
+  viewsMode: 1 | 2 | 3;
   aspectRatioXY: number;
   aspectRatioZY?: number;
   /** Orden horario estricto [TL, TR, BR, BL] mapeado a (0,1), (1,1), (1,0), (0,0). */
@@ -174,6 +266,10 @@ export interface FurnitureTopology {
   toeKickHeightMm?: number;
   /** Acabado opcional para la cubierta superior (ej. cubierta roble sobre carcasa blanca). */
   cubiertaMaterialOverride?: MelamineMaterial;
+  /** Configuración opcional de ala secundaria perpendicular a 90° en planta XZ (Mueble en L). */
+  lShape?: LShapeWingConfig;
+  /** Cortes y empalmes curvos suaves analizados mediante cálculo diferencial (r'(t), κ, ∫ds). */
+  curvedCuts?: CurvedCutSpec[];
   /** Etiqueta descriptiva del tipo de mueble interpretado (para plano vectorial). */
   furnitureProfileLabel?: string;
 }
@@ -251,6 +347,10 @@ export interface BoardPiece {
   handleSide?: 'left' | 'right' | 'top' | 'none';
   /** Ángulo de inglete en grados para divisiones diagonales. */
   miterAngleDeg?: number;
+  /** Ala de origen en muebles en L ('main' = ala principal, 'return' = ala de retorno). */
+  wing?: WingRole;
+  /** Perfil curvo 2D extruido para render 3D suave y tapacanto diferencial s = ∫ds. */
+  curveProfile?: BoardCurveProfile;
 }
 
 export interface StructuralAlert {
@@ -298,6 +398,8 @@ export interface DespieceResult {
   alerts: StructuralAlert[];
   /** Lista consolidada de accesorios/herrajes externos (patas, tiradores, etc.) fuera de melamina. */
   hardwareSummary: HardwareItem[];
+  /** Métricas acumuladas de cálculo diferencial cuando existen cortes o esquinas curvas. */
+  differentialMetrics?: DifferentialMetrics;
 }
 
 export interface BaseMatrixScaleResult {

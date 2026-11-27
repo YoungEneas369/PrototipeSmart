@@ -6,6 +6,9 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  CanvasViewTab,
+  CurvePlane,
+  CurvedCutSpec,
   DiagonalSegment,
   FurnitureTopology,
   MelamineMaterial,
@@ -17,6 +20,8 @@ import {
   applyHomography,
   computeQuadToUnitHomography,
   exteriorToInterior,
+  fitDifferentialCurveFromStroke,
+  interiorToExterior,
   type Matrix3x3,
 } from '../../core/mathEngine';
 import {
@@ -37,6 +42,7 @@ import {
   MELAMINE_LABELS,
   clampNum,
   cloneQuad,
+  computeAdaptiveAutoExtend,
   computeSmoothOrthoGuide,
   distScreenPx,
   dragQuadEdge,
@@ -52,6 +58,7 @@ import {
   type LineHitResult,
   type LineRef,
   type LinesSubMode,
+  type OrthoGuideAxis,
   type SelectedSubRegion,
   type SnapIndicator,
   type SubTool,
@@ -106,9 +113,8 @@ type ActiveDrag =
       startU: number;
       startV: number;
       guidedEndImg: Point2D;
-      guidedEndU: number;
-      guidedEndV: number;
-      lockedAxis: 'horizontal' | 'vertical' | null;
+      points: Point2D[];
+      plane: CurvePlane;
       startClient: Point2D;
       clickFallbackLine: LineRef | null;
       pointerId: number;
@@ -123,7 +129,6 @@ type ActiveDrag =
   | {
       kind: 'editLine';
       hit: LineHitResult;
-      startImg: Point2D;
       startU: number;
       startV: number;
       baseLines: DraftLinesState;
@@ -139,7 +144,7 @@ type ActiveDrag =
 export interface UseCanvasPointerControllerOptions {
   canvasRef: React.RefObject<HTMLCanvasElement>;
   stageRef: React.RefObject<HTMLDivElement>;
-  viewTab: 'frontal' | 'lateral';
+  viewTab: CanvasViewTab;
   traceStep: TraceStep;
   frameMode: FrameMode;
   linesSubMode: LinesSubMode;
@@ -148,8 +153,10 @@ export interface UseCanvasPointerControllerOptions {
   magneticSnap: boolean;
   isSpacePan: boolean;
   frontBitmap: WorkingBitmap | null;
+  topBitmap: WorkingBitmap | null;
   sideBitmap: WorkingBitmap | null;
   quad: [Point2D, Point2D, Point2D, Point2D];
+  topQuad: [Point2D, Point2D, Point2D, Point2D];
   sideQuad: [Point2D, Point2D, Point2D, Point2D];
   focal35mm: 26 | 52;
   exteriorBgRgb: [number, number, number];
@@ -165,19 +172,20 @@ export interface UseCanvasPointerControllerOptions {
   onSelectZone: (zoneId: string | null) => void;
   onHoverZone: (zoneId: string | null) => void;
   onAddCalibPoint: (pt: Point2D) => void;
-  onEyedropperSampled: (material: MelamineMaterial, rgb: [number, number, number]) => void;
+  onEyedropperSampled: (material: MelamineMaterial) => void;
   onAddOrToggleSubRegion: (region: Omit<SelectedSubRegion, 'id'>, isCellClick: boolean) => void;
   onCommitOuterFrame: (
     bmp: WorkingBitmap,
     nextQuad: [Point2D, Point2D, Point2D, Point2D],
     opts: {
       resetInternalLines?: boolean;
-      applyDims?: boolean;
+      syncProportionY?: boolean;
       advanceToLines?: boolean;
       recordUndo?: boolean;
       undoBaseQuad?: [Point2D, Point2D, Point2D, Point2D];
     },
   ) => void;
+  onCommitTopQuad?: (nextTop: [Point2D, Point2D, Point2D, Point2D], ratioXZ: number) => void;
   onCommitSideQuad: (nextSide: [Point2D, Point2D, Point2D, Point2D], ratioZY: number, estDepth: number) => void;
   onCommitTracedVectors: (
     vDivs: NormalizedSegment[],
@@ -185,6 +193,7 @@ export interface UseCanvasPointerControllerOptions {
     diags: DiagonalSegment[],
     opts: { preserveZones?: boolean; recordUndo?: boolean },
   ) => void;
+  onCommitCurvedCut?: (cut: CurvedCutSpec) => void;
   onSetStatusMsg: (msg: string) => void;
 }
 
@@ -200,8 +209,10 @@ export function useCanvasPointerController({
   magneticSnap,
   isSpacePan,
   frontBitmap,
+  topBitmap,
   sideBitmap,
   quad,
+  topQuad,
   sideQuad,
   focal35mm,
   exteriorBgRgb,
@@ -220,8 +231,10 @@ export function useCanvasPointerController({
   onEyedropperSampled,
   onAddOrToggleSubRegion,
   onCommitOuterFrame,
+  onCommitTopQuad,
   onCommitSideQuad,
   onCommitTracedVectors,
+  onCommitCurvedCut,
   onSetStatusMsg,
 }: UseCanvasPointerControllerOptions) {
   const [zoom, setZoom] = useState<number>(1);
@@ -229,6 +242,9 @@ export function useCanvasPointerController({
   const [panToolActive, setPanToolActive] = useState<boolean>(false);
 
   const [draftQuad, setDraftQuad] = useState<[Point2D, Point2D, Point2D, Point2D] | null>(null);
+  const [draftTopQuad, setDraftTopQuad] = useState<[Point2D, Point2D, Point2D, Point2D] | null>(
+    null,
+  );
   const [draftSideQuad, setDraftSideQuad] = useState<[Point2D, Point2D, Point2D, Point2D] | null>(
     null,
   );
@@ -245,9 +261,11 @@ export function useCanvasPointerController({
   const [eyedropperPreview, setEyedropperPreview] = useState<EyedropperPreview | null>(null);
   const [hoverTarget, setHoverTarget] = useState<ActiveHoverTarget>({ kind: 'none' });
   const [isDraggingState, setIsDraggingState] = useState<boolean>(false);
+  const [isPanningState, setIsPanningState] = useState<boolean>(false);
 
   const dragRef = useRef<ActiveDrag | null>(null);
   const draftQuadRef = useRef<[Point2D, Point2D, Point2D, Point2D] | null>(null);
+  const draftTopQuadRef = useRef<[Point2D, Point2D, Point2D, Point2D] | null>(null);
   const draftSideQuadRef = useRef<[Point2D, Point2D, Point2D, Point2D] | null>(null);
   const draftLinesRef = useRef<DraftLinesState | null>(null);
   const draftRegionRef = useRef<DraftSubRegion | null>(null);
@@ -292,12 +310,14 @@ export function useCanvasPointerController({
   const clearDrafts = useCallback(() => {
     dragRef.current = null;
     draftQuadRef.current = null;
+    draftTopQuadRef.current = null;
     draftSideQuadRef.current = null;
     draftLinesRef.current = null;
     draftRegionRef.current = null;
     pinchBaseRef.current = null;
     activeTouchMapRef.current.clear();
     setDraftQuad(null);
+    setDraftTopQuad(null);
     setDraftSideQuad(null);
     setDraftLines(null);
     setDraftRegion(null);
@@ -307,6 +327,7 @@ export function useCanvasPointerController({
     setEyedropperPreview(null);
     setHoverTarget({ kind: 'none' });
     setIsDraggingState(false);
+    setIsPanningState(false);
   }, []);
 
   // Zoom continuo con Ctrl+Rueda (jamás bloquea el scroll vertical normal cuando zoom = 1×)
@@ -394,52 +415,43 @@ export function useCanvasPointerController({
       hShs: readonly NormalizedSegment[],
       excludeId?: string,
       axisLock: 'both' | 'uOnly' | 'vOnly' = 'both',
+      snapTolPx = 11,
     ): { pt: Point2D; u: number; v: number; indicator: SnapIndicator | null } | null => {
       if (!displayHomography) return null;
       const eMm = params.boardThickness;
       const xf = params.targetDimensions.x;
       const yf = params.targetDimensions.y;
 
-      // Por defecto (Imán OFF) o con Alt: CERO snapping — devuelve rawPt 100 % exacto
-      if (!magneticSnap || altKey) {
-        const unit = applyHomography(displayHomography.toUnit, rawPt);
-        if (!unit) return null;
-        return {
-          pt: rawPt,
-          u: exteriorToInterior(unit.x, eMm, xf),
-          v: exteriorToInterior(unit.y, eMm, yf),
-          indicator: null,
-        };
+      if (!altKey) {
+        const structSnap = snapPointToStructuralAnchors(
+          rawPt,
+          displayHomography.toUnit,
+          displayHomography.toCanvas,
+          vDivs,
+          hShs,
+          eMm,
+          xf,
+          yf,
+          scaleX,
+          scaleY,
+          snapTolPx,
+          excludeId,
+          axisLock,
+        );
+        if (structSnap && structSnap.indicator) {
+          return {
+            pt: structSnap.snappedImg,
+            u: structSnap.u,
+            v: structSnap.v,
+            indicator: structSnap.indicator,
+          };
+        }
       }
 
-      // Solo cuando el usuario activó explícitamente Imán ON: transición muy suave ≤ 3 px
-      const structSnap = snapPointToStructuralAnchors(
-        rawPt,
-        displayHomography.toUnit,
-        displayHomography.toCanvas,
-        vDivs,
-        hShs,
-        eMm,
-        xf,
-        yf,
-        scaleX,
-        scaleY,
-        3,
-        excludeId,
-        axisLock,
-      );
-      if (structSnap && structSnap.indicator) {
-        return {
-          pt: structSnap.snappedImg,
-          u: structSnap.u,
-          v: structSnap.v,
-          indicator: structSnap.indicator,
-        };
-      }
-
+      // Cuando se ancla solo un eje perpendicular durante trazo recto, evitar imán Sobel 2D que jale lateralmente
       const edgeRes =
         axisLock === 'both'
-          ? snapEdgeIfEnabled(rawPt, altKey, scaleX, scaleY, 3)
+          ? snapEdgeIfEnabled(rawPt, altKey, scaleX, scaleY, 5)
           : { pt: rawPt, indicator: null };
       const unit = applyHomography(displayHomography.toUnit, edgeRes.pt);
       if (!unit) return null;
@@ -450,7 +462,88 @@ export function useCanvasPointerController({
         indicator: edgeRes.indicator,
       };
     },
-    [displayHomography, magneticSnap, params.boardThickness, params.targetDimensions, snapEdgeIfEnabled],
+    [displayHomography, params.boardThickness, params.targetDimensions, snapEdgeIfEnabled],
+  );
+
+  const resolveGuidedStrokeEnd = useCallback(
+    (
+      startU: number,
+      startV: number,
+      rawEndPt: Point2D,
+      hom: { toUnit: Matrix3x3; toCanvas: Matrix3x3 },
+      scaleX: number,
+      scaleY: number,
+      altKey: boolean,
+      isTouch: boolean,
+      fallbackPt?: Point2D,
+    ): { endPt: Point2D; axis: OrthoGuideAxis; indicator: SnapIndicator | null } => {
+      const eMm = params.boardThickness;
+      const xf = params.targetDimensions.x;
+      const yf = params.targetDimensions.y;
+
+      const guide = computeSmoothOrthoGuide(
+        startU,
+        startV,
+        rawEndPt,
+        hom.toUnit,
+        hom.toCanvas,
+        eMm,
+        xf,
+        yf,
+        strokeMode,
+      );
+
+      // Ancla SOLO el eje perpendicular al trazo para no jalar nunca hacia bordes paralelos
+      const axisLock: 'both' | 'uOnly' | 'vOnly' =
+        guide.axis === 'horizontal' || guide.axis === 'near_horizontal'
+          ? 'uOnly'
+          : guide.axis === 'vertical' || guide.axis === 'near_vertical'
+            ? 'vOnly'
+            : 'both';
+
+      const snapped = snapForLineOperation(
+        rawEndPt,
+        scaleX,
+        scaleY,
+        altKey,
+        materializedBase.vDividers,
+        materializedBase.hShelves,
+        undefined,
+        axisLock,
+        isTouch ? 16 : 11,
+      );
+
+      let endPt = snapped?.pt ?? guide.guidedImg;
+      if (guide.axis === 'horizontal') {
+        const finalU = snapped ? snapped.u : guide.u;
+        endPt =
+          applyHomography(hom.toCanvas, {
+            x: interiorToExterior(finalU, eMm, xf),
+            y: interiorToExterior(startV, eMm, yf),
+          }) ??
+          fallbackPt ??
+          guide.guidedImg;
+      } else if (guide.axis === 'vertical') {
+        const finalV = snapped ? snapped.v : guide.v;
+        endPt =
+          applyHomography(hom.toCanvas, {
+            x: interiorToExterior(startU, eMm, xf),
+            y: interiorToExterior(finalV, eMm, yf),
+          }) ??
+          fallbackPt ??
+          guide.guidedImg;
+      }
+
+      return { endPt, axis: guide.axis, indicator: snapped?.indicator ?? null };
+    },
+    [
+      params.boardThickness,
+      params.targetDimensions,
+      strokeMode,
+      snapForLineOperation,
+      materializedBase.vDividers,
+      materializedBase.hShelves,
+    ],
   );
 
   const handlePointerCancel = useCallback(() => {
@@ -496,6 +589,7 @@ export function useCanvasPointerController({
         pointerId: e.pointerId,
       };
       setIsDraggingState(true);
+      setIsPanningState(true);
       canvas.setPointerCapture(e.pointerId);
       return;
     }
@@ -524,43 +618,65 @@ export function useCanvasPointerController({
         );
         setLoupeFocusPt(null);
         setEyedropperPreview(null);
-        onEyedropperSampled(sampled.material, sampled.rgb);
+        onEyedropperSampled(sampled.material);
         onSetStatusMsg(
-          `Color copiado de la foto: ${MELAMINE_LABELS[sampled.material]}. Medidas y trazos intactos.`,
+          `Acabado detectado por gotero: ${MELAMINE_LABELS[sampled.material]} (RGB ${sampled.rgb.join(', ')}). Medidas y trazos intactos.`,
         );
         return;
       }
     }
 
-    // 2. Vista Lateral ZY
-    if (viewTab === 'lateral') {
-      const hit = hitTestFrameScreenPx(rawPt, sideQuad, scaleX, scaleY, isTouch);
-      if (!hit) return;
-      if (hit.kind === 'corner') {
-        dragRef.current = {
-          kind: 'corner',
-          idx: hit.idx,
-          baseQuad: cloneQuad(sideQuad),
-          pointerId: e.pointerId,
-        };
-      } else if (hit.kind === 'edge') {
-        dragRef.current = {
-          kind: 'edge',
-          edgeIdx: hit.edgeIdx,
-          startImg: rawPt,
-          baseQuad: cloneQuad(sideQuad),
-          pointerId: e.pointerId,
-        };
-      } else {
-        dragRef.current = {
-          kind: 'moveFrame',
-          startImg: rawPt,
-          baseQuad: cloneQuad(sideQuad),
-          pointerId: e.pointerId,
-        };
+    // 2. Vistas Superior XZ (Arriba) y Lateral ZY (Lado): contorno o dibujo libre de curvas
+    if (viewTab === 'superior' || viewTab === 'lateral') {
+      const targetQuad = viewTab === 'superior' ? topQuad : sideQuad;
+      const hit = hitTestFrameScreenPx(rawPt, targetQuad, scaleX, scaleY, isTouch);
+      if (hit && (hit.kind === 'corner' || hit.kind === 'edge' || (hit.kind === 'interior' && traceStep === 'frame' && strokeMode !== 'curve'))) {
+        if (hit.kind === 'corner') {
+          dragRef.current = {
+            kind: 'corner',
+            idx: hit.idx,
+            baseQuad: cloneQuad(targetQuad),
+            pointerId: e.pointerId,
+          };
+        } else if (hit.kind === 'edge') {
+          dragRef.current = {
+            kind: 'edge',
+            edgeIdx: hit.edgeIdx,
+            startImg: rawPt,
+            baseQuad: cloneQuad(targetQuad),
+            pointerId: e.pointerId,
+          };
+        } else {
+          dragRef.current = {
+            kind: 'moveFrame',
+            startImg: rawPt,
+            baseQuad: cloneQuad(targetQuad),
+            pointerId: e.pointerId,
+          };
+        }
+        setIsDraggingState(true);
+        setLoupeFocusPt(rawPt);
+        canvas.setPointerCapture(e.pointerId);
+        return;
       }
-      setIsDraggingState(true);
+
+      // Dibujo libre a mano alzada en Arriba (XZ) o Lado (ZY)
+      const nonFrontPlane: CurvePlane = viewTab === 'superior' ? 'xz' : 'zy';
       setLoupeFocusPt(rawPt);
+      setLiveStroke({ startImg: rawPt, currentImg: rawPt, points: [rawPt], orthoGuide: 'diagonal' });
+      dragRef.current = {
+        kind: 'drawVector',
+        startImg: rawPt,
+        startU: 0.5,
+        startV: 0.5,
+        guidedEndImg: rawPt,
+        points: [rawPt],
+        plane: nonFrontPlane,
+        startClient: { x: e.clientX, y: e.clientY },
+        clickFallbackLine: null,
+        pointerId: e.pointerId,
+      };
+      setIsDraggingState(true);
       canvas.setPointerCapture(e.pointerId);
       return;
     }
@@ -590,7 +706,7 @@ export function useCanvasPointerController({
           if (frontBitmap) {
             onCommitOuterFrame(frontBitmap, nextQuad, {
               resetInternalLines: false,
-              applyDims: false,
+              syncProportionY: true,
               advanceToLines: true,
               recordUndo: true,
               undoBaseQuad: quad,
@@ -730,7 +846,6 @@ export function useCanvasPointerController({
         dragRef.current = {
           kind: 'editLine',
           hit,
-          startImg: rawPt,
           startU: exteriorToInterior(unit.x, eMm, xf),
           startV: exteriorToInterior(unit.y, eMm, yf),
           baseLines,
@@ -742,36 +857,33 @@ export function useCanvasPointerController({
         return;
       }
 
-      // Espacio libre en 'smart' o modo explícito 'draw_only': tomar rawPt EXACTAMENTE donde hizo clic
-      // (cero teletransporte Sobel ni salto al borde, salvo si el usuario encendió explícitamente Imán ON ≤ 3 px)
-      const snappedStart =
-        magneticSnap && !e.altKey
-          ? snapForLineOperation(rawPt, scaleX, scaleY, false, vDivs, hShs, undefined, 'both')
-          : null;
+      // Espacio libre en 'smart' o modo explícito 'draw_only': iniciar trazo limpio
+      const snappedStart = snapForLineOperation(
+        rawPt,
+        scaleX,
+        scaleY,
+        e.altKey,
+        vDivs,
+        hShs,
+        undefined,
+        'both',
+        isTouch ? 16 : 11,
+      );
       const startPt = snappedStart?.pt ?? rawPt;
       const startUnit = applyHomography(displayHomography.toUnit, startPt);
       const startU = snappedStart?.u ?? (startUnit ? exteriorToInterior(startUnit.x, eMm, xf) : 0.5);
       const startV = snappedStart?.v ?? (startUnit ? exteriorToInterior(startUnit.y, eMm, yf) : 0.5);
       setSnapIndicator(snappedStart?.indicator ?? null);
       setLoupeFocusPt(startPt);
-      setLiveStroke({
-        startImg: startPt,
-        currentImg: startPt,
-        startU,
-        startV,
-        currentU: startU,
-        currentV: startV,
-        orthoGuide: null,
-      });
+      setLiveStroke({ startImg: startPt, currentImg: startPt, points: [startPt], orthoGuide: null });
       dragRef.current = {
         kind: 'drawVector',
         startImg: startPt,
         startU,
         startV,
         guidedEndImg: startPt,
-        guidedEndU: startU,
-        guidedEndV: startV,
-        lockedAxis: null,
+        points: [startPt],
+        plane: 'xy',
         startClient: { x: e.clientX, y: e.clientY },
         clickFallbackLine: hit ? { kind: hit.kind, id: hit.id } : null,
         pointerId: e.pointerId,
@@ -852,8 +964,8 @@ export function useCanvasPointerController({
         setSnapIndicator(snapped.indicator);
         return;
       }
-      if (viewTab === 'lateral' || (viewTab === 'frontal' && traceStep === 'frame')) {
-        const q = viewTab === 'frontal' ? quad : sideQuad;
+      if (viewTab !== 'frontal' || traceStep === 'frame') {
+        const q = viewTab === 'frontal' ? quad : viewTab === 'superior' ? topQuad : sideQuad;
         const hit = hitTestFrameScreenPx(rawPt, q, scaleX, scaleY, isTouch);
         if (!hit) setHoverTarget({ kind: 'none' });
         else if (hit.kind === 'corner') setHoverTarget({ kind: 'corner', idx: hit.idx });
@@ -909,21 +1021,17 @@ export function useCanvasPointerController({
         }
 
         setHoverTarget({ kind: 'none' });
-        if (magneticSnap && !e.altKey) {
-          const snapped = snapForLineOperation(
-            rawPt,
-            scaleX,
-            scaleY,
-            false,
-            materializedBase.vDividers,
-            materializedBase.hShelves,
-            undefined,
-            'both',
-          );
-          setSnapIndicator(snapped?.indicator ?? null);
-        } else {
-          setSnapIndicator(null);
-        }
+        const snapped = snapForLineOperation(
+          rawPt,
+          scaleX,
+          scaleY,
+          e.altKey,
+          materializedBase.vDividers,
+          materializedBase.hShelves,
+          undefined,
+          'both',
+        );
+        setSnapIndicator(snapped?.indicator ?? null);
         setLoupeFocusPt(null);
         return;
       }
@@ -955,7 +1063,8 @@ export function useCanvasPointerController({
       return;
     }
 
-    const bmp = viewTab === 'frontal' ? frontBitmap : sideBitmap;
+    const bmp =
+      viewTab === 'frontal' ? frontBitmap : viewTab === 'superior' ? topBitmap : sideBitmap;
     const bw = bmp?.w ?? 900;
     const bh = bmp?.h ?? 680;
 
@@ -974,12 +1083,21 @@ export function useCanvasPointerController({
           : (() => {
               const copy = cloneQuad(active.baseQuad);
               copy[active.idx] = clampedPt;
-              return isConvexQuad(copy) ? copy : (draftQuadRef.current ?? active.baseQuad);
+              const fallback =
+                viewTab === 'frontal'
+                  ? draftQuadRef.current
+                  : viewTab === 'superior'
+                    ? draftTopQuadRef.current
+                    : draftSideQuadRef.current;
+              return isConvexQuad(copy) ? copy : (fallback ?? active.baseQuad);
             })();
 
       if (viewTab === 'frontal') {
         draftQuadRef.current = nextQ;
         setDraftQuad(nextQ);
+      } else if (viewTab === 'superior') {
+        draftTopQuadRef.current = nextQ;
+        setDraftTopQuad(nextQ);
       } else {
         draftSideQuadRef.current = nextQ;
         setDraftSideQuad(nextQ);
@@ -1007,6 +1125,9 @@ export function useCanvasPointerController({
       if (viewTab === 'frontal') {
         draftQuadRef.current = nextQ;
         setDraftQuad(nextQ);
+      } else if (viewTab === 'superior') {
+        draftTopQuadRef.current = nextQ;
+        setDraftTopQuad(nextQ);
       } else {
         draftSideQuadRef.current = nextQ;
         setDraftSideQuad(nextQ);
@@ -1025,6 +1146,9 @@ export function useCanvasPointerController({
       if (viewTab === 'frontal') {
         draftQuadRef.current = nextQ;
         setDraftQuad(nextQ);
+      } else if (viewTab === 'superior') {
+        draftTopQuadRef.current = nextQ;
+        setDraftTopQuad(nextQ);
       } else {
         draftSideQuadRef.current = nextQ;
         setDraftSideQuad(nextQ);
@@ -1091,49 +1215,42 @@ export function useCanvasPointerController({
       return;
     }
 
-    if (active.kind === 'drawVector' && displayHomography) {
-      const eMm = params.boardThickness;
-      const xf = params.targetDimensions.x;
-      const yf = params.targetDimensions.y;
-      const effectiveMode: UserStrokeMode = strokeMode === 'diagonal' ? 'diagonal' : 'ortho';
-
-      // CERO snapping durante pointerMove: movimiento 100 % suave y continuo 1:1 con tu mano
-      const guide = computeSmoothOrthoGuide(
-        active.startU,
-        active.startV,
-        rawPt,
-        displayHomography.toUnit,
-        displayHomography.toCanvas,
-        eMm,
-        xf,
-        yf,
-        effectiveMode,
-        active.lockedAxis,
-        scaleX,
-        scaleY,
-        active.startImg,
-      );
-
-      if (guide.axis === 'horizontal' || guide.axis === 'vertical') {
-        active.lockedAxis = guide.axis;
+    if (active.kind === 'drawVector') {
+      const lastPt = active.points[active.points.length - 1];
+      if (!lastPt || Math.hypot(rawPt.x - lastPt.x, rawPt.y - lastPt.y) >= 4) {
+        active.points.push({ ...rawPt });
       }
-
-      const finalEndImg = effectiveMode === 'diagonal' ? rawPt : guide.guidedImg;
-      active.guidedEndImg = finalEndImg;
-      active.guidedEndU = guide.u;
-      active.guidedEndV = guide.v;
-
-      setSnapIndicator(null);
-      setLoupeFocusPt(finalEndImg);
-      setLiveStroke({
-        startImg: active.startImg,
-        currentImg: finalEndImg,
-        startU: active.startU,
-        startV: active.startV,
-        currentU: guide.u,
-        currentV: guide.v,
-        orthoGuide: guide.axis,
-      });
+      if (active.plane === 'xy' && displayHomography) {
+        const resolved = resolveGuidedStrokeEnd(
+          active.startU,
+          active.startV,
+          rawPt,
+          displayHomography,
+          scaleX,
+          scaleY,
+          e.altKey,
+          isTouch,
+        );
+        active.guidedEndImg = resolved.endPt;
+        setSnapIndicator(resolved.indicator);
+        setLoupeFocusPt(resolved.endPt);
+        setLiveStroke({
+          startImg: active.startImg,
+          currentImg: resolved.endPt,
+          points: [...active.points],
+          orthoGuide: resolved.axis,
+        });
+      } else {
+        active.guidedEndImg = rawPt;
+        setSnapIndicator(null);
+        setLoupeFocusPt(rawPt);
+        setLiveStroke({
+          startImg: active.startImg,
+          currentImg: rawPt,
+          points: [...active.points],
+          orthoGuide: 'diagonal',
+        });
+      }
       return;
     }
 
@@ -1148,17 +1265,9 @@ export function useCanvasPointerController({
       let focusPt: Point2D;
       let ind: SnapIndicator | null = null;
 
-      // Por defecto (Imán OFF) o con Alt: CERO snapping — rawPt 100 % directo sin saltos
-      if (!magneticSnap || e.altKey) {
-        const unit = applyHomography(displayHomography.toUnit, rawPt);
-        if (!unit) return;
-        u = exteriorToInterior(unit.x, eMm, xf);
-        v = exteriorToInterior(unit.y, eMm, yf);
-        focusPt = rawPt;
-        ind = null;
-      } else if (hit.part === 'body' && hit.kind !== 'diagonal') {
-        // Imán ON explícito: transición suave ≤ 3 px
-        const edgeRes = snapEdgeIfEnabled(rawPt, false, scaleX, scaleY, 3);
+      if (hit.part === 'body' && hit.kind !== 'diagonal') {
+        // Movimiento suave de cuerpo: sin saltos > 4 px ni jalones a bordes paralelos
+        const edgeRes = snapEdgeIfEnabled(rawPt, e.altKey, scaleX, scaleY, 4);
         const unit = applyHomography(displayHomography.toUnit, edgeRes.pt);
         if (!unit) return;
         u = exteriorToInterior(unit.x, eMm, xf);
@@ -1172,11 +1281,12 @@ export function useCanvasPointerController({
           rawPt,
           scaleX,
           scaleY,
-          false,
+          e.altKey,
           baseLines.vDividers,
           baseLines.hShelves,
           hit.id,
           endAxisLock,
+          isTouch ? 16 : 11,
         );
         if (!snapped) return;
         u = snapped.u;
@@ -1191,7 +1301,7 @@ export function useCanvasPointerController({
       if (hit.kind === 'vDivider') {
         const nextVDivs = baseLines.vDividers.map((d) => {
           if (d.id !== hit.id) return d;
-          if (hit.part === 'body') return { ...d, position: round4(clampNum(u, 0.015, 0.985)) };
+          if (hit.part === 'body') return { ...d, position: round4(clampNum(u, 0.03, 0.97)) };
           if (hit.part === 'start') {
             return { ...d, start: round4(clampNum(v, 0, Math.max(0, d.end - 0.05))) };
           }
@@ -1207,7 +1317,7 @@ export function useCanvasPointerController({
       } else if (hit.kind === 'hShelf') {
         const nextHShelves = baseLines.hShelves.map((s) => {
           if (s.id !== hit.id) return s;
-          if (hit.part === 'body') return { ...s, position: round4(clampNum(v, 0.015, 0.985)) };
+          if (hit.part === 'body') return { ...s, position: round4(clampNum(v, 0.03, 0.97)) };
           if (hit.part === 'start') {
             return { ...s, start: round4(clampNum(u, 0, Math.max(0, s.end - 0.05))) };
           }
@@ -1284,8 +1394,10 @@ export function useCanvasPointerController({
     }
 
     const { pt: endRaw, scaleX, scaleY } = getCanvasMetrics(e.clientX, e.clientY);
+    const isTouch = e.pointerType === 'touch';
     dragRef.current = null;
     setIsDraggingState(false);
+    setIsPanningState(false);
     setLiveStroke(null);
     setSnapIndicator(null);
     setLoupeFocusPt(null);
@@ -1300,11 +1412,24 @@ export function useCanvasPointerController({
         if (finalQuad && frontBitmap) {
           onCommitOuterFrame(frontBitmap, finalQuad, {
             resetInternalLines: false,
-            applyDims: false,
+            syncProportionY: finished.kind !== 'moveFrame',
             advanceToLines: false,
             recordUndo: true,
             undoBaseQuad: finished.baseQuad,
           });
+        }
+      } else if (viewTab === 'superior') {
+        const finalTop = draftTopQuadRef.current;
+        draftTopQuadRef.current = null;
+        setDraftTopQuad(null);
+        if (finalTop && topBitmap && onCommitTopQuad) {
+          const ratioXZ = estimateAspectRatioFixedFocal(
+            finalTop,
+            topBitmap.w,
+            topBitmap.h,
+            focal35mm,
+          );
+          onCommitTopQuad(finalTop, ratioXZ);
         }
       } else {
         const finalSide = draftSideQuadRef.current;
@@ -1338,7 +1463,7 @@ export function useCanvasPointerController({
         if (boxW >= 24 && boxH >= 24) {
           onCommitOuterFrame(frontBitmap, finalBox, {
             resetInternalLines: false,
-            applyDims: false,
+            syncProportionY: true,
             advanceToLines: true,
             recordUndo: true,
             undoBaseQuad: finished.baseQuad,
@@ -1411,62 +1536,107 @@ export function useCanvasPointerController({
         e.clientX - finished.startClient.x,
         e.clientY - finished.startClient.y,
       );
-      if (distScreen < 6) {
+      if (distScreen < 5) {
         if (finished.clickFallbackLine) {
           onSetSelectedLine(finished.clickFallbackLine);
-          onSetStatusMsg('Línea seleccionada: muévela, edita sus medidas o pulsa "✕ Borrar línea".');
+          onSetStatusMsg('Línea seleccionada: muévela, edita sus medidas o pulsa "Borrar línea".');
         } else if (linesSubMode === 'smart') {
           onSetSelectedLine(null);
         }
         return;
       }
 
-      if (!committedHomography) return;
-      const eMm = params.boardThickness;
-      const xf = params.targetDimensions.x;
-      const yf = params.targetDimensions.y;
-      const xInt = Math.max(1, xf - 2 * eMm);
-      const yInt = Math.max(1, yf - 2 * eMm);
-      const effectiveMode: UserStrokeMode = strokeMode === 'diagonal' ? 'diagonal' : 'ortho';
+      const rawStrokePts = [...finished.points, endRaw];
+      const planeHom =
+        finished.plane === 'xy'
+          ? committedHomography
+          : computeQuadToUnitHomography(finished.plane === 'xz' ? topQuad : sideQuad);
+      if (!planeHom) return;
 
-      // Usar EXACTAMENTE `finished.startImg` y `finished.guidedEndImg` que el usuario veía en pantalla
-      // (solo cae a `endRaw` si se disparó `pointerup` sin `pointermove` previo)
-      let endPt = finished.guidedEndImg;
-      let endU = finished.guidedEndU;
-      let endV = finished.guidedEndV;
-      if (Math.hypot(endPt.x - finished.startImg.x, endPt.y - finished.startImg.y) < 1) {
-        const fallbackGuide = computeSmoothOrthoGuide(
-          finished.startU,
-          finished.startV,
-          endRaw,
-          committedHomography.toUnit,
-          committedHomography.toCanvas,
-          eMm,
-          xf,
-          yf,
-          effectiveMode,
-          finished.lockedAxis,
-          scaleX,
-          scaleY,
-          finished.startImg,
-        );
-        endPt = effectiveMode === 'diagonal' ? endRaw : fallbackGuide.guidedImg;
-        endU = fallbackGuide.u;
-        endV = fallbackGuide.v;
+      const planeW =
+        finished.plane === 'xy'
+          ? Math.max(1, params.targetDimensions.x - 2 * params.boardThickness)
+          : finished.plane === 'xz'
+            ? params.targetDimensions.x
+            : params.targetDimensions.z;
+      const planeH =
+        finished.plane === 'xy'
+          ? Math.max(1, params.targetDimensions.y - 2 * params.boardThickness)
+          : finished.plane === 'xz'
+            ? params.targetDimensions.z
+            : params.targetDimensions.y;
+
+      const pointsMm: Point2D[] = [];
+      for (const sp of rawStrokePts) {
+        const uPt = applyHomography(planeHom.toUnit, sp);
+        if (!uPt) continue;
+        const uNorm =
+          finished.plane === 'xy'
+            ? exteriorToInterior(uPt.x, params.boardThickness, params.targetDimensions.x)
+            : clampNum(uPt.x, 0, 1);
+        const vNorm =
+          finished.plane === 'xy'
+            ? exteriorToInterior(uPt.y, params.boardThickness, params.targetDimensions.y)
+            : clampNum(uPt.y, 0, 1);
+        pointsMm.push({ x: uNorm * planeW, y: vNorm * planeH });
       }
 
-      // En 'ortho': autoExtend = 0.012 (solo toca pared si soltó a ≤ 1.2 %; con Alt: ~0)
-      // En 'diagonal': autoExtend = false (exactamente donde soltaste, cero teletransporte)
+      const curveFit = fitDifferentialCurveFromStroke(pointsMm, strokeMode === 'curve');
+      if (curveFit?.isCurved && onCommitCurvedCut) {
+        const toNorm = (pMm: Point2D): Point2D => ({
+          x: Number(clampNum(pMm.x / planeW, 0, 1).toFixed(4)),
+          y: Number(clampNum(pMm.y / planeH, 0, 1).toFixed(4)),
+        });
+        onCommitCurvedCut({
+          id: `usr_curve_${Date.now()}`,
+          plane: finished.plane,
+          kind: 'free_bezier',
+          controlPoints: [
+            toNorm(curveFit.controlPoints[0]),
+            toNorm(curveFit.controlPoints[1]),
+            toNorm(curveFit.controlPoints[2]),
+            toNorm(curveFit.controlPoints[3]),
+          ],
+          label: `Curva ${finished.plane.toUpperCase()} (s=${Math.round(curveFit.arcLengthMm)} mm)`,
+          arcLengthMm: curveFit.arcLengthMm,
+          minRadiusMm: curveFit.minRadiusMm,
+          maxCurvature: curveFit.maxCurvature,
+        });
+        return;
+      }
+
+      if (finished.plane !== 'xy' || !committedHomography) {
+        onSetStatusMsg(
+          'Trazo recto detectado en Arriba/Lado. Dibuja una curva amplia o usa las esquinas para ajustar el contorno.',
+        );
+        return;
+      }
+
+      const resolved = resolveGuidedStrokeEnd(
+        finished.startU,
+        finished.startV,
+        endRaw,
+        committedHomography,
+        scaleX,
+        scaleY,
+        e.altKey,
+        isTouch,
+        finished.guidedEndImg,
+      );
+      const autoExtendTol = e.altKey
+        ? 0.001
+        : computeAdaptiveAutoExtend(quad, scaleX, scaleY);
+
       const stroke = vectorizeUserStroke(
         finished.startImg,
-        endPt,
+        resolved.endPt,
         committedHomography.toUnit,
         materializedBase.vDividers,
         materializedBase.hShelves,
         params.boardThickness,
         params.targetDimensions,
-        effectiveMode === 'diagonal' ? false : e.altKey ? 0.0001 : 0.012,
-        effectiveMode,
+        autoExtendTol,
+        strokeMode,
       );
       if (!stroke) {
         onSetStatusMsg('Trazo demasiado corto. Arrastra una línea recta o diagonal sobre la foto.');
@@ -1474,58 +1644,37 @@ export function useCanvasPointerController({
       }
 
       if (stroke.kind === 'vDivider') {
-        // Preservar posición exacta en [0.015, 0.985] para evitar salto hacia [0.04, 0.96] cerca de bordes
-        const exactPos = round4(clampNum(finished.startU, 0.015, 0.985));
-        const finalSeg: NormalizedSegment = { ...stroke.segment, position: exactPos };
-        const posMm = Math.round(eMm + exactPos * xInt);
         onCommitTracedVectors(
-          [...materializedBase.vDividers, finalSeg],
+          [...materializedBase.vDividers, stroke.segment],
           materializedBase.hShelves,
           topology.diagonalDividers ?? [],
           { recordUndo: true },
         );
-        onSetSelectedLine({ kind: 'vDivider', id: finalSeg.id });
+        onSetSelectedLine({ kind: 'vDivider', id: stroke.segment.id });
         onSetStatusMsg(
-          `Divisor vertical creado en X = ${posMm} mm (largo ${stroke.spanMm} mm).`,
+          `Divisor vertical creado en X = ${stroke.positionMm} mm (largo ${stroke.spanMm} mm).`,
         );
       } else if (stroke.kind === 'hShelf') {
-        // Preservar posición exacta en [0.015, 0.985] para evitar salto hacia [0.04, 0.96] cerca de bordes
-        const exactPos = round4(clampNum(finished.startV, 0.015, 0.985));
-        const finalSeg: NormalizedSegment = { ...stroke.segment, position: exactPos };
-        const posMm = Math.round(eMm + exactPos * yInt);
         onCommitTracedVectors(
           materializedBase.vDividers,
-          [...materializedBase.hShelves, finalSeg],
+          [...materializedBase.hShelves, stroke.segment],
           topology.diagonalDividers ?? [],
           { recordUndo: true },
         );
-        onSetSelectedLine({ kind: 'hShelf', id: finalSeg.id });
+        onSetSelectedLine({ kind: 'hShelf', id: stroke.segment.id });
         onSetStatusMsg(
-          `Repisa horizontal creada en Y = ${posMm} mm (luz ${stroke.spanMm} mm).`,
+          `Repisa horizontal creada en Y = ${stroke.positionMm} mm (luz ${stroke.spanMm} mm).`,
         );
       } else {
-        // En diagonal: conservar extremos EXACTOS donde inició y soltó (cero snap 4.5 %)
-        const u1 = round4(clampNum(finished.startU, 0, 1));
-        const v1 = round4(clampNum(finished.startV, 0, 1));
-        const u2 = round4(clampNum(endU, 0, 1));
-        const v2 = round4(clampNum(endV, 0, 1));
-        const fdx = (u2 - u1) * xInt;
-        const fdy = (v2 - v1) * yInt;
-        const exactLenMm = Math.round(Math.hypot(fdx, fdy));
-        const exactAngleDeg = Math.round((Math.atan2(fdy, fdx) * 180) / Math.PI);
-        const finalDiag: DiagonalSegment =
-          exactLenMm >= Math.max(30, eMm * 1.5)
-            ? { ...stroke.segment, u1, v1, u2, v2 }
-            : stroke.segment;
         onCommitTracedVectors(
           materializedBase.vDividers,
           materializedBase.hShelves,
-          [...(topology.diagonalDividers ?? []), finalDiag],
+          [...(topology.diagonalDividers ?? []), stroke.segment],
           { recordUndo: true },
         );
-        onSetSelectedLine({ kind: 'diagonal', id: finalDiag.id });
+        onSetSelectedLine({ kind: 'diagonal', id: stroke.segment.id });
         onSetStatusMsg(
-          `División diagonal creada (${Math.abs(exactLenMm >= 30 ? exactAngleDeg : stroke.angleDeg)}° · largo ${exactLenMm >= 30 ? exactLenMm : stroke.spanMm} mm).`,
+          `División diagonal creada (${Math.abs(stroke.angleDeg)}° · largo ${stroke.spanMm} mm).`,
         );
       }
       return;
@@ -1570,14 +1719,14 @@ export function useCanvasPointerController({
     if (isDraggingState) return 'grabbing';
     if (isSpacePan || panToolActive) return 'grab';
     if (subTool !== 'none') return 'crosshair';
-    if (viewTab === 'lateral' || traceStep === 'frame') {
+    if (viewTab !== 'frontal' || traceStep === 'frame') {
       if (pickingCorners !== null) return 'crosshair';
       if (hoverTarget.kind === 'corner') return 'grab';
       if (hoverTarget.kind === 'edge') {
         return hoverTarget.edgeIdx === 0 || hoverTarget.edgeIdx === 2 ? 'ns-resize' : 'ew-resize';
       }
-      if (hoverTarget.kind === 'frameInterior') return 'move';
-      return frameMode === 'box' ? 'crosshair' : 'default';
+      if (hoverTarget.kind === 'frameInterior') return strokeMode === 'curve' ? 'crosshair' : 'move';
+      return frameMode === 'box' || strokeMode === 'curve' ? 'crosshair' : 'default';
     }
     if (traceStep === 'lines') {
       if (linesSubMode === 'regions') return 'crosshair';
@@ -1614,6 +1763,7 @@ export function useCanvasPointerController({
     applyZoom,
     resetViewport,
     draftQuad,
+    draftTopQuad,
     draftSideQuad,
     draftLines,
     draftRegion,
@@ -1626,7 +1776,7 @@ export function useCanvasPointerController({
     setEyedropperPreview,
     hoverTarget,
     isDraggingState,
-    isPanning: dragRef.current?.kind === 'pan',
+    isPanning: isPanningState,
     canvasCursor,
     clearDrafts,
     handlePointerDown,

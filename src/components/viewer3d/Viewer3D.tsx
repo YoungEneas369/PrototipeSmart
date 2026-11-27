@@ -11,71 +11,48 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentRef } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
 import { Edges, Html, Line, OrbitControls } from '@react-three/drei';
-import { AlertTriangle, Eye, EyeOff, RotateCcw, X } from 'lucide-react';
+import { AlertTriangle, Eye, EyeOff, Layers, RotateCcw, X } from 'lucide-react';
 import * as THREE from 'three';
 import type {
+  BoardCurveProfile,
   BoardPiece,
   DespieceResult,
   FurnitureTopology,
   MelamineMaterial,
   ScaleAndBoardParams,
 } from '../../types/contracts';
-import { calculateShelfDeflectionDIN, resolveBaseSupport } from '../../core/mathEngine';
+import {
+  calculateShelfDeflectionDIN,
+  computeSupportLegCoordsMm,
+  extractReturnWingTopology,
+  resolveBaseSupport,
+  resolveLShapePlan,
+} from '../../core/mathEngine';
 
 export interface Viewer3DProps {
   despiece: DespieceResult;
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
   explodeFactor: number;
+  displayUnit?: 'mm' | 'cm';
   variant?: 'default' | 'compact' | 'solo';
   modelKey?: string;
   selectedZoneId?: string | null;
   hoveredZoneId?: string | null;
   onSelectZone?: (zoneId: string | null) => void;
   onHoverZone?: (zoneId: string | null) => void;
+  onExplodeChange?: (value: number) => void;
   onAddCenterDivider?: () => void;
 }
 
-type CameraPreset = 'iso' | 'front' | 'side' | 'back';
+type CameraPreset = 'iso' | 'front' | 'side';
+type BaseSupportResolved = ReturnType<typeof resolveBaseSupport>;
 
-interface BasketRodSpec {
-  position: [number, number, number];
-  rotation: [number, number, number];
-  length: number;
-}
-
-const _rodUpAxis = new THREE.Vector3(0, 1, 0);
-const _rodDirVec = new THREE.Vector3();
-const _rodQuat = new THREE.Quaternion();
-const _rodEuler = new THREE.Euler();
-
-function makeWireRod(
-  ax: number,
-  ay: number,
-  az: number,
-  bx: number,
-  by: number,
-  bz: number,
-): BasketRodSpec {
-  const dx = bx - ax;
-  const dy = by - ay;
-  const dz = bz - az;
-  const length = Math.hypot(dx, dy, dz);
-  if (length < 1e-6) {
-    return { position: [ax, ay, az], rotation: [0, 0, 0], length: 0 };
+function format3DDim(mm: number, unit: 'mm' | 'cm'): string {
+  if (unit === 'cm') {
+    return `${Number((mm / 10).toFixed(1))} cm`;
   }
-  _rodDirVec.set(dx / length, dy / length, dz / length);
-  if (_rodDirVec.y < -0.999999) {
-    _rodEuler.set(Math.PI, 0, 0);
-  } else {
-    _rodQuat.setFromUnitVectors(_rodUpAxis, _rodDirVec);
-    _rodEuler.setFromQuaternion(_rodQuat);
-  }
-  return {
-    position: [(ax + bx) / 2, (ay + by) / 2, (az + bz) / 2],
-    rotation: [_rodEuler.x, _rodEuler.y, _rodEuler.z],
-    length,
-  };
+  return `${Math.round(mm)} mm`;
 }
 
 function createProceduralTexture(
@@ -126,27 +103,11 @@ function createProceduralTexture(
         ctx.stroke();
       }
     } else {
-      // Tablero MDF / Durolac 3 mm beige-madera claro limpio con sutil textura prensada
-      const grad = ctx.createLinearGradient(0, 0, 256, 256);
-      grad.addColorStop(0, '#e3d6c2');
-      grad.addColorStop(0.5, '#ebdfce');
-      grad.addColorStop(1, '#dbcbb4');
-      ctx.fillStyle = grad;
+      ctx.fillStyle = '#a47e58';
       ctx.fillRect(0, 0, 256, 256);
-
-      // Sutil fibra horizontal de tablero prensado
-      ctx.fillStyle = 'rgba(148, 118, 84, 0.065)';
-      for (let y = 0; y < 256; y += 5) {
-        ctx.fillRect(0, y, 256, 1);
-      }
-      // Micro-moteado determinista tipo MDF crudo fino
-      for (let i = 0; i < 420; i++) {
-        const px = ((i * 73 + 19) % 256);
-        const py = ((i * 137 + 41) % 256);
-        const w = 2 + (i % 4);
-        ctx.fillStyle =
-          i % 3 === 0 ? 'rgba(255, 250, 242, 0.16)' : 'rgba(130, 102, 72, 0.08)';
-        ctx.fillRect(px, py, w, 1.5);
+      ctx.fillStyle = 'rgba(65, 42, 20, 0.12)';
+      for (let i = 0; i < 256; i += 4) {
+        ctx.fillRect(i, 0, 1, 256);
       }
     }
   }
@@ -157,6 +118,96 @@ function createProceduralTexture(
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.needsUpdate = true;
   return tex;
+}
+
+function CurvedBoardMesh({
+  piece,
+  curveProfile,
+  pos,
+  tex,
+  emissiveColor,
+  emissiveIntensity,
+  sev,
+  isHighlighted,
+  edgeColor,
+  onClick,
+  onPointerOver,
+  onPointerOut,
+}: {
+  piece: BoardPiece;
+  curveProfile: BoardCurveProfile;
+  pos: [number, number, number];
+  tex: THREE.CanvasTexture;
+  emissiveColor: string;
+  emissiveIntensity: number;
+  sev?: 'warning' | 'critical';
+  isHighlighted: boolean;
+  edgeColor: string;
+  onClick: (e: { stopPropagation: () => void }) => void;
+  onPointerOver: (e: { stopPropagation: () => void }) => void;
+  onPointerOut: () => void;
+}) {
+  const geom = useMemo(() => {
+    const shape = new THREE.Shape();
+    const isXZ = curveProfile.extrudePlane === 'xz';
+    curveProfile.pointsMm.forEach((pt, idx) => {
+      const sx = pt.x / 1000;
+      const sy = isXZ ? -pt.y / 1000 : pt.y / 1000;
+      if (idx === 0) shape.moveTo(sx, sy);
+      else shape.lineTo(sx, sy);
+    });
+    shape.closePath();
+
+    const depthM = Math.max(0.003, curveProfile.extrudeDepthMm / 1000);
+    const extruded = new THREE.ExtrudeGeometry(shape, {
+      depth: depthM,
+      bevelEnabled: false,
+      curveSegments: 24,
+    });
+    extruded.translate(0, 0, -depthM / 2);
+    if (isXZ) {
+      extruded.rotateX(-Math.PI / 2);
+    }
+    extruded.computeVertexNormals();
+    return extruded;
+  }, [curveProfile]);
+
+  useEffect(() => {
+    return () => {
+      geom.dispose();
+    };
+  }, [geom]);
+
+  return (
+    <mesh
+      position={pos}
+      rotation={piece.rotacion3D}
+      geometry={geom}
+      castShadow
+      receiveShadow
+      onClick={onClick}
+      onPointerOver={onPointerOver}
+      onPointerOut={onPointerOut}
+    >
+      {sev ? (
+        <meshStandardMaterial
+          color={sev === 'critical' ? '#ef4444' : '#f59e0b'}
+          emissive={emissiveColor}
+          emissiveIntensity={isHighlighted ? 0.35 : 0}
+          roughness={0.45}
+        />
+      ) : (
+        <meshStandardMaterial
+          map={tex}
+          emissive={emissiveColor}
+          emissiveIntensity={emissiveIntensity}
+          roughness={0.55}
+          metalness={0.05}
+        />
+      )}
+      <Edges color={edgeColor} threshold={22} />
+    </mesh>
+  );
 }
 
 /**
@@ -199,11 +250,9 @@ function CameraRig({
     const apparentHalfW =
       preset === 'front'
         ? xm * 0.5 + 0.16
-        : preset === 'back'
-          ? (xm * 0.96 + zm * 0.26) * 0.5 + 0.16
-          : preset === 'side'
-            ? zm * 0.5 + 0.16
-            : (xm * 0.83 + zm * 0.57) * 0.5 + 0.17;
+        : preset === 'side'
+          ? zm * 0.5 + 0.16
+          : (xm * 0.83 + zm * 0.57) * 0.5 + 0.17;
     const horizFitDist = apparentHalfW / (0.39 * aspect);
     const vertFitDist = (ymTotal * 0.5 + 0.18) / 0.42;
     const dist = Math.max(camDistRef.current, horizFitDist, vertFitDist);
@@ -211,11 +260,9 @@ function CameraRig({
     const pos: [number, number, number] =
       preset === 'front'
         ? [0, ty, dist * 1.42]
-        : preset === 'back'
-          ? [-dist * 0.24, Math.max(ty * 1.06, dist * 0.22), -dist * 1.4]
-          : preset === 'side'
-            ? [dist * 1.42, ty * 1.05, 0.02]
-            : [dist * 0.72, Math.max(ty * 1.15, dist * 0.58), dist * 1.08];
+        : preset === 'side'
+          ? [dist * 1.42, ty * 1.05, 0.02]
+          : [dist * 0.72, Math.max(ty * 1.15, dist * 0.58), dist * 1.08];
 
     camera.position.set(pos[0], pos[1], pos[2]);
     if (controlsRef.current) {
@@ -233,6 +280,9 @@ interface MeshGroupProps {
   despiece: DespieceResult;
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
+  support: BaseSupportResolved;
+  hasToeKickPieces: boolean;
+  displayUnit: 'mm' | 'cm';
   explodeFactor: number;
   showDimensions: boolean;
   selectedPieceId: string | null;
@@ -247,6 +297,9 @@ function FurnitureMeshGroup({
   despiece,
   topology,
   params,
+  support,
+  hasToeKickPieces,
+  displayUnit,
   explodeFactor,
   showDimensions,
   selectedPieceId,
@@ -266,11 +319,6 @@ function FurnitureMeshGroup({
   const e = params.boardThickness;
   const xInt = Math.max(1, xf - 2 * e);
   const yInt = Math.max(1, yf - 2 * e);
-  const support = resolveBaseSupport(topology);
-  const hasToeKickPieces = useMemo(
-    () => despiece.matrizDespiece.some((p) => p.tipo === 'zocalo'),
-    [despiece.matrizDespiece],
-  );
   const legHeightMm = support.type === 'legs' || support.type === 'wheels' ? support.heightMm : 0;
   const toeKickMm = support.type === 'toe_kick' && hasToeKickPieces ? support.heightMm : 0;
   const isWheels = support.type === 'wheels';
@@ -308,10 +356,47 @@ function FurnitureMeshGroup({
     };
   }, [textureBank]);
 
-  const zoneMap = useMemo(
-    () => new Map((topology.frontZones ?? []).map((z) => [z.id, z])),
-    [topology.frontZones],
-  );
+  const lPlanBase = useMemo(() => resolveLShapePlan(topology, params), [topology, params]);
+
+  const effectiveLPlan = useMemo(() => {
+    if (!lPlanBase?.enabled) return null;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (const p of despiece.matrizDespiece) {
+      if (p.wing !== 'return' || p.tipo === 'puerta' || p.tipo === 'frente_cajon') continue;
+      const rotY = p.rotacion3D[1] ?? 0;
+      const cosY = Math.abs(Math.cos(rotY));
+      const sinY = Math.abs(Math.sin(rotY));
+      const worldDz = p.dimensiones3D[0] * sinY + p.dimensiones3D[2] * cosY;
+      minZ = Math.min(minZ, p.posicion3D[2] - worldDz / 2);
+      maxZ = Math.max(maxZ, p.posicion3D[2] + worldDz / 2);
+    }
+    if (Number.isFinite(minZ) && Number.isFinite(maxZ) && maxZ > minZ) {
+      return {
+        ...lPlanBase,
+        zStartB: minZ,
+        netLengthMm: maxZ - minZ,
+        totalLengthMm: maxZ,
+      };
+    }
+    return lPlanBase;
+  }, [lPlanBase, despiece.matrizDespiece]);
+
+  const zoneMap = useMemo(() => {
+    const map = new Map<
+      string,
+      { zone: NonNullable<FurnitureTopology['frontZones']>[number]; wing: 'main' | 'return' }
+    >();
+    for (const z of topology.frontZones ?? []) {
+      map.set(z.id, { zone: z, wing: 'main' });
+    }
+    if (effectiveLPlan?.enabled) {
+      for (const z of topology.lShape?.frontZones ?? []) {
+        map.set(z.id, { zone: z, wing: 'return' });
+      }
+    }
+    return map;
+  }, [topology.frontZones, topology.lShape?.frontZones, effectiveLPlan]);
 
   const alertMap = useMemo(() => {
     const map = new Map<string, 'warning' | 'critical'>();
@@ -321,9 +406,11 @@ function FurnitureMeshGroup({
     return map;
   }, [despiece.alerts]);
 
+  const totalZMm = effectiveLPlan?.enabled ? Math.max(zf, effectiveLPlan.totalLengthMm) : zf;
+  const maxBodyYMm = effectiveLPlan?.enabled ? Math.max(yf, effectiveLPlan.heightMm) : yf;
   const cx0 = xf / 2;
-  const cy0 = yf / 2;
-  const cz0 = zf / 2;
+  const cy0 = maxBodyYMm / 2;
+  const cz0 = totalZMm / 2;
   const explodeDist = explodeFactor * 0.24;
 
   const piecePosition = (p: BoardPiece): [number, number, number] => {
@@ -332,9 +419,10 @@ function FurnitureMeshGroup({
     let dy = py - cy0;
     let dz = pz - cz0;
     if (p.tipo === 'fondo') {
-      dx = 0;
+      const rotY = p.rotacion3D[1] ?? 0;
+      dx = -Math.sin(rotY);
       dy = 0;
-      dz = -1;
+      dz = -Math.cos(rotY);
     } else if (p.tipo === 'zocalo') {
       const xzLen = Math.hypot(dx, dz);
       const nx = xzLen > 1e-4 ? (dx / xzLen) * 0.55 : 0;
@@ -360,79 +448,18 @@ function FurnitureMeshGroup({
   const xm = xf / 1000;
   const ym = yf / 1000;
   const zm = zf / 1000;
-  const legInset = Math.min(0.06, xm * 0.12, zm * 0.18);
+  const totalZm = totalZMm / 1000;
 
-  const legCoords = useMemo<[number, number][]>(() => {
-    const total = Math.max(2, Math.min(12, Math.round(support.count || 4)));
-    const frontCount = Math.ceil(total / 2);
-    const backCount = Math.max(1, total - frontCount);
-    const spanX = Math.max(0.02, xm - 2 * legInset);
-    const distributeX = (count: number): number[] => {
-      if (count <= 1) return [xm / 2];
-      return Array.from({ length: count }, (_, idx) => legInset + (spanX * idx) / (count - 1));
-    };
-    const coords: [number, number][] = [];
-    for (const lx of distributeX(backCount)) coords.push([lx, legInset]);
-    for (const lx of distributeX(frontCount)) coords.push([lx, zm - legInset]);
-    return coords;
-  }, [support.count, xm, zm, legInset]);
+  const legCoords = useMemo<[number, number][]>(
+    () =>
+      computeSupportLegCoordsMm(topology, params, effectiveLPlan).map((pt) => [
+        pt.x / 1000,
+        pt.z / 1000,
+      ]),
+    [topology, params, effectiveLPlan],
+  );
 
-  // Geometría y materiales compartidos (GPU-safe) para canastos metálicos cromados modernos
-  const basketResources = useMemo(() => {
-    return {
-      unitCyl: new THREE.CylinderGeometry(1, 1, 1, 8),
-      rimMat: new THREE.MeshStandardMaterial({
-        color: '#f1f5f9',
-        metalness: 0.78,
-        roughness: 0.18,
-      }),
-      rimMatHi: new THREE.MeshStandardMaterial({
-        color: '#38bdf8',
-        metalness: 0.55,
-        roughness: 0.22,
-      }),
-      wireMat: new THREE.MeshStandardMaterial({
-        color: '#e8eef5',
-        metalness: 0.74,
-        roughness: 0.2,
-      }),
-      wireMatHi: new THREE.MeshStandardMaterial({
-        color: '#7dd3fc',
-        metalness: 0.5,
-        roughness: 0.22,
-      }),
-      railMat: new THREE.MeshStandardMaterial({
-        color: '#e2e8f0',
-        metalness: 0.52,
-        roughness: 0.28,
-      }),
-      railMatHi: new THREE.MeshStandardMaterial({
-        color: '#0ea5e9',
-        metalness: 0.45,
-        roughness: 0.26,
-      }),
-      railLipMat: new THREE.MeshStandardMaterial({
-        color: '#cbd5e1',
-        metalness: 0.62,
-        roughness: 0.24,
-      }),
-    };
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      basketResources.unitCyl.dispose();
-      basketResources.rimMat.dispose();
-      basketResources.rimMatHi.dispose();
-      basketResources.wireMat.dispose();
-      basketResources.wireMatHi.dispose();
-      basketResources.railMat.dispose();
-      basketResources.railMatHi.dispose();
-      basketResources.railLipMat.dispose();
-    };
-  }, [basketResources]);
-
-  // Geometría 3D procedural de canastos metálicos extraíbles (estilizados, aireados y con rejilla abierta real)
+  // Geometría 3D procedural de canastos metálicos extraíbles (excluidos de melamina) en ambas alas
   const basketVisuals = useMemo(() => {
     const list: Array<{
       key: string;
@@ -440,174 +467,173 @@ function FurnitureMeshGroup({
       cx: number;
       cy: number;
       cz: number;
+      rotY: number;
       w: number;
       h: number;
       d: number;
-      xLeftWall: number;
-      xRightWall: number;
-      railY: number;
-      railCz: number;
-      railLen: number;
-      rimRods: BasketRodSpec[];
-      wireRods: BasketRodSpec[];
+      railOffsetX: number;
     }> = [];
-    for (const z of topology.frontZones ?? []) {
-      if (z.kind !== 'baskets') continue;
-      const nb = Math.max(1, Math.min(6, Math.round(z.basketCount ?? 3)));
-      const u0 = Math.min(z.uStart, z.uEnd);
-      const u1 = Math.max(z.uStart, z.uEnd);
-      const v0 = Math.min(z.vStart, z.vEnd);
-      const v1 = Math.max(z.vStart, z.vEnd);
-      const x0 = e + u0 * xInt + (u0 > 0.01 ? e / 2 : 0);
-      const x1 = e + u1 * xInt - (u1 < 0.99 ? e / 2 : 0);
-      const y0 = e + v0 * yInt + (v0 > 0.01 ? e / 2 : 0);
-      const y1 = e + v1 * yInt - (v1 < 0.99 ? e / 2 : 0);
-      const wIn = x1 - x0;
-      const hIn = y1 - y0;
-      if (wIn < 80 || hIn < 90) continue;
 
-      const bw = Math.max(60, wIn - 16) / 1000;
-      const bd = Math.max(120, zf - 48) / 1000;
-      const slotH = hIn / nb;
-      const slotHM = slotH / 1000;
-      // Proporción real y aireada de canasto frutero moderno (deja espacio abierto encima de cada canasto)
-      const bh = Math.max(0.045, Math.min(0.115, slotHM * 0.44));
+    const appendWingBaskets = (
+      zones: FurnitureTopology['frontZones'],
+      wingXLeftStart: number,
+      wingXRightEnd: number,
+      wingYf: number,
+      wingZf: number,
+      wingSide: 'main' | 'right' | 'left',
+      zStartB = 0,
+      netLenB = 0,
+    ) => {
+      const wXInt = Math.max(1, wingXRightEnd - wingXLeftStart);
+      const wYInt = Math.max(1, wingYf - 2 * e);
+      for (const z of zones ?? []) {
+        if (z.kind !== 'baskets') continue;
+        const nb = Math.max(1, Math.min(6, Math.round(z.basketCount ?? 3)));
+        const u0 = Math.min(z.uStart, z.uEnd);
+        const u1 = Math.max(z.uStart, z.uEnd);
+        const v0 = Math.min(z.vStart, z.vEnd);
+        const v1 = Math.max(z.vStart, z.vEnd);
+        const x0 = wingXLeftStart + u0 * wXInt + (u0 > 0.01 ? e / 2 : 0);
+        const x1 = wingXLeftStart + u1 * wXInt - (u1 < 0.99 ? e / 2 : 0);
+        const y0 = e + v0 * wYInt + (v0 > 0.01 ? e / 2 : 0);
+        const y1 = e + v1 * wYInt - (v1 < 0.99 ? e / 2 : 0);
+        const wIn = x1 - x0;
+        const hIn = y1 - y0;
+        if (wIn < 80 || hIn < 90) continue;
+        const bw = Math.max(60, wIn - 24) / 1000;
+        const bd = Math.max(120, wingZf - 44) / 1000;
+        const slotH = hIn / nb;
+        const bh = Math.max(70, Math.min(175, slotH * 0.6)) / 1000;
+        const lx = (x0 + x1) / 2;
+        const lz = wingZf - 12 - (bd * 1000) / 2 + explodeDist * 650;
+        const railOffsetX = Math.max(0.02, wIn / 2000 - 0.005);
 
-      const halfW = bw / 2;
-      const halfD = bd / 2;
-      const halfH = bh / 2;
-      const taperX = Math.min(0.012, bw * 0.055);
-      const taperZ = Math.min(0.01, bd * 0.03);
-      const botHalfW = Math.max(0.016, halfW - taperX);
-      const botHalfD = Math.max(0.03, halfD - taperZ);
-      const midHalfW = (halfW + botHalfW) / 2;
-      const midHalfD = (halfD + botHalfD) / 2;
-
-      const handleHalfW = Math.min(0.048, bw * 0.19);
-      const handleOut = 0.011;
-      const handleY = halfH + 0.001;
-
-      const rimRods: BasketRodSpec[] = [
-        // Marco superior cromado
-        makeWireRod(-halfW, halfH, halfD, halfW, halfH, halfD),
-        makeWireRod(-halfW, halfH, -halfD, halfW, halfH, -halfD),
-        makeWireRod(-halfW, halfH, -halfD, -halfW, halfH, halfD),
-        makeWireRod(halfW, halfH, -halfD, halfW, halfH, halfD),
-        // Asa frontal sutil integrada al marco superior
-        makeWireRod(-handleHalfW, halfH, halfD, -handleHalfW, handleY, halfD + handleOut),
-        makeWireRod(handleHalfW, halfH, halfD, handleHalfW, handleY, halfD + handleOut),
-        makeWireRod(
-          -handleHalfW,
-          handleY,
-          halfD + handleOut,
-          handleHalfW,
-          handleY,
-          halfD + handleOut,
-        ),
-      ];
-
-      const wireRods: BasketRodSpec[] = [
-        // Aro horizontal medio perimetral (frente, atrás, izquierda, derecha)
-        makeWireRod(-midHalfW, 0, midHalfD, midHalfW, 0, midHalfD),
-        makeWireRod(-midHalfW, 0, -midHalfD, midHalfW, 0, -midHalfD),
-        makeWireRod(-midHalfW, 0, -midHalfD, -midHalfW, 0, midHalfD),
-        makeWireRod(midHalfW, 0, -midHalfD, midHalfW, 0, midHalfD),
-        // Marco inferior de rejilla
-        makeWireRod(-botHalfW, -halfH, botHalfD, botHalfW, -halfH, botHalfD),
-        makeWireRod(-botHalfW, -halfH, -botHalfD, botHalfW, -halfH, -botHalfD),
-        makeWireRod(-botHalfW, -halfH, -botHalfD, -botHalfW, -halfH, botHalfD),
-        makeWireRod(botHalfW, -halfH, -botHalfD, botHalfW, -halfH, botHalfD),
-        // 4 esquinas verticales suavemente ahusadas
-        makeWireRod(-halfW, halfH, halfD, -botHalfW, -halfH, botHalfD),
-        makeWireRod(halfW, halfH, halfD, botHalfW, -halfH, botHalfD),
-        makeWireRod(-halfW, halfH, -halfD, -botHalfW, -halfH, -botHalfD),
-        makeWireRod(halfW, halfH, -halfD, botHalfW, -halfH, -botHalfD),
-      ];
-
-      // Varillas verticales frente/atrás + varillas longitudinales del fondo abierto
-      const nX = Math.max(4, Math.min(8, Math.round(bw / 0.044)));
-      for (let i = 1; i <= nX; i++) {
-        const t = -1 + (2 * i) / (nX + 1);
-        wireRods.push(
-          makeWireRod(t * halfW, halfH, halfD, t * botHalfW, -halfH, botHalfD),
-          makeWireRod(t * halfW, halfH, -halfD, t * botHalfW, -halfH, -botHalfD),
-          makeWireRod(t * botHalfW, -halfH, -botHalfD, t * botHalfW, -halfH, botHalfD),
-        );
+        for (let k = 0; k < nb; k++) {
+          const cyMm = y0 + (k + 0.44) * slotH;
+          const worldX =
+            wingSide === 'main'
+              ? lx
+              : wingSide === 'right'
+                ? xf - lz
+                : lz;
+          const worldZ =
+            wingSide === 'main'
+              ? lz
+              : wingSide === 'right'
+                ? zStartB + lx
+                : zStartB + netLenB - lx;
+          const rotY =
+            wingSide === 'main' ? 0 : wingSide === 'right' ? -Math.PI / 2 : Math.PI / 2;
+          list.push({
+            key: `basket_${wingSide}_${z.id}_${k}`,
+            zoneId: z.id,
+            cx: worldX / 1000,
+            cy: cyMm / 1000,
+            cz: worldZ / 1000,
+            rotY,
+            w: bw,
+            h: bh,
+            d: bd,
+            railOffsetX,
+          });
+        }
       }
+    };
 
-      // Varillas verticales laterales izq/der + varillas transversales del fondo abierto
-      const nZ = Math.max(4, Math.min(8, Math.round(bd / 0.054)));
-      for (let j = 1; j <= nZ; j++) {
-        const t = -1 + (2 * j) / (nZ + 1);
-        wireRods.push(
-          makeWireRod(-halfW, halfH, t * halfD, -botHalfW, -halfH, t * botHalfD),
-          makeWireRod(halfW, halfH, t * halfD, botHalfW, -halfH, t * botHalfD),
-          makeWireRod(-botHalfW, -halfH, t * botHalfD, botHalfW, -halfH, t * botHalfD),
-        );
-      }
-
-      const railCz = (zf - 14 - (bd * 1000) / 2) / 1000;
-      const railLen = Math.min((zf - 12) / 1000, bd + 0.012);
-
-      for (let k = 0; k < nb; k++) {
-        const yBotMm = y0 + (k + 0.16) * slotH;
-        const cyM = (yBotMm + (bh * 1000) / 2) / 1000;
-        list.push({
-          key: `basket_${z.id}_${k}`,
-          zoneId: z.id,
-          cx: (x0 + x1) / 2000,
-          cy: cyM,
-          cz: (zf - 18 - (bd * 1000) / 2) / 1000 + explodeDist * 0.65,
-          w: bw,
-          h: bh,
-          d: bd,
-          xLeftWall: x0 / 1000,
-          xRightWall: x1 / 1000,
-          railY: cyM + halfH,
-          railCz,
-          railLen,
-          rimRods,
-          wireRods,
-        });
-      }
+    appendWingBaskets(topology.frontZones, e, xf - e, yf, zf, 'main');
+    if (effectiveLPlan?.enabled) {
+      const rTop = extractReturnWingTopology(topology);
+      const rLeftStart = effectiveLPlan.omitLeftLateral ? 0 : e;
+      const rRightEnd = effectiveLPlan.omitRightLateral
+        ? effectiveLPlan.netLengthMm
+        : effectiveLPlan.netLengthMm - e;
+      appendWingBaskets(
+        rTop.frontZones,
+        rLeftStart,
+        rRightEnd,
+        effectiveLPlan.heightMm,
+        effectiveLPlan.depthMm,
+        effectiveLPlan.side,
+        effectiveLPlan.zStartB,
+        effectiveLPlan.netLengthMm,
+      );
     }
-    return list;
-  }, [topology.frontZones, e, xInt, yInt, zf, explodeDist]);
 
-  // Resalte 3D suave para zonas abiertas / hueco de piernas seleccionadas o hovered desde 2D
+    return list;
+  }, [topology, effectiveLPlan, e, xf, yf, zf, explodeDist]);
+
+  // Resalte 3D suave para zonas abiertas / hueco de piernas seleccionadas o hovered desde 2D (ambas alas)
   const activeOpenZoneHighlight = useMemo(() => {
     const targetId = hoveredZoneId ?? selectedZoneId ?? null;
     if (!targetId) return null;
-    const z = zoneMap.get(targetId);
-    if (!z || (z.kind !== 'open' && z.kind !== 'leg_void')) return null;
+    const entry = zoneMap.get(targetId);
+    if (!entry) return null;
+    const { zone: z, wing } = entry;
+    if (z.kind !== 'open' && z.kind !== 'leg_void') return null;
+
     const u0 = Math.min(z.uStart, z.uEnd);
     const u1 = Math.max(z.uStart, z.uEnd);
     const v0 = Math.min(z.vStart, z.vEnd);
     const v1 = Math.max(z.vStart, z.vEnd);
-    const x0 = e + u0 * xInt;
-    const x1 = e + u1 * xInt;
-    const y0 = e + v0 * yInt;
-    const y1 = e + v1 * yInt;
+
+    if (wing === 'main' || !effectiveLPlan?.enabled) {
+      const x0 = e + u0 * xInt;
+      const x1 = e + u1 * xInt;
+      const y0 = e + v0 * yInt;
+      const y1 = e + v1 * yInt;
+      const w = (x1 - x0) / 1000;
+      const h = (y1 - y0) / 1000;
+      const d = Math.max(0.04, (zf - 10) / 1000);
+      if (w <= 0.02 || h <= 0.02) return null;
+      return {
+        cx: (x0 + x1) / 2000,
+        cy: (y0 + y1) / 2000,
+        cz: zf / 2000,
+        rotY: 0,
+        w,
+        h,
+        d,
+        isHover: hoveredZoneId === targetId,
+      };
+    }
+
+    const rLeftStart = effectiveLPlan.omitLeftLateral ? 0 : e;
+    const rRightEnd = effectiveLPlan.omitRightLateral
+      ? effectiveLPlan.netLengthMm
+      : effectiveLPlan.netLengthMm - e;
+    const rXInt = Math.max(1, rRightEnd - rLeftStart);
+    const rYInt = Math.max(1, effectiveLPlan.heightMm - 2 * e);
+    const x0 = rLeftStart + u0 * rXInt;
+    const x1 = rLeftStart + u1 * rXInt;
+    const y0 = e + v0 * rYInt;
+    const y1 = e + v1 * rYInt;
     const w = (x1 - x0) / 1000;
     const h = (y1 - y0) / 1000;
-    const d = Math.max(0.04, (zf - 10) / 1000);
+    const d = Math.max(0.04, (effectiveLPlan.depthMm - 10) / 1000);
     if (w <= 0.02 || h <= 0.02) return null;
+    const lx = (x0 + x1) / 2;
+    const lz = effectiveLPlan.depthMm / 2;
+    const worldX = effectiveLPlan.side === 'right' ? xf - lz : lz;
+    const worldZ =
+      effectiveLPlan.side === 'right'
+        ? effectiveLPlan.zStartB + lx
+        : effectiveLPlan.zStartB + effectiveLPlan.netLengthMm - lx;
     return {
-      cx: (x0 + x1) / 2000,
+      cx: worldX / 1000,
       cy: (y0 + y1) / 2000,
-      cz: zf / 2000,
+      cz: worldZ / 1000,
+      rotY: effectiveLPlan.side === 'right' ? -Math.PI / 2 : Math.PI / 2,
       w,
       h,
       d,
       isHover: hoveredZoneId === targetId,
     };
-  }, [hoveredZoneId, selectedZoneId, zoneMap, e, xInt, yInt, zf]);
+  }, [hoveredZoneId, selectedZoneId, zoneMap, effectiveLPlan, e, xInt, yInt, xf, zf]);
 
-  const edgeLineColor = params.material === 'grafito' ? '#94a3b8' : '#334155';
   const renderDims = showDimensions && explodeFactor <= 0.1;
 
   return (
-    <group position={[-xm / 2, 0, -zm / 2]}>
+    <group position={[-xm / 2, 0, -totalZm / 2]}>
       {/* Patas independientes o Ruedas giratorias (NO forman parte de la melamina) */}
       {(support.type === 'legs' || support.type === 'wheels') && legHeightMm > 0 && (
         <group>
@@ -663,7 +689,7 @@ function FurnitureMeshGroup({
           const pos = piecePosition(piece);
           const sev = alertMap.get(piece.id);
           const isBack = piece.tipo === 'fondo' || piece.tipo === 'fondo_cajon';
-          const pieceZone = piece.zoneId ? zoneMap.get(piece.zoneId) : undefined;
+          const pieceZone = piece.zoneId ? zoneMap.get(piece.zoneId)?.zone : undefined;
           const isGlassDoor = piece.isGlassDoor ?? pieceZone?.kind === 'door_glass';
           const isVertical =
             piece.tipo === 'lateral' ||
@@ -705,11 +731,9 @@ function FurnitureMeshGroup({
             ? '#0284c7'
             : sev
               ? '#7f1d1d'
-              : isBack
-                ? '#64748b'
-                : melMat === 'grafito'
-                  ? '#94a3b8'
-                  : edgeLineColor;
+              : melMat === 'grafito'
+                ? '#94a3b8'
+                : '#334155';
 
           const dxM = dx / 1000;
           const dyM = dy / 1000;
@@ -748,10 +772,13 @@ function FurnitureMeshGroup({
 
           const handleClickPiece = (e: { stopPropagation: () => void }) => {
             e.stopPropagation();
-            onSelectPiece(isSelected ? null : piece.id);
-            if (piece.zoneId && onSelectZone) {
-              onSelectZone(piece.zoneId);
+            if (isSelected) {
+              onSelectPiece(null);
+              onSelectZone?.(null);
+              return;
             }
+            onSelectPiece(piece.id);
+            onSelectZone?.(piece.zoneId ?? null);
           };
 
           const handlePointerOver = (e: { stopPropagation: () => void }) => {
@@ -850,6 +877,26 @@ function FurnitureMeshGroup({
             );
           }
 
+          if (piece.curveProfile && !isGlassDoor) {
+            return (
+              <CurvedBoardMesh
+                key={piece.id}
+                piece={piece}
+                curveProfile={piece.curveProfile}
+                pos={pos}
+                tex={tex}
+                emissiveColor={emissiveColor}
+                emissiveIntensity={emissiveIntensity}
+                sev={sev}
+                isHighlighted={isHighlighted}
+                edgeColor={pieceEdgeColor}
+                onClick={handleClickPiece}
+                onPointerOver={handlePointerOver}
+                onPointerOut={handlePointerOut}
+              />
+            );
+          }
+
           return (
             <mesh
               key={piece.id}
@@ -884,7 +931,7 @@ function FurnitureMeshGroup({
                   map={tex}
                   emissive={emissiveColor}
                   emissiveIntensity={emissiveIntensity}
-                  roughness={isBack ? 0.76 : 0.55}
+                  roughness={isBack ? 0.85 : 0.55}
                 />
               )}
               <Edges color={pieceEdgeColor} />
@@ -920,6 +967,7 @@ function FurnitureMeshGroup({
               activeOpenZoneHighlight.cy,
               activeOpenZoneHighlight.cz,
             ]}
+            rotation={[0, activeOpenZoneHighlight.rotY, 0]}
             raycast={() => null}
           >
             <boxGeometry
@@ -939,19 +987,19 @@ function FurnitureMeshGroup({
           </mesh>
         )}
 
-        {/* Canastos metálicos cromados extraíbles de rejilla abierta real (herraje externo no-melamina) */}
+        {/* Canastos metálicos cromados extraíbles (herraje externo no-melamina) */}
         {basketVisuals.map((bk) => {
-          const rodR = 0.0022;
-          const rimR = 0.0029;
+          const rodR = 0.003;
+          const wireOffsets = [-0.36, -0.18, 0, 0.18, 0.36];
           const isBkHighlight =
             selectedZoneId === bk.zoneId || hoveredZoneId === bk.zoneId;
-          const rimMat = isBkHighlight ? basketResources.rimMatHi : basketResources.rimMat;
-          const wireMat = isBkHighlight ? basketResources.wireMatHi : basketResources.wireMat;
-          const railMat = isBkHighlight ? basketResources.railMatHi : basketResources.railMat;
-          const railLipMat = isBkHighlight ? basketResources.railMatHi : basketResources.railLipMat;
+          const wireColor = isBkHighlight ? '#38bdf8' : '#cbd5e1';
+          const frontWireColor = isBkHighlight ? '#7dd3fc' : '#e2e8f0';
           return (
             <group
               key={bk.key}
+              position={[bk.cx, bk.cy, bk.cz]}
+              rotation={[0, bk.rotY, 0]}
               onClick={(e) => {
                 e.stopPropagation();
                 onSelectZone?.(bk.zoneId);
@@ -966,53 +1014,59 @@ function FurnitureMeshGroup({
                 onHoverZone?.(null);
               }}
             >
-              {/* Riel corredera izquierdo en perfil C pegado limpiamente a la pared del vano */}
-              <group position={[bk.xLeftWall, bk.railY, bk.railCz]}>
-                <mesh position={[0.0015, 0, 0]} material={railMat}>
-                  <boxGeometry args={[0.003, 0.015, bk.railLen]} />
+              <mesh position={[-bk.railOffsetX, bk.h * 0.35, 0]}>
+                <boxGeometry args={[0.008, 0.012, bk.d]} />
+                <meshStandardMaterial color="#64748b" metalness={0.75} roughness={0.3} />
+              </mesh>
+              <mesh position={[bk.railOffsetX, bk.h * 0.35, 0]}>
+                <boxGeometry args={[0.008, 0.012, bk.d]} />
+                <meshStandardMaterial color="#64748b" metalness={0.75} roughness={0.3} />
+              </mesh>
+              <group>
+                <mesh position={[0, bk.h / 2, bk.d / 2]}>
+                  <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
-                <mesh position={[0.0055, -0.0055, 0]} material={railLipMat}>
-                  <boxGeometry args={[0.01, 0.0028, bk.railLen]} />
+                <mesh position={[0, -bk.h / 2, bk.d / 2]}>
+                  <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
-                <mesh position={[0.0055, 0.0055, 0]} material={railLipMat}>
-                  <boxGeometry args={[0.01, 0.0028, bk.railLen]} />
+                <mesh position={[0, bk.h / 2, -bk.d / 2]}>
+                  <boxGeometry args={[bk.w, rodR * 2, rodR * 2]} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
-              </group>
-              {/* Riel corredera derecho en perfil C pegado limpiamente a la pared del vano */}
-              <group position={[bk.xRightWall, bk.railY, bk.railCz]}>
-                <mesh position={[-0.0015, 0, 0]} material={railMat}>
-                  <boxGeometry args={[0.003, 0.015, bk.railLen]} />
+                <mesh position={[-bk.w / 2, bk.h / 2, 0]}>
+                  <boxGeometry args={[rodR * 2, rodR * 2, bk.d]} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
-                <mesh position={[-0.0055, -0.0055, 0]} material={railLipMat}>
-                  <boxGeometry args={[0.01, 0.0028, bk.railLen]} />
+                <mesh position={[bk.w / 2, bk.h / 2, 0]}>
+                  <boxGeometry args={[rodR * 2, rodR * 2, bk.d]} />
+                  <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
                 </mesh>
-                <mesh position={[-0.0055, 0.0055, 0]} material={railLipMat}>
-                  <boxGeometry args={[0.01, 0.0028, bk.railLen]} />
-                </mesh>
-              </group>
-
-              {/* Cuerpo de rejilla cromada abierta (se desliza hacia adelante en vista explotada) */}
-              <group position={[bk.cx, bk.cy, bk.cz]}>
-                {bk.rimRods.map((rod, ri) => (
-                  <mesh
-                    key={`rim_${ri}`}
-                    geometry={basketResources.unitCyl}
-                    material={rimMat}
-                    position={rod.position}
-                    rotation={rod.rotation}
-                    scale={[rimR, rod.length, rimR]}
+                <mesh position={[0, -bk.h / 2, 0]}>
+                  <boxGeometry args={[bk.w, rodR * 1.4, bk.d]} />
+                  <meshStandardMaterial
+                    color={isBkHighlight ? '#0ea5e9' : '#94a3b8'}
+                    metalness={0.7}
+                    roughness={0.32}
+                    transparent
+                    opacity={0.72}
                   />
+                </mesh>
+                {wireOffsets.map((frac, wi) => (
+                  <mesh key={wi} position={[bk.w * frac, 0, bk.d / 2]}>
+                    <boxGeometry args={[rodR * 1.6, bk.h, rodR * 1.6]} />
+                    <meshStandardMaterial color={frontWireColor} metalness={0.85} roughness={0.2} />
+                  </mesh>
                 ))}
-                {bk.wireRods.map((rod, wi) => (
-                  <mesh
-                    key={`wire_${wi}`}
-                    geometry={basketResources.unitCyl}
-                    material={wireMat}
-                    position={rod.position}
-                    rotation={rod.rotation}
-                    scale={[rodR, rod.length, rodR]}
-                  />
-                ))}
+                {([-1, 1] as const).map((sx) =>
+                  ([-1, 1] as const).map((sz) => (
+                    <mesh key={`${sx}_${sz}`} position={[(sx * bk.w) / 2, 0, (sz * bk.d) / 2]}>
+                      <boxGeometry args={[rodR * 2, bk.h, rodR * 2]} />
+                      <meshStandardMaterial color={wireColor} metalness={0.85} roughness={0.22} />
+                    </mesh>
+                  )),
+                )}
               </group>
             </group>
           );
@@ -1036,7 +1090,7 @@ function FurnitureMeshGroup({
               wrapperClass="dim-html-wrapper"
               style={{ pointerEvents: 'none' }}
             >
-              <div className="dim-badge">X: {Math.round(xf)} mm</div>
+              <div className="dim-badge">X: {format3DDim(xf, displayUnit)}</div>
             </Html>
 
             <Line
@@ -1055,13 +1109,13 @@ function FurnitureMeshGroup({
               style={{ pointerEvents: 'none' }}
             >
               <div className="dim-badge dim-y">
-                <span>Y: {Math.round(yf)} mm</span>
+                <span>Y: {format3DDim(yf, displayUnit)}</span>
                 {support.type === 'wheels' ? (
-                  <span className="dim-sub">+{legHeightMm} ruedas</span>
+                  <span className="dim-sub">+{format3DDim(legHeightMm, displayUnit)} ruedas</span>
                 ) : support.type === 'legs' ? (
-                  <span className="dim-sub">+{legHeightMm} patas</span>
+                  <span className="dim-sub">+{format3DDim(legHeightMm, displayUnit)} patas</span>
                 ) : support.type === 'toe_kick' && toeKickMm > 0 ? (
-                  <span className="dim-sub">+{toeKickMm} zócalo</span>
+                  <span className="dim-sub">+{format3DDim(toeKickMm, displayUnit)} zócalo</span>
                 ) : null}
               </div>
             </Html>
@@ -1081,8 +1135,58 @@ function FurnitureMeshGroup({
               wrapperClass="dim-html-wrapper"
               style={{ pointerEvents: 'none' }}
             >
-              <div className="dim-badge dim-z">Z: {Math.round(zf)} mm</div>
+              <div className="dim-badge dim-z">Z: {format3DDim(zf, displayUnit)}</div>
             </Html>
+
+            {effectiveLPlan?.enabled && (() => {
+              const rzM = effectiveLPlan.depthMm / 1000;
+              const retX0 = effectiveLPlan.side === 'right' ? xm - rzM : 0;
+              const retX1 = effectiveLPlan.side === 'right' ? xm : rzM;
+              const l2EdgeX = effectiveLPlan.side === 'right' ? xm + 0.065 : -0.065;
+              const retYm = effectiveLPlan.heightMm / 1000;
+              return (
+                <>
+                  <Line
+                    points={[
+                      [l2EdgeX, -0.045, 0],
+                      [l2EdgeX, -0.045, totalZm],
+                    ]}
+                    color="#0284c7"
+                    lineWidth={2}
+                  />
+                  <Html
+                    position={[l2EdgeX, -0.085, totalZm / 2]}
+                    center
+                    zIndexRange={[1, 4]}
+                    wrapperClass="dim-html-wrapper"
+                    style={{ pointerEvents: 'none' }}
+                  >
+                    <div className="dim-badge">
+                      L2: {format3DDim(totalZMm, displayUnit)}
+                    </div>
+                  </Html>
+                  <Line
+                    points={[
+                      [retX0, retYm + 0.03, totalZm + 0.045],
+                      [retX1, retYm + 0.03, totalZm + 0.045],
+                    ]}
+                    color="#7c3aed"
+                    lineWidth={2}
+                  />
+                  <Html
+                    position={[(retX0 + retX1) / 2, retYm + 0.07, totalZm + 0.045]}
+                    center
+                    zIndexRange={[1, 4]}
+                    wrapperClass="dim-html-wrapper"
+                    style={{ pointerEvents: 'none' }}
+                  >
+                    <div className="dim-badge dim-z">
+                      Z2: {format3DDim(effectiveLPlan.depthMm, displayUnit)}
+                    </div>
+                  </Html>
+                </>
+              );
+            })()}
           </>
         )}
       </group>
@@ -1095,18 +1199,21 @@ export function Viewer3D({
   topology,
   params,
   explodeFactor,
+  displayUnit = 'mm',
   variant = 'default',
   modelKey,
   selectedZoneId,
   hoveredZoneId,
   onSelectZone,
   onHoverZone,
+  onExplodeChange,
   onAddCenterDivider,
 }: Viewer3DProps) {
   const [camPreset, setCamPreset] = useState<CameraPreset>('iso');
   const [camTrigger, setCamTrigger] = useState<number>(0);
   const [showDimensions, setShowDimensions] = useState<boolean>(true);
   const [selectedPieceId, setSelectedPieceId] = useState<string | null>(null);
+  const [explodeOpen, setExplodeOpen] = useState<boolean>(false);
 
   // Limpia automáticamente la pieza seleccionada si ya no existe al cambiar preset/catálogo
   useEffect(() => {
@@ -1115,6 +1222,10 @@ export function Viewer3D({
     }
   }, [despiece.matrizDespiece, selectedPieceId]);
 
+  useEffect(() => {
+    setExplodeOpen(false);
+  }, [modelKey]);
+
   const selectedPiece = useMemo(
     () => despiece.matrizDespiece.find((p) => p.id === selectedPieceId) ?? null,
     [despiece.matrizDespiece, selectedPieceId],
@@ -1122,9 +1233,13 @@ export function Viewer3D({
 
   const selectedPieceZoneLabel = useMemo(() => {
     if (!selectedPiece?.zoneId) return null;
-    const z = (topology.frontZones ?? []).find((item) => item.id === selectedPiece.zoneId);
+    const allZones = [
+      ...(topology.frontZones ?? []),
+      ...(topology.lShape?.enabled ? topology.lShape.frontZones ?? [] : []),
+    ];
+    const z = allZones.find((item) => item.id === selectedPiece.zoneId);
     return z?.label ?? selectedPiece.zoneId;
-  }, [selectedPiece, topology.frontZones]);
+  }, [selectedPiece, topology.frontZones, topology.lShape]);
 
   const selectedPieceDin = useMemo(() => {
     if (!selectedPiece || selectedPiece.tipo !== 'repisa') return null;
@@ -1136,7 +1251,7 @@ export function Viewer3D({
     );
   }, [selectedPiece]);
 
-  const supportSummary = resolveBaseSupport(topology);
+  const supportSummary = useMemo(() => resolveBaseSupport(topology), [topology]);
   const hasToeKickPieces = useMemo(
     () => despiece.matrizDespiece.some((p) => p.tipo === 'zocalo'),
     [despiece.matrizDespiece],
@@ -1147,9 +1262,27 @@ export function Viewer3D({
         ? supportSummary.heightMm
         : 0
       : supportSummary.heightMm;
+  const lPlanOuter = useMemo(() => resolveLShapePlan(topology, params), [topology, params]);
+  const totalZMm = useMemo(() => {
+    if (!lPlanOuter?.enabled) return params.targetDimensions.z;
+    let maxZ = Math.max(params.targetDimensions.z, lPlanOuter.totalLengthMm);
+    for (const p of despiece.matrizDespiece) {
+      if (p.wing !== 'return') continue;
+      const rotY = p.rotacion3D[1] ?? 0;
+      const cosY = Math.abs(Math.cos(rotY));
+      const sinY = Math.abs(Math.sin(rotY));
+      const worldDz = p.dimensiones3D[0] * sinY + p.dimensiones3D[2] * cosY;
+      maxZ = Math.max(maxZ, p.posicion3D[2] + worldDz / 2);
+    }
+    return maxZ;
+  }, [lPlanOuter, params.targetDimensions.z, despiece.matrizDespiece]);
+
   const xm = params.targetDimensions.x / 1000;
-  const ymTotal = (params.targetDimensions.y + legExtraMm) / 1000;
-  const zm = params.targetDimensions.z / 1000;
+  const maxBodyYMm = lPlanOuter?.enabled
+    ? Math.max(params.targetDimensions.y, lPlanOuter.heightMm)
+    : params.targetDimensions.y;
+  const ymTotal = (maxBodyYMm + legExtraMm) / 1000;
+  const zm = totalZMm / 1000;
   const maxDim = Math.max(xm, ymTotal, zm);
   const camDist = Math.max(2.0, maxDim * 1.84);
   const targetY = ymTotal / 2;
@@ -1160,6 +1293,17 @@ export function Viewer3D({
   const selectView = (next: CameraPreset) => {
     setCamPreset(next);
     setCamTrigger((n) => n + 1);
+  };
+
+  const handleToggleExplode = () => {
+    if (!onExplodeChange) return;
+    if (explodeOpen || explodeFactor > 0) {
+      setExplodeOpen(false);
+      onExplodeChange(0);
+    } else {
+      setExplodeOpen(true);
+      onExplodeChange(0.5);
+    }
   };
 
   const wrapperClass = [
@@ -1174,76 +1318,102 @@ export function Viewer3D({
     <div className={wrapperClass}>
       <div className="viewer3d-overlay-top">
         <div className="viewer3d-badges">
-          <span className="viewer3d-pill">
-            Visor 3D Offline · {despiece.matrizDespiece.length} placas
-            {!selectedPiece ? ' · Clic en pieza' : ''}
+          <span
+            className="viewer3d-pill"
+            title="Haz clic sobre cualquier placa para inspeccionar medidas de corte"
+          >
+            {despiece.matrizDespiece.length} piezas
           </span>
           {(supportSummary.type === 'legs' || supportSummary.type === 'wheels') && (
             <span className="badge-legs">
               {supportSummary.type === 'wheels' ? 'Ruedas' : 'Patas'} ({supportSummary.count} ×{' '}
-              {supportSummary.heightMm} mm) aparte
+              {format3DDim(supportSummary.heightMm, displayUnit)})
             </span>
           )}
           {supportSummary.type === 'toe_kick' && hasToeKickPieces && (
-            <span className="badge-support">Zócalo 4 lados ({supportSummary.heightMm} mm)</span>
+            <span className="badge-support">
+              Zócalo ({format3DDim(supportSummary.heightMm, displayUnit)})
+            </span>
           )}
         </div>
 
-        <div className="viewer3d-cam-bar" role="toolbar" aria-label="Controles de cámara 3D">
-          <button
-            type="button"
-            className={camPreset === 'iso' ? 'cam-btn active' : 'cam-btn'}
-            onClick={() => selectView('iso')}
-            title="Vista isométrica 3/4"
-            aria-label="Vista isométrica 3/4"
-          >
-            Iso
-          </button>
-          <button
-            type="button"
-            className={camPreset === 'front' ? 'cam-btn active' : 'cam-btn'}
-            onClick={() => selectView('front')}
-            title="Vista frontal XY"
-            aria-label="Vista frontal XY"
-          >
-            Frente
-          </button>
-          <button
-            type="button"
-            className={camPreset === 'side' ? 'cam-btn active' : 'cam-btn'}
-            onClick={() => selectView('side')}
-            title="Vista lateral ZY"
-            aria-label="Vista lateral ZY"
-          >
-            Lateral
-          </button>
-          <button
-            type="button"
-            className={camPreset === 'back' ? 'cam-btn active' : 'cam-btn'}
-            onClick={() => selectView('back')}
-            title="Vista trasera para inspeccionar la tapa / fondo Durolac"
-            aria-label="Vista trasera del mueble"
-          >
-            Atrás
-          </button>
-          <button
-            type="button"
-            className={showDimensions ? 'cam-btn active' : 'cam-btn'}
-            onClick={() => setShowDimensions((v) => !v)}
-            title="Mostrar u ocultar cotas 3D"
-            aria-label={showDimensions ? 'Ocultar cotas 3D' : 'Mostrar cotas 3D'}
-          >
-            {showDimensions ? <Eye size={13} /> : <EyeOff size={13} />} Cotas
-          </button>
-          <button
-            type="button"
-            className="cam-btn"
-            onClick={() => selectView(camPreset)}
-            title="Centrar y restablecer cámara"
-            aria-label="Centrar y restablecer cámara"
-          >
-            <RotateCcw size={13} />
-          </button>
+        <div className="viewer3d-controls-right">
+          <div className="viewer3d-cam-bar" role="toolbar" aria-label="Controles de cámara 3D">
+            <button
+              type="button"
+              className={camPreset === 'iso' ? 'cam-btn active' : 'cam-btn'}
+              onClick={() => selectView('iso')}
+              title="Vista isométrica 3/4"
+              aria-label="Vista isométrica 3/4"
+            >
+              Iso
+            </button>
+            <button
+              type="button"
+              className={camPreset === 'front' ? 'cam-btn active' : 'cam-btn'}
+              onClick={() => selectView('front')}
+              title="Vista frontal XY"
+              aria-label="Vista frontal XY"
+            >
+              Frente
+            </button>
+            <button
+              type="button"
+              className={camPreset === 'side' ? 'cam-btn active' : 'cam-btn'}
+              onClick={() => selectView('side')}
+              title="Vista lateral ZY"
+              aria-label="Vista lateral ZY"
+            >
+              Lateral
+            </button>
+            <button
+              type="button"
+              className={showDimensions ? 'cam-btn active' : 'cam-btn'}
+              onClick={() => setShowDimensions((v) => !v)}
+              title="Mostrar u ocultar cotas 3D"
+              aria-label={showDimensions ? 'Ocultar cotas 3D' : 'Mostrar cotas 3D'}
+            >
+              {showDimensions ? <Eye size={13} /> : <EyeOff size={13} />} Cotas
+            </button>
+            {onExplodeChange && (
+              <button
+                type="button"
+                className={explodeOpen || explodeFactor > 0 ? 'cam-btn active' : 'cam-btn'}
+                onClick={handleToggleExplode}
+                title="Separar piezas en vista explotada (0%–100%)"
+                aria-label="Separar piezas en vista explotada"
+                aria-pressed={explodeOpen || explodeFactor > 0}
+              >
+                <Layers size={13} />
+                {explodeFactor > 0 ? `${Math.round(explodeFactor * 100)}%` : 'Explotar'}
+              </button>
+            )}
+            <button
+              type="button"
+              className="cam-btn"
+              onClick={() => selectView(camPreset)}
+              title="Centrar y restablecer cámara"
+              aria-label="Centrar y restablecer cámara"
+            >
+              <RotateCcw size={13} />
+            </button>
+          </div>
+
+          {onExplodeChange && (explodeOpen || explodeFactor > 0) && (
+            <div className="viewer3d-explode-popover" role="group" aria-label="Separación vista explotada">
+              <span className="small-note muted">Explotada</span>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={explodeFactor}
+                onChange={(e) => onExplodeChange(Number(e.target.value))}
+                aria-label="Porcentaje de vista explotada"
+              />
+              <strong className="mono">{Math.round(explodeFactor * 100)}%</strong>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1255,6 +1425,11 @@ export function Viewer3D({
                 <div className="piece-hud-title">
                   <strong>{selectedPiece.nombre}</strong>
                   <span className="piece-hud-tag">{selectedPiece.tipo}</span>
+                  {selectedPiece.wing && (
+                    <span className="piece-hud-tag">
+                      {selectedPiece.wing === 'return' ? 'Ala Retorno B' : 'Ala Principal A'}
+                    </span>
+                  )}
                   {selectedPieceZoneLabel && (
                     <span className="piece-hud-tag zone-tag">Zona: {selectedPieceZoneLabel}</span>
                   )}
@@ -1275,6 +1450,12 @@ export function Viewer3D({
                   {selectedPiece.miterAngleDeg !== undefined && (
                     <span>Inglete: {selectedPiece.miterAngleDeg.toFixed(1)}°</span>
                   )}
+                  {selectedPiece.curveProfile && (
+                    <span>
+                      Curva: arco={selectedPiece.curveProfile.arcLengthMm.toFixed(1)} mm (R_mín=
+                      {selectedPiece.curveProfile.minRadiusMm.toFixed(0)} mm)
+                    </span>
+                  )}
                   {selectedPieceDin && (
                     <span className={selectedPieceDin.passesDIN ? 'din-pill ok' : 'din-pill bad'}>
                       DIN 68874-1: δ={selectedPieceDin.deflectionMm.toFixed(2)} mm /{' '}
@@ -1287,7 +1468,10 @@ export function Viewer3D({
               <button
                 type="button"
                 className="hud-close-btn"
-                onClick={() => setSelectedPieceId(null)}
+                onClick={() => {
+                  setSelectedPieceId(null);
+                  onSelectZone?.(null);
+                }}
                 aria-label="Cerrar inspector de pieza"
                 title="Cerrar"
               >
@@ -1318,18 +1502,24 @@ export function Viewer3D({
           position: [camDist * 0.72, Math.max(targetY * 1.15, camDist * 0.58), camDist * 1.08],
           fov: 42,
         }}
-        onPointerMissed={() => setSelectedPieceId(null)}
+        onPointerMissed={() => {
+          setSelectedPieceId(null);
+          onSelectZone?.(null);
+        }}
       >
         <color attach="background" args={['#eef2f6']} />
         <ambientLight intensity={0.75} />
         <hemisphereLight args={['#ffffff', '#cbd5e1', 0.6]} />
         <directionalLight position={[4, 7, 5]} intensity={1.1} castShadow />
-        <directionalLight position={[-2.5, 2.5, -4.5]} intensity={0.55} />
+        <directionalLight position={[-4, 3, -3]} intensity={0.4} />
         <gridHelper args={[6, 24, '#94a3b8', '#cbd5e1']} position={[0, -0.001, 0]} />
         <FurnitureMeshGroup
           despiece={despiece}
           topology={topology}
           params={params}
+          support={supportSummary}
+          hasToeKickPieces={hasToeKickPieces}
+          displayUnit={displayUnit}
           explodeFactor={explodeFactor}
           showDimensions={showDimensions}
           selectedPieceId={selectedPieceId}

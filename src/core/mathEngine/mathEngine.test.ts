@@ -4,16 +4,27 @@ import {
   ETAPA2_BASE_MATRIX_M0,
   analyzeShelvesDeflectionDIN,
   applyHomography,
+  applyReturnWingTopology,
+  buildCornerFilletCutSpec,
+  buildDefaultLShapeConfig,
+  buildFilletBezier,
+  buildReturnWingParams,
   calculateDespiece,
   calculateShelfDeflectionDIN,
   calculateShelfProgression,
   clonePreset,
   compareShapeAspect,
+  computePieceWorldAABB,
   computeQuadToUnitHomography,
+  computeSupportLegCoordsMm,
   computeUnitDirectionVector,
+  evaluateBezierDifferential,
   exteriorToInterior,
   exteriorToInteriorRaw,
+  extractReturnWingTopology,
+  fitDifferentialCurveFromStroke,
   interiorToExterior,
+  resolveBaseSupport,
   scaleBaseMatrix,
 } from './index';
 
@@ -662,12 +673,11 @@ describe('SmartFurniture Bloque 1 — Motor Matemático y Homografía (v3.0)', (
     expect(Math.hypot(restored.x - probe4k.x, restored.y - probe4k.y)).toBeLessThan(1e-6);
   });
 
-  it('20. Tapa trasera inteligente con `leg_void`: cierra cajoneras/pedestales y deja abierto el hueco de piernas con 0 solapamientos 3D', () => {
-    // Caso A: Escritorio con hueco de piernas a la izquierda + cajonera derecha de piso a cubierta
+  it('20. `leg_void` + `hasBackPanel: true`: excluye el fondo Durolac 3 mm detrás del hueco de piernas y conserva fondo en pedestal/cajonera', () => {
+    // Caso A: Escritorio con hueco de piernas a la izquierda [0..0.65] + pedestal cajonera a la derecha [0.65..1]
     const { topology, params } = clonePreset('estanteria');
     params.targetDimensions = { x: 1400, y: 750, z: 600 };
     params.referenceDimensions = { x: 1400, y: 750, z: 600 };
-    params.cornerJointType = 'topOverSides';
     topology.shelfMode = 'custom';
     topology.equalShelfCount = 0;
     topology.hasBackPanel = true;
@@ -684,71 +694,456 @@ describe('SmartFurniture Bloque 1 — Motor Matemático y Homografía (v3.0)', (
     const pedDiv = resA.matrizDespiece.find((p) => p.id === 'ped_div')!;
     const fondosA = resA.matrizDespiece.filter((p) => p.tipo === 'fondo');
     expect(fondosA).toHaveLength(1);
-    const fondoPed = fondosA[0];
-    const fMinX = fondoPed.posicion3D[0] - fondoPed.dimensiones3D[0] / 2;
-    const fMaxX = fondoPed.posicion3D[0] + fondoPed.dimensiones3D[0] / 2;
-    const fMinY = fondoPed.posicion3D[1] - fondoPed.dimensiones3D[1] / 2;
-    const fMaxY = fondoPed.posicion3D[1] + fondoPed.dimensiones3D[1] / 2;
-    // Tapa trasera sólida cubre estrictamente la cajonera derecha [pedDiv.cx, xf] × [0, yf]
-    expect(fMinX).toBeCloseTo(pedDiv.posicion3D[0], 3);
-    expect(fMaxX).toBeCloseTo(1400, 3);
-    expect(fMinY).toBeCloseTo(0, 3);
-    expect(fMaxY).toBeCloseTo(750, 3);
-    expect(fondoPed.posicion3D[2]).toBeCloseTo(-1.5, 4);
+    const fondoPedMinX = fondosA[0].posicion3D[0] - fondosA[0].dimensiones3D[0] / 2;
+    const fondoPedMaxX = fondosA[0].posicion3D[0] + fondosA[0].dimensiones3D[0] / 2;
+    // El fondo cubre exclusivamente el pedestal derecho (desde cara izq. de ped_div hasta xf), cero fondo en hueco de piernas
+    expect(fondoPedMinX).toBeCloseTo(pedDiv.posicion3D[0] - 9, 2);
+    expect(fondoPedMaxX).toBeCloseTo(1400, 2);
 
-    // Caso B: Escritorio ejecutivo con 2 pedestales laterales + hueco central de piernas + cajón central superior
-    const exec = clonePreset('estanteria');
-    exec.params.targetDimensions = { x: 1500, y: 750, z: 600 };
-    exec.params.referenceDimensions = { x: 1500, y: 750, z: 600 };
-    exec.topology.shelfMode = 'custom';
-    exec.topology.equalShelfCount = 0;
-    exec.topology.hasBackPanel = true;
-    exec.topology.vDividers = [
-      { id: 'd_izq', position: 0.27, start: 0, end: 1 },
-      { id: 'd_der', position: 0.73, start: 0, end: 1 },
+    // Caso B: Escritorio completo `leg_void` [0..1] con `hasBackPanel: true` -> cero fondos Durolac
+    const deskFull = clonePreset('estanteria');
+    deskFull.params.targetDimensions = { x: 1200, y: 750, z: 600 };
+    deskFull.topology.shelfMode = 'custom';
+    deskFull.topology.hasBackPanel = true;
+    deskFull.topology.vDividers = [];
+    deskFull.topology.hShelves = [];
+    deskFull.topology.frontZones = [
+      { id: 'full_leg', uStart: 0, uEnd: 1, vStart: 0, vEnd: 1, kind: 'leg_void' },
     ];
-    exec.topology.hShelves = [
-      { id: 'r_caj_cen', position: 0.8, start: 0.27, end: 0.73 },
-    ];
-    exec.topology.frontZones = [
-      { id: 'p_izq', uStart: 0, uEnd: 0.27, vStart: 0, vEnd: 1, kind: 'door_left' },
-      { id: 'void_c', uStart: 0.27, uEnd: 0.73, vStart: 0, vEnd: 0.8, kind: 'leg_void' },
-      { id: 'c_cen', uStart: 0.27, uEnd: 0.73, vStart: 0.8, vEnd: 1, kind: 'drawers', drawerCount: 1 },
-      { id: 'p_der', uStart: 0.73, uEnd: 1, vStart: 0, vEnd: 1, kind: 'door_right' },
-    ];
-
-    const resB = calculateDespiece(exec.topology, exec.params);
+    const resB = calculateDespiece(deskFull.topology, deskFull.params);
     assertNo3DOverlap(resB.matrizDespiece);
+    expect(resB.matrizDespiece.filter((p) => p.tipo === 'fondo')).toHaveLength(0);
 
-    const fondosB = resB.matrizDespiece.filter((p) => p.tipo === 'fondo');
-    expect(fondosB).toHaveLength(3);
-    // Los 2 pedestales tienen tapa completa de 750 mm; el cajón central superior tiene tapa recortada encima del hueco de piernas
-    expect(fondosB.filter((f) => Math.abs(f.alto - 750) < 0.5)).toHaveLength(2);
-    const cenTopBack = fondosB.find((f) => f.alto < 300)!;
-    expect(cenTopBack).toBeDefined();
-    expect(cenTopBack.posicion3D[1] - cenTopBack.dimensiones3D[1] / 2).toBeGreaterThan(550);
-
-    // Caso C: Cajonera suspendida derecha sobre doble `leg_void` (izquierda + debajo)
-    const susp = clonePreset('estanteria');
-    susp.params.targetDimensions = { x: 1200, y: 750, z: 600 };
-    susp.params.referenceDimensions = { x: 1200, y: 750, z: 600 };
-    susp.topology.shelfMode = 'custom';
-    susp.topology.equalShelfCount = 0;
-    susp.topology.hasBackPanel = true;
-    susp.topology.vDividers = [{ id: 'd_caj', position: 0.64, start: 0.56, end: 1 }];
-    susp.topology.hShelves = [{ id: 'r_bajo_caj', position: 0.56, start: 0.64, end: 1 }];
-    susp.topology.frontZones = [
+    // Caso C: Escritorio tipo m11 (2 `leg_void` contiguos + cajonera suspendida arriba-derecha) -> fondo solo detrás de la cajonera
+    const deskSusp = clonePreset('estanteria');
+    deskSusp.params.targetDimensions = { x: 1200, y: 750, z: 600 };
+    deskSusp.topology.shelfMode = 'custom';
+    deskSusp.topology.hasBackPanel = true;
+    deskSusp.topology.vDividers = [{ id: 'd_caj', position: 0.64, start: 0.56, end: 1 }];
+    deskSusp.topology.hShelves = [{ id: 'r_bajo_caj', position: 0.56, start: 0.64, end: 1 }];
+    deskSusp.topology.frontZones = [
       { id: 'void_izq', uStart: 0, uEnd: 0.64, vStart: 0, vEnd: 1, kind: 'leg_void' },
       { id: 'void_bajo', uStart: 0.64, uEnd: 1, vStart: 0, vEnd: 0.56, kind: 'leg_void' },
       { id: 'caj_der', uStart: 0.64, uEnd: 1, vStart: 0.56, vEnd: 1, kind: 'drawers', drawerCount: 2 },
     ];
-
-    const resC = calculateDespiece(susp.topology, susp.params);
+    const resC = calculateDespiece(deskSusp.topology, deskSusp.params);
     assertNo3DOverlap(resC.matrizDespiece);
-
     const fondosC = resC.matrizDespiece.filter((p) => p.tipo === 'fondo');
     expect(fondosC).toHaveLength(1);
-    expect(fondosC[0].posicion3D[0] - fondosC[0].dimensiones3D[0] / 2).toBeGreaterThan(750);
-    expect(fondosC[0].posicion3D[1] - fondosC[0].dimensiones3D[1] / 2).toBeGreaterThan(400);
+    const fC = fondosC[0];
+    // Sin tiras huérfanas de 18 mm: únicamente el paño de la cajonera superior derecha
+    expect(fC.posicion3D[0] - fC.dimensiones3D[0] / 2).toBeGreaterThan(700);
+    expect(fC.posicion3D[1] - fC.dimensiones3D[1] / 2).toBeGreaterThan(390);
+  });
+
+  it('21. Tolerancia física 2D->3D en extremos arrastrados (`hShelves`/`vDividers`) y supresión de repisas en `baskets` y `leg_void`', () => {
+    // Repisas arrastradas ligeramente cortas (0.497) o ligeramente largas (0.503) respecto a divisor en 0.500:
+    // cero penetración 3D y cero alertas falsas `dimension_invalida`
+    const { topology, params } = clonePreset('estanteria');
+    params.targetDimensions = { x: 1200, y: 1200, z: 400 };
+    params.referenceDimensions = { x: 1200, y: 1200, z: 400 };
+    topology.shelfMode = 'custom';
+    topology.vDividers = [
+      { id: 'div_c', position: 0.5, start: 0, end: 1 },
+      { id: 'div_parcial', position: 0.25, start: 0.5, end: 1 },
+    ];
+    topology.hShelves = [
+      { id: 'rep_corta', position: 0.3, start: 0, end: 0.497 },
+      { id: 'rep_overshoot', position: 0.7, start: 0, end: 0.503 },
+      // Repisa que termina a 0.247 cerca de `div_parcial` en 0.25
+      { id: 'rep_media', position: 0.5, start: 0, end: 0.247 },
+    ];
+
+    const res = calculateDespiece(topology, params);
+    assertNo3DOverlap(res.matrizDespiece);
+    expect(res.alerts.filter((a) => a.tipo === 'dimension_invalida')).toHaveLength(0);
+
+    const repCorta = res.matrizDespiece.find((p) => p.id === 'rep_corta')!;
+    const repOvershootSpans = res.matrizDespiece.filter((p) => p.id.startsWith('rep_overshoot'));
+    // `rep_overshoot` se parte solo en `div_parcial` (u=0.25) en 2 vanos útiles, sin micro-cola tras `div_c` (u=0.5)
+    expect(repOvershootSpans).toHaveLength(2);
+    const repOvershootRight = repOvershootSpans[1];
+    const divC = res.matrizDespiece.find((p) => p.id === 'div_c')!;
+    // Ambos extremos se detienen exactamente en la cara izquierda de div_c (600 - 9 = 591 mm)
+    expect(repCorta.posicion3D[0] + repCorta.dimensiones3D[0] / 2).toBeCloseTo(
+      divC.posicion3D[0] - 9,
+      3,
+    );
+    expect(repOvershootRight.posicion3D[0] + repOvershootRight.dimensiones3D[0] / 2).toBeCloseTo(
+      divC.posicion3D[0] - 9,
+      3,
+    );
+
+    // Repisas equidistantes NO atraviesan zonas `baskets` ni `leg_void` (solo sobreviven en zonas `open`)
+    const eqCase = clonePreset('estanteria');
+    eqCase.params.targetDimensions = { x: 1200, y: 1200, z: 420 };
+    eqCase.topology.shelfMode = 'equidistant';
+    eqCase.topology.equalShelfCount = 3;
+    eqCase.topology.vDividers = [
+      { id: 'd1', position: 1 / 3, start: 0, end: 1 },
+      { id: 'd2', position: 2 / 3, start: 0, end: 1 },
+    ];
+    eqCase.topology.frontZones = [
+      { id: 'z_bask', uStart: 0, uEnd: 1 / 3, vStart: 0, vEnd: 1, kind: 'baskets', basketCount: 3 },
+      { id: 'z_open', uStart: 1 / 3, uEnd: 2 / 3, vStart: 0, vEnd: 1, kind: 'open' },
+      { id: 'z_leg', uStart: 2 / 3, uEnd: 1, vStart: 0, vEnd: 1, kind: 'leg_void' },
+    ];
+    const resEq = calculateDespiece(eqCase.topology, eqCase.params);
+    assertNo3DOverlap(resEq.matrizDespiece);
+    const eqShelves = resEq.matrizDespiece.filter((p) => p.tipo === 'repisa');
+    // Solo 3 repisas en el vano central abierto (ninguna en canastos ni en hueco de piernas)
+    expect(eqShelves).toHaveLength(3);
+    for (const s of eqShelves) {
+      expect(s.posicion3D[0]).toBeGreaterThan(400);
+      expect(s.posicion3D[0]).toBeLessThan(800);
+    }
+  });
+
+  it('22. Escalón `void_outside`: frente cubre canto lateral exterior, divisor parcial sin colisión, cero flotación con `leg_void` y diagonal sin doble descuento', () => {
+    // Caso A: Carro cocina escalonado — cajón superior cubre pared derecha exterior de la torre sin colisionar con puerta baja
+    const { topology, params } = clonePreset('estanteria');
+    params.targetDimensions = { x: 950, y: 820, z: 420 };
+    params.referenceDimensions = { x: 950, y: 820, z: 420 };
+    topology.shelfMode = 'custom';
+    topology.hasBackPanel = true;
+    topology.vDividers = [
+      { id: 'd1', position: 0.34, start: 0, end: 0.78 },
+      // Divisor parcial que sube hasta 0.86 (entra parcialmente en el tramo del escalón 0.72..1)
+      { id: 'd2_parcial', position: 0.68, start: 0, end: 0.86 },
+    ];
+    topology.hShelves = [
+      { id: 'r_caj', position: 0.78, start: 0, end: 0.68 },
+      { id: 'r_step', position: 0.72, start: 0.68, end: 1 },
+    ];
+    topology.frontZones = [
+      { id: 'c_sup', uStart: 0, uEnd: 0.68, vStart: 0.78, vEnd: 1, kind: 'drawers', drawerCount: 1 },
+      { id: 'p_der', uStart: 0.68, uEnd: 1, vStart: 0, vEnd: 0.72, kind: 'door_right' },
+      { id: 'void_step', uStart: 0.68, uEnd: 1, vStart: 0.72, vEnd: 1, kind: 'void_outside' },
+    ];
+    const resA = calculateDespiece(topology, params);
+    assertNo3DOverlap(resA.matrizDespiece);
+
+    const frenteSup = resA.matrizDespiece.find((p) => p.id === 'frente_c_sup_c1')!;
+    const stepX = 18 + 0.68 * (950 - 36);
+    // Cubre el canto exterior derecho de la torre (stepX + e/2 - 2 mm) de forma simétrica al borde izquierdo (2 mm)
+    expect(frenteSup.posicion3D[0] + frenteSup.dimensiones3D[0] / 2).toBeCloseTo(stepX + 9 - 2, 2);
+    // `lateral_escalon_der` solo cierra el tramo superior restante sobre `d2_parcial` (0 overlap)
+    expect(resA.matrizDespiece.some((p) => p.id === 'lateral_escalon_der')).toBe(true);
+
+    // Caso B: `bottomRight` + `leg_void` + `topOverSides` -> `lateral_escalon_inf_der` toca piso y = 0 (cero flotación)
+    const caseB = clonePreset('estanteria');
+    caseB.params.targetDimensions = { x: 1200, y: 900, z: 450 };
+    caseB.params.cornerJointType = 'topOverSides';
+    caseB.topology.shelfMode = 'custom';
+    caseB.topology.vDividers = [];
+    caseB.topology.hShelves = [];
+    caseB.topology.frontZones = [
+      { id: 'lv_izq', uStart: 0, uEnd: 0.65, vStart: 0, vEnd: 1, kind: 'leg_void' },
+      { id: 'v_br', uStart: 0.65, uEnd: 1, vStart: 0, vEnd: 0.35, kind: 'void_outside' },
+    ];
+    const resB = calculateDespiece(caseB.topology, caseB.params);
+    assertNo3DOverlap(resB.matrizDespiece);
+    const latInfDer = resB.matrizDespiece.find((p) => p.id === 'lateral_escalon_inf_der')!;
+    expect(latInfDer).toBeDefined();
+    expect(latInfDer.posicion3D[1] - latInfDer.dimensiones3D[1] / 2).toBeCloseTo(0, 4);
+
+    // Caso C: `division_diagonal` recortada contra `void_outside` (`topRight`) queda a ras sin doble descuento `-e/2`
+    const caseC = clonePreset('estanteria');
+    caseC.params.targetDimensions = { x: 1000, y: 1000, z: 320 };
+    caseC.topology.shelfMode = 'custom';
+    caseC.topology.vDividers = [];
+    caseC.topology.hShelves = [];
+    caseC.topology.frontZones = [
+      { id: 'v_tr', uStart: 0.7, uEnd: 1, vStart: 0.7, vEnd: 1, kind: 'void_outside' },
+    ];
+    caseC.topology.diagonalDividers = [{ id: 'diag_step', u1: 0, v1: 0, u2: 1, v2: 1 }];
+    const resC = calculateDespiece(caseC.topology, caseC.params);
+    const diagPiece = resC.matrizDespiece.find((p) => p.id === 'diag_step')!;
+    expect(diagPiece).toBeDefined();
+
+    // En 45°, el punto recortado es (stepX - 9, stepY - 9) = (683.8, 683.8); con trim único = 9 mm la esquina máxima toca 683.8 exactamente
+    const stepFace = 18 + 0.7 * (1000 - 36) - 9;
+    const [cx, cy] = diagPiece.posicion3D;
+    const halfL = diagPiece.dimensiones3D[0] / 2;
+    const halfE = diagPiece.dimensiones3D[1] / 2;
+    const cosT = Math.cos(diagPiece.rotacion3D[2]);
+    const sinT = Math.sin(diagPiece.rotacion3D[2]);
+    const cornersX = [
+      cx + halfL * cosT - halfE * sinT,
+      cx + halfL * cosT + halfE * sinT,
+      cx - halfL * cosT - halfE * sinT,
+      cx - halfL * cosT + halfE * sinT,
+    ];
+    const cornersY = [
+      cy + halfL * sinT + halfE * cosT,
+      cy + halfL * sinT - halfE * cosT,
+      cy - halfL * sinT + halfE * cosT,
+      cy - halfL * sinT - halfE * cosT,
+    ];
+    const maxCornerX = Math.max(...cornersX);
+    const maxCornerY = Math.max(...cornersY);
+    expect(maxCornerX).toBeLessThanOrEqual(stepFace + 0.05);
+    expect(maxCornerX).toBeGreaterThanOrEqual(stepFace - 0.5);
+    expect(maxCornerY).toBeLessThanOrEqual(stepFace + 0.05);
+    expect(maxCornerY).toBeGreaterThanOrEqual(stepFace - 0.5);
+  });
+
+  it('23. `door_glass` simétrica con tirador al centro y cambio de `baseSupportType` purga ruedas detectadas obsoletas', () => {
+    const { topology, params } = clonePreset('estanteria');
+    params.targetDimensions = { x: 800, y: 1900, z: 400 };
+    topology.shelfMode = 'custom';
+    topology.baseSupportType = 'wheels';
+    topology.hasExternalLegs = true;
+    topology.externalLegHeightMm = 65;
+    topology.externalLegCount = 4;
+    topology.vDividers = [{ id: 'd_cen', position: 0.5, start: 0, end: 1 }];
+    topology.hShelves = [{ id: 'r_mid', position: 0.4, start: 0, end: 1 }];
+    topology.frontZones = [
+      { id: 'pv1', uStart: 0, uEnd: 0.5, vStart: 0.4, vEnd: 1, kind: 'door_glass' },
+      { id: 'pv2', uStart: 0.5, uEnd: 1, vStart: 0.4, vEnd: 1, kind: 'door_glass' },
+    ];
+    topology.hardwareItems = [
+      {
+        id: 'hw_ruedas_12',
+        categoria: 'patas',
+        descripcion: 'Ruedas giratorias con freno (65 mm)',
+        cantidad: 4,
+        medidaReferenciaMm: 65,
+        notaCompra: 'Detectadas en catálogo.',
+        origen: 'detectado',
+      },
+      {
+        id: 'hw_manual_custom',
+        categoria: 'otro',
+        descripcion: 'Cerradura manual del usuario',
+        cantidad: 1,
+        notaCompra: 'Debe preservarse siempre.',
+        origen: 'manual',
+      },
+    ];
+
+    // 1. Par simétrico de puertas vidriadas -> tiradores enfrentados al centro
+    const resWheels = calculateDespiece(topology, params);
+    assertNo3DOverlap(resWheels.matrizDespiece);
+    const pv1 = resWheels.matrizDespiece.find((p) => p.id === 'puerta_pv1')!;
+    const pv2 = resWheels.matrizDespiece.find((p) => p.id === 'puerta_pv2')!;
+    expect(pv1.isGlassDoor).toBe(true);
+    expect(pv2.isGlassDoor).toBe(true);
+    expect(pv1.handleSide).toBe('right');
+    expect(pv2.handleSide).toBe('left');
+    expect(resWheels.hardwareSummary.some((h) => h.id === 'hw_ruedas_12')).toBe(true);
+
+    // 2. Cambiar apoyo a `toe_kick`: purga `hw_ruedas_12` detectado y conserva ítem manual
+    const topoToe = {
+      ...topology,
+      baseSupportType: 'toe_kick' as const,
+      hasExternalLegs: false,
+      toeKickHeightMm: 80,
+    };
+    const resToe = calculateDespiece(topoToe, params);
+    assertNo3DOverlap(resToe.matrizDespiece);
+    expect(resToe.hardwareSummary.some((h) => h.categoria === 'patas')).toBe(false);
+    expect(resToe.hardwareSummary.some((h) => h.id === 'hw_manual_custom')).toBe(true);
+    expect(resToe.matrizDespiece.filter((p) => p.tipo === 'zocalo')).toHaveLength(4);
+
+    // 3. Cambiar apoyo a `none`: tampoco conserva ruedas detectadas
+    const topoNone = {
+      ...topology,
+      baseSupportType: 'none' as const,
+      hasExternalLegs: false,
+      toeKickHeightMm: 0,
+    };
+    const resNone = calculateDespiece(topoNone, params);
+    expect(resNone.hardwareSummary.some((h) => h.categoria === 'patas')).toBe(false);
+    expect(resNone.hardwareSummary.some((h) => h.id === 'hw_manual_custom')).toBe(true);
+
+    // 4. Cambiar de ruedas (65 mm) a patas (150 mm): reemplaza ruedas viejas por patas de 150 mm
+    const topoLegs = {
+      ...topology,
+      baseSupportType: 'legs' as const,
+      hasExternalLegs: true,
+      externalLegHeightMm: 150,
+      externalLegCount: 4,
+    };
+    const resLegs = calculateDespiece(topoLegs, params);
+    const legsHw = resLegs.hardwareSummary.filter((h) => h.categoria === 'patas');
+    expect(legsHw).toHaveLength(1);
+    expect(legsHw[0].medidaReferenciaMm).toBe(150);
+    expect(legsHw[0].descripcion).toMatch(/patas/i);
+  });
+
+  it('24. Muebles en L (escritorio_l, cocina_l, closet_l): AABB 3D mundial con 0 solapamiento entre alas y esquina abierta/cerrada', () => {
+    const assertWorldAABBNoOverlap = (pieces: readonly BoardPiece[], label: string) => {
+      const tol = 1e-4;
+      for (let i = 0; i < pieces.length; i++) {
+        const a = pieces[i];
+        const aBox = computePieceWorldAABB(a);
+        for (let j = i + 1; j < pieces.length; j++) {
+          const b = pieces[j];
+          const bBox = computePieceWorldAABB(b);
+          const ox = Math.min(aBox.maxX, bBox.maxX) - Math.max(aBox.minX, bBox.minX);
+          const oy = Math.min(aBox.maxY, bBox.maxY) - Math.max(aBox.minY, bBox.minY);
+          const oz = Math.min(aBox.maxZ, bBox.maxZ) - Math.max(aBox.minZ, bBox.minZ);
+          expect(
+            ox > tol && oy > tol && oz > tol,
+            `[${label}] Solapamiento 3D mundial entre "${a.id}" y "${b.id}" (dx=${ox.toFixed(3)}, dy=${oy.toFixed(3)}, dz=${oz.toFixed(3)})`,
+          ).toBe(false);
+        }
+      }
+    };
+
+    // 1. Escritorio Ejecutivo en L (Derecha + esquina abierta + bicolor + cajoneras)
+    const desk = clonePreset('escritorio_l');
+    const deskDesp = calculateDespiece(desk.topology, desk.params);
+    assertWorldAABBNoOverlap(deskDesp.matrizDespiece, 'escritorio_l');
+    const deskMain = deskDesp.matrizDespiece.filter((p) => p.wing === 'main');
+    const deskRet = deskDesp.matrizDespiece.filter((p) => p.wing === 'return');
+    expect(deskMain.length).toBeGreaterThanOrEqual(8);
+    expect(deskRet.length).toBeGreaterThanOrEqual(8);
+    // En esquina abierta derecha, el ala de retorno omite su lateral izquierdo (el que besa al ala principal)
+    expect(deskRet.some((p) => p.id === 'ret_lateral_izq')).toBe(false);
+    expect(deskRet.some((p) => p.id === 'ret_lateral_der')).toBe(true);
+    // El tirador y rotación Y = -pi/2 quedan correctamente asignados
+    expect(deskRet.every((p) => Math.abs(p.rotacion3D[1] + Math.PI / 2) < 1e-4)).toBe(true);
+
+    // 2. Cocina Base en L (Derecha + zócalo 100mm + cubierta grafito + esquina con holgura automática frente a puerta Ala A)
+    const kitchen = clonePreset('cocina_l');
+    const kitchenDesp = calculateDespiece(kitchen.topology, kitchen.params);
+    assertWorldAABBNoOverlap(kitchenDesp.matrizDespiece, 'cocina_l');
+    expect(kitchenDesp.matrizDespiece.filter((p) => p.tipo === 'zocalo')).toHaveLength(8);
+    const kRetCub = kitchenDesp.matrizDespiece.find((p) => p.id === 'ret_cubierta')!;
+    const kRetBox = computePieceWorldAABB(kRetCub);
+    // La puerta esquina de Ala A sobresale 1 + 18 = 19mm en +Z => Ala B arranca tras >= 619mm
+    expect(kRetBox.minZ).toBeGreaterThanOrEqual(kitchen.params.targetDimensions.z + 18);
+
+    // 3. Clóset Vestidor en L (Izquierda + fondo Durolac 3mm + vidrio + canastos + repisas equidistantes B)
+    const closet = clonePreset('closet_l');
+    const closetDesp = calculateDespiece(closet.topology, closet.params);
+    assertWorldAABBNoOverlap(closetDesp.matrizDespiece, 'closet_l');
+    const cRet = closetDesp.matrizDespiece.filter((p) => p.wing === 'return');
+    expect(cRet.every((p) => Math.abs(p.rotacion3D[1] - Math.PI / 2) < 1e-4)).toBe(true);
+    expect(cRet.filter((p) => p.tipo === 'repisa')).toHaveLength(4);
+    expect(cRet.some((p) => p.tipo === 'fondo')).toBe(true);
+    // Los canastos de Ala A siguen contabilizados en hardwareSummary
+    expect(closetDesp.hardwareSummary.some((h) => /canasto/i.test(h.descripcion))).toBe(true);
+  });
+
+  it('25. Conversión recto -> L (Izquierda/Derecha), patas 1:1 en L, adaptador bidireccional y alerta por retorno corto', () => {
+    // 1. Convertir Rack TV (con patas externas 150 mm) en L Izquierda con `topBetweenSides`
+    const { topology, params } = clonePreset('rack_tv');
+    const topoL = {
+      ...topology,
+      lShape: buildDefaultLShapeConfig('left', topology, params),
+    };
+    const despL = calculateDespiece(topoL, params);
+    const legs3D = computeSupportLegCoordsMm(topoL, params, null);
+    const legsHw = despL.hardwareSummary.find((h) => h.categoria === 'patas')!;
+    expect(legs3D.length).toBeGreaterThanOrEqual(6);
+    expect(legsHw.cantidad).toBe(legs3D.length);
+    expect(resolveBaseSupport(topoL).type).toBe('legs');
+
+    // 2. Redirigir edición de zonas del Ala B mediante extractReturnWingTopology / applyReturnWingTopology
+    const retTop = extractReturnWingTopology(topoL);
+    const retParams = buildReturnWingParams(topoL, params);
+    expect(retParams.targetDimensions.x).toBeGreaterThan(200);
+    retTop.shelfMode = 'equidistant';
+    retTop.equalShelfCount = 2;
+    const updatedL = applyReturnWingTopology(topoL, retTop);
+    const despUpdated = calculateDespiece(updatedL, params);
+    const retShelves = despUpdated.matrizDespiece.filter(
+      (p) => p.wing === 'return' && p.tipo === 'repisa',
+    );
+    expect(retShelves).toHaveLength(2);
+
+    // 3. Largo total insuficiente (< zStartB + 2*e + 40 mm) dispara alerta crítica controlada
+    const invalidL = {
+      ...topoL,
+      lShape: { ...topoL.lShape, returnLengthMm: params.targetDimensions.z + 20 },
+    };
+    const despInv = calculateDespiece(invalidL, params);
+    expect(despInv.alerts.some((a) => a.id === 'alert_dim_invalida_ala_l')).toBe(true);
+    expect(despInv.matrizDespiece.some((p) => p.wing === 'return')).toBe(false);
+  });
+
+  it('26. Cálculo diferencial en Bézier: longitud de arco s = ∫‖r\'(t)‖dt, curvatura κ(t) = 1/R y ajuste de trazo', () => {
+    const rMm = 200;
+    const fillet = buildFilletBezier({ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0, y: 1 }, rMm);
+    const diff = evaluateBezierDifferential(fillet, 36);
+    const expectedQuarterArc = (Math.PI * rMm) / 2;
+
+    expect(Math.abs(diff.arcLengthMm - expectedQuarterArc)).toBeLessThan(0.5);
+    expect(Math.abs(diff.minRadiusMm - rMm)).toBeLessThan(6);
+    expect(Math.abs(diff.maxCurvature - 1 / rMm)).toBeLessThan(0.0005);
+
+    // Trazo recto no debe clasificarse como curvo cuando forceCurve=false
+    const straightStroke: Point2D[] = [
+      { x: 0, y: 0 },
+      { x: 120, y: 1.5 },
+      { x: 240, y: -1 },
+      { x: 360, y: 0 },
+    ];
+    const straightFit = fitDifferentialCurveFromStroke(straightStroke, false);
+    expect(straightFit?.isCurved).toBe(false);
+
+    // Trazo circular muestreado de radio 180 mm ajusta a curva cúbica Bézier con bajo error
+    const arcPts: Point2D[] = [];
+    for (let i = 0; i <= 20; i++) {
+      const th = (Math.PI / 2) * (i / 20);
+      arcPts.push({ x: 180 * Math.cos(th), y: 180 * Math.sin(th) });
+    }
+    const arcFit = fitDifferentialCurveFromStroke(arcPts, false);
+    expect(arcFit?.isCurved).toBe(true);
+    expect(arcFit!.maxChordDeviationMm).toBeGreaterThan(20);
+    expect(Math.abs(arcFit!.arcLengthMm - (Math.PI * 180) / 2)).toBeLessThan(8);
+  });
+
+  it('27. Empalme curvo L diferencial (`l_inner`), 0 solapamiento 3D, tapacanto curvo exacto y alerta radio < 28 mm', () => {
+    const desk = clonePreset('escritorio_l');
+    const curvedCut = buildCornerFilletCutSpec({
+      id: 'c_in',
+      cornerTarget: 'l_inner',
+      radiusMm: 180,
+      label: 'Empalme curvo L',
+    });
+    const despCurved = calculateDespiece(
+      { ...desk.topology, curvedCuts: [curvedCut] },
+      desk.params,
+    );
+
+    const bridge = despCurved.matrizDespiece.find((p) => p.id === 'cubierta_curva_l_c_in');
+    expect(bridge).toBeDefined();
+    expect(bridge!.curveProfile?.extrudePlane).toBe('xz');
+    expect(bridge!.curveProfile?.pointsMm.length).toBeGreaterThanOrEqual(10);
+    expect(despCurved.differentialMetrics?.curvedCutCount).toBe(1);
+    expect(despCurved.differentialMetrics!.totalArcLengthMm).toBeGreaterThan(200);
+
+    // Verificar AABB 3D mundial sin colisión entre todas las piezas del mueble en L curvo
+    const boxes = despCurved.matrizDespiece.map((p) => ({ id: p.id, box: computePieceWorldAABB(p) }));
+    const tol = 1e-3;
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i].box;
+        const b = boxes[j].box;
+        const ox = Math.min(a.maxX, b.maxX) - Math.max(a.minX, b.minX);
+        const oy = Math.min(a.maxY, b.maxY) - Math.max(a.minY, b.minY);
+        const oz = Math.min(a.maxZ, b.maxZ) - Math.max(a.minZ, b.minZ);
+        expect(
+          ox > tol && oy > tol && oz > tol,
+          `Solape entre ${boxes[i].id} y ${boxes[j].id}`,
+        ).toBe(false);
+      }
+    }
+
+    // Radio de curvatura menor a MIN_SAFE_EDGE_BANDING_RADIUS_MM (28 mm) debe emitir alerta técnica
+    const tightCut = buildCornerFilletCutSpec({
+      id: 'c_tight',
+      cornerTarget: 'l_inner',
+      radiusMm: 18,
+    });
+    const despTight = calculateDespiece(
+      { ...desk.topology, curvedCuts: [tightCut] },
+      desk.params,
+    );
+    expect(despTight.alerts.some((a) => a.tipo === 'dimension_invalida')).toBe(true);
   });
 });

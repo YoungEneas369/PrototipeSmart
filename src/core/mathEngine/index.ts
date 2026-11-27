@@ -18,8 +18,17 @@ import type {
 import {
   buildInitialHardwareSummary,
   buildToeKickPieces,
+  computeSupportLegCoordsMm,
   resolveBaseSupport,
 } from './baseSupport';
+import { applyCurvedCutsToPieces } from './differentialCurve';
+import {
+  extractReturnWingTopology,
+  mergeLShapeHardwareSummaries,
+  resolveCornerFrontClearance,
+  resolveLShapePlan,
+  transformReturnPieceToWorld,
+} from './lShapeBuilder';
 import {
   buildFrontZonesAndHardware,
   buildLegVoidBasesAndFaldon,
@@ -30,7 +39,6 @@ import {
   clipSegmentAgainstMmBoxes,
   clipShelfSpanAgainstVoids,
   computeBackPanelNonVoidRects,
-  computeLegVoidBackExcludedBoxes,
   emitStepCutoutStructures,
   resolveVoidCutouts,
   type ActiveDividerSpan,
@@ -53,7 +61,6 @@ import {
 
 export {
   applyHomography,
-  computeHomography,
   computeQuadToUnitHomography,
   invertMatrix3x3,
 } from './homography';
@@ -83,8 +90,30 @@ export type {
   ShelfDeflectionDIN,
   UnitDirectionVectorResult,
 } from './structuralDin';
-export { resolveBaseSupport } from './baseSupport';
-export type { ResolvedBaseSupport } from './baseSupport';
+export { computeSupportLegCoordsMm, resolveBaseSupport } from './baseSupport';
+export type { ResolvedBaseSupport, SupportLegCoordMm } from './baseSupport';
+export {
+  applyReturnWingTopology,
+  buildDefaultLShapeConfig,
+  buildReturnWingParams,
+  computePieceWorldAABB,
+  extractReturnWingTopology,
+  resolveLShapePlan,
+} from './lShapeBuilder';
+export {
+  MIN_SAFE_EDGE_BANDING_RADIUS_MM,
+  buildCornerFilletCutSpec,
+  buildFilletBezier,
+  evaluateBezierDifferential,
+  evaluateCubicBezierDerivatives,
+  fitDifferentialCurveFromStroke,
+} from './differentialCurve';
+export type {
+  BezierDifferentialAnalysis,
+  BezierSamplePoint,
+  StrokeCurveFitResult,
+} from './differentialCurve';
+export type { ResolvedLShapePlan, WorldAABB } from './lShapeBuilder';
 
 function hasHorizontalSupportUnder(
   x0: number,
@@ -128,6 +157,8 @@ function pushDeflectionAlertIfNeeded(
 }
 
 function pluralLabelForType(tipo: PieceType, fallback: string, backE: number): string {
+  if (tipo === 'cubierta') return 'Cubiertas';
+  if (tipo === 'base') return 'Bases';
   if (tipo === 'lateral') return 'Laterales';
   if (tipo === 'repisa') return 'Repisas';
   if (tipo === 'division_vertical') return 'Divisores Verticales';
@@ -139,6 +170,7 @@ function pluralLabelForType(tipo: PieceType, fallback: string, backE: number): s
   if (tipo === 'costado_cajon') return 'Costados Cajón';
   if (tipo === 'trasera_cajon') return 'Traseras Cajón';
   if (tipo === 'zocalo') return 'Zócalos';
+  if (tipo === 'faldon') return 'Faldones';
   return fallback;
 }
 
@@ -146,10 +178,26 @@ function pluralLabelForType(tipo: PieceType, fallback: string, backE: number): s
  * Calcula el despiece físico 1:1 completo, coordenadas 3D sin solapamiento,
  * matrices n×3 y n×5, alertas estructurales y resumen de herrajes no-melamina.
  */
-export function calculateDespiece(
+interface SingleWingBuildOptions {
+  omitLeftLateral?: boolean;
+  omitRightLateral?: boolean;
+  cornerFrontTrim?: { side: 'left' | 'right'; trimMm: number };
+}
+
+interface SingleWingBuildResult {
+  valid: boolean;
+  scaleFactors: DespieceResult['scaleFactors'];
+  shelfProgression: DespieceResult['shelfProgression'];
+  pieces: BoardPiece[];
+  alerts: StructuralAlert[];
+  hardwareSummary: DespieceResult['hardwareSummary'];
+}
+
+function buildSingleWingCarcass(
   topology: FurnitureTopology,
   params: ScaleAndBoardParams,
-): DespieceResult {
+  options?: SingleWingBuildOptions,
+): SingleWingBuildResult {
   const { x: xf, y: yf, z: zf } = params.targetDimensions;
   const { x: x0, y: y0, z: z0 } = params.referenceDimensions;
   const e = params.boardThickness;
@@ -168,7 +216,11 @@ export function calculateDespiece(
       ? calculateShelfProgression(yf, e, topology.equalShelfCount)
       : calculateShelfProgression(yf, e, 0);
 
-  const xInt = xf - 2 * e;
+  const omitLeftLateral = options?.omitLeftLateral ?? false;
+  const omitRightLateral = options?.omitRightLateral ?? false;
+  const xLeftStart = omitLeftLateral ? 0 : e;
+  const xRightEnd = omitRightLateral ? xf : xf - e;
+  const xInt = xRightEnd - xLeftStart;
   const yInt = yf - 2 * e;
 
   if (xf <= 0 || yf <= 0 || zf <= 0 || e <= 0 || xInt <= 0 || yInt <= 0) {
@@ -180,17 +232,10 @@ export function calculateDespiece(
       piezaId: 'carcasa',
     });
     return {
+      valid: false,
       scaleFactors,
       shelfProgression,
-      matrizDespiece: [],
-      matrixNx3: [],
-      matrixNx5: [],
-      consolidatedRows: [],
-      totalNetAreaM2: 0,
-      melamineNetAreaM2: 0,
-      backPanelAreaM2: 0,
-      totalEdgeBandingMeters: 0,
-      edgeBandingByMaterial: {},
+      pieces: [],
       alerts,
       hardwareSummary,
     };
@@ -235,14 +280,14 @@ export function calculateDespiece(
       ? joint === 'topOverSides'
         ? stepBL.x - e / 2
         : stepBL.x + e / 2
-      : joint === 'topOverSides'
+      : joint === 'topOverSides' || omitLeftLateral
         ? 0
         : e;
     const rawBaseX1 = stepBR
       ? joint === 'topOverSides'
         ? stepBR.x + e / 2
         : stepBR.x - e / 2
-      : joint === 'topOverSides'
+      : joint === 'topOverSides' || omitRightLateral
         ? xf
         : xf - e;
 
@@ -287,6 +332,8 @@ export function calculateDespiece(
       joint,
       edgeMode,
       pieces,
+      xLeftStart,
+      xRightEnd,
     });
     baseSpans.push(...pedSpans);
   }
@@ -297,14 +344,14 @@ export function calculateDespiece(
     ? joint === 'topOverSides'
       ? stepTL.x - e / 2
       : stepTL.x + e / 2
-    : joint === 'topOverSides'
+    : joint === 'topOverSides' || omitLeftLateral
       ? 0
       : e;
   const rawCubX1 = stepTR
     ? joint === 'topOverSides'
       ? stepTR.x + e / 2
       : stepTR.x - e / 2
-    : joint === 'topOverSides'
+    : joint === 'topOverSides' || omitRightLateral
       ? xf
       : xf - e;
 
@@ -354,7 +401,7 @@ export function calculateDespiece(
       : yf;
   const hLeft = yL1 - yL0;
 
-  if (hLeft > GEOM_EPS) {
+  if (!omitLeftLateral && hLeft > GEOM_EPS) {
     pieces.push({
       id: 'lateral_izq',
       nombre: 'Lateral Izquierdo',
@@ -388,7 +435,7 @@ export function calculateDespiece(
       : yf;
   const hRight = yR1 - yR0;
 
-  if (hRight > GEOM_EPS) {
+  if (!omitRightLateral && hRight > GEOM_EPS) {
     pieces.push({
       id: 'lateral_der',
       nombre: 'Lateral Derecho',
@@ -501,13 +548,15 @@ export function calculateDespiece(
   const sortedDivs = [...topology.vDividers].sort((a, b) => a.position - b.position);
   const activeDividers: ActiveDividerSpan[] = [];
   const shelfTouchTolMm = Math.max(e * 0.65, yInt * 0.015);
+  // Tolerancia horizontal física: cubre el medio espesor real del divisor para absorber redondeos de arrastre
+  const shelfEndTolU = Math.max(SEGMENT_TOUCH_TOL, (e / 2) / xInt + SEGMENT_TOUCH_TOL);
 
   for (let i = 0; i < sortedDivs.length; i++) {
     const seg = sortedDivs[i];
     const u = clamp(seg.position, minMarginU, 1 - minMarginU);
     const vStart = clamp01(Math.min(seg.start, seg.end));
     const vEnd = clamp01(Math.max(seg.start, seg.end));
-    const cx = e + u * xInt;
+    const cx = xLeftStart + u * xInt;
 
     let divY0 =
       vStart <= SEGMENT_TOUCH_TOL
@@ -527,18 +576,18 @@ export function calculateDespiece(
       const bottomShelf = virtualShelves.find(
         (sh) =>
           Math.abs(sh.cy - divY0) <= shelfTouchTolMm &&
-          u >= sh.uStart - SEGMENT_TOUCH_TOL &&
-          u <= sh.uEnd + SEGMENT_TOUCH_TOL,
+          u >= sh.uStart - shelfEndTolU &&
+          u <= sh.uEnd + shelfEndTolU,
       );
       if (bottomShelf) {
         divY0 = bottomShelf.cy + e / 2;
-      } else if (stepTR && u >= stepTR.u - SEGMENT_TOUCH_TOL && Math.abs(stepTR.cy - divY0) <= shelfTouchTolMm) {
+      } else if (stepTR && u >= stepTR.u - shelfEndTolU && Math.abs(stepTR.cy - divY0) <= shelfTouchTolMm) {
         divY0 = stepTR.yTop;
-      } else if (stepTL && u <= stepTL.u + SEGMENT_TOUCH_TOL && Math.abs(stepTL.cy - divY0) <= shelfTouchTolMm) {
+      } else if (stepTL && u <= stepTL.u + shelfEndTolU && Math.abs(stepTL.cy - divY0) <= shelfTouchTolMm) {
         divY0 = stepTL.yTop;
-      } else if (stepBR && u >= stepBR.u - SEGMENT_TOUCH_TOL && Math.abs(stepBR.cy - divY0) <= shelfTouchTolMm) {
+      } else if (stepBR && u >= stepBR.u - shelfEndTolU && Math.abs(stepBR.cy - divY0) <= shelfTouchTolMm) {
         divY0 = stepBR.yTop;
-      } else if (stepBL && u <= stepBL.u + SEGMENT_TOUCH_TOL && Math.abs(stepBL.cy - divY0) <= shelfTouchTolMm) {
+      } else if (stepBL && u <= stepBL.u + shelfEndTolU && Math.abs(stepBL.cy - divY0) <= shelfTouchTolMm) {
         divY0 = stepBL.yTop;
       }
     }
@@ -546,18 +595,18 @@ export function calculateDespiece(
       const topShelf = virtualShelves.find(
         (sh) =>
           Math.abs(sh.cy - divY1) <= shelfTouchTolMm &&
-          u >= sh.uStart - SEGMENT_TOUCH_TOL &&
-          u <= sh.uEnd + SEGMENT_TOUCH_TOL,
+          u >= sh.uStart - shelfEndTolU &&
+          u <= sh.uEnd + shelfEndTolU,
       );
       if (topShelf) {
         divY1 = topShelf.cy - e / 2;
-      } else if (stepTR && u >= stepTR.u - SEGMENT_TOUCH_TOL && Math.abs(stepTR.cy - divY1) <= shelfTouchTolMm) {
+      } else if (stepTR && u >= stepTR.u - shelfEndTolU && Math.abs(stepTR.cy - divY1) <= shelfTouchTolMm) {
         divY1 = stepTR.yBot;
-      } else if (stepTL && u <= stepTL.u + SEGMENT_TOUCH_TOL && Math.abs(stepTL.cy - divY1) <= shelfTouchTolMm) {
+      } else if (stepTL && u <= stepTL.u + shelfEndTolU && Math.abs(stepTL.cy - divY1) <= shelfTouchTolMm) {
         divY1 = stepTL.yBot;
-      } else if (stepBR && u >= stepBR.u - SEGMENT_TOUCH_TOL && Math.abs(stepBR.cy - divY1) <= shelfTouchTolMm) {
+      } else if (stepBR && u >= stepBR.u - shelfEndTolU && Math.abs(stepBR.cy - divY1) <= shelfTouchTolMm) {
         divY1 = stepBR.yBot;
-      } else if (stepBL && u <= stepBL.u + SEGMENT_TOUCH_TOL && Math.abs(stepBL.cy - divY1) <= shelfTouchTolMm) {
+      } else if (stepBL && u <= stepBL.u + shelfEndTolU && Math.abs(stepBL.cy - divY1) <= shelfTouchTolMm) {
         divY1 = stepBL.yBot;
       }
     }
@@ -656,12 +705,17 @@ export function calculateDespiece(
     cubiertaMat,
     joint,
     edgeMode,
+    baseSpans,
+    cubiertaSpans,
     activeDividers,
     placedShelves,
     pieces,
   });
 
   // 4. PIPELINE UNIFICADO DE REPISAS (`equidistant`, `custom` e interiores)
+  // Resta exacta en mm contra volúmenes reales `[div.cx - e/2, div.cx + e/2]` y cubiertas/bases de escalón,
+  // eliminando penetraciones por zona muerta `SEGMENT_TOUCH_TOL` y falsas alertas al arrastrar en 2D.
+  const minResidualTailMm = Math.min(6, e * 0.35);
   for (const rawShelf of virtualShelves) {
     const unvoidedSpans = clipShelfSpanAgainstVoids(
       rawShelf.uStart,
@@ -681,53 +735,64 @@ export function calculateDespiece(
         uEnd: sUEnd,
       };
 
+      const rawXLeft = xLeftStart + shelf.uStart * xInt;
+      const rawXRight = xLeftStart + shelf.uEnd * xInt;
       const crossingDivs = activeDividers.filter(
         (div) => div.y0 < shelf.cy + e / 2 - GEOM_EPS && div.y1 > shelf.cy - e / 2 + GEOM_EPS,
       );
 
-      const interiorCuts = crossingDivs
-        .filter(
-          (div) =>
-            div.u > shelf.uStart + SEGMENT_TOUCH_TOL &&
-            div.u < shelf.uEnd - SEGMENT_TOUCH_TOL,
-        )
-        .map((div) => div.u);
+      const blockingX: Array<[number, number]> = crossingDivs.map((div) => [
+        div.cx - e / 2,
+        div.cx + e / 2,
+      ]);
 
-      const splitPoints = [shelf.uStart, ...interiorCuts, shelf.uEnd];
-
-      for (let sIdx = 0; sIdx < splitPoints.length - 1; sIdx++) {
-        const a = splitPoints[sIdx];
-        const b = splitPoints[sIdx + 1];
-
-        const touchesLeftDiv = crossingDivs.some((div) => Math.abs(div.u - a) <= SEGMENT_TOUCH_TOL);
-        const touchesRightDiv = crossingDivs.some((div) => Math.abs(div.u - b) <= SEGMENT_TOUCH_TOL);
-
-        let xLeft = e + a * xInt + (touchesLeftDiv ? e / 2 : 0);
-        let xRight = e + b * xInt - (touchesRightDiv ? e / 2 : 0);
-
-        // Recorte limpio contra cubiertas/bases de escalón adyacentes (evita borrar repisas colindantes por overlapsVertical)
-        let coveredByStepCap = false;
-        for (const cap of placedShelves) {
-          if (!cap.isStepCap) continue;
-          if (Math.abs(cap.cy - shelf.cy) < e - GEOM_EPS) {
-            if (cap.x0 <= xLeft + GEOM_EPS && cap.x1 >= xRight - GEOM_EPS) {
-              coveredByStepCap = true;
-              break;
-            }
-            if (cap.x0 > xLeft + GEOM_EPS && cap.x0 < xRight - GEOM_EPS) {
-              xRight = Math.min(xRight, cap.x0);
-            }
-            if (cap.x1 > xLeft + GEOM_EPS && cap.x1 < xRight - GEOM_EPS) {
-              xLeft = Math.max(xLeft, cap.x1);
-            }
+      let coveredByStepCap = false;
+      for (const cap of placedShelves) {
+        if (!cap.isStepCap) continue;
+        if (Math.abs(cap.cy - shelf.cy) < e - GEOM_EPS) {
+          if (cap.x0 <= rawXLeft + GEOM_EPS && cap.x1 >= rawXRight - GEOM_EPS) {
+            coveredByStepCap = true;
+            break;
           }
+          blockingX.push([cap.x0, cap.x1]);
         }
-        if (coveredByStepCap) continue;
+      }
+      if (coveredByStepCap) continue;
 
+      const rawSurvivingX = subtractIntervals([rawXLeft, rawXRight], blockingX, GEOM_EPS).sort(
+        (a, b) => a[0] - b[0],
+      );
+      const hasRealSpan = rawSurvivingX.some(([x0, x1]) => x1 - x0 >= minResidualTailMm);
+      const survivingX = hasRealSpan
+        ? rawSurvivingX.filter(([x0, x1]) => x1 - x0 >= minResidualTailMm)
+        : rawSurvivingX;
+
+      if (survivingX.length === 0) {
+        const blockedByCap = placedShelves.some(
+          (cap) =>
+            cap.isStepCap &&
+            Math.abs(cap.cy - shelf.cy) < e - GEOM_EPS &&
+            cap.x0 < rawXRight - GEOM_EPS &&
+            cap.x1 > rawXLeft + GEOM_EPS,
+        );
+        if (!blockedByCap) {
+          alerts.push({
+            id: `alert_rep_cero_${shelf.id}`,
+            severidad: 'critical',
+            tipo: 'dimension_invalida',
+            mensaje: `${shelf.labelPrefix} resultó con ancho útil <= 0 mm tras descontar divisores.`,
+            piezaId: shelf.id,
+          });
+        }
+        continue;
+      }
+
+      for (let sIdx = 0; sIdx < survivingX.length; sIdx++) {
+        const [xLeft, xRight] = survivingX[sIdx];
         const dx = xRight - xLeft;
-        const pieceId = splitPoints.length > 2 ? `${shelf.id}_tramo_${sIdx + 1}` : shelf.id;
+        const pieceId = survivingX.length > 1 ? `${shelf.id}_tramo_${sIdx + 1}` : shelf.id;
         const pieceName =
-          splitPoints.length > 2 ? `${shelf.labelPrefix} (Vano ${sIdx + 1})` : shelf.labelPrefix;
+          survivingX.length > 1 ? `${shelf.labelPrefix} (Vano ${sIdx + 1})` : shelf.labelPrefix;
 
         if (dx <= GEOM_EPS) {
           alerts.push({
@@ -784,9 +849,9 @@ export function calculateDespiece(
   const diagonalDividers = topology.diagonalDividers ?? [];
   for (let dIdx = 0; dIdx < diagonalDividers.length; dIdx++) {
     const seg = diagonalDividers[dIdx];
-    const rawX1 = e + clamp01(seg.u1) * xInt;
+    const rawX1 = xLeftStart + clamp01(seg.u1) * xInt;
     const rawY1 = e + clamp01(seg.v1) * yInt;
-    const rawX2 = e + clamp01(seg.u2) * xInt;
+    const rawX2 = xLeftStart + clamp01(seg.u2) * xInt;
     const rawY2 = e + clamp01(seg.v2) * yInt;
 
     const survivingT =
@@ -810,10 +875,30 @@ export function calculateDespiece(
       const tanA = cosA > 1e-3 ? sinA / cosA : 0;
       const cotA = sinA > 1e-3 ? cosA / sinA : 0;
 
-      const computeEndMiterTrim = (px: number, py: number): number => {
-        const uPt = (px - e) / xInt;
+      const computeEndMiterTrim = (px: number, py: number, isClippedByVoid: boolean): number => {
+        const uPt = (px - xLeftStart) / xInt;
         const vPt = (py - e) / yInt;
-        const onOuterVert = uPt <= SEGMENT_TOUCH_TOL || uPt >= 1 - SEGMENT_TOUCH_TOL;
+        // Si el extremo ya fue recortado contra la cara física de un escalón `void_outside`
+        // (`excludedMmBoxes` ya incluye ±e/2), tratarlo como apoyo en cara (no volver a restar e/2).
+        const onVoidVertFace =
+          isClippedByVoid &&
+          cutouts.excludedMmBoxes.some(
+            (b) =>
+              (Math.abs(px - b.x0) <= 0.5 || Math.abs(px - b.x1) <= 0.5) &&
+              py >= b.y0 - 0.5 &&
+              py <= b.y1 + 0.5,
+          );
+        const onVoidHorizFace =
+          isClippedByVoid &&
+          cutouts.excludedMmBoxes.some(
+            (b) =>
+              (Math.abs(py - b.y0) <= 0.5 || Math.abs(py - b.y1) <= 0.5) &&
+              px >= b.x0 - 0.5 &&
+              px <= b.x1 + 0.5,
+          );
+
+        const onOuterVert =
+          uPt <= SEGMENT_TOUCH_TOL || uPt >= 1 - SEGMENT_TOUCH_TOL || onVoidVertFace;
         const onInteriorVert =
           !onOuterVert &&
           activeDividers.some(
@@ -822,7 +907,8 @@ export function calculateDespiece(
               py >= d.y0 - 1 &&
               py <= d.y1 + 1,
           );
-        const onOuterHoriz = vPt <= SEGMENT_TOUCH_TOL || vPt >= 1 - SEGMENT_TOUCH_TOL;
+        const onOuterHoriz =
+          vPt <= SEGMENT_TOUCH_TOL || vPt >= 1 - SEGMENT_TOUCH_TOL || onVoidHorizFace;
         const onInteriorHoriz =
           !onOuterHoriz &&
           placedShelves.some(
@@ -862,8 +948,8 @@ export function calculateDespiece(
         return clamp(rawTrim, 0, Math.min(lenDiag * 0.25, e * 3.5));
       };
 
-      const trim1 = computeEndMiterTrim(x1, y1);
-      const trim2 = computeEndMiterTrim(x2, y2);
+      const trim1 = computeEndMiterTrim(x1, y1, ta > GEOM_EPS);
+      const trim2 = computeEndMiterTrim(x2, y2, tb < 1 - GEOM_EPS);
       const trimmedLen = lenDiag - trim1 - trim2;
       if (trimmedLen < e * 1.5) return;
 
@@ -899,7 +985,7 @@ export function calculateDespiece(
     });
   }
 
-  // 4B. FONDO DUROLAC / MDF 3 mm (subdivisión inteligente en X e Y + respeto de `void_outside` y `leg_void`)
+  // 4B. FONDO DUROLAC / MDF 3 mm (subdivisión inteligente en X e Y + exclusión de `void_outside` y `leg_void`)
   if (topology.hasBackPanel && backE > 0) {
     const backSheet = params.backPanelSheetDimensions ?? params.sheetDimensions;
     const trim = Math.max(0, params.trimMm ?? 0);
@@ -908,7 +994,65 @@ export function calculateDespiece(
     const minS = Math.min(usableW, usableH);
     const maxS = Math.max(usableW, usableH);
 
-    const legVoidBackBoxes = computeLegVoidBackExcludedBoxes(frontZones, xf, yf, e);
+    // Excluir zonas `leg_void` del fondo 3 mm conservando apoyo de clavado en pedestales/cajoneras contiguos
+    const legVoidZones = frontZones
+      .filter((z) => z.kind === 'leg_void')
+      .map((z) => ({
+        id: z.id,
+        u0: clamp01(Math.min(z.uStart, z.uEnd)),
+        u1: clamp01(Math.max(z.uStart, z.uEnd)),
+        v0: clamp01(Math.min(z.vStart, z.vEnd)),
+        v1: clamp01(Math.max(z.vStart, z.vEnd)),
+      }))
+      .filter((z) => z.u1 - z.u0 > 0.02 && z.v1 - z.v0 > 0.02);
+
+    const hasActiveDivOnEdge = (uEdge: number, yA: number, yB: number): boolean =>
+      activeDividers.some(
+        (d) =>
+          Math.abs(d.u - uEdge) <= Math.max(0.015, (e / 2 + 1) / xInt) &&
+          d.y0 < yB - GEOM_EPS &&
+          d.y1 > yA + GEOM_EPS,
+      );
+
+    const legVoidBackBoxes: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
+    for (const lv of legVoidZones) {
+      const rawX0 = xLeftStart + lv.u0 * xInt;
+      const rawX1 = xLeftStart + lv.u1 * xInt;
+      const rawY0 = e + lv.v0 * yInt;
+      const rawY1 = e + lv.v1 * yInt;
+      const hasDivL = lv.u0 > 0.02 && hasActiveDivOnEdge(lv.u0, rawY0, rawY1);
+      const hasDivR = lv.u1 < 0.98 && hasActiveDivOnEdge(lv.u1, rawY0, rawY1);
+      const touchesLegVoidLeft =
+        !hasDivL &&
+        lv.u0 > 0.02 &&
+        legVoidZones.some(
+          (other) =>
+            other.id !== lv.id &&
+            Math.abs(other.u1 - lv.u0) <= 0.02 &&
+            other.v0 < lv.v1 - GEOM_EPS &&
+            other.v1 > lv.v0 + GEOM_EPS,
+        );
+      const touchesLegVoidRight =
+        !hasDivR &&
+        lv.u1 < 0.98 &&
+        legVoidZones.some(
+          (other) =>
+            other.id !== lv.id &&
+            Math.abs(other.u0 - lv.u1) <= 0.02 &&
+            other.v0 < lv.v1 - GEOM_EPS &&
+            other.v1 > lv.v0 + GEOM_EPS,
+        );
+      const bx0 =
+        lv.u0 <= 0.02 ? 0 : hasDivL ? rawX0 + e / 2 : touchesLegVoidLeft ? rawX0 - e / 2 : rawX0;
+      const bx1 =
+        lv.u1 >= 0.98 ? xf : hasDivR ? rawX1 - e / 2 : touchesLegVoidRight ? rawX1 + e / 2 : rawX1;
+      const by0 = lv.v0 <= 0.02 ? 0 : rawY0 + e / 2;
+      const by1 = lv.v1 >= 0.98 ? yf : rawY1 - e / 2;
+      if (bx1 > bx0 + GEOM_EPS && by1 > by0 + GEOM_EPS) {
+        legVoidBackBoxes.push({ x0: bx0, x1: bx1, y0: by0, y1: by1 });
+      }
+    }
+
     const backStrips = computeBackPanelNonVoidRects(xf, yf, cutouts, legVoidBackBoxes);
     const backSubPanels: Array<{ x0: number; x1: number; y0: number; y1: number; label: string }> = [];
 
@@ -976,6 +1120,7 @@ export function calculateDespiece(
             )
             .sort((a, b) => a.cx - b.cx);
 
+          let usedDivs = false;
           if (innerDivs.length > 0) {
             const candidateCuts = [strip.x0, ...innerDivs.map((d) => d.cx), strip.x1];
             const allPanelsFit = candidateCuts.every((cut, idx) => {
@@ -988,17 +1133,11 @@ export function calculateDespiece(
             });
             if (allPanelsFit) {
               xCuts = candidateCuts;
-            } else {
-              const maxAllowedW = shBand <= maxS ? minS : maxS;
-              const panels = Math.max(2, Math.ceil(swStrip / Math.max(1, maxAllowedW)));
-              xCuts = Array.from(
-                { length: panels + 1 },
-                (_, k) => strip.x0 + (swStrip * k) / panels,
-              );
+              usedDivs = true;
             }
-          } else {
-            const maxAllowedW = shBand <= maxS ? minS : maxS;
-            const panels = Math.max(2, Math.ceil(swStrip / Math.max(1, maxAllowedW)));
+          }
+          if (!usedDivs) {
+            const panels = Math.max(2, Math.ceil(swStrip / Math.max(1, minS)));
             xCuts = Array.from(
               { length: panels + 1 },
               (_, k) => strip.x0 + (swStrip * k) / panels,
@@ -1065,6 +1204,10 @@ export function calculateDespiece(
     edgeMode,
     pieces,
     hardwareSummary,
+    xLeftStart,
+    omitLeftLateral,
+    omitRightLateral,
+    cornerFrontTrim: options?.cornerFrontTrim,
   });
 
   // 4D. ZÓCALO COMPLETO DE 4 LADOS (`toe_kick`)
@@ -1084,6 +1227,25 @@ export function calculateDespiece(
     pieces.push(...toePieces);
   }
 
+  return {
+    valid: true,
+    scaleFactors,
+    shelfProgression,
+    pieces,
+    alerts,
+    hardwareSummary,
+  };
+}
+
+function finalizeDespieceResult(
+  scaleFactors: DespieceResult['scaleFactors'],
+  shelfProgression: DespieceResult['shelfProgression'],
+  pieces: BoardPiece[],
+  alerts: StructuralAlert[],
+  hardwareSummary: DespieceResult['hardwareSummary'],
+  backE: number,
+  differentialMetrics?: DespieceResult['differentialMetrics'],
+): DespieceResult {
   // 5. MATRICES n×3 (melamina), n×5 (extendida), CONSOLIDACIÓN Y SUMATORIAS POR COLOR
   const matrixNx3: [number, number, number][] = pieces
     .filter((p) => p.tipo !== 'fondo' && p.tipo !== 'fondo_cajon')
@@ -1156,5 +1318,173 @@ export function calculateDespiece(
     edgeBandingByMaterial,
     alerts,
     hardwareSummary,
+    ...(differentialMetrics ? { differentialMetrics } : {}),
   };
+}
+
+/**
+ * Orquestador principal de despiece técnico 3D con soporte recto, planta en L (90°)
+ * y cortes/empalmes curvos evaluados mediante cálculo diferencial, matrices n×3 y n×5,
+ * alertas estructurales y resumen de herrajes no-melamina.
+ */
+export function calculateDespiece(
+  topology: FurnitureTopology,
+  params: ScaleAndBoardParams,
+): DespieceResult {
+  const backE = params.backPanelThickness;
+  const mainRes = buildSingleWingCarcass(topology, params);
+
+  if (!mainRes.valid) {
+    return finalizeDespieceResult(
+      mainRes.scaleFactors,
+      mainRes.shelfProgression,
+      mainRes.pieces,
+      mainRes.alerts,
+      mainRes.hardwareSummary,
+      backE,
+    );
+  }
+
+  if (!topology.lShape?.enabled) {
+    const pieces = [...mainRes.pieces];
+    const alerts = [...mainRes.alerts];
+    const curveRes = applyCurvedCutsToPieces({
+      topology,
+      params,
+      lPlan: null,
+      pieces,
+      alerts,
+    });
+    return finalizeDespieceResult(
+      mainRes.scaleFactors,
+      mainRes.shelfProgression,
+      pieces,
+      alerts,
+      mainRes.hardwareSummary,
+      backE,
+      curveRes.differentialMetrics,
+    );
+  }
+
+  const taggedMain: BoardPiece[] = mainRes.pieces.map((p) => ({ ...p, wing: 'main' }));
+  const { x: xf, z: zf } = params.targetDimensions;
+  const e = params.boardThickness;
+
+  const initialPlan = resolveLShapePlan(topology, params);
+  if (!initialPlan) {
+    return finalizeDespieceResult(
+      mainRes.scaleFactors,
+      mainRes.shelfProgression,
+      taggedMain,
+      mainRes.alerts,
+      mainRes.hardwareSummary,
+      backE,
+    );
+  }
+
+  const clearance = resolveCornerFrontClearance(taggedMain, initialPlan, zf, e);
+  const effectivePlan = resolveLShapePlan(topology, params, clearance.zStartB) ?? initialPlan;
+  const minReturnNetMm =
+    (effectivePlan.omitLeftLateral || effectivePlan.omitRightLateral ? e : 2 * e) + 40;
+
+  if (effectivePlan.netLengthMm < minReturnNetMm) {
+    const alertInvalid: StructuralAlert = {
+      id: 'alert_dim_invalida_ala_l',
+      severidad: 'critical',
+      tipo: 'dimension_invalida',
+      mensaje: `El largo total del ala en L (${effectivePlan.totalLengthMm} mm) deja largo neto insuficiente (${effectivePlan.netLengthMm.toFixed(0)} mm < ${minReturnNetMm} mm tras descontar Z1=${effectivePlan.zStartB.toFixed(0)} mm).`,
+      piezaId: 'ala_retorno',
+    };
+    const legCoordsMainOnly = computeSupportLegCoordsMm(topology, params, null);
+    const support = resolveBaseSupport(topology);
+    const mergedHwOnly = mergeLShapeHardwareSummaries(
+      mainRes.hardwareSummary,
+      [],
+      legCoordsMainOnly.length,
+      support,
+    );
+    return finalizeDespieceResult(
+      mainRes.scaleFactors,
+      mainRes.shelfProgression,
+      taggedMain,
+      [...mainRes.alerts, alertInvalid],
+      mergedHwOnly,
+      backE,
+    );
+  }
+
+  const returnTop = extractReturnWingTopology(topology);
+  const returnParams: ScaleAndBoardParams = {
+    ...params,
+    targetDimensions: {
+      x: effectivePlan.netLengthMm,
+      y: effectivePlan.heightMm,
+      z: effectivePlan.depthMm,
+    },
+    referenceDimensions: {
+      x: effectivePlan.netLengthMm,
+      y: effectivePlan.heightMm,
+      z: effectivePlan.depthMm,
+    },
+  };
+
+  const cornerFrontTrim =
+    clearance.cornerFrontTrimMm > 0
+      ? {
+          side: (effectivePlan.side === 'right' ? 'left' : 'right') as 'left' | 'right',
+          trimMm: clearance.cornerFrontTrimMm,
+        }
+      : undefined;
+
+  const returnRes = buildSingleWingCarcass(returnTop, returnParams, {
+    omitLeftLateral: effectivePlan.omitLeftLateral,
+    omitRightLateral: effectivePlan.omitRightLateral,
+    cornerFrontTrim,
+  });
+
+  const taggedReturn = returnRes.pieces.map((p) =>
+    transformReturnPieceToWorld(
+      p,
+      effectivePlan.side,
+      xf,
+      effectivePlan.zStartB,
+      effectivePlan.netLengthMm,
+    ),
+  );
+
+  const returnAlerts: StructuralAlert[] = returnRes.alerts.map((a) => ({
+    ...a,
+    id: `ret_${a.id}`,
+    mensaje: `[Ala Retorno] ${a.mensaje}`,
+    piezaId: `ret_${a.piezaId}`,
+  }));
+
+  const allLegCoords = computeSupportLegCoordsMm(topology, params, effectivePlan);
+  const support = resolveBaseSupport(topology);
+  const mergedHardware = mergeLShapeHardwareSummaries(
+    mainRes.hardwareSummary,
+    returnRes.hardwareSummary,
+    allLegCoords.length,
+    support,
+  );
+
+  const combinedPieces: BoardPiece[] = [...taggedMain, ...taggedReturn];
+  const combinedAlerts: StructuralAlert[] = [...mainRes.alerts, ...returnAlerts];
+  const curveRes = applyCurvedCutsToPieces({
+    topology,
+    params,
+    lPlan: effectivePlan,
+    pieces: combinedPieces,
+    alerts: combinedAlerts,
+  });
+
+  return finalizeDespieceResult(
+    mainRes.scaleFactors,
+    mainRes.shelfProgression,
+    combinedPieces,
+    combinedAlerts,
+    mergedHardware,
+    backE,
+    curveRes.differentialMetrics,
+  );
 }

@@ -51,6 +51,77 @@ classDiagram
         otro
     }
 
+    class LShapeSide {
+        <<enumeration>>
+        right
+        left
+    }
+
+    class LShapeCornerJoint {
+        <<enumeration>>
+        butt_joint
+    }
+
+    class WingRole {
+        <<enumeration>>
+        main
+        return
+    }
+
+    class CanvasViewTab {
+        <<enumeration>>
+        frontal
+        superior
+        lateral
+    }
+
+    class CurvePlane {
+        <<enumeration>>
+        xz
+        xy
+        zy
+    }
+
+    class CurveContourKind {
+        <<enumeration>>
+        corner_fillet
+        top_arc
+        free_bezier
+    }
+
+    class CurvedCutSpec {
+        <<interface>>
+        +string id
+        +CurvePlane plane
+        +CurveContourKind kind
+        +Tuple4~Point2D~ controlPoints
+        +number radiusMm
+        +string cornerTarget
+        +string label
+        +number arcLengthMm
+        +number minRadiusMm
+        +number maxCurvature
+    }
+
+    class LShapeWingConfig {
+        <<interface>>
+        +boolean enabled
+        +LShapeSide side
+        +number returnLengthMm
+        +number returnDepthMm
+        +number returnHeightMm
+        +LShapeCornerJoint cornerJoint
+        +boolean openCorner
+        +NormalizedSegment[] vDividers
+        +NormalizedSegment[] hShelves
+        +DiagonalSegment[] diagonalDividers
+        +string shelfMode
+        +number equalShelfCount
+        +boolean hasBackPanel
+        +MelamineMaterial cubiertaMaterialOverride
+        +FrontZone[] frontZones
+    }
+
     class Point2D {
         <<interface>>
         +number x
@@ -124,6 +195,8 @@ classDiagram
         +number toeKickHeightMm
         +MelamineMaterial cubiertaMaterialOverride
         +string furnitureProfileLabel
+        +CurvedCutSpec[] curvedCuts
+        +LShapeWingConfig lShape
     }
 
     class CostEstimatorConfig {
@@ -172,6 +245,17 @@ classDiagram
     FurnitureTopology *-- "0..*" DiagonalSegment : diagonalDividers
     FurnitureTopology *-- "0..*" FrontZone : frontZones
     FurnitureTopology *-- "0..*" HardwareItem : hardwareItems
+    FurnitureTopology *-- "0..*" CurvedCutSpec : curvedCuts
+    FurnitureTopology *-- "0..1" LShapeWingConfig : lShape
+    CurvedCutSpec --> CurvePlane : plane
+    CurvedCutSpec --> CurveContourKind : kind
+    CurvedCutSpec *-- "4" Point2D : controlPoints
+    LShapeWingConfig *-- "0..*" NormalizedSegment : vDividers y hShelves
+    LShapeWingConfig *-- "0..*" DiagonalSegment : diagonalDividers
+    LShapeWingConfig *-- "0..*" FrontZone : frontZones
+    LShapeWingConfig --> LShapeSide : side
+    LShapeWingConfig --> LShapeCornerJoint : cornerJoint
+    LShapeWingConfig --> MelamineMaterial : cubiertaMaterialOverride
     FurnitureTopology --> BaseSupportType : baseSupportType
     FurnitureTopology --> MelamineMaterial : cubiertaMaterialOverride
     FrontZone --> FrontModuleKind : kind
@@ -212,6 +296,25 @@ classDiagram
         +boolean right
     }
 
+    class BoardCurveProfile {
+        <<interface>>
+        +Point2D[] pointsMm
+        +string extrudePlane
+        +number extrudeDepthMm
+        +number arcLengthMm
+        +number minRadiusMm
+        +boolean useOnlyArcEdge
+        +boolean replaceTopEdgeWithArc
+    }
+
+    class DifferentialMetrics {
+        <<interface>>
+        +number curvedCutCount
+        +number totalArcLengthMm
+        +number minCurvatureRadiusMm
+        +number maxCurvature
+    }
+
     class BoardPiece {
         <<interface>>
         +string id
@@ -231,6 +334,8 @@ classDiagram
         +boolean isGlassDoor
         +string handleSide
         +number miterAngleDeg
+        +WingRole wing
+        +BoardCurveProfile curveProfile
     }
 
     class StructuralAlert {
@@ -287,6 +392,7 @@ classDiagram
         +EdgeBandingByMaterial edgeBandingByMaterial
         +StructuralAlert[] alerts
         +HardwareItem[] hardwareSummary
+        +DifferentialMetrics differentialMetrics
     }
 
     class PlacedRectangle {
@@ -349,14 +455,20 @@ classDiagram
         +number fastenersClp
         +number externalHardwareClp
         +number totalClp
+        +number unplacedPiecesCount
+        +MelamineByMaterialClp melamineByMaterialClp
+        +EdgeBandingByMaterial edgeBandingByMaterialMeters
     }
 
     DespieceResult *-- "1" ShelfProgressionData : shelfProgression
+    DespieceResult *-- "0..1" DifferentialMetrics : differentialMetrics
     DespieceResult *-- "0..*" BoardPiece : matrizDespiece
     DespieceResult *-- "0..*" MatrixNx5Row : consolidatedRows
     DespieceResult *-- "0..*" StructuralAlert : alerts
     BoardPiece *-- "1" EdgeBandingFlags : edges
+    BoardPiece *-- "0..1" BoardCurveProfile : curveProfile
     BoardPiece --> PieceType : tipo
+    BoardPiece --> WingRole : wing
     CuttingPlanResult *-- "0..*" SheetLayout : sheetsUsed
     CuttingPlanResult o-- "0..*" BoardPiece : unplacedPieces
     SheetLayout *-- "0..*" PlacedRectangle : piezasColocadas
@@ -374,5 +486,7 @@ classDiagram
 | `isGlassDoor?: boolean` | `BoardPiece` | Identifica puertas vidriadas de forma tipada para render translúcido y marco en `Viewer3D` (cero parsing de strings en IDs). |
 | `handleSide?: 'left' \| 'right' \| 'top' \| 'none'` | `BoardPiece` | Ubica tiradores exactos en `Viewer3D` y `VectorBlueprintPanel` sin inferencias frágiles. |
 | `miterAngleDeg?: number` | `BoardPiece`, `PlacedRectangle` | Registra el ángulo de corte en inglete (grados) para divisiones diagonales (`division_diagonal`) en despiece y plano de corte SVG. |
+| `curveProfile?: BoardCurveProfile` | `BoardPiece` | Perfil curvo extruido por cálculo diferencial (polígono local mm, plano XZ/XY, largo de arco $\int ds$ y radio mínimo $R_{\min}$) para render `ExtrudeGeometry`, planos SVG y tapacanto curvo. |
 | `material?: PieceMaterial` | `SheetLayout`, `PlacedRectangle` | Garantiza separación estricta de planchas por `(espesorMm, material)` en muebles bicolor (`blanco` / `roble` / `grafito` / `durolac_3mm`). |
 | `tipo?: PieceType` | `PlacedRectangle` | Colorea por categoría funcional los rectángulos del plano de corte SVG (`svgGenerator.ts`). |
+| `CanvasViewTab` | Editor 3-Vistas | Controla la vista ortogonal activa en `VectorCanvas` (`frontal`, `superior`, `lateral`). |

@@ -88,30 +88,9 @@ function solveLinearSystem(A: number[][], b: number[]): number[] | null {
 }
 
 /**
- * Verifica que ningún subconjunto de 3 puntos de un cuadrilátero sea colineal.
- */
-function hasCollinearTriple(pts: readonly [Point2D, Point2D, Point2D, Point2D]): boolean {
-  const triples: readonly [number, number, number][] = [
-    [0, 1, 2],
-    [0, 1, 3],
-    [0, 2, 3],
-    [1, 2, 3],
-  ];
-  for (const [i, j, k] of triples) {
-    const a = pts[i];
-    const b = pts[j];
-    const c = pts[k];
-    const cross = Math.abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
-    if (!Number.isFinite(cross) || cross < COLLINEAR_EPS) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
  * Valida que los 4 vértices formen un cuadrilátero estrictamente convexo y no auto-intersectado
- * (rechaza cuadriláteros cóncavos y "corbatines" verificando signo consistente del producto cruzado).
+ * (rechaza ternas colineales, cuadriláteros cóncavos y "corbatines" verificando signo consistente
+ * y magnitud del producto cruzado en las 4 ternas cíclicas).
  */
 function isStrictlyConvexQuad(pts: readonly [Point2D, Point2D, Point2D, Point2D]): boolean {
   let expectedSign = 0;
@@ -227,21 +206,28 @@ export function invertMatrix3x3(H: readonly (readonly number[])[]): Matrix3x3 | 
   ];
 }
 
-function computeHomographyPair(
-  src: readonly [Point2D, Point2D, Point2D, Point2D],
-  dst: readonly [Point2D, Point2D, Point2D, Point2D],
-): { H: Matrix3x3; invH: Matrix3x3 } | null {
-  if (
-    hasCollinearTriple(src) ||
-    hasCollinearTriple(dst) ||
-    !isStrictlyConvexQuad(src) ||
-    !isStrictlyConvexQuad(dst)
-  ) {
+/**
+ * Calcula las homografías duales entre un cuadrilátero de foto en orden horario estricto
+ * `[TL, TR, BR, BL]` y el espacio normalizado exterior `[(0,1), (1,1), (1,0), (0,0)]`
+ * (eje Y invertido: v = 0 en base, v = 1 en cubierta) aplicando normalización de Hartley
+ * y validando convexidad estricta sin invertir dos veces.
+ */
+export function computeQuadToUnitHomography(
+  quadCorners: readonly [Point2D, Point2D, Point2D, Point2D],
+): { toUnit: Matrix3x3; toCanvas: Matrix3x3 } | null {
+  if (!isStrictlyConvexQuad(quadCorners)) {
     return null;
   }
 
-  const normSrc = computeHartleyNormalization(src);
-  const normDst = computeHartleyNormalization(dst);
+  const unitCorners: readonly [Point2D, Point2D, Point2D, Point2D] = [
+    { x: 0, y: 1 }, // TL -> (0, 1)
+    { x: 1, y: 1 }, // TR -> (1, 1)
+    { x: 1, y: 0 }, // BR -> (1, 0)
+    { x: 0, y: 0 }, // BL -> (0, 0)
+  ];
+
+  const normSrc = computeHartleyNormalization(quadCorners);
+  const normDst = computeHartleyNormalization(unitCorners);
   if (!normSrc || !normDst) {
     return null;
   }
@@ -287,40 +273,7 @@ function computeHomographyPair(
     return null;
   }
 
-  return { H, invH };
-}
-
-/**
- * Calcula la matriz de homografía 3×3 que mapea 4 puntos `src` a 4 puntos `dst`
- * aplicando normalización de Hartley y validando convexidad estricta.
- */
-export function computeHomography(
-  src: readonly [Point2D, Point2D, Point2D, Point2D],
-  dst: readonly [Point2D, Point2D, Point2D, Point2D],
-): Matrix3x3 | null {
-  return computeHomographyPair(src, dst)?.H ?? null;
-}
-
-/**
- * Calcula las homografías duales entre un cuadrilátero de foto en orden horario estricto
- * `[TL, TR, BR, BL]` y el espacio normalizado exterior `[(0,1), (1,1), (1,0), (0,0)]`
- * (eje Y invertido: v = 0 en base, v = 1 en cubierta) sin invertir dos veces.
- */
-export function computeQuadToUnitHomography(
-  quadCorners: readonly [Point2D, Point2D, Point2D, Point2D],
-): { toUnit: Matrix3x3; toCanvas: Matrix3x3 } | null {
-  const unitCorners: readonly [Point2D, Point2D, Point2D, Point2D] = [
-    { x: 0, y: 1 }, // TL -> (0, 1)
-    { x: 1, y: 1 }, // TR -> (1, 1)
-    { x: 1, y: 0 }, // BR -> (1, 0)
-    { x: 0, y: 0 }, // BL -> (0, 0)
-  ];
-
-  const pair = computeHomographyPair(quadCorners, unitCorners);
-  if (!pair) {
-    return null;
-  }
-  return { toUnit: pair.H, toCanvas: pair.invH };
+  return { toUnit: H, toCanvas: invH };
 }
 
 /**

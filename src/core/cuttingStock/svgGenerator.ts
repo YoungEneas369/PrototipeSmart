@@ -12,6 +12,7 @@ import type {
   SheetLayout,
 } from '../../types/contracts';
 import { escapeXml } from '../utils/xml';
+import { isBackPanelSheet } from './optimizer';
 
 function colorForPiece(r: PlacedRectangle): { fill: string; stroke: string } {
   if (r.tipo === 'fondo' || r.tipo === 'fondo_cajon' || r.material === 'durolac_3mm') {
@@ -148,7 +149,7 @@ export function renderCuttingPlanSvg(
     const sw = sh.anchoSheet * scale;
     const shH = sh.altoSheet * scale;
     const yTop = cursorY + headerH;
-    const isBackSheet = sh.material === 'durolac_3mm' || sh.espesorMm <= 5;
+    const isBackSheet = isBackPanelSheet(sh.espesorMm, sh.material);
     const swatch = materialSwatchColor(sh.material);
 
     const title = `Plancha #${sh.sheetId} · ${sh.materialLabel} (${sh.anchoSheet}×${sh.altoSheet} mm) · Uso ${sh.usoPorcentaje.toFixed(1)}% / Desp. ${sh.desperdicioPorcentaje.toFixed(1)}% · Kerf ${kerf} mm`;

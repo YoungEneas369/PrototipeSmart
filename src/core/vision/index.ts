@@ -1,57 +1,43 @@
 /**
- * Punto de entrada del módulo de Visión Computacional 100% Offline (`src/core/vision/`).
+ * Punto de entrada público del módulo de Visión Computacional 100% Offline (`src/core/vision/`).
+ * Expone exclusivamente la API consumida por `VectorCanvas` y los contratos verificados por pruebas.
  */
+export { analyzeRectifiedFurniture } from './bandDetector';
+export type { BandDetectionResult, BandDetectorOptions, DetectedCavity } from './bandDetector';
+
 export {
-  analyzeRectifiedFurniture,
-  consolidateNarrowCenterDividers,
-  detectLowerGapHint,
-  detectSteppedCornerCutout,
-} from './bandDetector';
-export type {
-  BandDetectionResult,
-  BandDetectorOptions,
-  DetectedCavity,
-  DetectedHandlePoint,
-  LowerGapHintResult,
-  SteppedCornerCutout,
-} from './bandDetector';
-export {
-  MATERIAL_BASE_RGB,
   classifyMelamineMaterial,
   classifyMelamineMaterialFromRgb,
-  clusterCarcassVsFronts,
   deltaE76,
-  inferMaterialOverrideLab,
-  isWarmWoodLab,
   rgbDeltaE,
   rgbToLab,
 } from './colorClassifier';
-export type { BicolorClusterResult, LabColor } from './colorClassifier';
+export type { LabColor } from './colorClassifier';
+
 export {
-  boxBlur2D,
-  boxBlur3x3,
-  clamp,
-  computeSobelField,
-  computeSobelMag,
-  edgeInwardUnitNormal,
   extractLuminanceBuffer,
-  gaussianBlur3x3,
   interiorToExteriorPoint,
   interiorToExteriorRect,
   isConvexQuad,
-  mad,
-  median,
   pointInQuad,
-  quadArea,
-  rgbaLuminance,
+  sampleCarcassBorderRgb,
   sampleExteriorBgRgb,
-  sampleLocalExteriorBgRgb,
-  sampleLumSafe,
-  sampleRgbaSafe,
-  sobel3x3At,
-  sobel3x3AtRgba,
 } from './imageOps';
-export type { ExteriorPixelRect, LocalExteriorBgSamples } from './imageOps';
+export type { ExteriorPixelRect } from './imageOps';
+
+export {
+  detectStructureInSubRegions,
+  reconstructStructureFromVectors,
+  runIterativePhotoTo3D,
+} from './photoPipeline';
+export type {
+  IterativePhoto3DOptions,
+  IterativePhoto3DResult,
+  SubRegionDetectionResult,
+  SubRegionRect,
+  VectorStructureReconstruction,
+} from './photoPipeline';
+
 export {
   autoDetectFurnitureQuad,
   computeRectifiedSize,
@@ -62,6 +48,10 @@ export {
   rectifyImageRGBA,
 } from './rectify';
 export type { AutoQuadResult, CameraPoseEstimate } from './rectify';
+
+export { evaluate3DvsPhotoSimilarity } from './similarity3D';
+export type { Visual3DSimilarityResult } from './similarity3D';
+
 export {
   classifyPartitionedZonesFromPhoto,
   partitionCellsFromVectors,
@@ -69,53 +59,43 @@ export {
   vectorizeUserStroke,
 } from './userVectorTrace';
 export type { PartitionRectCell, TracedStrokeResult, UserStrokeMode } from './userVectorTrace';
+
 export {
-  detectStructureInSubRegions,
-  evaluate3DvsPhotoSimilarity,
-  evaluateMarginsAgainstPhoto,
-  extractStructuralVectorLines,
-  reconstructStructureFromVectors,
-  runIterativePhotoTo3D,
-} from './vectorLines';
+  binarizeSketchInk,
+  isHandDrawnSketchImage,
+  recognizeHandDrawnSketch,
+} from './sketchRecognizer';
 export type {
-  IterativePhoto3DOptions,
-  IterativePhoto3DResult,
+  SketchDetectionBadge,
+  SketchLShapeInference,
+  SketchRecognitionResult,
+} from './sketchRecognizer';
+
+export {
+  makeDrawingMeasurementsReasonable,
+  synthesize3DFromTriViews,
+} from './triViewReasonableness';
+export type { ReasonableResult, TriViewCaptureInput } from './triViewReasonableness';
+
+export { evaluateMarginsAgainstPhoto, extractStructuralVectorLines } from './vectorLines';
+export type {
   MarginEvaluationResult,
-  SubRegionDetectionResult,
-  SubRegionRect,
   VectorLine2D,
   VectorLineExtractionResult,
   VectorLineOrientation,
   VectorLineRole,
-  VectorStructureReconstruction,
-  Visual3DSimilarityResult,
 } from './vectorLines';
-export { findLocalPeaks1D, runRecursiveXYCut } from './xyCut';
-export type {
-  FindPeaksOptions,
-  Peak1D,
-  XYCutCandidate,
-  XYCutConfig,
-  XYCutRegion,
-  XYCutResult,
-} from './xyCut';
+
 export {
   classifyZonesUnified,
   detectBaseSupportHint,
   detectBasketPattern,
-  detectHandlesLocalContrast,
-  detectInternalDrawersInCell,
-  detectMetallicBasketRails,
-  isGlassDoorFromStats,
-  measureCellStats,
   suppressShelvesInsideDrawers,
 } from './zoneClassifier';
 export type {
   BaseSupportHintResult,
   BasketPatternEstimate,
-  BasketRailEstimate,
-  CellPixelStats,
   CellRect,
-  InternalDrawerAnalysis,
+  DetectedHandlePoint,
   ZoneClassificationContext,
 } from './zoneClassifier';

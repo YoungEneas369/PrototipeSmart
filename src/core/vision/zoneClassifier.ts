@@ -40,9 +40,7 @@ import {
   median,
   rgbaLuminance,
   sampleLumSafe,
-  type LocalExteriorBgSamples,
 } from './imageOps';
-import { findLocalPeaks1D } from './xyCut';
 
 export interface DetectedHandlePoint {
   u: number;
@@ -64,19 +62,6 @@ export interface BasketPatternEstimate {
   estimatedCount: number;
 }
 
-export interface BasketRailEstimate {
-  isBasketRails: boolean;
-  railScore: number;
-  basketCount: number;
-  railPositionsV: number[];
-}
-
-export interface InternalDrawerAnalysis {
-  kind: 'none' | 'stacked' | 'top_drawer_over_door';
-  drawerCount: number;
-  splitV?: number;
-}
-
 export interface CellPixelStats {
   meanR: number;
   meanG: number;
@@ -85,8 +70,6 @@ export interface CellPixelStats {
   meanL: number;
   stdL: number;
   bgRatio: number;
-  localBgRatio: number;
-  outerCornerBgRatio: number;
   transparentRatio: number;
   matchRatio: number;
   frameMeanL: number;
@@ -95,19 +78,10 @@ export interface CellPixelStats {
   centerMeanL: number;
   centerStdL: number;
   centerLab: LabColor;
-  ringFrameMeanL: number;
-  ringFrameStdL: number;
-  ringFrameLab: LabColor;
-  paneCenterMeanL: number;
-  paneCenterStdL: number;
-  paneCenterLab: LabColor;
-  paneSpecularRatio: number;
   centerGradMean: number;
   centerSpecularRatio: number;
   wireGridScore: number;
-  basketRailScore: number;
   estimatedBasketCount: number;
-  validPixels: number;
 }
 
 /**
@@ -443,362 +417,11 @@ export function detectBasketPattern(
 }
 
 /**
- * Detecta canastos metálicos reales incluso LLENOS de frutas u objetos coloridos dentro de un
- * nicho oscuro (ej. carro de cocina con verduras/frutas): busca 2–4 rieles/bordes metálicos
- * horizontales finos, brillantes y acromáticos (`C* < 17`, `L* > cavityL* + 18`, espesor `2..11 px`)
- * que cruzan >= 62% del ancho de una columna angosta, descartando repisas de madera cálida (`C* >= 12`),
- * mesas anchas y libros coloridos sin rieles metálicos continuos.
- */
-export function detectMetallicBasketRails(
-  rectRgba: Uint8ClampedArray,
-  lum: Float32Array,
-  W: number,
-  H: number,
-  x0: number,
-  x1: number,
-  y0: number,
-  y1: number,
-): BasketRailEstimate {
-  const empty: BasketRailEstimate = {
-    isBasketRails: false,
-    railScore: 0,
-    basketCount: 3,
-    railPositionsV: [],
-  };
-  if (W < 16 || H < 16 || rectRgba.length < W * H * 4 || lum.length < W * H) {
-    return empty;
-  }
-  const sx0 = clamp(Math.floor(x0), 0, W - 1);
-  const sx1 = clamp(Math.ceil(x1), sx0, W - 1);
-  const sy0 = clamp(Math.floor(y0), 0, H - 1);
-  const sy1 = clamp(Math.ceil(y1), sy0, H - 1);
-  const cw = sx1 - sx0;
-  const ch = sy1 - sy0;
-  if (cw < 24 || ch < 60 || cw / Math.max(1, ch) > 1.15) {
-    return empty;
-  }
-
-  // Estadísticas globales de la cavidad (exigir nicho oscuro/sombreado con contenido/contraste)
-  let sumLum = 0;
-  let sumLum2 = 0;
-  let sumLabL = 0;
-  let cavCnt = 0;
-  const stepS = cw > 120 || ch > 160 ? 2 : 1;
-  for (let y = sy0 + 2; y <= sy1 - 2; y += stepS) {
-    const rowOff = y * W;
-    for (let x = sx0 + 2; x <= sx1 - 2; x += stepS) {
-      const idx = rowOff + x;
-      const p = idx * 4;
-      const l = lum[idx];
-      sumLum += l;
-      sumLum2 += l * l;
-      sumLabL += rgbToLab(rectRgba[p], rectRgba[p + 1], rectRgba[p + 2])[0];
-      cavCnt++;
-    }
-  }
-  if (cavCnt < 60) return empty;
-  const cavMeanLum = sumLum / cavCnt;
-  const cavStdLum = Math.sqrt(Math.max(0, sumLum2 / cavCnt - cavMeanLum * cavMeanLum));
-  const cavMeanLabL = sumLabL / cavCnt;
-
-  // Rechazar celdas claras uniformes (puertas blancas/roble claro) o vacías sin contraste
-  if (cavMeanLum > 125 || cavStdLum < 24) {
-    return empty;
-  }
-
-  const rx0 = sx0 + Math.max(2, Math.round(cw * 0.05));
-  const rx1 = sx1 - Math.max(2, Math.round(cw * 0.05));
-  const rowSpanX = Math.max(1, rx1 - rx0 + 1);
-  const rowMetalFrac = new Float32Array(ch + 1);
-  const rowMeanLabL = new Float32Array(ch + 1);
-
-  for (let y = sy0; y <= sy1; y++) {
-    const rowOff = y * W;
-    let metalHits = 0;
-    let lSum = 0;
-    for (let x = rx0; x <= rx1; x++) {
-      const idx = rowOff + x;
-      const p = idx * 4;
-      const lab = rgbToLab(rectRgba[p], rectRgba[p + 1], rectRgba[p + 2]);
-      const chroma = Math.hypot(lab[1], lab[2]);
-      lSum += lab[0];
-      // Píxel metálico/cromado brillante: acromático (C* < 17, sin tono madera cálido b* < 11)
-      // y marcadamente más claro que el interior oscuro de la cavidad
-      if (
-        chroma < 17 &&
-        lab[2] < 11 &&
-        lab[0] >= Math.max(52, cavMeanLabL + 18) &&
-        lum[idx] >= cavMeanLum + 24
-      ) {
-        metalHits++;
-      }
-    }
-    rowMetalFrac[y - sy0] = metalHits / rowSpanX;
-    rowMeanLabL[y - sy0] = lSum / rowSpanX;
-  }
-
-  // Agrupar filas consecutivas en bandas finas horizontales (espesor 1..maxBandPx)
-  interface RailBand {
-    yStart: number;
-    yEnd: number;
-    yCenter: number;
-    peakFrac: number;
-  }
-  const rawBands: RailBand[] = [];
-  let inBand = false;
-  let bStart = 0;
-  let bEnd = 0;
-  let bPeak = 0;
-  let gap = 0;
-
-  const flushBand = () => {
-    const thickness = bEnd - bStart + 1;
-    const maxThick = Math.max(11, Math.round(ch * 0.065));
-    if (thickness >= 1 && thickness <= maxThick && bPeak >= 0.62) {
-      rawBands.push({
-        yStart: bStart + sy0,
-        yEnd: bEnd + sy0,
-        yCenter: 0.5 * (bStart + bEnd) + sy0,
-        peakFrac: bPeak,
-      });
-    }
-  };
-
-  for (let r = 3; r <= ch - 3; r++) {
-    const frac = rowMetalFrac[r];
-    if (frac >= 0.48) {
-      if (!inBand) {
-        inBand = true;
-        bStart = r;
-        bEnd = r;
-        bPeak = frac;
-      } else {
-        bEnd = r;
-        if (frac > bPeak) bPeak = frac;
-      }
-      gap = 0;
-    } else if (inBand) {
-      gap++;
-      if (gap > 2) {
-        flushBand();
-        inBand = false;
-      }
-    }
-  }
-  if (inBand) flushBand();
-
-  // Consolidar bandas muy próximas (< 12% alto de celda) conservando la más intensa
-  const minSepPx = Math.max(16, Math.round(ch * 0.12));
-  const bands: RailBand[] = [];
-  for (const b of rawBands) {
-    const prev = bands[bands.length - 1];
-    if (prev && b.yCenter - prev.yCenter < minSepPx) {
-      if (b.peakFrac > prev.peakFrac) bands[bands.length - 1] = b;
-    } else {
-      bands.push(b);
-    }
-  }
-
-  if (bands.length < 2 || bands.length > 4) {
-    return empty;
-  }
-
-  // Verificar espaciado razonablemente regular entre rieles cuando hay >= 3 bandas
-  if (bands.length >= 3) {
-    const gaps: number[] = [];
-    for (let i = 1; i < bands.length; i++) {
-      gaps.push(bands[i].yCenter - bands[i - 1].yCenter);
-    }
-    const minG = Math.min(...gaps);
-    const maxG = Math.max(...gaps);
-    if (minG < 12 || maxG / minG > 2.2) {
-      return empty;
-    }
-  }
-
-  // Verificar contraste oscuro/contenido entre los rieles (descarta paneles metálicos lisos claros)
-  let darkRowCnt = 0;
-  let betweenRows = 0;
-  for (let r = Math.round(ch * 0.08); r <= Math.round(ch * 0.92); r++) {
-    const absY = r + sy0;
-    const onRail = bands.some((b) => absY >= b.yStart - 2 && absY <= b.yEnd + 2);
-    if (onRail) continue;
-    betweenRows++;
-    if (rowMeanLabL[r] < cavMeanLabL + 14) darkRowCnt++;
-  }
-  if (betweenRows < 10 || darkRowCnt / betweenRows < 0.6) {
-    return empty;
-  }
-
-  const avgPeak = bands.reduce((acc, b) => acc + b.peakFrac, 0) / bands.length;
-  const railScore = clamp(0.5 + avgPeak * 0.45, 0, 0.96);
-
-  return {
-    isBasketRails: true,
-    railScore,
-    basketCount: bands.length,
-    railPositionsV: bands.map((b) => Number((1 - b.yCenter / H).toFixed(4))),
-  };
-}
-
-/**
- * Detector dedicado de cajones apilados (o cajón superior + puerta inferior) DENTRO de una
- * celda cerrada candidata `[uStart..uEnd, vStart..vEnd]`, proyectando el perfil horizontal
- * interno de juntas oscuras + gradiente `|gy|` con continuidad en ambos extremos laterales
- * (inmune a molduras decorativas Shaker que se detienen antes de los costados de la puerta).
- */
-export function detectInternalDrawersInCell(
-  cell: CellRect,
-  lum: Float32Array,
-  rectW: number,
-  rectH: number,
-  dimsMm: { x: number; y: number },
-  boardThicknessMm: number,
-  detectedHandles: readonly DetectedHandlePoint[] = [],
-): InternalDrawerAnalysis {
-  const cellWmm = (cell.uEnd - cell.uStart) * dimsMm.x;
-  const cellHmm = (cell.vEnd - cell.vStart) * dimsMm.y;
-  if (cellWmm < 170 || cellWmm > 1050 || cellHmm < 280) {
-    return { kind: 'none', drawerCount: 0 };
-  }
-
-  const rect = interiorToExteriorRect(cell, dimsMm, boardThicknessMm, rectW, rectH, 0.02);
-  const cw = rect.x1 - rect.x0;
-  const ch = rect.y1 - rect.y0;
-  if (cw < 32 || ch < 48) {
-    return { kind: 'none', drawerCount: 0 };
-  }
-
-  const pad = clamp(Math.round(Math.min(rectW, rectH) * 0.014), 4, 10);
-  const xAll0 = clamp(rect.x0 + Math.max(4, Math.round(cw * 0.05)), 2, rectW - 3);
-  const xAll1 = clamp(rect.x1 - Math.max(4, Math.round(cw * 0.05)), xAll0 + 4, rectW - 3);
-  const xL1 = clamp(rect.x0 + Math.max(8, Math.round(cw * 0.2)), xAll0 + 2, xAll1);
-  const xR0 = clamp(rect.x1 - Math.max(8, Math.round(cw * 0.2)), xAll0, xAll1 - 2);
-
-  // Luminancia media interna de la celda para umbral adaptativo
-  let lSum = 0;
-  let lCnt = 0;
-  for (let y = rect.y0 + 4; y <= rect.y1 - 4; y += 2) {
-    const row = y * rectW;
-    for (let x = xAll0; x <= xAll1; x += 2) {
-      lSum += lum[row + x];
-      lCnt++;
-    }
-  }
-  const cellMeanL = lCnt > 0 ? lSum / lCnt : 140;
-  const minDiff = clamp(cellMeanL * 0.14, 10, 22);
-
-  const evalRow = (y: number, x0: number, x1: number): { ratio: number; meanPos: number } => {
-    const cnt = Math.max(1, x1 - x0);
-    let hits = 0;
-    let sumPos = 0;
-    const flankN = Math.max(1, pad - 2);
-    for (let x = x0; x < x1; x++) {
-      const cMin = Math.min(lum[(y - 1) * rectW + x], lum[y * rectW + x], lum[(y + 1) * rectW + x]);
-      let uSum = 0;
-      let dSum = 0;
-      for (let k = 3; k <= pad; k++) {
-        uSum += lum[(y - k) * rectW + x];
-        dSum += lum[(y + k) * rectW + x];
-      }
-      const flank = (0.5 * (uSum + dSum)) / flankN;
-      const valley = flank - cMin;
-      const gyStep = Math.abs(lum[(y - 2) * rectW + x] - lum[(y + 2) * rectW + x]) * 0.45;
-      const eff = Math.max(valley, gyStep);
-      if (eff >= minDiff) hits++;
-      if (eff > 0) sumPos += eff;
-    }
-    return { ratio: hits / cnt, meanPos: sumPos / cnt };
-  };
-
-  const yMin = clamp(Math.round(rect.y0 + ch * 0.14), pad + 2, rectH - pad - 3);
-  const yMax = clamp(Math.round(rect.y1 - ch * 0.14), yMin, rectH - pad - 3);
-  const scores = new Float32Array(rectH);
-
-  for (let y = yMin; y <= yMax; y++) {
-    const all = evalRow(y, xAll0, xAll1);
-    if (all.ratio < 0.62) continue;
-    const left = evalRow(y, xAll0, xL1);
-    if (left.ratio < 0.5) continue;
-    const right = evalRow(y, xR0, xAll1);
-    if (right.ratio < 0.5) continue;
-    scores[y] = all.ratio * all.meanPos;
-  }
-
-  const nmsRad = Math.max(14, Math.round(ch * 0.15));
-  const minPeak = cellMeanL < 85 ? 11 : 15;
-  const peaks = findLocalPeaks1D(scores, yMin, yMax, nmsRad, minPeak, { maxPeaks: 4 });
-
-  // Evaluar también tiradores centrados apilados verticalmente en la columna
-  const uMid = 0.5 * (cell.uStart + cell.uEnd);
-  const spanU = cell.uEnd - cell.uStart;
-  const spanV = cell.vEnd - cell.vStart;
-  const centeredHandles = detectedHandles
-    .filter(
-      (h) =>
-        Math.abs(h.u - uMid) <= spanU * 0.24 &&
-        h.v >= cell.vStart + spanV * 0.06 &&
-        h.v <= cell.vEnd - spanV * 0.06,
-    )
-    .sort((a, b) => a.v - b.v);
-
-  const distinctHandles: DetectedHandlePoint[] = [];
-  for (const h of centeredHandles) {
-    if (
-      distinctHandles.length === 0 ||
-      h.v - distinctHandles[distinctHandles.length - 1].v >= Math.max(0.11, spanV * 0.15)
-    ) {
-      distinctHandles.push(h);
-    }
-  }
-
-  if (peaks.length >= 1) {
-    const seamVs = peaks
-      .map((pk) =>
-        clamp(exteriorToInterior(1 - pk.pos / rectH, boardThicknessMm, dimsMm.y), cell.vStart, cell.vEnd),
-      )
-      .sort((a, b) => a - b);
-
-    const vStops = [cell.vStart, ...seamVs, cell.vEnd];
-    const heightsMm: number[] = [];
-    for (let i = 0; i < vStops.length - 1; i++) {
-      heightsMm.push((vStops[i + 1] - vStops[i]) * dimsMm.y);
-    }
-    const maxH = Math.max(...heightsMm);
-    const minH = Math.min(...heightsMm);
-
-    // Caso A: Columna completa de N cajones apilados regularmente (N = 2..5)
-    if (heightsMm.length >= 2 && heightsMm.length <= 5 && maxH <= 370 && minH >= 90 && maxH / minH <= 1.9) {
-      return { kind: 'stacked', drawerCount: heightsMm.length };
-    }
-
-    // Caso B: 1 cajón superior sobre puerta inferior (cocinas #09, #13, #14)
-    if (peaks.length === 1) {
-      const topH = heightsMm[heightsMm.length - 1];
-      const botH = heightsMm[0];
-      if (topH >= 100 && topH <= 290 && botH >= 320) {
-        return { kind: 'top_drawer_over_door', drawerCount: 1, splitV: seamVs[0] };
-      }
-    }
-  }
-
-  // Fallback por >= 2 tiradores horizontales centrados y apilados regularmente en la columna
-  if (distinctHandles.length >= 2 && distinctHandles.length <= 5) {
-    const approxH = cellHmm / distinctHandles.length;
-    if (approxH >= 100 && approxH <= 360) {
-      return { kind: 'stacked', drawerCount: distinctHandles.length };
-    }
-  }
-
-  return { kind: 'none', drawerCount: 0 };
-}
-
-/**
  * Muestrea estadísticas completas de una celda `[uStart, uEnd] × [vStart, vEnd]`
  * (SIEMPRE en espacio INTERIOR) mapeándola exactamente a píxeles de la imagen rectificada
  * mediante `interiorToExteriorRect()`.
  */
-export function measureCellStats(
+function measureCellStats(
   cell: CellRect,
   rectRgba: Uint8ClampedArray,
   lum: Float32Array,
@@ -809,8 +432,6 @@ export function measureCellStats(
   exteriorBgRgb?: readonly [number, number, number],
   matchMap?: Float32Array,
   insetFrac = 0.08,
-  localCornerBgRgb?: readonly [number, number, number],
-  cornerSide?: 'top_right' | 'top_left',
 ): CellPixelStats {
   const rect = interiorToExteriorRect(
     cell,
@@ -832,9 +453,6 @@ export function measureCellStats(
   const bgLab = exteriorBgRgb
     ? rgbToLab(exteriorBgRgb[0], exteriorBgRgb[1], exteriorBgRgb[2])
     : null;
-  const localBgLab = localCornerBgRgb
-    ? rgbToLab(localCornerBgRgb[0], localCornerBgRgb[1], localCornerBgRgb[2])
-    : null;
 
   let sumR = 0,
     sumG = 0,
@@ -842,9 +460,6 @@ export function measureCellStats(
     sumL = 0,
     sumL2 = 0;
   let bgHits = 0,
-    localBgHits = 0,
-    outerCornerBgHits = 0,
-    outerCornerCnt = 0,
     transHits = 0,
     matchHits = 0,
     cnt = 0;
@@ -866,45 +481,14 @@ export function measureCellStats(
   const centerLums: number[] = [];
 
   const step = cw > 140 || ch > 140 ? 2 : 1;
-  const midX = x0 + cw * 0.5;
-  const midY = y0 + ch * 0.5;
-
-  const matchesBgColor = (
-    r: number,
-    g: number,
-    b: number,
-    refBg: readonly [number, number, number],
-    refBgLab: LabColor,
-    rgbTol: number,
-    labTol: number,
-  ): boolean => {
-    const dRgb = Math.hypot(r - refBg[0], g - refBg[1], b - refBg[2]);
-    if (dRgb <= rgbTol) return true;
-    if (dRgb <= rgbTol + 18) {
-      return deltaE76(rgbToLab(r, g, b), refBgLab) <= labTol;
-    }
-    return false;
-  };
 
   for (let y = y0; y <= y1; y += step) {
     const rowOff = y * rectW;
     for (let x = x0; x <= x1; x += step) {
       const idx = rowOff + x;
       const p = idx * 4;
-      const inOuterCorner =
-        cornerSide === 'top_right'
-          ? x >= midX && y <= midY
-          : cornerSide === 'top_left'
-            ? x <= midX && y <= midY
-            : false;
-
       if (rectRgba[p + 3] < 128) {
         bgHits++;
-        localBgHits++;
-        if (inOuterCorner) {
-          outerCornerBgHits++;
-          outerCornerCnt++;
-        }
         transHits++;
         cnt++;
         continue;
@@ -923,16 +507,17 @@ export function measureCellStats(
         matchHits++;
       }
 
-      if (exteriorBgRgb && bgLab && matchesBgColor(r, g, b, exteriorBgRgb, bgLab, 36, 16)) {
-        bgHits++;
-      }
-
-      if (localCornerBgRgb && localBgLab) {
-        const isLocalBg = matchesBgColor(r, g, b, localCornerBgRgb, localBgLab, 38, 18);
-        if (isLocalBg) localBgHits++;
-        if (inOuterCorner) {
-          outerCornerCnt++;
-          if (isLocalBg) outerCornerBgHits++;
+      if (exteriorBgRgb && bgLab) {
+        const dRgb = Math.hypot(
+          r - exteriorBgRgb[0],
+          g - exteriorBgRgb[1],
+          b - exteriorBgRgb[2],
+        );
+        if (dRgb <= 36) {
+          bgHits++;
+        } else if (dRgb <= 54) {
+          const dE = deltaE76(rgbToLab(r, g, b), bgLab);
+          if (dE <= 16) bgHits++;
         }
       }
 
@@ -963,54 +548,6 @@ export function measureCellStats(
     }
   }
 
-  // Muestreo dedicado de marco exterior de puerta (ring 2..14% X, 2..9% Y) vs vidrio interior (22..78% X, 14..86% Y)
-  // Evita que `insetFrac=0.09` recorte los largueros del marco en vitrinas oscuras (#06) o blancas (#09)
-  const fullRect = interiorToExteriorRect(cell, dimsMm, boardThicknessMm, rectW, rectH, 0.02);
-  const fcw = Math.max(1, fullRect.x1 - fullRect.x0);
-  const fch = Math.max(1, fullRect.y1 - fullRect.y0);
-  const rStep = fcw > 140 || fch > 140 ? 2 : 1;
-  let rfSumL = 0,
-    rfSumL2 = 0,
-    rfSumR = 0,
-    rfSumG = 0,
-    rfSumB = 0,
-    rfCnt = 0;
-  let pcSumL = 0,
-    pcSumL2 = 0,
-    pcSumR = 0,
-    pcSumG = 0,
-    pcSumB = 0,
-    pcCnt = 0;
-  const paneLums: number[] = [];
-
-  for (let y = fullRect.y0; y <= fullRect.y1; y += rStep) {
-    const ry = (y - fullRect.y0) / fch;
-    const rowOff = y * rectW;
-    for (let x = fullRect.x0; x <= fullRect.x1; x += rStep) {
-      const idx = rowOff + x;
-      const p = idx * 4;
-      if (rectRgba[p + 3] < 128) continue;
-      const rx = (x - fullRect.x0) / fcw;
-      const l = lum[idx];
-      if (rx <= 0.14 || rx >= 0.86 || ry <= 0.08 || ry >= 0.92) {
-        rfSumL += l;
-        rfSumL2 += l * l;
-        rfSumR += rectRgba[p];
-        rfSumG += rectRgba[p + 1];
-        rfSumB += rectRgba[p + 2];
-        rfCnt++;
-      } else if (rx >= 0.22 && rx <= 0.78 && ry >= 0.14 && ry <= 0.86) {
-        pcSumL += l;
-        pcSumL2 += l * l;
-        pcSumR += rectRgba[p];
-        pcSumG += rectRgba[p + 1];
-        pcSumB += rectRgba[p + 2];
-        pcCnt++;
-        paneLums.push(l);
-      }
-    }
-  }
-
   const opaqueCnt = Math.max(1, cnt - transHits);
   const nSafe = Math.max(1, cnt);
   const meanR = sumR / opaqueCnt;
@@ -1031,22 +568,6 @@ export function measureCellStats(
     cCnt > 0 ? rgbToLab(cSumR / cCnt, cSumG / cCnt, cSumB / cCnt) : rgbToLab(meanR, meanG, meanB);
   const centerGradMean = cGradCnt > 0 ? cGradSum / cGradCnt : 0;
 
-  const ringFrameMeanL = rfCnt > 0 ? rfSumL / rfCnt : frameMeanL;
-  const ringFrameStdL =
-    rfCnt > 0 ? Math.sqrt(Math.max(0, rfSumL2 / rfCnt - ringFrameMeanL * ringFrameMeanL)) : frameStdL;
-  const ringFrameLab =
-    rfCnt > 0
-      ? rgbToLab(rfSumR / rfCnt, rfSumG / rfCnt, rfSumB / rfCnt)
-      : frameLab;
-
-  const paneCenterMeanL = pcCnt > 0 ? pcSumL / pcCnt : centerMeanL;
-  const paneCenterStdL =
-    pcCnt > 0 ? Math.sqrt(Math.max(0, pcSumL2 / pcCnt - paneCenterMeanL * paneCenterMeanL)) : centerStdL;
-  const paneCenterLab =
-    pcCnt > 0
-      ? rgbToLab(pcSumR / pcCnt, pcSumG / pcCnt, pcSumB / pcCnt)
-      : centerLab;
-
   // Reflejos especulares dentro del cristal (píxeles notablemente más brillantes que la media del cristal)
   let specHits = 0;
   if (centerLums.length >= 12) {
@@ -1057,26 +578,7 @@ export function measureCellStats(
   }
   const centerSpecularRatio = centerLums.length > 0 ? specHits / centerLums.length : 0;
 
-  let paneSpecHits = 0;
-  if (paneLums.length >= 12) {
-    const pSpecThresh = Math.min(248, paneCenterMeanL + Math.max(20, paneCenterStdL * 1.4));
-    for (let i = 0; i < paneLums.length; i++) {
-      if (paneLums[i] >= pSpecThresh) paneSpecHits++;
-    }
-  }
-  const paneSpecularRatio = paneLums.length > 0 ? paneSpecHits / paneLums.length : centerSpecularRatio;
-
   const basket = detectBasketPattern(lum, rectW, rectH, x0, x1, y0, y1, rectRgba);
-  const railBasket = detectMetallicBasketRails(
-    rectRgba,
-    lum,
-    rectW,
-    rectH,
-    fullRect.x0,
-    fullRect.x1,
-    fullRect.y0,
-    fullRect.y1,
-  );
 
   return {
     meanR,
@@ -1086,8 +588,6 @@ export function measureCellStats(
     meanL,
     stdL,
     bgRatio: bgHits / nSafe,
-    localBgRatio: localCornerBgRgb ? localBgHits / nSafe : bgHits / nSafe,
-    outerCornerBgRatio: outerCornerCnt > 0 ? outerCornerBgHits / outerCornerCnt : 0,
     transparentRatio: transHits / nSafe,
     matchRatio: matchHits / nSafe,
     frameMeanL,
@@ -1096,69 +596,44 @@ export function measureCellStats(
     centerMeanL,
     centerStdL,
     centerLab,
-    ringFrameMeanL,
-    ringFrameStdL,
-    ringFrameLab,
-    paneCenterMeanL,
-    paneCenterStdL,
-    paneCenterLab,
-    paneSpecularRatio,
     centerGradMean,
     centerSpecularRatio,
     wireGridScore: basket.wireGridScore,
-    basketRailScore: railBasket.railScore,
-    estimatedBasketCount: railBasket.isBasketRails
-      ? railBasket.basketCount
-      : basket.estimatedCount,
-    validPixels: cnt,
+    estimatedBasketCount: basket.estimatedCount,
   };
 }
 
 /**
  * Determina si una celda corresponde a una PUERTA VIDRIADA (`door_glass`) sin confundirla
  * con una puerta Shaker de madera con tablero rehundido:
- *  - Exige altura mínima (`>= 360 mm`) y marco exterior (ring) más claro que el cristal interior.
- *  - Soporta tanto vitrinas claras con cuarterones (#09) como vitrinas oscuras con repisas internas (#06).
+ *  - Exige altura mínima (`>= 360 mm`) y marco relativamente uniforme más claro que el centro.
  *  - Descarta puertas Shaker de madera (marco y centro del mismo tono cálido sin gradiente/reflejo).
+ *  - Valida señal genuina de vidrio: gradiente/estructura interna, reflejo especular o cambio cromático/oscurecimiento fuerte.
  */
-export function isGlassDoorFromStats(
+function isGlassDoorFromStats(
   stats: CellPixelStats,
   cellWmm: number,
   cellHmm: number,
 ): boolean {
   if (cellHmm < 360) return false;
   if (cellHmm / Math.max(1, cellWmm) < 1.05) return false;
+  if (stats.frameStdL >= 42) return false;
 
-  const useRing =
-    stats.ringFrameMeanL - stats.paneCenterMeanL > stats.frameMeanL - stats.centerMeanL + 2;
-  const fMeanL = useRing ? stats.ringFrameMeanL : stats.frameMeanL;
-  const fStdL = useRing ? stats.ringFrameStdL : stats.frameStdL;
-  const fLab = useRing ? stats.ringFrameLab : stats.frameLab;
-  const cMeanL = useRing ? stats.paneCenterMeanL : stats.centerMeanL;
-  const cStdL = useRing ? stats.paneCenterStdL : stats.centerStdL;
-  const cLab = useRing ? stats.paneCenterLab : stats.centerLab;
-  const specRatio = Math.max(stats.centerSpecularRatio, stats.paneSpecularRatio);
-
-  if (fStdL >= 46) return false;
-
-  const frameDrop = fMeanL - cMeanL;
+  const frameDrop = stats.frameMeanL - stats.centerMeanL;
   if (frameDrop < 11) return false;
-  // Vitrinas blancas con cuarterones oscuros (#09) alcanzan stdL ~ 50-56 por alto contraste marco/vidrio
-  const maxStdL = frameDrop >= 24 ? 60 : 52;
-  if (stats.stdL >= maxStdL) return false;
+  if (stats.stdL >= 52) return false;
 
-  const frameIsWood = isWarmWoodLab(fLab);
-  const centerIsWood = isWarmWoodLab(cLab);
+  const frameIsWood = isWarmWoodLab(stats.frameLab);
+  const centerIsWood = isWarmWoodLab(stats.centerLab);
   const sameWoodHue =
     frameIsWood &&
     centerIsWood &&
-    Math.abs(cLab[1] - fLab[1]) < 6 &&
-    Math.abs(cLab[2] - fLab[2]) < 7;
+    Math.abs(stats.centerLab[1] - stats.frameLab[1]) < 6 &&
+    Math.abs(stats.centerLab[2] - stats.frameLab[2]) < 7;
 
-  const hasInternalStructure = stats.centerGradMean >= 7.5 || cStdL >= 11;
-  const hasSpecularReflection = specRatio >= 0.02;
-  const hasCoolerGlassTint =
-    cLab[2] < fLab[2] - 3.2 || (frameIsWood && !centerIsWood);
+  const hasInternalStructure = stats.centerGradMean >= 7.5 || stats.centerStdL >= 11;
+  const hasSpecularReflection = stats.centerSpecularRatio >= 0.02;
+  const hasCoolerGlassTint = stats.centerLab[2] < stats.frameLab[2] - 5 || !centerIsWood;
 
   // Guardia anti-Shaker: si marco y centro son madera del mismo tono sin estructura ni reflejo
   if (sameWoodHue && !hasInternalStructure && !hasSpecularReflection && frameDrop < 26) {
@@ -1168,7 +643,7 @@ export function isGlassDoorFromStats(
   return (
     hasInternalStructure ||
     hasSpecularReflection ||
-    (hasCoolerGlassTint && frameDrop >= 12) ||
+    (hasCoolerGlassTint && frameDrop >= 13) ||
     frameDrop >= 24
   );
 }
@@ -1387,8 +862,6 @@ export interface ZoneClassificationContext {
   carcassMaterial: MelamineMaterial;
   refRgb?: readonly [number, number, number];
   exteriorBgRgb?: readonly [number, number, number];
-  /** Muestras locales de pared exterior junto al quad (para recortes escalonados `void_outside`). */
-  localExteriorBg?: LocalExteriorBgSamples;
   lum?: Float32Array;
   matchMap?: Float32Array;
   detectedHandles?: readonly DetectedHandlePoint[];
@@ -1436,7 +909,6 @@ export function classifyZonesUnified(
     boardThicknessMm,
     carcassMaterial,
     exteriorBgRgb,
-    localExteriorBg,
     matchMap,
     detectedHandles = [],
     previousZones = [],
@@ -1450,8 +922,7 @@ export function classifyZonesUnified(
   const refRgb = ctx.refRgb ?? MATERIAL_BASE_RGB[carcassMaterial];
   const refLum = rgbaLuminance(refRgb[0], refRgb[1], refRgb[2]);
   const refLab = rgbToLab(refRgb[0], refRgb[1], refRgb[2]);
-  const effExteriorBg = exteriorBgRgb ?? localExteriorBg?.globalBgRgb;
-  const bgDistFromCarcass = effExteriorBg ? rgbDeltaE(refRgb, effExteriorBg) : 999;
+  const bgDistFromCarcass = exteriorBgRgb ? rgbDeltaE(refRgb, exteriorBgRgb) : 999;
 
   if (!rectRgba || rectW < 20 || rectH < 20) {
     return cells.map((cell, idx) => ({
@@ -1477,28 +948,62 @@ export function classifyZonesUnified(
     preserved?: FrontZone;
   }
 
-  // 1. Medir estadísticas exactas en espacio exterior rectificado para cada celda
-  const measured = cells.map((cell) => {
-    const prevMatch = previousZones.find(
-      (pz) =>
-        Math.abs(pz.uStart - cell.uStart) <= 0.04 &&
-        Math.abs(pz.uEnd - cell.uEnd) <= 0.04 &&
-        Math.abs(pz.vStart - cell.vStart) <= 0.04 &&
-        Math.abs(pz.vEnd - cell.vEnd) <= 0.04,
-    );
-    const isTopRightCorner = cell.vEnd >= 0.94 && cell.uEnd >= 0.94 && cell.vStart > 0.08;
-    const isTopLeftCorner = cell.vEnd >= 0.94 && cell.uStart <= 0.06 && cell.vStart > 0.08;
-    const cornerSide: 'top_right' | 'top_left' | undefined = isTopRightCorner
-      ? 'top_right'
-      : isTopLeftCorner
-        ? 'top_left'
-        : undefined;
-    const localCornerBgRgb = isTopRightCorner
-      ? (localExteriorBg?.rightWallBgRgb ?? localExteriorBg?.topRightBgRgb ?? effExteriorBg)
-      : isTopLeftCorner
-        ? (localExteriorBg?.leftWallBgRgb ?? localExteriorBg?.topLeftBgRgb ?? effExteriorBg)
-        : undefined;
+  // 1. Emparejamiento 1:1 con `previousZones` (borde ±0.04 o IoU >= 0.72 para conservar ajustes de 5–8%)
+  const cellRectIoU = (
+    a: { uStart: number; uEnd: number; vStart: number; vEnd: number },
+    b: { uStart: number; uEnd: number; vStart: number; vEnd: number },
+  ): number => {
+    const iu = Math.max(0, Math.min(a.uEnd, b.uEnd) - Math.max(a.uStart, b.uStart));
+    const iv = Math.max(0, Math.min(a.vEnd, b.vEnd) - Math.max(a.vStart, b.vStart));
+    const inter = iu * iv;
+    if (inter <= 0) return 0;
+    const areaA = Math.max(1e-6, (a.uEnd - a.uStart) * (a.vEnd - a.vStart));
+    const areaB = Math.max(1e-6, (b.uEnd - b.uStart) * (b.vEnd - b.vStart));
+    return inter / Math.max(1e-6, areaA + areaB - inter);
+  };
 
+  const prevMatches: Array<FrontZone | undefined> = new Array(cells.length).fill(undefined);
+  if (previousZones.length > 0) {
+    const usedPrev = new Set<number>();
+    // Paso 1a: coincidencia estrecha de los 4 bordes (±0.04)
+    for (let ci = 0; ci < cells.length; ci++) {
+      const cell = cells[ci];
+      const pIdx = previousZones.findIndex(
+        (pz, pi) =>
+          !usedPrev.has(pi) &&
+          Math.abs(pz.uStart - cell.uStart) <= 0.04 &&
+          Math.abs(pz.uEnd - cell.uEnd) <= 0.04 &&
+          Math.abs(pz.vStart - cell.vStart) <= 0.04 &&
+          Math.abs(pz.vEnd - cell.vEnd) <= 0.04,
+      );
+      if (pIdx !== -1) {
+        usedPrev.add(pIdx);
+        prevMatches[ci] = previousZones[pIdx];
+      }
+    }
+    // Paso 1b: coincidencia global por IoU >= 0.72 (ordenada de mayor a menor IoU, 1:1 sin ambigüedad)
+    const pairs: Array<{ ci: number; pi: number; iou: number }> = [];
+    for (let ci = 0; ci < cells.length; ci++) {
+      if (prevMatches[ci]) continue;
+      for (let pi = 0; pi < previousZones.length; pi++) {
+        if (usedPrev.has(pi)) continue;
+        const iou = cellRectIoU(cells[ci], previousZones[pi]);
+        if (iou >= 0.72) {
+          pairs.push({ ci, pi, iou });
+        }
+      }
+    }
+    pairs.sort((a, b) => b.iou - a.iou);
+    for (const pair of pairs) {
+      if (prevMatches[pair.ci] || usedPrev.has(pair.pi)) continue;
+      usedPrev.add(pair.pi);
+      prevMatches[pair.ci] = previousZones[pair.pi];
+    }
+  }
+
+  // Medir estadísticas exactas en espacio exterior rectificado para cada celda
+  const measured = cells.map((cell, ci) => {
+    const prevMatch = prevMatches[ci];
     const stats = measureCellStats(
       cell,
       rectRgba,
@@ -1507,13 +1012,11 @@ export function classifyZonesUnified(
       rectH,
       dimsMm,
       boardThicknessMm,
-      effExteriorBg,
+      exteriorBgRgb,
       matchMap,
       0.09,
-      localCornerBgRgb,
-      cornerSide,
     );
-    return { cell, stats, prevMatch, cornerSide, localCornerBgRgb };
+    return { cell, stats, prevMatch };
   });
 
   // 2. Clustering ligero bicolor en CIE-Lab sobre celdas candidatas a frente sólido
@@ -1529,7 +1032,7 @@ export function classifyZonesUnified(
     refRgb,
     carcassMaterial,
     candidateRgbs,
-    effExteriorBg,
+    exteriorBgRgb,
   );
   const clusterOverrideByIdx = new Map<number, MelamineMaterial>();
   if (bicolorCluster.isBicolor && bicolorCluster.secondaryMaterial) {
@@ -1540,375 +1043,173 @@ export function classifyZonesUnified(
     }
   }
 
-  // Evalúa si existe un borde horizontal fuerte (cubierta del escalón) en `cell.vStart`
-  const hasStrongStepEdgeAtBase = (cell: CellRect): boolean => {
-    const r = interiorToExteriorRect(cell, dimsMm, boardThicknessMm, rectW, rectH, 0.04);
-    const yBase = clamp(r.y1, 4, rectH - 5);
-    const xA = clamp(r.x0, 2, rectW - 3);
-    const xB = clamp(r.x1, xA + 4, rectW - 3);
-    let hits = 0;
-    const nX = Math.max(1, xB - xA);
-    for (let x = xA; x < xB; x++) {
-      let bestGrad = 0;
-      for (let dy = -6; dy <= 6; dy++) {
-        const yy = clamp(yBase + dy, 3, rectH - 4);
-        const iU = ((yy - 3) * rectW + x) * 4;
-        const iD = ((yy + 3) * rectW + x) * 4;
-        const dCol = Math.hypot(
-          rectRgba[iU] - rectRgba[iD],
-          rectRgba[iU + 1] - rectRgba[iD + 1],
-          rectRgba[iU + 2] - rectRgba[iD + 2],
-        );
-        if (dCol > bestGrad) bestGrad = dCol;
-      }
-      if (bestGrad >= 28) hits++;
-    }
-    return hits / nX >= 0.55;
-  };
-
   // 3. Clasificar cada celda con criterios unificados
-  const items: ClassifiedCell[] = measured.map(
-    ({ cell, stats, prevMatch, cornerSide, localCornerBgRgb }, idx) => {
-      if (prevMatch) {
-        return {
-          cell,
-          stats,
-          kind: prevMatch.kind,
-          drawerCount: prevMatch.drawerCount,
-          basketCount: prevMatch.basketCount,
-          matOverride: prevMatch.materialOverride,
-          preserved: prevMatch,
-        };
-      }
-
-      const spanU = cell.uEnd - cell.uStart;
-      const spanV = cell.vEnd - cell.vStart;
-      const cellWmm = spanU * dimsMm.x;
-      const cellHmm = spanV * dimsMm.y;
-      const isWarmWood = isWarmWoodLab(stats.meanLab, stats.stdL);
-      const dCarcassLab = deltaE76(stats.meanLab, refLab);
-      const dCarcassRgb = Math.hypot(
-        stats.meanR - refRgb[0],
-        stats.meanG - refRgb[1],
-        stats.meanB - refRgb[2],
-      );
-      const dToBgLab = effExteriorBg
-        ? deltaE76(stats.meanLab, rgbToLab(effExteriorBg[0], effExteriorBg[1], effExteriorBg[2]))
-        : 999;
-
-      const singleOverride = inferMaterialOverrideLab(
-        [stats.meanR, stats.meanG, stats.meanB],
-        refRgb,
-        carcassMaterial,
-        stats.stdL,
-        effExteriorBg,
-      );
-      const matOverride = singleOverride ?? clusterOverrideByIdx.get(idx);
-
-      const bgClearlyExterior =
-        stats.transparentRatio >= 0.45 ||
-        (effExteriorBg !== undefined &&
-          (bgDistFromCarcass >= 14 || dToBgLab < dCarcassLab * 0.55));
-
-      // 3a. Hueco inferior de piernas (`leg_void` — escritorio): exige que el fondo difiera de la carcasa
-      // (evita convertir puertas blancas inferiores sobre pared blanca en falsos huecos de piernas)
-      const isCenterDeskKneeHole =
-        cell.vStart <= 0.05 &&
-        cell.vEnd >= 0.64 &&
-        cell.vEnd <= 0.88 &&
-        cell.uStart >= 0.18 &&
-        cell.uEnd <= 0.82 &&
-        spanU >= 0.28 &&
-        dimsMm.y >= 680 &&
-        dimsMm.y <= 880 &&
-        dimsMm.x >= 1100 &&
-        (!matchMap || stats.matchRatio < 0.62) &&
-        (stats.bgRatio >= 0.2 || stats.stdL >= 36 || stats.centerMeanL < refLum - 30);
-      const isLegVoid =
-        isCenterDeskKneeHole ||
-        (cell.vStart <= 0.05 &&
-          stats.bgRatio >= 0.48 &&
-          bgClearlyExterior &&
-          (!matchMap || stats.matchRatio < 0.45) &&
-          (spanU < 0.94 || spanV < 0.92));
-
-      // 3b. Recorte escalonado superior (`void_outside` v8.0):
-      //     (i) fondo limpio homogéneo distinto de carcasa, O
-      //     (ii) pared exterior LOCAL (rightWall/leftWall) continua sin borde de melamina en esquina + borde de escalón en vStart
-      const atTopCorner =
-        cell.vEnd >= 0.94 &&
-        cell.vStart > 0.08 &&
-        (cell.uStart <= 0.06 || cell.uEnd >= 0.94) &&
-        spanU < 0.92 &&
-        spanV < 0.92;
-      const localBorderOpen =
-        cornerSide === 'top_right'
-          ? localExteriorBg?.topRightBorderOpen === true
-          : cornerSide === 'top_left'
-            ? localExteriorBg?.topLeftBorderOpen === true
-            : false;
-      const dLocalWallToCarcass = localCornerBgRgb ? rgbDeltaE(refRgb, localCornerBgRgb) : 999;
-      const isCleanGlobalVoidOutside =
-        atTopCorner &&
-        stats.bgRatio >= 0.62 &&
-        bgClearlyExterior &&
-        stats.stdL < 22 &&
-        (!matchMap || stats.matchRatio < 0.28);
-      const isLocalWallVoidOutside =
-        atTopCorner &&
-        localCornerBgRgb !== undefined &&
-        localBorderOpen &&
-        (stats.localBgRatio >= 0.46 || stats.outerCornerBgRatio >= 0.65) &&
-        (dLocalWallToCarcass >= 10 || stats.outerCornerBgRatio >= 0.72) &&
-        hasStrongStepEdgeAtBase(cell);
-      const isVoidOutside = !isLegVoid && (isCleanGlobalVoidOutside || isLocalWallVoidOutside);
-
-      // 3c. Canastos metálicos (`baskets` v8.0):
-      //     (i) rejilla metálica acromática periódica bidireccional (canastos vacíos), O
-      //     (ii) 2–4 rieles metálicos horizontales plateados/acromáticos en nicho oscuro con frutas/objetos
-      const basketGeometryValid =
-        spanU <= 0.75 &&
-        cellHmm >= 220 &&
-        cellWmm <= 700 &&
-        cellWmm / Math.max(1, cellHmm) <= 1.65;
-      const basketRailGeometryValid =
-        spanU >= 0.14 &&
-        spanU <= 0.52 &&
-        cellHmm >= 240 &&
-        cellWmm <= 560 &&
-        cellWmm / Math.max(1, cellHmm) <= 1.2;
-      const isWireGridBaskets =
-        basketGeometryValid && stats.wireGridScore >= 0.54 && stats.stdL >= 14 && !isWarmWood;
-      const isRailBaskets =
-        basketRailGeometryValid && stats.basketRailScore >= 0.68 && stats.stdL >= 24;
-      const isBaskets = !isLegVoid && !isVoidOutside && (isWireGridBaskets || isRailBaskets);
-
-      let kind: FrontModuleKind;
-      let basketCount: number | undefined;
-      let drawerCount: number | undefined;
-
-      if (isLegVoid) {
-        kind = 'leg_void';
-      } else if (isVoidOutside) {
-        kind = 'void_outside';
-      } else if (isBaskets) {
-        kind = 'baskets';
-        basketCount =
-          cellHmm >= 540 && spanV >= 0.65
-            ? clamp(Math.max(stats.estimatedBasketCount, Math.round(cellHmm / 215)), 2, 4)
-            : stats.estimatedBasketCount;
-      } else if (modeHint === 'open') {
-        // En modo abierto, solo promover a puerta bicolor cerrada cuando hay claro panel liso de madera contrastante
-        const isContrastingWoodDoor =
-          cells.length >= 2 &&
-          stats.stdL < 38 &&
-          isWarmWood &&
-          carcassMaterial !== 'roble' &&
-          dCarcassLab >= 18;
-        if (isContrastingWoodDoor) {
-          kind = cellWmm > 620 ? 'door_double' : cell.uStart < 0.48 ? 'door_left' : 'door_right';
-        } else {
-          kind = 'open';
-        }
-      } else {
-        const isOpenPassThrough =
-          cell.vStart > 0.05 &&
-          stats.bgRatio >= 0.62 &&
-          (carcassMaterial !== 'blanco' ||
-            bgDistFromCarcass >= 10 ||
-            dToBgLab < dCarcassLab * 0.85);
-
-        // Nicho central de mesón empotrado en mueble de cocina claro/blanco (banda ancha sombreada entre 2 cuerpos)
-        const isRecessedCountertopNiche =
-          spanU >= 0.86 &&
-          cell.vStart >= 0.22 &&
-          cell.vEnd <= 0.82 &&
-          refLum >= 165 &&
-          stats.meanL < refLum - 32 &&
-          !isWarmWood &&
-          stats.stdL < 34;
-
-        const effGlassFrameLab =
-          stats.ringFrameMeanL - stats.paneCenterMeanL > stats.frameMeanL - stats.centerMeanL + 2
-            ? stats.ringFrameLab
-            : stats.frameLab;
-        const effGlassFrameL = Math.max(stats.frameMeanL, stats.ringFrameMeanL);
-        const effGlassCenterL = Math.min(stats.centerMeanL, stats.paneCenterMeanL);
-        // Exigir luminancia interior >= 42 (o reflejo especular real en puertas altas >= 520 mm) para no
-        // confundir cubículos abiertos ultra-oscuros de grafito (#04, L=25..34) con puertas de vidrio
-        const glassCenterLumOk =
-          effGlassCenterL >= (refLum < 115 ? 44 : 48) ||
-          (effGlassCenterL >= 36 &&
-            cellHmm >= 520 &&
-            Math.max(stats.centerSpecularRatio, stats.paneSpecularRatio) >= 0.03);
-        const isGlass =
-          !isOpenPassThrough &&
-          !isRecessedCountertopNiche &&
-          glassCenterLumOk &&
-          (deltaE76(effGlassFrameLab, refLab) <= 28 || effGlassFrameL >= refLum - 35) &&
-          isGlassDoorFromStats(stats, cellWmm, cellHmm);
-
-        const isDarkGraphiteCavity =
-          carcassMaterial === 'grafito' &&
-          !isWarmWood &&
-          stats.centerMeanL < 46 &&
-          stats.meanL < refLum - 22;
-
-        const isDarkOpen =
-          !isGlass &&
-          (isRecessedCountertopNiche ||
-            isDarkGraphiteCavity ||
-            (stats.centerMeanL < 56 && !isWarmWood && carcassMaterial !== 'grafito') ||
-            (refLum >= 195 && stats.meanL < refLum - 62 && stats.stdL > 20) ||
-            (stats.meanL < refLum - 26 &&
-              dCarcassRgb > 32 &&
-              !isWarmWood &&
-              (!matchMap || stats.matchRatio < 0.44)) ||
-            (stats.stdL > 35 && stats.bgRatio < 0.45));
-
-        // Franja horizontal ancha y baja (especialmente en parte superior, ej. cajón ancho #12) -> SIEMPRE 1 cajón
-        const isWideSingleDrawer =
-          cellHmm >= 90 && cellHmm <= 280 && cellWmm / Math.max(1, cellHmm) >= 1.8;
-
-        if (isOpenPassThrough || isDarkOpen) {
-          kind = 'open';
-        } else if (isGlass) {
-          kind = 'door_glass';
-        } else if (isWideSingleDrawer || (cellHmm <= 310 && cellWmm > cellHmm * 1.15)) {
-          kind = 'drawers';
-          drawerCount = 1;
-        } else if (mergeDrawers && cellHmm <= 360 && cellWmm > cellHmm * 0.85 && stats.stdL <= 34) {
-          // Candidato a cajón apilado (se confirmará al fusionar corrida adyacente o degradará a puerta)
-          kind = 'drawers';
-          drawerCount = 1;
-        } else {
-          // Detector dedicado de cajones apilados internos dentro de columnas cerradas (ej. #01 columna derecha)
-          const internalDrw =
-            stats.stdL <= 34 && cellWmm <= 750 && cellHmm >= 340
-              ? detectInternalDrawersInCell(
-                  cell,
-                  lum,
-                  rectW,
-                  rectH,
-                  dimsMm,
-                  boardThicknessMm,
-                  detectedHandles,
-                )
-              : { kind: 'none' as const, drawerCount: 0 };
-
-          if (internalDrw.kind === 'stacked' && internalDrw.drawerCount >= 2) {
-            kind = 'drawers';
-            drawerCount = internalDrw.drawerCount;
-          } else if (cellWmm >= 540 && cellWmm / Math.max(1, cellHmm) >= 0.85) {
-            kind = 'door_double';
-          } else {
-            const uMid = (cell.uStart + cell.uEnd) * 0.5;
-            const handle = detectedHandles.find(
-              (h) =>
-                h.u >= cell.uStart - 0.03 &&
-                h.u <= cell.uEnd + 0.03 &&
-                h.v >= cell.vStart - 0.03 &&
-                h.v <= cell.vEnd + 0.03,
-            );
-            if (handle) {
-              kind = handle.u >= uMid ? 'door_left' : 'door_right';
-            } else {
-              kind = cell.uStart < 0.48 ? 'door_left' : 'door_right';
-            }
-          }
-        }
-      }
-
-      const noOverride =
-        kind === 'open' ||
-        kind === 'leg_void' ||
-        kind === 'void_outside' ||
-        kind === 'baskets' ||
-        (kind === 'door_glass' && matOverride === 'grafito');
+  const items: ClassifiedCell[] = measured.map(({ cell, stats, prevMatch }, idx) => {
+    if (prevMatch) {
       return {
         cell,
         stats,
-        kind,
-        drawerCount,
-        basketCount,
-        matOverride: noOverride ? undefined : matOverride,
+        kind: prevMatch.kind,
+        drawerCount: prevMatch.drawerCount,
+        basketCount: prevMatch.basketCount,
+        matOverride: prevMatch.materialOverride,
+        preserved: prevMatch,
       };
-    },
-  );
+    }
 
-  // 3d. Coherencia de librero alto abierto (ej. #10): si en un mueble alto multi-vano (>= 6 celdas)
-  // la mayoría (>= 55%) son vanos abiertos y las celdas restantes NO son bicolor ni tienen tirador
-  // centrado limpio, evitar inventar puertas/cajones/vidrios falsos sobre nichos vacíos sombreados.
-  if (dimsMm.y >= 1350 && items.length >= 6) {
-    const openCount = items.filter((it) => it.kind === 'open').length;
-    const openFrac = openCount / items.length;
-    if (openFrac >= 0.55) {
-      for (const it of items) {
-        if (it.preserved || it.kind === 'open' || it.kind === 'baskets') {
-          continue;
-        }
-        // En un librero multi-repisa (>= 9 nichos con >= 60% abiertos), ningún cubículo bajo (< 620 mm) es puerta vidriada
-        const subCubbyGlassInBookcase =
-          (items.length >= 9 && openFrac >= 0.6 && it.kind === 'door_glass' && (it.cell.vEnd - it.cell.vStart) * dimsMm.y < 620) ||
-          (openFrac >= 0.75 &&
-            it.kind === 'door_glass' &&
-            (it.cell.vEnd - it.cell.vStart) * dimsMm.y < 620);
-        if (subCubbyGlassInBookcase) {
-          it.kind = 'open';
-          it.drawerCount = undefined;
-          it.matOverride = undefined;
-          continue;
-        }
-        if (it.kind === 'door_glass' && (it.cell.vEnd - it.cell.vStart) * dimsMm.y >= 620) {
-          continue;
-        }
-        if (it.matOverride) continue;
-        const spanU = it.cell.uEnd - it.cell.uStart;
-        const spanV = it.cell.vEnd - it.cell.vStart;
-        const uMid = 0.5 * (it.cell.uStart + it.cell.uEnd);
-        const vMid = 0.5 * (it.cell.vStart + it.cell.vEnd);
-        const hasCleanCenteredHandle = detectedHandles.some(
+    const spanU = cell.uEnd - cell.uStart;
+    const spanV = cell.vEnd - cell.vStart;
+    const cellWmm = spanU * dimsMm.x;
+    const cellHmm = spanV * dimsMm.y;
+    const isWarmWood = isWarmWoodLab(stats.meanLab, stats.stdL);
+    const dCarcassLab = deltaE76(stats.meanLab, refLab);
+    const dCarcassRgb = Math.hypot(
+      stats.meanR - refRgb[0],
+      stats.meanG - refRgb[1],
+      stats.meanB - refRgb[2],
+    );
+    const dToBgLab = exteriorBgRgb
+      ? deltaE76(stats.meanLab, rgbToLab(exteriorBgRgb[0], exteriorBgRgb[1], exteriorBgRgb[2]))
+      : 999;
+
+    const singleOverride = inferMaterialOverrideLab(
+      [stats.meanR, stats.meanG, stats.meanB],
+      refRgb,
+      carcassMaterial,
+      stats.stdL,
+      exteriorBgRgb,
+    );
+    const matOverride = singleOverride ?? clusterOverrideByIdx.get(idx);
+
+    const bgClearlyExterior =
+      stats.transparentRatio >= 0.45 ||
+      (exteriorBgRgb !== undefined &&
+        (bgDistFromCarcass >= 14 || dToBgLab < dCarcassLab * 0.55));
+
+    // 3a. Hueco inferior de piernas (`leg_void` — escritorio): exige que el fondo difiera de la carcasa
+    // (evita convertir puertas blancas inferiores sobre pared blanca en falsos huecos de piernas)
+    const isLegVoid =
+      cell.vStart <= 0.05 &&
+      stats.bgRatio >= 0.48 &&
+      bgClearlyExterior &&
+      (!matchMap || stats.matchRatio < 0.45) &&
+      (spanU < 0.94 || spanV < 0.92);
+
+    // 3b. Recorte escalonado superior (`void_outside` v7.0/v8.0)
+    const atTopCorner =
+      cell.vEnd >= 0.96 &&
+      cell.vStart > 0.08 &&
+      (cell.uStart <= 0.04 || cell.uEnd >= 0.96) &&
+      spanU < 0.92 &&
+      spanV < 0.92;
+    const isVoidOutside =
+      !isLegVoid &&
+      atTopCorner &&
+      stats.bgRatio >= 0.62 &&
+      bgClearlyExterior &&
+      stats.stdL < 22 &&
+      (!matchMap || stats.matchRatio < 0.28);
+
+    // 3c. Canastos metálicos (`baskets` v8.0 — rejilla metálica acromática periódica en vano dedicado)
+    // Descarta celdas anchas (> 75% del ancho del mueble sin divisores, ej. mesa de centro) y repisas muy apaisadas
+    const basketGeometryValid =
+      spanU <= 0.75 &&
+      cellHmm >= 220 &&
+      cellWmm <= 700 &&
+      cellWmm / Math.max(1, cellHmm) <= 1.65;
+    const isBaskets =
+      !isLegVoid &&
+      !isVoidOutside &&
+      basketGeometryValid &&
+      stats.wireGridScore >= 0.54 &&
+      stats.stdL >= 14 &&
+      !isWarmWood;
+
+    let kind: FrontModuleKind;
+    let basketCount: number | undefined;
+    let drawerCount: number | undefined;
+
+    if (isLegVoid) {
+      kind = 'leg_void';
+    } else if (isVoidOutside) {
+      kind = 'void_outside';
+    } else if (isBaskets) {
+      kind = 'baskets';
+      basketCount = stats.estimatedBasketCount;
+    } else if (modeHint === 'open') {
+      // En modo abierto, solo promover a puerta bicolor cerrada cuando hay claro panel liso de madera contrastante
+      const isContrastingWoodDoor =
+        cells.length >= 2 &&
+        stats.stdL < 38 &&
+        isWarmWood &&
+        carcassMaterial !== 'roble' &&
+        dCarcassLab >= 18;
+      if (isContrastingWoodDoor) {
+        kind = cellWmm > 620 ? 'door_double' : cell.uStart < 0.48 ? 'door_left' : 'door_right';
+      } else {
+        kind = 'open';
+      }
+    } else {
+      const isOpenPassThrough =
+        cell.vStart > 0.05 &&
+        stats.bgRatio >= 0.65 &&
+        (carcassMaterial !== 'blanco' || dToBgLab < dCarcassLab * 0.55);
+      const isGlass =
+        !isOpenPassThrough &&
+        stats.centerMeanL >= 52 &&
+        (deltaE76(stats.frameLab, refLab) <= 26 || stats.frameMeanL >= refLum - 35) &&
+        isGlassDoorFromStats(stats, cellWmm, cellHmm);
+
+      const isDarkOpen =
+        !isGlass &&
+        ((stats.centerMeanL < 56 && !isWarmWood && carcassMaterial !== 'grafito') ||
+          (refLum >= 195 && stats.meanL < refLum - 62 && stats.stdL > 20) ||
+          (stats.meanL < refLum - 26 &&
+            dCarcassRgb > 32 &&
+            !isWarmWood &&
+            (!matchMap || stats.matchRatio < 0.44)) ||
+          (stats.stdL > 35 && stats.bgRatio < 0.45));
+
+      if (isOpenPassThrough || isDarkOpen) {
+        kind = 'open';
+      } else if (isGlass) {
+        kind = 'door_glass';
+      } else if (cellHmm <= 310 && cellWmm > cellHmm * 1.15) {
+        kind = 'drawers';
+        drawerCount = 1;
+      } else if (mergeDrawers && cellHmm <= 360 && cellWmm > cellHmm * 0.85 && stats.stdL <= 34) {
+        // Candidato a cajón apilado (se confirmará al fusionar corrida adyacente o degradará a puerta)
+        kind = 'drawers';
+        drawerCount = 1;
+      } else if (cellWmm >= 540 && cellWmm / Math.max(1, cellHmm) >= 0.85) {
+        kind = 'door_double';
+      } else {
+        const uMid = (cell.uStart + cell.uEnd) * 0.5;
+        const handle = detectedHandles.find(
           (h) =>
-            Math.abs(h.u - uMid) <= spanU * 0.22 &&
-            Math.abs(h.v - vMid) <= spanV * 0.28,
+            h.u >= cell.uStart - 0.03 &&
+            h.u <= cell.uEnd + 0.03 &&
+            h.v >= cell.vStart - 0.03 &&
+            h.v <= cell.vEnd + 0.03,
         );
-        const looksLikeOpenShelf =
-          it.stats.stdL >= 16 ||
-          it.stats.meanL < refLum - 8 ||
-          it.stats.centerGradMean >= 4.0;
-        if (!hasCleanCenteredHandle && looksLikeOpenShelf) {
-          it.kind = 'open';
-          it.drawerCount = undefined;
-          it.matOverride = undefined;
+        if (handle) {
+          kind = handle.u >= uMid ? 'door_left' : 'door_right';
+        } else {
+          kind = cell.uStart < 0.48 ? 'door_left' : 'door_right';
         }
       }
     }
-  }
 
-  // 3e. Coherencia bicolor de puertas/cajones de madera cálida sobre carcasa blanca con nichos abiertos blancos (ej. #14):
-  // si el mueble posee al menos un nicho abierto claro neutro (`blanco`) y frentes cerrados con tono cálido de madera (`roble`),
-  // explicitar `matOverride = 'roble'` en dichos frentes cerrados para que se rendericen siempre en roble incluso si la carcasa base es blanca.
-  const hasBrightNeutralOpenNiche = items.some(
-    (it) =>
-      it.kind === 'open' &&
-      it.stats.meanL >= 160 &&
-      Math.abs(it.stats.meanLab[1]) < 6 &&
-      Math.abs(it.stats.meanLab[2]) < 10,
-  );
-  if (hasBrightNeutralOpenNiche) {
-    for (const it of items) {
-      if (
-        (it.kind === 'door_left' ||
-          it.kind === 'door_right' ||
-          it.kind === 'door_double' ||
-          it.kind === 'drawers') &&
-        !it.matOverride &&
-        (it.stats.meanLab[2] >= 14 && it.stats.meanLab[0] >= 42)
-      ) {
-        it.matOverride = 'roble';
-      }
-    }
-  }
+    const noOverride = kind === 'open' || kind === 'leg_void' || kind === 'void_outside' || kind === 'baskets';
+    return {
+      cell,
+      stats,
+      kind,
+      drawerCount,
+      basketCount,
+      matOverride: noOverride ? undefined : matOverride,
+    };
+  });
 
   // 4. Sin fusión de cajones (modo `userVectorTrace` donde cada celda trazada es 1:1)
   if (!mergeDrawers) {
@@ -1938,67 +1239,22 @@ export function classifyZonesUnified(
     });
   }
 
-  // 4b. En vitrinas altas de 2 columnas con puertas inferiores ciegas y cuerpo superior vidriado con repisas internas visibles (#06):
-  // si el cuerpo superior (v >= 0.25) de una columna tiene >= 2 sub-celdas apiladas y al menos una fue detectada como `door_glass`,
-  // unificar las sub-celdas superiores de cada columna en una única puerta vidriada alta `door_glass`.
-  const hasLowerClosedDoors = items.some(
-    (it) =>
-      it.cell.vStart <= 0.03 &&
-      it.cell.vEnd <= 0.5 &&
-      (it.kind === 'door_left' || it.kind === 'door_right' || it.kind === 'door_double'),
-  );
-  const hasUpperSubGlass = items.some((it) => it.cell.vStart >= 0.24 && it.kind === 'door_glass');
-  const isTwoColTallVitrina =
-    dimsMm.y >= 1600 &&
-    dimsMm.x <= 1000 &&
-    hasLowerClosedDoors &&
-    hasUpperSubGlass &&
-    items.filter((it) => it.cell.vStart >= 0.24).length >= 4;
-
   // 5. Fusión de cajones apilados por columna VERIFICANDO ADYACENCIA VERTICAL REAL (`|a.vEnd - b.vStart| < 0.03`)
-  const colGroups = new Map<string, ClassifiedCell[]>();
+  const colGroups: Array<{ uStart: number; uEnd: number; list: ClassifiedCell[] }> = [];
   for (const it of items) {
-    const key = `${it.cell.uStart.toFixed(2)}_${it.cell.uEnd.toFixed(2)}`;
-    const list = colGroups.get(key) ?? [];
-    list.push(it);
-    colGroups.set(key, list);
+    const hit = colGroups.find(
+      (g) => Math.abs(g.uStart - it.cell.uStart) <= 0.025 && Math.abs(g.uEnd - it.cell.uEnd) <= 0.025,
+    );
+    if (hit) {
+      hit.list.push(it);
+    } else {
+      colGroups.push({ uStart: it.cell.uStart, uEnd: it.cell.uEnd, list: [it] });
+    }
   }
 
   const out: FrontZone[] = [];
-  for (const group of colGroups.values()) {
+  for (const { list: group } of colGroups) {
     const sorted = [...group].sort((a, b) => a.cell.vStart - b.cell.vStart);
-    if (isTwoColTallVitrina) {
-      const lowerItems = sorted.filter((it) => it.cell.vEnd <= 0.5);
-      const upperItems = sorted.filter((it) => it.cell.vStart >= 0.24);
-      if (lowerItems.length >= 1 && upperItems.length >= 2) {
-        for (const low of lowerItems) {
-          out.push({
-            id: `${idPrefix}_${low.kind}_${out.length + 1}`,
-            uStart: Number(low.cell.uStart.toFixed(4)),
-            uEnd: Number(low.cell.uEnd.toFixed(4)),
-            vStart: Number(low.cell.vStart.toFixed(4)),
-            vEnd: Number(low.cell.vEnd.toFixed(4)),
-            kind: low.kind,
-            label: defaultLabelForKind(low.kind, out.length),
-            materialOverride: low.matOverride,
-          });
-        }
-        const u0 = upperItems[0].cell.uStart;
-        const u1 = upperItems[0].cell.uEnd;
-        const v0 = Math.min(...upperItems.map((u) => u.cell.vStart));
-        const v1 = Math.max(...upperItems.map((u) => u.cell.vEnd));
-        out.push({
-          id: `${idPrefix}_door_glass_${out.length + 1}`,
-          uStart: Number(u0.toFixed(4)),
-          uEnd: Number(u1.toFixed(4)),
-          vStart: Number(v0.toFixed(4)),
-          vEnd: Number(v1.toFixed(4)),
-          kind: 'door_glass',
-          label: defaultLabelForKind('door_glass', out.length),
-        });
-        continue;
-      }
-    }
     let i = 0;
     while (i < sorted.length) {
       if (sorted[i].kind === 'drawers') {
@@ -2012,10 +1268,7 @@ export function classifyZonesUnified(
         ) {
           j++;
         }
-        let count = 0;
-        for (let k = i; k <= j; k++) {
-          count += sorted[k].drawerCount ?? 1;
-        }
+        const count = j - i + 1;
         const u0 = sorted[i].cell.uStart;
         const u1 = sorted[i].cell.uEnd;
         const v0 = sorted[i].cell.vStart;
@@ -2024,8 +1277,7 @@ export function classifyZonesUnified(
         // Si era un bloque solitario relativamente alto (> 310 mm o poco apaisado), reevaluar como puerta
         const wMm = (u1 - u0) * dimsMm.x;
         const hMm = (v1 - v0) * dimsMm.y;
-        const isWideTopDrawer = hMm >= 90 && hMm <= 280 && wMm / Math.max(1, hMm) >= 1.8;
-        if (count === 1 && !isWideTopDrawer && (hMm > 310 || wMm <= hMm * 1.15)) {
+        if (count === 1 && (hMm > 310 || wMm <= hMm * 1.15)) {
           const uMid = (u0 + u1) * 0.5;
           const handle = detectedHandles.find(
             (h) => h.u >= u0 - 0.03 && h.u <= u1 + 0.03 && h.v >= v0 - 0.03 && h.v <= v1 + 0.03,
@@ -2087,9 +1339,7 @@ export function classifyZonesUnified(
 
 export interface BaseSupportHintResult {
   possibleExternalLegs: boolean;
-  estimatedLegRatio?: number;
   supportType: BaseSupportType;
-  estimatedHeightRatio?: number;
 }
 
 /**
@@ -2151,20 +1401,15 @@ export function detectBaseSupportHint(
   if (farContrast >= 0.16) {
     return {
       possibleExternalLegs: true,
-      estimatedLegRatio: Number(((dropOffset * 1.4) / bodyH).toFixed(3)),
       supportType: 'legs',
-      estimatedHeightRatio: Number(((dropOffset * 1.4) / bodyH).toFixed(3)),
     };
   }
 
   // Ruedas compactas: contraste fuerte justo bajo las esquinas (5..9% alto) pero ausente a 14% (rueda baja)
   if (nearContrast >= 0.2 && midContrast < 0.28 && farContrast < 0.12) {
-    const ratio = Number(((Math.max(4, Math.round(bodyH * 0.075))) / bodyH).toFixed(3));
     return {
       possibleExternalLegs: true,
-      estimatedLegRatio: ratio,
       supportType: 'wheels',
-      estimatedHeightRatio: ratio,
     };
   }
 
@@ -2189,11 +1434,9 @@ export function detectBaseSupportHint(
     const uniformContinuousBand = stdNear <= 22 && nearContrast < 0.16;
 
     if (darkerThanBody && distinctFromFloor && uniformContinuousBand) {
-      const toeRatio = Number((0.08).toFixed(3));
       return {
         possibleExternalLegs: false,
         supportType: 'toe_kick',
-        estimatedHeightRatio: toeRatio,
       };
     }
   }

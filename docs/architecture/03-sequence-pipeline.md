@@ -22,37 +22,39 @@ sequenceDiagram
         opt Prueba opcional de visión real sobre foto de catálogo
             App->>VC: Carga ./ejemplos/foto para análisis en vivo
         end
-    else Carga de Foto Propia del Usuario
-        User->>VC: Sube imagen local (URL.createObjectURL)
-        VC->>User: Paso 1 frame (4 pts TL,TR,BR,BL o marco recto + lupa 4x)
-        User->>VC: Ajusta contorno exterior y calibra (1 medida o A4 297 mm)
+    else Carga de 1 a 3 Vistas (Foto, Boceto en Papel o Lienzo Libre)
+        User->>VC: Sube foto/dibujo o activa Dibujar en lienzo libre en Frente (XY), Arriba (XZ) o Lado (ZY)
+        VC->>Vis: isHandDrawnSketchImage() y recognizeHandDrawnSketch(rgba, plane)
+        Vis-->>VC: Contorno quad, vDividers, hShelves, lShapeInference y curvedCuts
         VC->>Hom: computeQuadToUnitHomography(quadCorners)
         Hom-->>VC: toUnit (H 3x3 con Hartley) y toCanvas (H^-1)
-        VC->>Vis: rectifyImageRGBA(img, toCanvas, W, H)
-        Vis-->>VC: Buffer RGBA rectificado + aspectRatioXY (focal fija 26/52 mm)
-        alt Trazo Guiado Manual (Paso 2 lines)
-            User->>VC: Traza divisores/repisas/diagonales (snap T-junctions)
-            VC->>Vis: vectorizeUserStroke() + partitionCellsFromVectors()
-            VC->>Vis: classifyPartitionedZonesFromPhoto() (CIE-Lab)
-        else Auto-Sugerir Estructura
-            User->>VC: Pulsa Sugerir líneas auto (y gotero 1 clic opcional)
-            VC->>Vis: runIterativePhotoTo3D() (CIE-Lab + XY-Cut + dEdge 18-72 deg)
+        VC->>Vis: rectifyImageRGBA(img, toCanvas, W, H) + synthesize3DFromTriViews(front, top, side)
+        Vis-->>VC: Cotas calibradas (X, Y, Z) y topología unificada 3-vistas
+        VC->>App: onApplyCalibratedDims (sincroniza X/Y/Z en 3D)
+        alt Trazo Libre en Tiempo Real (Recta, Diagonal o Curva Bézier)
+            User->>VC: Traza rectas/diagonales o polilínea curva en modo curve
+            VC->>Math: fitDifferentialCurveFromStroke(ptsMm) (Schneider LSQ + curvatura κ)
+            VC->>Vis: vectorizeUserStroke() + partitionCellsFromVectors() + classifyPartitionedZonesFromPhoto()
+        else Botón Medidas Razonables o Detección Auto
+            User->>VC: Pulsa Medidas razonables o Detectar dibujo / Sugerir líneas
+            VC->>Vis: makeDrawingMeasurementsReasonable() o runIterativePhotoTo3D()
         end
-        Vis-->>VC: vDividers, hShelves, diagonalDividers, frontZones, confidence
-        User->>VC: Paso 3 zones (Inspector unificado: tipo, cajones, merge/split, bicolor)
+        Vis-->>VC: vDividers, hShelves, diagonalDividers, curvedCuts, lShape, frontZones
+        User->>VC: Paso 3 zones (ZoneInspector simplificado: 9 tipos, cajones/canastos, dividir/unir, bicolor)
         VC->>Math: exteriorToInterior(p, e, dim)
         VC->>App: onUpdateTopology(nextTopology) y dims calibradas V0/Vf
     end
 
     App->>Math: calculateDespiece(topology, params)
-    Math-->>App: DespieceResult (BoardPiece 1:1 con metadatos, n x 3, n x 5, alertas DIN, hardwareSummary)
+    Note over Math: Genera Ala A + Ala B a 90 deg en XZ (lShapeBuilder) y aplica curvas diferenciales (differentialCurve: Gauss-Legendre ∫ds y κ_max)
+    Math-->>App: DespieceResult (BoardPiece 1:1 con wing y curveProfile, differentialMetrics, n x 3, n x 5, alertas DIN y radio < 28 mm)
 
     par Actualización Sincronizada de Vistas
-        App->>V3D: despiece + topology + params + hoveredZoneId
-        V3D-->>User: Render 3D bicolor, puertas/vidrio/cajones/canastos/patas/ruedas/zócalo/diagonales (sin reset de cámara)
+        App->>V3D: despiece + topology + params + hoveredZoneId + explodeFactor
+        V3D-->>User: Render 3D bicolor (alas L + ExtrudeGeometry para BoardCurveProfile) y botón Explotar
     and
         App->>BP: topology + params (V0 y Vf) + despiece
-        BP-->>User: Plano técnico SVG V0 vs Vf con aprobación explícita
+        BP-->>User: Plano técnico SVG V0 vs Vf (Planta XZ, Alzados A/B y rutas Bézier svg-diff-curve)
     and
         App->>CS: generateCuttingPlan(despiece.matrizDespiece, params)
         CS->>CS: Agrupa estrictamente por (espesorMm, material)

@@ -16,6 +16,7 @@ import type {
   MelamineMaterial,
   ScaleAndBoardParams,
 } from '../../types/contracts';
+import { isBackPanelSheet } from './optimizer';
 
 export interface BomLineItem {
   id: string;
@@ -70,7 +71,7 @@ function sanitizeClp(value: number | undefined, fallback: number): number {
   return Math.round(value);
 }
 
-function resolveCostConfig(overrides?: Partial<CostEstimatorConfig>): CostEstimatorConfig {
+export function resolveCostConfig(overrides?: Partial<CostEstimatorConfig>): CostEstimatorConfig {
   if (!overrides) {
     return { ...DEFAULT_COST_CONFIG };
   }
@@ -99,16 +100,11 @@ function resolveCostConfig(overrides?: Partial<CostEstimatorConfig>): CostEstima
 
 function resolveHardwareUnitClp(hw: HardwareItem, cfg: CostEstimatorConfig): number {
   const desc = hw.descripcion;
-  // Prioridad explícita: canastos antes que metal/estructura para no confundir "Canastos metálicos"
-  if (/canasto/i.test(desc)) return cfg.basketClp;
-  if (/rueda|caster|garrucha/i.test(desc)) return cfg.wheelClp;
-  if (/vidrio|vitrina/i.test(desc)) return cfg.glassPanelClp;
-  if (/mes[oó]n|granito|cuarzo/i.test(desc)) return cfg.countertopClp;
-  if (/fierro|metal|estructura/i.test(desc)) return cfg.metalFrameClp;
 
+  // 1. Respetar primero las categorías específicas (evita sobrecobrar "Tiradores de metal" o "Patas metálicas")
   switch (hw.categoria) {
     case 'patas':
-      return cfg.legClp;
+      return /rueda|caster|garrucha/i.test(desc) ? cfg.wheelClp : cfg.legClp;
     case 'tiradores':
       return cfg.handleClp;
     case 'bisagras':
@@ -117,8 +113,19 @@ function resolveHardwareUnitClp(hw: HardwareItem, cfg: CostEstimatorConfig): num
       return cfg.slideClp;
     case 'otro':
     default:
-      return cfg.otherClp;
+      break;
   }
+
+  // 2. Clasificación semántica para `categoria: 'otro'`
+  // Prioridad explícita: canastos, ruedas y cerraduras antes que estructura metálica o vidrio
+  if (/canasto/i.test(desc)) return cfg.basketClp;
+  if (/rueda|caster|garrucha/i.test(desc)) return cfg.wheelClp;
+  if (/cerradura|chapa/i.test(desc)) return cfg.otherClp;
+  if (/vidrio|vitrina/i.test(desc)) return cfg.glassPanelClp;
+  if (/mes[oó]n|granito|cuarzo/i.test(desc)) return cfg.countertopClp;
+  if (/fierro|met[aá]l|estructura/i.test(desc)) return cfg.metalFrameClp;
+
+  return cfg.otherClp;
 }
 
 /**
@@ -158,7 +165,11 @@ export function estimateProjectBomAndCost(
     nailCount += Math.max(minNails, Math.ceil(perimeterMm / 120)) * qty;
   }
 
-  const glideCount = hasExternalLegs ? 0 : params.targetDimensions.x >= 1500 ? 6 : 4;
+  const hasReturnWing = despiece.matrizDespiece.some((p) => p.wing === 'return');
+  const glideCount =
+    carcassBoardQty === 0 || hasExternalLegs
+      ? 0
+      : (params.targetDimensions.x >= 1500 ? 6 : 4) + (hasReturnWing ? 2 : 0);
 
   const fasteners: BomLineItem[] = [];
   if (screwCount > 0) {
@@ -229,7 +240,9 @@ export function estimateProjectBomAndCost(
 
   const melamineSheetsClp = cuttingPlan.melamineSheetsCount * melamineUnitClp;
   const backPanelSheetsClp = cuttingPlan.backPanelSheetsCount * backPanelUnitClp;
-  const edgeBandingMetersWithAllowance = Math.ceil(despiece.totalEdgeBandingMeters * 1.1);
+  const rawEdgeWithAllowance = Math.max(0, despiece.totalEdgeBandingMeters) * 1.1;
+  const edgeBandingMetersWithAllowance =
+    rawEdgeWithAllowance <= 1e-9 ? 0 : Math.ceil(rawEdgeWithAllowance - 1e-9);
   const edgeBandingClp = edgeBandingMetersWithAllowance * cfg.edgeBandingPerMeterClp;
   const fastenersClp = fasteners.reduce((acc, it) => acc + it.subtotalClp, 0);
   const externalHardwareClp = externalHardware.reduce((acc, it) => acc + it.subtotalClp, 0);
@@ -243,12 +256,16 @@ export function estimateProjectBomAndCost(
   // Desglose bicolor de planchas de melamina por color
   const melamineByMaterialClp: Partial<Record<MelamineMaterial, { sheets: number; clp: number }>> = {};
   for (const sh of cuttingPlan.sheetsUsed) {
-    const isBack =
-      sh.material === 'durolac_3mm' ||
-      (sh.material === undefined &&
-        Math.abs(sh.espesorMm - params.backPanelThickness) <= 0.5 &&
-        sh.espesorMm < params.boardThickness);
-    if (isBack) continue;
+    if (
+      isBackPanelSheet(
+        sh.espesorMm,
+        sh.material,
+        params.backPanelThickness,
+        params.boardThickness,
+      )
+    ) {
+      continue;
+    }
     const matKey: MelamineMaterial =
       sh.material && sh.material !== 'durolac_3mm' ? sh.material : params.material;
     const prev = melamineByMaterialClp[matKey];

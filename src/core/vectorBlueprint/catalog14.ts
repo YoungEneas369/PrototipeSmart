@@ -1,5 +1,5 @@
 /**
- * SMARTFURNITURE — CATÁLOGO DE VALIDACIÓN QA DE LOS 14 MUEBLES REALES (v3.2)
+ * SMARTFURNITURE v8.0 — CATÁLOGO DE VALIDACIÓN QA DE LOS 14 MUEBLES REALES
  * Cada ficha modela fielmente la topología, material, puertas, cajones, nichos abiertos,
  * patas/ruedas/estructura metálica y herrajes de las 14 fotos reales entregadas para QA.
  */

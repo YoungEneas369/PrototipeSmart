@@ -11,6 +11,7 @@ import {
   CHILE_MELAMINE_SHEET,
   calculateDespiece,
   clonePreset,
+  type PresetKey,
 } from '../mathEngine';
 import {
   DEFAULT_COST_CONFIG,
@@ -102,7 +103,7 @@ function baseParams(overrides?: Partial<ScaleAndBoardParams>): ScaleAndBoardPara
   };
 }
 
-describe('SmartFurniture Bloque 2 — Cutting Stock 2D, SVG y Exportadores Excel/CSV (v3.0)', () => {
+describe('SmartFurniture Bloque 2 — Cutting Stock 2D, SVG y Exportadores Excel/CSV (v8.0)', () => {
   it('Casos límite de kerf exacto (virtual-pad) y piezas sobredimensionadas en unplacedPieces', () => {
     const p = baseParams({ kerf: 4, trimMm: 0 });
 
@@ -498,5 +499,242 @@ describe('SmartFurniture Bloque 2 — Cutting Stock 2D, SVG y Exportadores Excel
     expect(csv).toContain(";\'-2+3;");
     expect(csv).toContain(';"\'@IMPORT(""evil"")";');
     expect(csv).toContain(';"Repisa\rConRetorno";');
+  });
+
+  it('10. Anti-regresión BOM/Excel: despiece vacío sin patines, categorías antes de regex, tapacanto IEEE-754/Hoja 2 cuadrada, isBackPanelSheet y unplaced expandido', () => {
+    const p = baseParams();
+
+    // 1) Despiece vacío: 0 fijaciones (no inventar 4–6 patines) y totalClp === 0
+    const emptyDespiece = {
+      scaleFactors: { kx: 1, ky: 1, kz: 1 },
+      shelfProgression: { count: 0, hInteriorMm: 0, clearSpanMm: 0, a1: 0, d: 0, terms: [] },
+      matrizDespiece: [],
+      matrixNx3: [],
+      matrixNx5: [],
+      consolidatedRows: [],
+      totalNetAreaM2: 0,
+      melamineNetAreaM2: 0,
+      backPanelAreaM2: 0,
+      totalEdgeBandingMeters: 0,
+      edgeBandingByMaterial: {},
+      alerts: [],
+      hardwareSummary: [],
+    };
+    const emptyPlan = generateCuttingPlan([], p);
+    const emptyBom = estimateProjectBomAndCost(emptyDespiece, emptyPlan, p);
+    expect(emptyBom.fasteners).toHaveLength(0);
+    expect(emptyBom.fastenersClp).toBe(0);
+    expect(emptyBom.edgeBandingMetersWithAllowance).toBe(0);
+    expect(Object.is(emptyBom.edgeBandingMetersWithAllowance, 0)).toBe(true);
+    expect(emptyBom.totalClp).toBe(0);
+
+    // 2) IEEE-754 +10% holgura en múltiplos exactos: 50 m -> 55 m (no 56), 100 m -> 110 m (no 111)
+    const bom50 = estimateProjectBomAndCost(
+      { ...emptyDespiece, totalEdgeBandingMeters: 50 },
+      emptyPlan,
+      p,
+    );
+    expect(bom50.edgeBandingMetersWithAllowance).toBe(55);
+    expect(bom50.edgeBandingClp).toBe(55 * DEFAULT_COST_CONFIG.edgeBandingPerMeterClp);
+
+    const bom100 = estimateProjectBomAndCost(
+      { ...emptyDespiece, totalEdgeBandingMeters: 100 },
+      emptyPlan,
+      p,
+    );
+    expect(bom100.edgeBandingMetersWithAllowance).toBe(110);
+
+    // 3) resolveHardwareUnitClp: categorías específicas primero y cerraduras sin sobrecobrar metalFrameClp
+    const hwDespiece = {
+      ...emptyDespiece,
+      hardwareSummary: [
+        {
+          id: 'hw_tir_met',
+          categoria: 'tiradores' as const,
+          descripcion: 'Tiradores de metal negro mate',
+          cantidad: 2,
+          notaCompra: 'Ferretería',
+          origen: 'manual' as const,
+        },
+        {
+          id: 'hw_pat_met',
+          categoria: 'patas' as const,
+          descripcion: 'Patas metálicas cónicas 150 mm',
+          cantidad: 4,
+          notaCompra: 'Ferretería',
+          origen: 'manual' as const,
+        },
+        {
+          id: 'hw_rue_met',
+          categoria: 'patas' as const,
+          descripcion: 'Ruedas giratorias metálicas con freno',
+          cantidad: 4,
+          notaCompra: 'Ferretería',
+          origen: 'manual' as const,
+        },
+        {
+          id: 'hw_bis_vid',
+          categoria: 'bisagras' as const,
+          descripcion: 'Bisagras metálicas para puerta de vidrio',
+          cantidad: 4,
+          notaCompra: 'Ferretería',
+          origen: 'manual' as const,
+        },
+        {
+          id: 'hw_cor_met',
+          categoria: 'correderas' as const,
+          descripcion: 'Correderas metálicas telescópicas',
+          cantidad: 2,
+          notaCompra: 'Ferretería',
+          origen: 'manual' as const,
+        },
+        {
+          id: 'hw_cerr_sin_tilde',
+          categoria: 'otro' as const,
+          descripcion: 'Cerradura metalica con llave',
+          cantidad: 1,
+          notaCompra: 'Ferretería',
+          origen: 'manual' as const,
+        },
+        {
+          id: 'hw_marco_met',
+          categoria: 'otro' as const,
+          descripcion: 'Marco metálico estructural externo',
+          cantidad: 1,
+          notaCompra: 'Estructuras',
+          origen: 'manual' as const,
+        },
+      ],
+    };
+    const hwBom = estimateProjectBomAndCost(hwDespiece, emptyPlan, p);
+    expect(hwBom.externalHardware.find((h) => h.id === 'cost_hw_tir_met')?.costoUnitarioClp).toBe(
+      DEFAULT_COST_CONFIG.handleClp,
+    );
+    expect(hwBom.externalHardware.find((h) => h.id === 'cost_hw_pat_met')?.costoUnitarioClp).toBe(
+      DEFAULT_COST_CONFIG.legClp,
+    );
+    expect(hwBom.externalHardware.find((h) => h.id === 'cost_hw_rue_met')?.costoUnitarioClp).toBe(
+      DEFAULT_COST_CONFIG.wheelClp,
+    );
+    expect(hwBom.externalHardware.find((h) => h.id === 'cost_hw_bis_vid')?.costoUnitarioClp).toBe(
+      DEFAULT_COST_CONFIG.hingeClp,
+    );
+    expect(hwBom.externalHardware.find((h) => h.id === 'cost_hw_cor_met')?.costoUnitarioClp).toBe(
+      DEFAULT_COST_CONFIG.slideClp,
+    );
+    expect(
+      hwBom.externalHardware.find((h) => h.id === 'cost_hw_cerr_sin_tilde')?.costoUnitarioClp,
+    ).toBe(DEFAULT_COST_CONFIG.otherClp);
+    expect(hwBom.externalHardware.find((h) => h.id === 'cost_hw_marco_met')?.costoUnitarioClp).toBe(
+      DEFAULT_COST_CONFIG.metalFrameClp,
+    );
+
+    // 4) Excel Hoja 2 fila tapacanto: Cantidad * Precio Unit. === Subtotal + sanitización de NaN/negativos + IDs duplicados 1:1
+    const { topology, params } = clonePreset('estanteria');
+    params.costConfig = { edgeBandingPerMeterClp: Number.NaN };
+    const despEst = calculateDespiece(topology, params);
+    const planEst = generateCuttingPlan(despEst.matrizDespiece, params);
+    const bomEst = estimateProjectBomAndCost(despEst, planEst, params);
+    const xlsSanitized = generateExcelSpreadsheetML(despEst, planEst, params);
+
+    expect(xlsSanitized).not.toContain('>NaN<');
+    expect(xlsSanitized).not.toContain('>Infinity<');
+
+    const sheet2Start = xlsSanitized.indexOf('<Worksheet ss:Name="Herrajes_y_Patas">');
+    const sheet3Start = xlsSanitized.indexOf('<Worksheet ss:Name="Resumen_U3_y_Planchas">');
+    const sheet2Xml = xlsSanitized.slice(sheet2Start, sheet3Start);
+    const tapacantoRowMatch = sheet2Xml.match(/<Row><Cell><Data ss:Type="String">tapacanto<\/Data>.*?<\/Row>/);
+    expect(tapacantoRowMatch).not.toBeNull();
+    const numericCells = Array.from(
+      tapacantoRowMatch![0].matchAll(/<Data ss:Type="Number">([^<]+)<\/Data>/g),
+    ).map((m) => Number(m[1]));
+    expect(numericCells).toEqual([
+      bomEst.edgeBandingMetersWithAllowance,
+      DEFAULT_COST_CONFIG.edgeBandingPerMeterClp,
+      bomEst.edgeBandingClp,
+    ]);
+    expect(numericCells[0] * numericCells[1]).toBe(numericCells[2]);
+
+    // Protección xmlRow contra Infinity/NaN y acceso indexado 1:1 en herrajes con IDs repetidos
+    const dupIdDespiece = {
+      ...despEst,
+      totalNetAreaM2: Number.POSITIVE_INFINITY,
+      hardwareSummary: [
+        {
+          id: 'dup_hw',
+          categoria: 'tiradores' as const,
+          descripcion: 'Tirador repetido A',
+          cantidad: 2,
+          notaCompra: 'Nota A',
+          origen: 'manual' as const,
+        },
+        {
+          id: 'dup_hw',
+          categoria: 'patas' as const,
+          descripcion: 'Pata repetida B',
+          cantidad: 4,
+          notaCompra: 'Nota B',
+          origen: 'manual' as const,
+        },
+      ],
+    };
+    const xlsDup = generateExcelSpreadsheetML(dupIdDespiece, planEst, params);
+    expect(xlsDup).not.toContain('>NaN<');
+    expect(xlsDup).not.toContain('>Infinity<');
+    expect(xlsDup).toContain(`<Data ss:Type="Number">${DEFAULT_COST_CONFIG.handleClp}</Data>`);
+    expect(xlsDup).toContain(`<Data ss:Type="Number">${DEFAULT_COST_CONFIG.handleClp * 2}</Data>`);
+    expect(xlsDup).toContain(`<Data ss:Type="Number">${DEFAULT_COST_CONFIG.legClp}</Data>`);
+    expect(xlsDup).toContain(`<Data ss:Type="Number">${DEFAULT_COST_CONFIG.legClp * 4}</Data>`);
+
+    // 5) Predicado unificado isBackPanelSheet: pieza delgada 3 mm con material 'blanco' clasificada igual en optimizer y costEstimator
+    const thinWhitePiece = makePiece('fondo_b', 800, 600, 3, false, 'blanco', 'fondo', 'Fondo Blanco 3mm');
+    const thinPlan = generateCuttingPlan([thinWhitePiece], p);
+    expect(thinPlan.backPanelSheetsCount).toBe(1);
+    expect(thinPlan.melamineSheetsCount).toBe(0);
+    const thinBom = estimateProjectBomAndCost(
+      { ...emptyDespiece, matrizDespiece: [thinWhitePiece] },
+      thinPlan,
+      p,
+    );
+    expect(thinBom.melamineSheetsClp).toBe(0);
+    expect(Object.keys(thinBom.melamineByMaterialClp ?? {})).toHaveLength(0);
+    expect(thinBom.backPanelSheetsClp).toBe(DEFAULT_COST_CONFIG.backPanelSheetStdClp);
+
+    // 6) Guardia usableW <= 0 || usableH <= 0 normaliza unplacedPieces por cantidad expandida
+    const qty2Piece: BoardPiece = { ...makePiece('dup', 600, 400), cantidad: 2 };
+    const invalidTrimPlan = generateCuttingPlan([qty2Piece], baseParams({ trimMm: 700 }));
+    expect(invalidTrimPlan.totalSheetsCount).toBe(0);
+    expect(invalidTrimPlan.unplacedPieces).toHaveLength(2);
+  });
+
+  it('Empaqueta los 3 presets en L con separación bicolor por espesor/material, +2 patines y BOM CLP cuadrado', () => {
+    const lPresets: PresetKey[] = ['escritorio_l', 'cocina_l', 'closet_l'];
+    for (const key of lPresets) {
+      const { topology, params } = clonePreset(key);
+      const desp = calculateDespiece(topology, params);
+      const plan = generateCuttingPlan(desp.matrizDespiece, params);
+      expect(plan.unplacedPieces, `Preset en L ${key} no debe dejar piezas fuera`).toHaveLength(0);
+      expect(plan.usagePercentage + plan.wastePercentage).toBeCloseTo(100, 1);
+
+      // Separación estricta de planchas por material y espesor
+      for (const sh of plan.sheetsUsed) {
+        for (const r of sh.piezasColocadas) {
+          expect(r.material).toBe(sh.material);
+        }
+      }
+
+      const bom = estimateProjectBomAndCost(desp, plan, params);
+      expect(bom.totalClp).toBe(
+        bom.melamineSheetsClp +
+          bom.backPanelSheetsClp +
+          bom.edgeBandingClp +
+          bom.fastenersClp +
+          bom.externalHardwareClp,
+      );
+
+      // En mueble en L sin patas externas, patines incluye +2 por ala de retorno
+      const glides = bom.fasteners.find((f) => f.id === 'bom_patines');
+      expect(glides?.cantidad).toBe(params.targetDimensions.x >= 1500 ? 8 : 6);
+    }
   });
 });

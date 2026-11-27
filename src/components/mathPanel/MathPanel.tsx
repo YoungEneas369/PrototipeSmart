@@ -49,6 +49,7 @@ import {
   formatClp,
   generateDespieceCsv,
   generateExcelSpreadsheetML,
+  type ProjectCostEstimate,
 } from '../../core/cuttingStock';
 import { NumericInput } from '../NumericInput';
 
@@ -61,6 +62,7 @@ export interface MathPanelProps {
   params: ScaleAndBoardParams;
   unitVec?: UnitDirectionVectorResult;
   shapeComp?: ShapeComparisonResult | null;
+  bomCost?: ProjectCostEstimate;
   requestedTab?: { tab: MathPanelTab; seq: number } | null;
   onFixReferenceV0: () => void;
   onAddCenterDivider: () => void;
@@ -104,6 +106,15 @@ const COST_FIELDS: Array<{
   { key: 'glideClp', label: 'Patín deslizador a piso', step: 50, max: 5000, group: 'fijaciones' },
 ];
 
+const COST_GROUPS: ReadonlyArray<{
+  id: 'tableros' | 'herrajes' | 'fijaciones';
+  title: string;
+}> = [
+  { id: 'tableros', title: 'Tableros y Tapacanto' },
+  { id: 'herrajes', title: 'Herrajes y Módulos' },
+  { id: 'fijaciones', title: 'Fijaciones' },
+];
+
 function triggerDownload(filename: string, content: string, mimeType: string): void {
   const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
@@ -123,6 +134,7 @@ export function MathPanel({
   params,
   unitVec: unitVecProp,
   shapeComp: shapeCompProp,
+  bomCost: bomCostProp,
   requestedTab,
   onFixReferenceV0,
   onAddCenterDivider,
@@ -187,8 +199,8 @@ export function MathPanel({
   );
 
   const bomCost = useMemo(
-    () => estimateProjectBomAndCost(despiece, cuttingPlan, params),
-    [despiece, cuttingPlan, params],
+    () => bomCostProp ?? estimateProjectBomAndCost(despiece, cuttingPlan, params),
+    [bomCostProp, despiece, cuttingPlan, params],
   );
 
   const resolvedCost = useMemo<CostEstimatorConfig>(
@@ -555,6 +567,38 @@ export function MathPanel({
                 </pre>
               </div>
             )}
+
+            {despiece.differentialMetrics && despiece.differentialMetrics.curvedCutCount > 0 && (
+              <div className="metric-card">
+                <h4>5. Geometría Diferencial en Cortes Curvos (r&apos;(t), κ, ∫ds)</h4>
+                <div className="kpi-grid">
+                  <div>
+                    <span className="kpi-label">Cortes Curvos Bézier</span>
+                    <strong>{despiece.differentialMetrics.curvedCutCount}</strong>
+                  </div>
+                  <div>
+                    <span className="kpi-label">Longitud de Arco s = ∫‖r&apos;(t)‖dt</span>
+                    <strong>{despiece.differentialMetrics.totalArcLengthMm.toFixed(1)} mm</strong>
+                  </div>
+                  <div>
+                    <span className="kpi-label">Radio Mín. Rₘᵢₙ = 1/κₘₐₓ</span>
+                    <strong>
+                      {Number.isFinite(despiece.differentialMetrics.minCurvatureRadiusMm)
+                        ? `${despiece.differentialMetrics.minCurvatureRadiusMm.toFixed(1)} mm`
+                        : 'Recta (∞)'}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="kpi-label">Curvatura Máx. κₘₐₓ</span>
+                    <strong>{despiece.differentialMetrics.maxCurvature.toFixed(5)} mm⁻¹</strong>
+                  </div>
+                </div>
+                <p className="muted small-note">
+                  Integración numérica Gauss-Legendre (5 ptos/subtramo) para largo exacto de
+                  tapacanto curvo y control de radio mínimo fresable (R ≥ 28 mm).
+                </p>
+              </div>
+            )}
           </div>
         )}
 
@@ -754,11 +798,7 @@ export function MathPanel({
             ) : (
               <div className="hw-list">
                 {despiece.hardwareSummary.map((hw) => {
-                  const isManualEditable =
-                    hw.id !== 'hw_patas_externas' &&
-                    hw.id !== 'hw_ruedas_externas' &&
-                    !hw.id.endsWith('_calc') &&
-                    manualHardwareIds.has(hw.id);
+                  const isManualEditable = hw.origen === 'manual' && manualHardwareIds.has(hw.id);
                   const isEditing = editingHwId === hw.id;
 
                   if (isEditing) {
@@ -850,42 +890,45 @@ export function MathPanel({
               </div>
             )}
 
-            <div className="hw-form">
-              <select
-                aria-label="Categoría de nuevo herraje"
-                value={hwCategory}
-                onChange={(e) => setHwCategory(e.target.value as HardwareCategory)}
-              >
-                <option value="tiradores">Tiradores / Manillas</option>
-                <option value="patas">Patas adicionales</option>
-                <option value="bisagras">Bisagras</option>
-                <option value="correderas">Correderas</option>
-                <option value="otro">Otro herraje</option>
-              </select>
-              <input
-                type="text"
-                aria-label="Descripción de nuevo herraje"
-                value={hwDesc}
-                onChange={(e) => setHwDesc(e.target.value)}
-                placeholder="Ej. Tirador metálico 128 mm"
-              />
-              <NumericInput
-                min={1}
-                max={100}
-                value={hwQty}
-                onCommit={setHwQty}
-                style={{ width: 64 }}
-                ariaLabel="Cantidad de nuevo herraje"
-              />
-              <button
-                type="button"
-                className="btn-small"
-                onClick={handleAddHw}
-                disabled={!hwDesc.trim()}
-              >
-                + Agregar
-              </button>
-            </div>
+            <details className="hw-add-drawer">
+              <summary>+ Agregar herraje externo</summary>
+              <div className="hw-form">
+                <select
+                  aria-label="Categoría de nuevo herraje"
+                  value={hwCategory}
+                  onChange={(e) => setHwCategory(e.target.value as HardwareCategory)}
+                >
+                  <option value="tiradores">Tiradores / Manillas</option>
+                  <option value="patas">Patas adicionales</option>
+                  <option value="bisagras">Bisagras</option>
+                  <option value="correderas">Correderas</option>
+                  <option value="otro">Otro herraje</option>
+                </select>
+                <input
+                  type="text"
+                  aria-label="Descripción de nuevo herraje"
+                  value={hwDesc}
+                  onChange={(e) => setHwDesc(e.target.value)}
+                  placeholder="Ej. Tirador metálico 128 mm"
+                />
+                <NumericInput
+                  min={1}
+                  max={100}
+                  value={hwQty}
+                  onCommit={setHwQty}
+                  style={{ width: 64 }}
+                  ariaLabel="Cantidad de nuevo herraje"
+                />
+                <button
+                  type="button"
+                  className="btn-small"
+                  onClick={handleAddHw}
+                  disabled={!hwDesc.trim()}
+                >
+                  + Agregar
+                </button>
+              </div>
+            </details>
 
             <div className="metric-card">
               <div className="card-header-row">
@@ -956,35 +999,42 @@ export function MathPanel({
                         <RotateCcw size={13} /> Restaurar precios Chile
                       </button>
                     </div>
-                    <div className="cost-editor-grid">
-                      {COST_FIELDS.map((field) => {
-                        const isActiveSheet =
-                          (field.key === 'melamineSheetStdClp' && !isLargeMelamineSheet) ||
-                          (field.key === 'melamineSheetLargeClp' && isLargeMelamineSheet) ||
-                          (field.key === 'backPanelSheetStdClp' && !isLargeBackSheet) ||
-                          (field.key === 'backPanelSheetLargeClp' && isLargeBackSheet);
-                        return (
-                          <label
-                            key={field.key}
-                            className={isActiveSheet ? 'cost-field is-active-rate' : 'cost-field'}
-                          >
-                            <span className="cost-field-label">
-                              {field.label}
-                              {isActiveSheet && <em className="active-rate-tag">Activa</em>}
-                            </span>
-                            <NumericInput
-                              min={0}
-                              max={field.max}
-                              step={field.step}
-                              unitSuffix="CLP"
-                              value={resolvedCost[field.key]}
-                              onCommit={(v) => handleUpdateCostField(field.key, v)}
-                              ariaLabel={field.label}
-                            />
-                          </label>
-                        );
-                      })}
-                    </div>
+                    {COST_GROUPS.map((grp) => (
+                      <div key={grp.id} className="cost-group-section">
+                        <h5 className="cost-group-title">{grp.title}</h5>
+                        <div className="cost-editor-grid">
+                          {COST_FIELDS.filter((field) => field.group === grp.id).map((field) => {
+                            const isActiveSheet =
+                              (field.key === 'melamineSheetStdClp' && !isLargeMelamineSheet) ||
+                              (field.key === 'melamineSheetLargeClp' && isLargeMelamineSheet) ||
+                              (field.key === 'backPanelSheetStdClp' && !isLargeBackSheet) ||
+                              (field.key === 'backPanelSheetLargeClp' && isLargeBackSheet);
+                            return (
+                              <label
+                                key={field.key}
+                                className={
+                                  isActiveSheet ? 'cost-field is-active-rate' : 'cost-field'
+                                }
+                              >
+                                <span className="cost-field-label">
+                                  {field.label}
+                                  {isActiveSheet && <em className="active-rate-tag">Activa</em>}
+                                </span>
+                                <NumericInput
+                                  min={0}
+                                  max={field.max}
+                                  step={field.step}
+                                  unitSuffix="CLP"
+                                  value={resolvedCost[field.key]}
+                                  onCommit={(v) => handleUpdateCostField(field.key, v)}
+                                  ariaLabel={field.label}
+                                />
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </details>
               )}

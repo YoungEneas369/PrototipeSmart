@@ -10,7 +10,7 @@
 | 01 | [`01-components.md`](./01-components.md) | `flowchart TD` | Capas del sistema (UI, Core Engines, Contracts, PWA/Offline) y matriz estricta de fronteras DAG sin ciclos. |
 | 02 | [`02-domain-classes.md`](./02-domain-classes.md) | `classDiagram` | Modelo completo de clases, interfaces y enumeraciones de `src/types/contracts.ts` v8.0 + `ProjectCostEstimate`. |
 | 03 | [`03-sequence-pipeline.md`](./03-sequence-pipeline.md) | `sequenceDiagram` | Flujo end-to-end desde carga de foto/catálogo/preset hasta despiece, 3D, plano 2D, corte bicolor, presupuesto CLP y exportación. |
-| 04 | [`04-state-machines.md`](./04-state-machines.md) | `stateDiagram-v2` | Máquinas de estados de `App` (`studio` / `blueprint` / `workshop`) y del `VectorCanvas` v8.0 (3 pasos + subherramientas + Undo/Redo). |
+| 04 | [`04-state-machines.md`](./04-state-machines.md) | `stateDiagram-v2` | Máquinas de estados de `App` (`activeView`: `studio` / `blueprint` / `workshop`, `studioMode`: `photo` / `split` / `3d`) y de `VectorCanvas` v8.0 (3 pasos simplificados + subherramientas sin duplicados + Undo/Redo con `dims`). |
 | 05 | [`05-ux-activity.md`](./05-ux-activity.md) | `flowchart TD` | Flujo dual de experiencia de usuario: Rama A (Presets U3 / Catálogo 14) y Rama B (Foto propia del usuario) convergiendo a taller offline. |
 
 ## Principios Arquitectónicos v8.0

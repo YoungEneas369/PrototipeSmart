@@ -1,10 +1,10 @@
 /**
  * SMARTFURNITURE — PANEL DE PLANO VECTORIAL 2D, PARTES Y APROBACIÓN (v8.0)
- * - Compara el modelo vectorial original (V₀) frente al modelo redimensionado (V_f).
+ * - Compara el diseño original (V₀) frente al plano con nuevas medidas (V_f).
  * - Unifica la edición de módulos frontales con `ZoneInspector` (sincronizado 2D ↔ 3D).
- * - Formato dinámico de plancha (sin hardcodings 244×122) y unidad sincronizada (`mm` / `cm`).
+ * - Formato dinámico de plancha y unidad sincronizada (`mm` / `cm`).
  */
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { CheckCircle2, Download, SlidersHorizontal } from 'lucide-react';
 import type {
   CuttingPlanResult,
@@ -12,8 +12,14 @@ import type {
   FrontZone,
   FurnitureTopology,
   ScaleAndBoardParams,
+  WingRole,
 } from '../../types/contracts';
-import { calculateDespiece } from '../../core/mathEngine';
+import {
+  applyReturnWingTopology,
+  buildReturnWingParams,
+  calculateDespiece,
+  extractReturnWingTopology,
+} from '../../core/mathEngine';
 import { renderFurnitureVectorBlueprintSvg } from '../../core/vectorBlueprint';
 import { NumericInput } from '../NumericInput';
 import { ZoneInspector } from '../vectorCanvas/ZoneInspector';
@@ -27,6 +33,8 @@ export interface VectorBlueprintPanelProps {
   displayUnit?: 'mm' | 'cm';
   selectedZoneId: string | null;
   hoveredZoneId?: string | null;
+  editingWing?: WingRole;
+  onChangeEditingWing?: (wing: WingRole) => void;
   onSelectZone: (zoneId: string | null) => void;
   onHoverZone?: (zoneId: string | null) => void;
   onUpdateDim: (axis: 'x' | 'y' | 'z', valueMm: number) => void;
@@ -69,6 +77,8 @@ export function VectorBlueprintPanel({
   displayUnit = 'mm',
   selectedZoneId,
   hoveredZoneId,
+  editingWing,
+  onChangeEditingWing,
   onSelectZone,
   onHoverZone,
   onUpdateDim,
@@ -76,7 +86,45 @@ export function VectorBlueprintPanel({
   onUpdateFrontZones,
   onApproveModel,
 }: VectorBlueprintPanelProps) {
-  // Despiece del modelo ORIGINAL V0 para comparación lado a lado
+  const [internalWing, setInternalWing] = useState<WingRole>('main');
+  const isLShape = Boolean(topology.lShape?.enabled);
+  const rawWing = editingWing ?? internalWing;
+  const activeWing: WingRole = isLShape ? rawWing : 'main';
+  const setWing = (nextWing: WingRole) => {
+    setInternalWing(nextWing);
+    onChangeEditingWing?.(nextWing);
+  };
+
+  const inspectorTopology = useMemo(
+    () => (activeWing === 'return' ? extractReturnWingTopology(topology) : topology),
+    [activeWing, topology],
+  );
+  const inspectorParams = useMemo(
+    () => (activeWing === 'return' ? buildReturnWingParams(topology, params) : params),
+    [activeWing, topology, params],
+  );
+
+  const handleInspectorTopology = (nextWingTop: FurnitureTopology) => {
+    if (activeWing === 'return' && isLShape) {
+      onUpdateTopology(applyReturnWingTopology(topology, nextWingTop));
+    } else {
+      onUpdateTopology(nextWingTop);
+    }
+  };
+
+  const handleInspectorZones = (zones: FrontZone[]) => {
+    if (activeWing === 'return' && isLShape) {
+      onUpdateTopology(
+        applyReturnWingTopology(topology, {
+          ...inspectorTopology,
+          frontZones: zones,
+        }),
+      );
+    } else {
+      onUpdateFrontZones(zones);
+    }
+  };
+
   const originalParams = useMemo<ScaleAndBoardParams>(
     () => ({
       ...params,
@@ -121,10 +169,10 @@ export function VectorBlueprintPanel({
     <div className="vector-card">
       <div className="card-header-row">
         <div>
-          <h3>2. Plano Vectorial 2D, Partes y Aprobación</h3>
+          <h3>2. Plano Técnico 2D y Aprobación</h3>
           <p className="muted small-note">
-            Verifica la interpretación vectorial original (V₀), ajusta las nuevas dimensiones (V
-            <sub>f</sub>) y aprueba para pasar al despiece y planchas {sheetDimLabel}.
+            Revisa el diseño original (V₀), ajusta tus medidas finales (V<sub>f</sub>) y aprueba
+            para generar el corte en planchas {sheetDimLabel}.
           </p>
         </div>
         <div className="export-bar">
@@ -138,7 +186,7 @@ export function VectorBlueprintPanel({
               )
             }
           >
-            <Download size={15} /> Descargar Plano SVG
+            <Download size={15} /> Descargar SVG
           </button>
           <button
             type="button"
@@ -148,17 +196,17 @@ export function VectorBlueprintPanel({
             <CheckCircle2 size={16} />{' '}
             {modelApproved
               ? `Plano Aprobado — Ir a Taller (${sheetDimLabel})`
-              : `Aprobar Plano 2D → Ir a Corte y Presupuesto (${sheetDimLabel})`}
+              : `Aprobar Plano → Corte y Presupuesto (${sheetDimLabel})`}
           </button>
         </div>
       </div>
 
-      {/* Barra rápida de redimensionamiento sincronizada con la unidad activa */}
+      {/* Barra rápida de nuevas medidas sincronizada con la unidad activa */}
       <div className="calib-box">
         <SlidersHorizontal size={15} />
-        <strong>Redimensionar V<sub>f</sub> ({displayUnit}):</strong>
+        <strong>Tus medidas finales ({displayUnit}):</strong>
         <label className="small-note inline-num">
-          Ancho X:
+          Ancho:
           <NumericInput
             min={isCm ? 30 : 300}
             max={isCm ? 260 : 2600}
@@ -172,7 +220,7 @@ export function VectorBlueprintPanel({
           />
         </label>
         <label className="small-note inline-num">
-          Alto Y (cuerpo):
+          Alto:
           <NumericInput
             min={isCm ? 30 : 300}
             max={isCm ? 260 : 2600}
@@ -186,7 +234,7 @@ export function VectorBlueprintPanel({
           />
         </label>
         <label className="small-note inline-num">
-          Profundidad Z:
+          Profundidad:
           <NumericInput
             min={isCm ? 18 : 180}
             max={isCm ? 90 : 900}
@@ -200,24 +248,26 @@ export function VectorBlueprintPanel({
           />
         </label>
         <span className="mono small-note muted">
-          {dimsChanged
-            ? 'Redimensionado activo (nuevo plano V_f)'
-            : 'Dimensiones originales V₀'}
+          {dimsChanged ? 'Medidas personalizadas activas' : 'Medidas originales'}
         </span>
       </div>
 
-      {/* Planos Vectoriales SVG: Original V0 vs Nuevo Redimensionado Vf */}
+      {/* Planos Vectoriales SVG: Diseño original V0 vs Medidas finales Vf */}
       <div className="blueprint-grid">
         <div className="blueprint-pane">
           <div className="blueprint-pane-title">
-            1. Plano Original (V₀: {formatDimTriplet(params.referenceDimensions, displayUnit)})
+            1. Diseño original (V₀: {formatDimTriplet(params.referenceDimensions, displayUnit)})
           </div>
           <div className="svg-preview" dangerouslySetInnerHTML={{ __html: svgOriginal }} />
         </div>
 
         <div className="blueprint-pane">
           <div className="blueprint-pane-title resized">
-            2. Plano Redimensionado (V_f: {formatDimTriplet(params.targetDimensions, displayUnit)})
+            2. Plano con tus medidas (V_f: {formatDimTriplet(params.targetDimensions, displayUnit)}
+            {isLShape && topology.lShape
+              ? ` + L ${topology.lShape.side === 'right' ? 'Der' : 'Izq'} ${toDisplay(topology.lShape.returnLengthMm)}×${toDisplay(topology.lShape.returnDepthMm)} ${displayUnit}`
+              : ''}
+            )
           </div>
           <div className="svg-preview" dangerouslySetInnerHTML={{ __html: svgResized }} />
         </div>
@@ -226,20 +276,48 @@ export function VectorBlueprintPanel({
       {/* Inspector unificado de zonas frontales compartido con VectorCanvas */}
       <div className="metric-card">
         <div className="card-header-row">
-          <h4>Inspector de Zonas y Módulos Frontales ({(topology.frontZones ?? []).length} zonas)</h4>
-          <span className="small-note muted">
-            Los cambios se reflejan al instante en el plano 2D, el visor 3D y el despiece.
-          </span>
+          <h4>
+            Inspector de Zonas y Módulos Frontales (
+            {(inspectorTopology.frontZones ?? []).length} zonas
+            {isLShape
+              ? activeWing === 'return'
+                ? ' · Ala Retorno B'
+                : ' · Ala Principal A'
+              : ''}
+            )
+          </h4>
+          {isLShape ? (
+            <div className="segmented-2" role="group" aria-label="Ala activa en inspector de zonas">
+              <button
+                type="button"
+                className={activeWing === 'main' ? 'seg-btn active' : 'seg-btn'}
+                onClick={() => setWing('main')}
+              >
+                Ala Principal (A)
+              </button>
+              <button
+                type="button"
+                className={activeWing === 'return' ? 'seg-btn active' : 'seg-btn'}
+                onClick={() => setWing('return')}
+              >
+                Ala Retorno (B)
+              </button>
+            </div>
+          ) : (
+            <span className="small-note muted">
+              Los cambios actualizan al instante el plano 2D, el 3D y el despiece.
+            </span>
+          )}
         </div>
         <ZoneInspector
-          topology={topology}
-          params={params}
+          topology={inspectorTopology}
+          params={inspectorParams}
           selectedZoneId={selectedZoneId}
           hoveredZoneId={hoveredZoneId}
           onSelectZone={onSelectZone}
           onHoverZone={onHoverZone}
-          onUpdateTopology={onUpdateTopology}
-          onUpdateFrontZones={onUpdateFrontZones}
+          onUpdateTopology={handleInspectorTopology}
+          onUpdateFrontZones={handleInspectorZones}
         />
       </div>
     </div>

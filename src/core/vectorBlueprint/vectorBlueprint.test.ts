@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { BoardPiece, FurnitureTopology, ScaleAndBoardParams } from '../../types/contracts';
-import { calculateDespiece } from '../mathEngine';
+import {
+  buildCornerFilletCutSpec,
+  calculateDespiece,
+  clonePreset,
+  type PresetKey,
+} from '../mathEngine';
 import { generateCuttingPlan } from '../cuttingStock';
 import {
   CATALOG_14_MUEBLES,
@@ -170,5 +175,69 @@ describe('SmartFurniture QA — 14 Muebles Reales: Planos Vectoriales, Redimensi
     expect(svg).toContain('class="side-step-line"');
     expect(svg).toContain('SIN MUEBLE');
     expect(svg).toContain('class="side-front-panel"');
+  });
+
+  it('Renderiza Planta Superior XZ y alzados A/B para los 3 presets de muebles en L (XML-safe)', () => {
+    const lPresets: PresetKey[] = ['escritorio_l', 'cocina_l', 'closet_l'];
+    for (const key of lPresets) {
+      const { topology, params } = clonePreset(key);
+      const desp = calculateDespiece(topology, params);
+      const plan = generateCuttingPlan(desp.matrizDespiece, params);
+      const svg = renderFurnitureVectorBlueprintSvg(topology, params, desp, {
+        stageLabel: 'PRESET L',
+        cuttingPlan: plan,
+      });
+
+      expect(svg).toContain('<svg ');
+      expect(svg).toContain('</svg>');
+      expect(svg).toContain('PLANTA SUPERIOR (PLANO XZ');
+      expect(svg).toContain('class="plan-wing-main"');
+      expect(svg).toContain('class="plan-wing-return"');
+      expect(svg).toContain('ALZADO ALA RETORNO');
+      expect(svg).toContain('ALZADO FRONTAL');
+      expect(svg).toContain('L2 =');
+      expect(svg).toContain('Z2 =');
+      expect(svg).not.toMatch(/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)/);
+    }
+  });
+
+  it('Renderiza curvas diferenciales en Planta XZ y Alzado XY con longitud de arco s y XML válido', () => {
+    const desk = clonePreset('escritorio_l');
+    const curvedTopology: FurnitureTopology = {
+      ...desk.topology,
+      curvedCuts: [
+        buildCornerFilletCutSpec({
+          id: 'fillet_svg_1',
+          cornerTarget: 'l_inner',
+          radiusMm: 160,
+          label: 'Empalme L',
+        }),
+        {
+          id: 'arch_svg_xy',
+          plane: 'xy',
+          kind: 'free_bezier',
+          controlPoints: [
+            { x: 0.1, y: 0.8 },
+            { x: 0.35, y: 0.96 },
+            { x: 0.65, y: 0.96 },
+            { x: 0.9, y: 0.8 },
+          ],
+          label: 'Arco superior',
+        },
+      ],
+    };
+
+    const desp = calculateDespiece(curvedTopology, desk.params);
+    const plan = generateCuttingPlan(desp.matrizDespiece, desk.params);
+    const svg = renderFurnitureVectorBlueprintSvg(curvedTopology, desk.params, desp, {
+      stageLabel: 'CURVAS DIFERENCIALES',
+      cuttingPlan: plan,
+    });
+
+    expect(svg).toContain('class="plan-curve-piece"');
+    expect(svg).toContain('class="svg-diff-curve"');
+    expect(svg).toContain('s=');
+    expect(svg).toContain('CURVAS DIFERENCIALES');
+    expect(svg).not.toMatch(/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)/);
   });
 });

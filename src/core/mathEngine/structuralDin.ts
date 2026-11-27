@@ -357,8 +357,15 @@ export function resolveEdgeBanding(
 }
 
 export function computePieceEdgeBandingMm(piece: BoardPiece): number {
+  if (piece.curveProfile?.useOnlyArcEdge) {
+    return piece.curveProfile.arcLengthMm;
+  }
   let total = 0;
-  if (piece.edges.top) total += piece.ancho;
+  if (piece.edges.top) {
+    total += piece.curveProfile?.replaceTopEdgeWithArc
+      ? piece.curveProfile.arcLengthMm
+      : piece.ancho;
+  }
   if (piece.edges.bottom) total += piece.ancho;
   if (piece.edges.left) total += piece.alto;
   if (piece.edges.right) total += piece.alto;

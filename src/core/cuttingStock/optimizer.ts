@@ -58,13 +58,42 @@ interface VirtualSheet {
   usedH: number;
 }
 
-interface PackRunResult {
+interface BasePackResult {
+  sheets: Array<{
+    placements: PlacedRectangle[];
+  }>;
+  unplaced: BoardPiece[];
+}
+
+interface GuillotineRunResult {
   sheets: Array<{
     placements: PlacedRectangle[];
     stripCount: number;
     usedH: number;
   }>;
   unplaced: BoardPiece[];
+}
+
+/**
+ * Predicado único del módulo `cuttingStock` para identificar planchas de fondo delgado
+ * (Durolac/MDF 3–5 mm) de forma consistente entre optimizador, estimador CLP y SVG.
+ */
+export function isBackPanelSheet(
+  espesorMm: number,
+  material?: PieceMaterial,
+  backPanelThickness?: number,
+  boardThickness?: number,
+): boolean {
+  if (material === 'durolac_3mm') {
+    return true;
+  }
+  if (backPanelThickness !== undefined && boardThickness !== undefined) {
+    return (
+      Math.abs(espesorMm - backPanelThickness) <= 0.5 &&
+      espesorMm < boardThickness
+    );
+  }
+  return espesorMm <= 5;
 }
 
 type GuillotinePolicy =
@@ -208,7 +237,7 @@ function runGuillotinePolicy(
   kerf: number,
   trimMm: number,
   policy: GuillotinePolicy,
-): PackRunResult {
+): GuillotineRunResult {
   const capW = usableW + kerf;
   const capH = usableH + kerf;
   const unplaced: BoardPiece[] = [];
@@ -359,7 +388,7 @@ function runGuillotinePolicy(
   return { sheets: packStripsToSheets(strips, capH, trimMm), unplaced };
 }
 
-function compareRuns(a: PackRunResult, b: PackRunResult): number {
+function compareRuns(a: GuillotineRunResult, b: GuillotineRunResult): number {
   if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length - b.unplaced.length;
   if (a.sheets.length !== b.sheets.length) return a.sheets.length - b.sheets.length;
   const stripsA = a.sheets.reduce((acc, s) => acc + s.stripCount, 0);
@@ -402,7 +431,7 @@ function runMaxRectsBSSF(
   usableH: number,
   kerf: number,
   trimMm: number,
-): PackRunResult {
+): BasePackResult {
   const capW = usableW + kerf;
   const capH = usableH + kerf;
   const sorted = [...items].sort(
@@ -531,8 +560,6 @@ function runMaxRectsBSSF(
   return {
     sheets: sheets.map((s) => ({
       placements: s.placements,
-      stripCount: s.placements.length,
-      usedH: s.placements.reduce((m, r) => Math.max(m, r.y + r.alto), 0),
     })),
     unplaced,
   };
@@ -596,29 +623,34 @@ export function optimizeCuttingSheets(
 
   for (const group of sortedGroups) {
     const { thickness, material, pieces: groupPieces } = group;
-    const isBackPanelGroup =
-      material === 'durolac_3mm' ||
-      (Math.abs(thickness - params.backPanelThickness) <= 0.5 &&
-        thickness < params.boardThickness);
+    const isBackPanelGroup = isBackPanelSheet(
+      thickness,
+      material,
+      params.backPanelThickness,
+      params.boardThickness,
+    );
     const sheetDim = isBackPanelGroup
       ? (params.backPanelSheetDimensions ?? params.sheetDimensions)
       : params.sheetDimensions;
 
     const usableW = sheetDim.width - 2 * trimMm;
     const usableH = sheetDim.height - 2 * trimMm;
+    const flatItems = expandPieces(groupPieces, params.respectGrain);
 
     if (usableW <= 0 || usableH <= 0) {
-      unplacedPieces.push(...groupPieces);
+      for (const item of flatItems) {
+        unplacedPieces.push(item.sourcePiece);
+      }
       continue;
     }
 
-    const flatItems = expandPieces(groupPieces, params.respectGrain);
-    let runResult: PackRunResult;
+    let runResult: BasePackResult;
 
     if (strategy === 'maxrects') {
       runResult = runMaxRectsBSSF(flatItems, usableW, usableH, kerf, trimMm);
     } else {
-      const policies: GuillotinePolicy[] = flatItems.some((i) => i.canRotate)
+      const hasRotatable = flatItems.some((i) => i.canRotate);
+      const policies: GuillotinePolicy[] = hasRotatable
         ? [
             'default',
             'defaultReuse',
@@ -629,7 +661,7 @@ export function optimizeCuttingSheets(
             'preferRotatedAllReuse',
             'mixedGreedy',
           ]
-        : ['default', 'defaultReuse', 'areaDescReuse', 'mixedGreedy'];
+        : ['default', 'defaultReuse', 'areaDescReuse'];
 
       const results = policies.map((pol) =>
         runGuillotinePolicy(flatItems, usableW, usableH, kerf, trimMm, pol),

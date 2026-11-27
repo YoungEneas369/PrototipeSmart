@@ -251,31 +251,6 @@ export function sobel3x3AtRgba(
 }
 
 /**
- * Calcula el campo completo Sobel 3×3 (`gx`, `gy`, `mag`) de un buffer escalar `W×H`.
- */
-export function computeSobelField(
-  src: Float32Array,
-  W: number,
-  H: number,
-): { gx: Float32Array; gy: Float32Array; mag: Float32Array } {
-  const n = W * H;
-  const gx = new Float32Array(n);
-  const gy = new Float32Array(n);
-  const mag = new Float32Array(n);
-  for (let y = 1; y < H - 1; y++) {
-    const mid = y * W;
-    for (let x = 1; x < W - 1; x++) {
-      const [dx, dy] = sobel3x3At(src, W, x, y);
-      const idx = mid + x;
-      gx[idx] = dx;
-      gy[idx] = dy;
-      mag[idx] = Math.hypot(dx, dy);
-    }
-  }
-  return { gx, gy, mag };
-}
-
-/**
  * Calcula únicamente el mapa de magnitud Sobel 3×3 (`mag = hypot(gx, gy)`).
  */
 export function computeSobelMag(src: Float32Array, W: number, H: number): Float32Array {
@@ -335,226 +310,90 @@ export function sampleExteriorBgRgb(
   return [Math.round(median(rs)), Math.round(median(gs)), Math.round(median(bs))];
 }
 
-export interface LocalExteriorBgSamples {
-  globalBgRgb: [number, number, number];
-  rightWallBgRgb?: [number, number, number];
-  leftWallBgRgb?: [number, number, number];
-  topRightBgRgb?: [number, number, number];
-  topLeftBgRgb?: [number, number, number];
-  /** True si la esquina superior derecha del quad no tiene borde sólido de melamina (pared continua). */
-  topRightBorderOpen?: boolean;
-  /** True si la esquina superior izquierda del quad no tiene borde sólido de melamina (pared continua). */
-  topLeftBorderOpen?: boolean;
+/**
+ * Ajusta una coordenada normalizada `val` al ancla más cercana dentro de `tol`.
+ */
+export function snapToAnchors(val: number, anchors: readonly number[], tol = 0.055): number {
+  if (tol <= 0) return val;
+  let best = val;
+  let bestD = tol;
+  for (const a of anchors) {
+    const d = Math.abs(val - a);
+    if (d <= bestD) {
+      bestD = d;
+      best = a;
+    }
+  }
+  return best;
 }
 
 /**
- * Muestrea el color de fondo exterior LOCAL justo por fuera de las aristas derecha, izquierda
- * y superior del `quad` en la foto original, y evalúa si las esquinas superiores (TR/TL) son
- * continuas con la pared exterior (señal geométrica real de recorte escalonado `void_outside`).
+ * Muestrea el color RGB mediano del perímetro de la carcasa en la imagen rectificada
+ * (excluyendo el centro inferior para escritorios abiertos y aplicando fallback proporcional
+ * cuando el mueble comparte tono con el fondo, ej. blanco sobre pared blanca).
  */
-export function sampleLocalExteriorBgRgb(
-  rgba: Uint8ClampedArray,
-  imgW: number,
-  imgH: number,
-  quad: readonly [Point2D, Point2D, Point2D, Point2D],
-  globalBgRgb?: [number, number, number],
-): LocalExteriorBgSamples {
-  const globalBg = globalBgRgb ?? sampleExteriorBgRgb(rgba, imgW, imgH);
-  if (imgW < 24 || imgH < 24 || rgba.length < imgW * imgH * 4) {
-    return { globalBgRgb: globalBg };
+export function sampleCarcassBorderRgb(
+  rectRgba: Uint8ClampedArray,
+  W: number,
+  H: number,
+  exteriorBgRgb: readonly [number, number, number] | undefined,
+  fallbackRgb: readonly [number, number, number],
+): [number, number, number] {
+  if (W < 12 || H < 12 || rectRgba.length < W * H * 4) {
+    return [fallbackRgb[0], fallbackRgb[1], fallbackRgb[2]];
   }
+  const bandX = clamp(Math.round(W * 0.025), 2, 9);
+  const bandY = clamp(Math.round(H * 0.025), 2, 9);
+  const stepX = Math.max(1, Math.floor(W / 64));
+  const stepY = Math.max(1, Math.floor(H / 64));
 
-  const [tl, tr, br, bl] = quad;
-  const centroid: Point2D = {
-    x: (tl.x + tr.x + br.x + bl.x) * 0.25,
-    y: (tl.y + tr.y + br.y + bl.y) * 0.25,
-  };
-  const bodyW = 0.5 * (Math.hypot(tr.x - tl.x, tr.y - tl.y) + Math.hypot(br.x - bl.x, br.y - bl.y));
-  const bodyH = 0.5 * (Math.hypot(bl.x - tl.x, bl.y - tl.y) + Math.hypot(br.x - tr.x, br.y - tr.y));
-  const stepDist = clamp(Math.round(Math.min(bodyW, bodyH) * 0.024), 6, 22);
-  const dists = [stepDist, Math.round(stepDist * 1.7), Math.round(stepDist * 2.5)];
-
-  const sampleOutsideStrip = (
-    pA: Point2D,
-    pB: Point2D,
-    outNx: number,
-    outNy: number,
-  ): [number, number, number] | undefined => {
+  const collect = (filterBg: boolean): { rs: number[]; gs: number[]; bs: number[]; attempted: number } => {
     const rs: number[] = [];
     const gs: number[] = [];
     const bs: number[] = [];
-    for (let k = 2; k <= 18; k++) {
-      const t = k / 20;
-      const bx = pA.x + (pB.x - pA.x) * t;
-      const by = pA.y + (pB.y - pA.y) * t;
-      for (const d of dists) {
-        const sx = Math.round(bx + outNx * d);
-        const sy = Math.round(by + outNy * d);
-        if (sx < 1 || sx >= imgW - 1 || sy < 1 || sy >= imgH - 1) continue;
-        const p = (sy * imgW + sx) * 4;
-        if (rgba[p + 3] < 128) continue;
-        rs.push(rgba[p]);
-        gs.push(rgba[p + 1]);
-        bs.push(rgba[p + 2]);
+    let attempted = 0;
+
+    const push = (x: number, y: number) => {
+      const p = (y * W + x) * 4;
+      if (rectRgba[p + 3] < 128) return;
+      attempted++;
+      const r = rectRgba[p];
+      const g = rectRgba[p + 1];
+      const b = rectRgba[p + 2];
+      if (filterBg && exteriorBgRgb) {
+        const dBg = Math.hypot(r - exteriorBgRgb[0], g - exteriorBgRgb[1], b - exteriorBgRgb[2]);
+        if (dBg < 32) return;
+      }
+      rs.push(r);
+      gs.push(g);
+      bs.push(b);
+    };
+
+    for (let x = bandX; x < W - bandX; x += stepX) {
+      for (let dy = 1; dy <= bandY; dy++) {
+        push(x, dy);
+        if (x < W * 0.16 || x > W * 0.84) {
+          push(x, H - 1 - dy);
+        }
       }
     }
-    if (rs.length < 8) return undefined;
-    return [Math.round(median(rs)), Math.round(median(gs)), Math.round(median(bs))];
-  };
-
-  // Evalúa continuidad sin borde de melamina a través de un sub-tramo de arista lateral exterior
-  const isSideEdgeOpenToWall = (
-    pA: Point2D,
-    pB: Point2D,
-    inNx: number,
-    inNy: number,
-    refWall?: [number, number, number],
-  ): boolean => {
-    if (!refWall) return false;
-    const probeIn = Math.max(4, Math.round(stepDist * 0.9));
-    const probeOut = Math.max(6, Math.round(stepDist * 1.2));
-    let smoothHits = 0;
-    let total = 0;
-    for (let k = 2; k <= 14; k++) {
-      const t = k / 16;
-      const bx = pA.x + (pB.x - pA.x) * t;
-      const by = pA.y + (pB.y - pA.y) * t;
-      const inX = Math.round(bx + inNx * probeIn);
-      const inY = Math.round(by + inNy * probeIn);
-      const outX = Math.round(bx - inNx * probeOut);
-      const outY = Math.round(by - inNy * probeOut);
-      if (
-        inX < 1 ||
-        inX >= imgW - 1 ||
-        inY < 1 ||
-        inY >= imgH - 1 ||
-        outX < 1 ||
-        outX >= imgW - 1 ||
-        outY < 1 ||
-        outY >= imgH - 1
-      ) {
-        continue;
+    for (let y = bandY; y < H - bandY; y += stepY) {
+      for (let dx = 1; dx <= bandX; dx++) {
+        push(dx, y);
+        push(W - 1 - dx, y);
       }
-      const pIn = (inY * imgW + inX) * 4;
-      const pOut = (outY * imgW + outX) * 4;
-      const pOn = (clamp(Math.round(by), 0, imgH - 1) * imgW + clamp(Math.round(bx), 0, imgW - 1)) * 4;
-      if (rgba[pIn + 3] < 128 || rgba[pOut + 3] < 128) continue;
-      const dCross = Math.hypot(
-        rgba[pIn] - rgba[pOut],
-        rgba[pIn + 1] - rgba[pOut + 1],
-        rgba[pIn + 2] - rgba[pOut + 2],
-      );
-      const dOnWall = Math.hypot(
-        rgba[pOn] - refWall[0],
-        rgba[pOn + 1] - refWall[1],
-        rgba[pOn + 2] - refWall[2],
-      );
-      const dInWall = Math.hypot(
-        rgba[pIn] - refWall[0],
-        rgba[pIn + 1] - refWall[1],
-        rgba[pIn + 2] - refWall[2],
-      );
-      if (dCross < 22 && dOnWall < 24 && dInWall < 24) smoothHits++;
-      total++;
     }
-    return total >= 6 && smoothHits / total >= 0.7;
+    return { rs, gs, bs, attempted };
   };
 
-  // Evalúa si el interior inmediato bajo la arista superior en la esquina es pared pura
-  // (inmune a plantas colgantes u objetos decorativos que asomen POR FUERA arriba del quad)
-  const isTopInsideMatchingWall = (
-    pA: Point2D,
-    pB: Point2D,
-    inNx: number,
-    inNy: number,
-    refWall?: [number, number, number],
-  ): boolean => {
-    if (!refWall) return false;
-    const probeIn = Math.max(4, Math.round(stepDist * 0.9));
-    let wallHits = 0;
-    let total = 0;
-    for (let k = 2; k <= 14; k++) {
-      const t = k / 16;
-      const bx = pA.x + (pB.x - pA.x) * t;
-      const by = pA.y + (pB.y - pA.y) * t;
-      const inX = Math.round(bx + inNx * probeIn);
-      const inY = Math.round(by + inNy * probeIn);
-      if (inX < 1 || inX >= imgW - 1 || inY < 1 || inY >= imgH - 1) continue;
-      const pIn = (inY * imgW + inX) * 4;
-      if (rgba[pIn + 3] < 128) continue;
-      const dInWall = Math.hypot(
-        rgba[pIn] - refWall[0],
-        rgba[pIn + 1] - refWall[1],
-        rgba[pIn + 2] - refWall[2],
-      );
-      if (dInWall < 24) wallHits++;
-      total++;
-    }
-    return total >= 6 && wallHits / total >= 0.72;
-  };
-
-  const [topInX, topInY] = edgeInwardUnitNormal(tl, tr, centroid);
-  const [rightInX, rightInY] = edgeInwardUnitNormal(tr, br, centroid);
-  const [leftInX, leftInY] = edgeInwardUnitNormal(bl, tl, centroid);
-
-  const lerpPt = (a: Point2D, b: Point2D, t: number): Point2D => ({
-    x: a.x + (b.x - a.x) * t,
-    y: a.y + (b.y - a.y) * t,
-  });
-
-  const rightUpperEnd = lerpPt(tr, br, 0.34);
-  const leftUpperEnd = lerpPt(tl, bl, 0.34);
-  const topRightStart = lerpPt(tl, tr, 0.72);
-  const topLeftEnd = lerpPt(tl, tr, 0.28);
-
-  const rightWallBgRgb = sampleOutsideStrip(tr, rightUpperEnd, -rightInX, -rightInY);
-  const leftWallBgRgb = sampleOutsideStrip(tl, leftUpperEnd, -leftInX, -leftInY);
-  const topRightBgRgb = sampleOutsideStrip(topRightStart, tr, -topInX, -topInY);
-  const topLeftBgRgb = sampleOutsideStrip(tl, topLeftEnd, -topInX, -topInY);
-
-  const trRef = rightWallBgRgb ?? topRightBgRgb;
-  const tlRef = leftWallBgRgb ?? topLeftBgRgb;
-
-  // En una esquina escalonada real (`void_outside`), la arista lateral superior es pared continua
-  // sin tablero lateral Y el interior inmediato del borde superior de esa esquina coincide con la pared.
-  const trTopOpen = isTopInsideMatchingWall(
-    lerpPt(tl, tr, 0.76),
-    lerpPt(tl, tr, 0.96),
-    topInX,
-    topInY,
-    trRef,
-  );
-  const trSideOpen = isSideEdgeOpenToWall(
-    lerpPt(tr, br, 0.04),
-    lerpPt(tr, br, 0.24),
-    rightInX,
-    rightInY,
-    trRef,
-  );
-  const tlTopOpen = isTopInsideMatchingWall(
-    lerpPt(tl, tr, 0.04),
-    lerpPt(tl, tr, 0.24),
-    topInX,
-    topInY,
-    tlRef,
-  );
-  const tlSideOpen = isSideEdgeOpenToWall(
-    lerpPt(tl, bl, 0.04),
-    lerpPt(tl, bl, 0.24),
-    leftInX,
-    leftInY,
-    tlRef,
-  );
-
-  return {
-    globalBgRgb: globalBg,
-    rightWallBgRgb,
-    leftWallBgRgb,
-    topRightBgRgb,
-    topLeftBgRgb,
-    topRightBorderOpen: trTopOpen && trSideOpen,
-    topLeftBorderOpen: tlTopOpen && tlSideOpen,
-  };
+  let res = collect(true);
+  if (res.rs.length < Math.max(16, Math.round(res.attempted * 0.2))) {
+    res = collect(false);
+  }
+  if (res.rs.length < 12) {
+    return [fallbackRgb[0], fallbackRgb[1], fallbackRgb[2]];
+  }
+  return [Math.round(median(res.rs)), Math.round(median(res.gs)), Math.round(median(res.bs))];
 }
 
 /**

@@ -19,11 +19,11 @@ import type {
   Point2D,
 } from '../../types/contracts';
 import { applyHomography, exteriorToInterior } from '../mathEngine';
-import { MATERIAL_BASE_RGB } from './colorClassifier';
-import { clamp, sobel3x3AtRgba } from './imageOps';
+import { MATERIAL_BASE_RGB, classifyMelamineMaterial } from './colorClassifier';
+import { clamp, sampleCarcassBorderRgb, snapToAnchors, sobel3x3AtRgba } from './imageOps';
 import { classifyZonesUnified } from './zoneClassifier';
 
-export type UserStrokeMode = 'auto' | 'ortho' | 'diagonal';
+export type UserStrokeMode = 'auto' | 'ortho' | 'diagonal' | 'curve';
 
 export type TracedStrokeResult =
   | {
@@ -57,19 +57,6 @@ export interface PartitionRectCell {
   uEnd: number;
   vStart: number;
   vEnd: number;
-}
-
-function snapToAnchors(val: number, anchors: readonly number[], tol = 0.055): number {
-  let best = val;
-  let bestD = tol;
-  for (const a of anchors) {
-    const d = Math.abs(val - a);
-    if (d <= bestD) {
-      bestD = d;
-      best = a;
-    }
-  }
-  return best;
 }
 
 function makeDeterministicId(base: string, existingIds: ReadonlySet<string>): string {
@@ -209,26 +196,45 @@ export function vectorizeUserStroke(
       : autoExtend
         ? 0.06
         : 0;
-  const anchorSnapTol =
-    autoExtend === false
-      ? 0.01
-      : typeof autoExtend === 'number' && autoExtend <= 0.02
-        ? clamp(autoExtend, 0, 0.02)
-        : Math.min(0.06, extendTol);
+  const anchorSnapTol = extendTol > 0 ? Math.min(0.06, extendTol) : 0;
+
+  // En muebles bajos y anchos (ej. rack TV 1800×480), un pequeño temblor horizontal al trazar
+  // una vertical limpia (`|du| <= 0.035` con `|dv| >= 0.35`) no debe convertirse en diagonal
+  const isCleanLowFurnitureVertical =
+    xInt / yInt >= 2.0 && Math.abs(du) <= 0.035 && Math.abs(dv) >= 0.35;
 
   // Rango unificado 18°–72° (consistente con dEdge en vectorLines.ts y con la UI)
   const shouldBeDiagonal =
     strokeMode === 'diagonal' ||
-    (strokeMode === 'auto' && absAngleFromHorizDeg >= 18 && absAngleFromHorizDeg <= 72);
+    (strokeMode === 'auto' &&
+      !isCleanLowFurnitureVertical &&
+      absAngleFromHorizDeg >= 18 &&
+      absAngleFromHorizDeg <= 72);
 
   if (shouldBeDiagonal) {
-    const diagSnapTol = Math.min(0.045, anchorSnapTol);
-    const allUAnchors = [0, ...existingVDividers.map((d) => d.position), 1];
-    const allVAnchors = [0, ...existingHShelves.map((s) => s.position), 1];
-    const su1 = clamp(snapToAnchors(clamp(x1, 0, 1), allUAnchors, diagSnapTol), 0, 1);
-    const sv1 = clamp(snapToAnchors(clamp(y1, 0, 1), allVAnchors, diagSnapTol), 0, 1);
-    const su2 = clamp(snapToAnchors(clamp(x2, 0, 1), allUAnchors, diagSnapTol), 0, 1);
-    const sv2 = clamp(snapToAnchors(clamp(y2, 0, 1), allVAnchors, diagSnapTol), 0, 1);
+    const diagSnapTol = extendTol > 0.005 ? Math.min(0.045, Math.max(extendTol, 0.03)) : 0;
+    const uAnchorsAt = (vPt: number) => [
+      0,
+      ...existingVDividers
+        .filter((d) => vPt >= Math.min(d.start, d.end) - 0.04 && vPt <= Math.max(d.start, d.end) + 0.04)
+        .map((d) => d.position),
+      1,
+    ];
+    const vAnchorsAt = (uPt: number) => [
+      0,
+      ...existingHShelves
+        .filter((s) => uPt >= Math.min(s.start, s.end) - 0.04 && uPt <= Math.max(s.start, s.end) + 0.04)
+        .map((s) => s.position),
+      1,
+    ];
+    const cx1 = clamp(x1, 0, 1);
+    const cy1 = clamp(y1, 0, 1);
+    const cx2 = clamp(x2, 0, 1);
+    const cy2 = clamp(y2, 0, 1);
+    const su1 = clamp(snapToAnchors(cx1, uAnchorsAt(cy1), diagSnapTol), 0, 1);
+    const sv1 = clamp(snapToAnchors(cy1, vAnchorsAt(cx1), diagSnapTol), 0, 1);
+    const su2 = clamp(snapToAnchors(cx2, uAnchorsAt(cy2), diagSnapTol), 0, 1);
+    const sv2 = clamp(snapToAnchors(cy2, vAnchorsAt(cx2), diagSnapTol), 0, 1);
 
     const fdx = (su2 - su1) * xInt;
     const fdy = (sv2 - sv1) * yInt;
@@ -253,10 +259,10 @@ export function vectorizeUserStroke(
     };
   }
 
-  const isHorizontal = dxMm >= dyMm;
+  const isHorizontal = !isCleanLowFurnitureVertical && dxMm >= dyMm;
 
   if (isHorizontal) {
-    const vPos = clamp((y1 + y2) / 2, 0.015, 0.985);
+    const vPos = clamp((y1 + y2) / 2, 0.04, 0.96);
     const activeVAnchors = [
       0,
       ...existingVDividers
@@ -297,7 +303,7 @@ export function vectorizeUserStroke(
   }
 
   // Vector Vertical -> Divisor
-  const uPos = clamp((x1 + x2) / 2, 0.015, 0.985);
+  const uPos = clamp((x1 + x2) / 2, 0.04, 0.96);
   const activeHAnchors = [
     0,
     ...existingHShelves
@@ -347,7 +353,8 @@ export function partitionCellsFromVectors(
   vDividers: readonly NormalizedSegment[],
   hShelves: readonly NormalizedSegment[],
 ): PartitionRectCell[] {
-  const dedupeSorted = (vals: number[], eps = 0.012): number[] => {
+  const dedupeEps = 0.01;
+  const dedupeSorted = (vals: number[], eps = dedupeEps): number[] => {
     const sorted = [...vals].sort((a, b) => a - b);
     const out: number[] = [];
     for (const v of sorted) {
@@ -371,18 +378,32 @@ export function partitionCellsFromVectors(
     return [{ id: 'traced_zone_1', uStart: 0, uEnd: 1, vStart: 0, vEnd: 1 }];
   }
 
-  // Tolerancia adaptativa en posición + solapamiento estricto >= 50% de la altura/ancho de la celda
+  // Asignación estricta a la línea de grilla más cercana (`posTol >= dedupeEps`) + solapamiento >= 50%:
+  // impide que divisores/repisas parciales cercanos desaparezcan o contaminen bandas angostas adyacentes
+  const nearestGridIdx = (pos: number, grid: readonly number[]): number => {
+    let bestIdx = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < grid.length; i++) {
+      const d = Math.abs(pos - grid[i]);
+      if (d < bestD) {
+        bestD = d;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  };
+
+  const vDividerGridIdx = vDividers.map((d) => nearestGridIdx(clamp(d.position, 0.01, 0.99), us));
+  const hShelfGridIdx = hShelves.map((s) => nearestGridIdx(clamp(s.position, 0.01, 0.99), vs));
+
   const hasVertWall = (colBorderIdx: number, r: number): boolean => {
     const uWall = us[colBorderIdx];
     const v0 = vs[r];
     const v1 = vs[r + 1];
     const cellH = v1 - v0;
-    const minColGap = Math.min(
-      colBorderIdx > 0 ? us[colBorderIdx] - us[colBorderIdx - 1] : 1,
-      colBorderIdx + 1 < us.length ? us[colBorderIdx + 1] - us[colBorderIdx] : 1,
-    );
-    const posTol = Math.max(0.013, Math.min(0.018, minColGap * 0.55));
-    return vDividers.some((d) => {
+    const posTol = Math.max(dedupeEps + 0.002, 0.015);
+    return vDividers.some((d, idx) => {
+      if (vDividerGridIdx[idx] !== colBorderIdx) return false;
       if (Math.abs(d.position - uWall) > posTol) return false;
       const dStart = Math.min(d.start, d.end);
       const dEnd = Math.max(d.start, d.end);
@@ -396,12 +417,9 @@ export function partitionCellsFromVectors(
     const u0 = us[c];
     const u1 = us[c + 1];
     const cellW = u1 - u0;
-    const minRowGap = Math.min(
-      rowBorderIdx > 0 ? vs[rowBorderIdx] - vs[rowBorderIdx - 1] : 1,
-      rowBorderIdx + 1 < vs.length ? vs[rowBorderIdx + 1] - vs[rowBorderIdx] : 1,
-    );
-    const posTol = Math.max(0.013, Math.min(0.018, minRowGap * 0.55));
-    return hShelves.some((s) => {
+    const posTol = Math.max(dedupeEps + 0.002, 0.015);
+    return hShelves.some((s, idx) => {
+      if (hShelfGridIdx[idx] !== rowBorderIdx) return false;
       if (Math.abs(s.position - vWall) > posTol) return false;
       const sStart = Math.min(s.start, s.end);
       const sEnd = Math.max(s.start, s.end);
@@ -540,6 +558,15 @@ export function classifyPartitionedZonesFromPhoto(
   previousZones: readonly FrontZone[] = [],
   boardThicknessMm = 18,
 ): FrontZone[] {
+  const baseRgb = MATERIAL_BASE_RGB[carcassMaterial];
+  let refRgb: [number, number, number] = [baseRgb[0], baseRgb[1], baseRgb[2]];
+  if (rectRgba && rectW >= 20 && rectH >= 20) {
+    const sampled = sampleCarcassBorderRgb(rectRgba, rectW, rectH, exteriorBgRgb, baseRgb);
+    const sampledMat = classifyMelamineMaterial(sampled[0], sampled[1], sampled[2], exteriorBgRgb);
+    if (sampledMat === carcassMaterial) {
+      refRgb = sampled;
+    }
+  }
   return classifyZonesUnified(cells, {
     rectRgba,
     rectW,
@@ -547,7 +574,7 @@ export function classifyPartitionedZonesFromPhoto(
     dimsMm,
     boardThicknessMm,
     carcassMaterial,
-    refRgb: MATERIAL_BASE_RGB[carcassMaterial],
+    refRgb,
     exteriorBgRgb,
     previousZones,
     mergeDrawers: false,

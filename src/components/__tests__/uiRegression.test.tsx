@@ -9,6 +9,7 @@ import {
   CHILE_DUROLAC_SHEET,
   CHILE_MELAMINE_SHEET,
   ETAPA2_BASE_MATRIX_M0,
+  buildCornerFilletCutSpec,
   calculateDespiece,
   clonePreset,
   scaleBaseMatrix,
@@ -23,6 +24,7 @@ import { CATALOG_14_MUEBLES, cloneCatalogFurniture } from '../../core/vectorBlue
 import { NumericInput } from '../NumericInput';
 import { ZoneInspector } from '../vectorCanvas/ZoneInspector';
 import { LineSelectionBar } from '../vectorCanvas/LineSelectionBar';
+import { CanvasTopBars } from '../vectorCanvas/CanvasToolbars';
 import { MathPanel } from '../mathPanel/MathPanel';
 import { VectorBlueprintPanel } from '../vectorBlueprint/VectorBlueprintPanel';
 import {
@@ -629,9 +631,16 @@ describe('SmartFurniture v8.0 — 2. Lógica UX crítica (`geometryHelpers.ts`)'
   });
 });
 
-describe('SmartFurniture v8.0 — 3. Integridad 3 Presets + Etapa 2 + Catálogo 14 + Bicolor + BOM CLP', () => {
-  it('Los 3 Presets oficiales cumplen detectionSource="preset", corte completo sin piezas fuera y BOM CLP cuadrado', () => {
-    const presetKeys: PresetKey[] = ['estanteria', 'rack_tv', 'closet'];
+describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etapa 2 + Catálogo 14 + Bicolor + BOM CLP', () => {
+  it('Los 6 Presets oficiales y en L cumplen detectionSource="preset", corte completo sin piezas fuera y BOM CLP cuadrado', () => {
+    const presetKeys: PresetKey[] = [
+      'estanteria',
+      'rack_tv',
+      'closet',
+      'escritorio_l',
+      'cocina_l',
+      'closet_l',
+    ];
 
     for (const key of presetKeys) {
       const { topology, params } = clonePreset(key);
@@ -727,6 +736,220 @@ describe('SmartFurniture v8.0 — 3. Integridad 3 Presets + Etapa 2 + Catálogo 
       expect(bom.edgeBandingByMaterialMeters?.blanco).toBeGreaterThan(0);
       expect(bom.edgeBandingByMaterialMeters?.roble).toBeGreaterThan(0);
     }
+  });
+
+  it('VectorBlueprintPanel renderiza selector de Alas A/B y SVG Planta XZ cuando lShape está activo', () => {
+    const desk = clonePreset('escritorio_l');
+    const despiece = calculateDespiece(desk.topology, desk.params);
+    const cuttingPlan = generateCuttingPlan(despiece.matrizDespiece, desk.params);
+
+    const html = renderToStaticMarkup(
+      <VectorBlueprintPanel
+        topology={desk.topology}
+        params={desk.params}
+        despiece={despiece}
+        cuttingPlan={cuttingPlan}
+        modelApproved={false}
+        displayUnit="mm"
+        selectedZoneId="ezr2"
+        editingWing="return"
+        onChangeEditingWing={noop}
+        onSelectZone={noop}
+        onHoverZone={noop}
+        onUpdateDim={noop}
+        onUpdateTopology={noop}
+        onUpdateFrontZones={noop}
+        onApproveModel={noop}
+      />,
+    );
+
+    expect(html).toContain('Ala Principal (A)');
+    expect(html).toContain('Ala Retorno (B)');
+    expect(html).toContain('Cajonera Retorno');
+    expect(html).toContain('PLANTA SUPERIOR (PLANO XZ');
+  });
+
+  it('CanvasTopBars y MathPanel renderizan 3 vistas (Frente/Arriba/Lado), Medidas Razonables, Curva Bézier y Unidad 3 Diferencial', () => {
+    const desk = clonePreset('escritorio_l');
+    const curvedTop: FurnitureTopology = {
+      ...desk.topology,
+      viewsMode: 3,
+      curvedCuts: [
+        buildCornerFilletCutSpec({
+          id: 'ui_curva_l',
+          cornerTarget: 'l_inner',
+          radiusMm: 160,
+        }),
+      ],
+    };
+    const despiece = calculateDespiece(curvedTop, desk.params);
+    const cuttingPlan = generateCuttingPlan(despiece.matrizDespiece, desk.params);
+
+    const barHtml = renderToStaticMarkup(
+      <CanvasTopBars
+        hasPhoto
+        hasTopPhoto
+        hasSidePhoto
+        viewTab="frontal"
+        traceStep="lines"
+        frameMode="quad"
+        pickingCorners={null}
+        linesSubMode="smart"
+        strokeMode="curve"
+        subTool="none"
+        magneticSnap
+        calibRefMm={297}
+        calibPtsCount={0}
+        internalLineCount={2}
+        curvedCount={1}
+        zonesCount={3}
+        subRegions={[]}
+        xIntMm={1364}
+        yIntMm={732}
+        canUndo={false}
+        canRedo={false}
+        undoCount={0}
+        redoCount={0}
+        zoom={1}
+        panToolActive={false}
+        isSpacePan={false}
+        legHintDetected={false}
+        hasExternalLegs={false}
+        isCatalogReference={false}
+        ranRealVisionOnCatalog={false}
+        isLShape
+        hasLInnerCurve
+        onSelectStep={noop}
+        onSwitchViewTab={noop}
+        onUndo={noop}
+        onRedo={noop}
+        onZoomIn={noop}
+        onZoomOut={noop}
+        onZoomReset={noop}
+        onTogglePanTool={noop}
+        onUploadFrontPhoto={noop}
+        onUploadTopPhoto={noop}
+        onUploadSidePhoto={noop}
+        onStartBlankSketch={noop}
+        onRecognizeSketch={noop}
+        onRunReasonableMeasures={noop}
+        onToggleLInnerCurve={noop}
+        onReturnToFrontal={noop}
+        onChangeCalibRefMm={noop}
+        onApplyCalibA4={noop}
+        onExitSubTool={noop}
+        onToggleSubTool={noop}
+        onToggleFrameMode={noop}
+        onStartPickCorners={noop}
+        onCancelPickCorners={noop}
+        onToggleMagneticSnap={noop}
+        onAutoContour={noop}
+        onClearLines={noop}
+        onChangeLinesSubMode={noop}
+        onRemoveSubRegion={noop}
+        onClearSubRegions={noop}
+        onDetectSubRegions={noop}
+        onChangeStrokeMode={noop}
+        onAutoSuggestLines={noop}
+        onRunRealVisionOnCatalog={noop}
+      />,
+    );
+
+    expect(barHtml).toContain('1. Frente (XY)');
+    expect(barHtml).toContain('2. Arriba (XZ)');
+    expect(barHtml).toContain('3. Lado (ZY)');
+    expect(barHtml).toContain('Medidas razonables');
+    expect(barHtml).toContain('Modo curva');
+    expect(barHtml).toContain('>Curva<');
+
+    const topBarHtml = renderToStaticMarkup(
+      <CanvasTopBars
+        hasPhoto
+        hasTopPhoto
+        hasSidePhoto
+        viewTab="superior"
+        traceStep="lines"
+        frameMode="quad"
+        pickingCorners={null}
+        linesSubMode="smart"
+        strokeMode="curve"
+        subTool="none"
+        magneticSnap
+        calibRefMm={297}
+        calibPtsCount={0}
+        internalLineCount={2}
+        curvedCount={1}
+        zonesCount={3}
+        subRegions={[]}
+        xIntMm={1364}
+        yIntMm={732}
+        canUndo={false}
+        canRedo={false}
+        undoCount={0}
+        redoCount={0}
+        zoom={1}
+        panToolActive={false}
+        isSpacePan={false}
+        legHintDetected={false}
+        hasExternalLegs={false}
+        isCatalogReference={false}
+        ranRealVisionOnCatalog={false}
+        isLShape
+        hasLInnerCurve
+        onSelectStep={noop}
+        onSwitchViewTab={noop}
+        onUndo={noop}
+        onRedo={noop}
+        onZoomIn={noop}
+        onZoomOut={noop}
+        onZoomReset={noop}
+        onTogglePanTool={noop}
+        onUploadFrontPhoto={noop}
+        onUploadTopPhoto={noop}
+        onUploadSidePhoto={noop}
+        onStartBlankSketch={noop}
+        onRecognizeSketch={noop}
+        onRunReasonableMeasures={noop}
+        onToggleLInnerCurve={noop}
+        onReturnToFrontal={noop}
+        onChangeCalibRefMm={noop}
+        onApplyCalibA4={noop}
+        onExitSubTool={noop}
+        onToggleSubTool={noop}
+        onToggleFrameMode={noop}
+        onStartPickCorners={noop}
+        onCancelPickCorners={noop}
+        onToggleMagneticSnap={noop}
+        onAutoContour={noop}
+        onClearLines={noop}
+        onChangeLinesSubMode={noop}
+        onRemoveSubRegion={noop}
+        onClearSubRegions={noop}
+        onDetectSubRegions={noop}
+        onChangeStrokeMode={noop}
+        onAutoSuggestLines={noop}
+        onRunRealVisionOnCatalog={noop}
+      />,
+    );
+    expect(topBarHtml).toContain('Curva interior L');
+    expect(topBarHtml).toContain('Reconocer boceto XZ');
+    expect(topBarHtml).toContain('Lienzo Arriba');
+
+    const mathHtml = renderToStaticMarkup(
+      <MathPanel
+        params={desk.params}
+        topology={curvedTop}
+        despiece={despiece}
+        cuttingPlan={cuttingPlan}
+        onAddHardwareItem={noop}
+        onUpdateHardwareItem={noop}
+        onRemoveHardwareItem={noop}
+        onFixReferenceV0={noop}
+        onAddCenterDivider={noop}
+      />,
+    );
+    expect(mathHtml).toContain('5. Geometría Diferencial en Cortes Curvos');
+    expect(mathHtml).toContain('Cortes Curvos Bézier');
   });
 });
 

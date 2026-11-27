@@ -44,6 +44,8 @@ export function buildLegVoidBasesAndFaldon(options: {
   joint: ScaleAndBoardParams['cornerJointType'];
   edgeMode: ScaleAndBoardParams['edgeBandingMode'];
   pieces: BoardPiece[];
+  xLeftStart?: number;
+  xRightEnd?: number;
 }): BaseSpan[] {
   const {
     legVoidsAtBottom,
@@ -57,6 +59,8 @@ export function buildLegVoidBasesAndFaldon(options: {
     joint,
     edgeMode,
     pieces,
+    xLeftStart = e,
+    xRightEnd = xf - e,
   } = options;
 
   const baseSpans: BaseSpan[] = [];
@@ -73,8 +77,8 @@ export function buildLegVoidBasesAndFaldon(options: {
     const vV1 = clamp01(Math.max(v.vStart, v.vEnd));
 
     if (vU0 - curU > 0.04) {
-      const bx0 = curU <= SEGMENT_TOUCH_TOL ? e : e + curU * xInt + e / 2;
-      const bx1 = e + vU0 * xInt - e / 2;
+      const bx0 = curU <= SEGMENT_TOUCH_TOL ? xLeftStart : xLeftStart + curU * xInt + e / 2;
+      const bx1 = xLeftStart + vU0 * xInt - e / 2;
       const bw = bx1 - bx0;
       if (bw > e) {
         baseSpans.push({ x0: bx0, x1: bx1 });
@@ -96,8 +100,10 @@ export function buildLegVoidBasesAndFaldon(options: {
       }
     }
 
-    const fx0 = e + vU0 * xInt + (vU0 > 0.02 ? e / 2 : 0);
-    const fx1 = e + vU1 * xInt - (vU1 < 0.98 ? e / 2 : 0);
+    const fx0 =
+      vU0 <= 0.02 ? xLeftStart : xLeftStart + vU0 * xInt + e / 2;
+    const fx1 =
+      vU1 >= 0.98 ? xRightEnd : xLeftStart + vU1 * xInt - e / 2;
     const fw = fx1 - fx0;
     const fTop = e + vV1 * yInt - (vV1 < 1 - SEGMENT_TOUCH_TOL ? e / 2 : 0);
     const fh = Math.max(160, Math.min(360, (vV1 - vV0) * yInt * 0.45));
@@ -124,8 +130,8 @@ export function buildLegVoidBasesAndFaldon(options: {
   }
 
   if (maxU - curU > 0.04) {
-    const bx0 = e + curU * xInt + e / 2;
-    const bx1 = maxU >= 1 - SEGMENT_TOUCH_TOL ? xf - e : e + maxU * xInt - e / 2;
+    const bx0 = xLeftStart + curU * xInt + e / 2;
+    const bx1 = maxU >= 1 - SEGMENT_TOUCH_TOL ? xRightEnd : xLeftStart + maxU * xInt - e / 2;
     const bw = bx1 - bx0;
     if (bw > e) {
       baseSpans.push({ x0: bx0, x1: bx1 });
@@ -152,7 +158,8 @@ export function buildLegVoidBasesAndFaldon(options: {
 
 /**
  * Suprime cualquier porción de una repisa horizontal que quede estrictamente dentro del rango
- * vertical `(zV0, zV1)` y horizontal `[zU0, zU1]` de una zona `kind: 'drawers'` para evitar colisiones 3D.
+ * vertical `(zV0, zV1)` y horizontal `[zU0, zU1]` de una zona `drawers`, `baskets` o `leg_void`
+ * para evitar colisiones 3D con cajones, canastos metálicos o el hueco de piernas/faldón.
  */
 export function clipShelfSpanAgainstDrawerZones(
   uStart: number,
@@ -162,7 +169,7 @@ export function clipShelfSpanAgainstDrawerZones(
 ): Array<[number, number]> {
   const blocked: Array<[number, number]> = [];
   for (const z of frontZones) {
-    if (z.kind !== 'drawers') continue;
+    if (z.kind !== 'drawers' && z.kind !== 'baskets' && z.kind !== 'leg_void') continue;
     const zU0 = clamp01(Math.min(z.uStart, z.uEnd));
     const zU1 = clamp01(Math.max(z.uStart, z.uEnd));
     const zV0 = clamp01(Math.min(z.vStart, z.vEnd));
@@ -194,6 +201,10 @@ export function buildFrontZonesAndHardware(options: {
   edgeMode: ScaleAndBoardParams['edgeBandingMode'];
   pieces: BoardPiece[];
   hardwareSummary: HardwareItem[];
+  xLeftStart?: number;
+  omitLeftLateral?: boolean;
+  omitRightLateral?: boolean;
+  cornerFrontTrim?: { side: 'left' | 'right'; trimMm: number };
 }): void {
   const {
     frontZones,
@@ -211,6 +222,10 @@ export function buildFrontZonesAndHardware(options: {
     edgeMode,
     pieces,
     hardwareSummary,
+    xLeftStart = e,
+    omitLeftLateral = false,
+    omitRightLateral = false,
+    cornerFrontTrim,
   } = options;
 
   const { topRight: stepR, topLeft: stepL, bottomRight: stepBR, bottomLeft: stepBL } = cutouts;
@@ -220,7 +235,14 @@ export function buildFrontZonesAndHardware(options: {
   let autoGlassPanels = 0;
   let autoFrontHandles = 0;
   const basketsByWidth = new Map<number, number>();
-  let slideNominalLenMm = Math.min(350, Math.max(50, Math.floor(zf - 20)));
+  let slideNominalLenMm = 0;
+
+  const isClosedFrontKind = (k: FrontZone['kind']): boolean =>
+    k === 'door_left' ||
+    k === 'door_right' ||
+    k === 'door_double' ||
+    k === 'door_glass' ||
+    k === 'drawers';
 
   for (const zone of frontZones) {
     if (zone.kind === 'open' || zone.kind === 'leg_void' || zone.kind === 'void_outside') {
@@ -232,8 +254,8 @@ export function buildFrontZonesAndHardware(options: {
     const zV0 = clamp01(Math.min(zone.vStart, zone.vEnd));
     const zV1 = clamp01(Math.max(zone.vStart, zone.vEnd));
 
-    const zoneX0 = e + zU0 * xInt;
-    const zoneX1 = e + zU1 * xInt;
+    const zoneX0 = xLeftStart + zU0 * xInt;
+    const zoneX1 = xLeftStart + zU1 * xInt;
     const zoneY0 = e + zV0 * yInt;
     const zoneY1 = e + zV1 * yInt;
 
@@ -245,20 +267,22 @@ export function buildFrontZonesAndHardware(options: {
     );
     if (inVoid) continue;
 
-    const touchesL = activeDividers.some(
+    // Absorber holguras de redondeo manual / partición de celdas (<= e/2 + 2 mm) contra divisores contiguos
+    const divEdgeTolU = Math.min((zU1 - zU0) * 0.25, Math.max(0.015, (e / 2 + 2) / xInt));
+    const leftDiv = activeDividers.find(
       (d) =>
-        Math.abs(d.u - zU0) <= SEGMENT_TOUCH_TOL &&
+        Math.abs(d.u - zU0) <= divEdgeTolU &&
         d.y0 < zoneY1 - GEOM_EPS &&
         d.y1 > zoneY0 + GEOM_EPS,
     );
-    const touchesR = activeDividers.some(
+    const rightDiv = activeDividers.find(
       (d) =>
-        Math.abs(d.u - zU1) <= SEGMENT_TOUCH_TOL &&
+        Math.abs(d.u - zU1) <= divEdgeTolU &&
         d.y0 < zoneY1 - GEOM_EPS &&
         d.y1 > zoneY0 + GEOM_EPS,
     );
-    const xInner0 = zoneX0 + (touchesL ? e / 2 : 0);
-    const xInner1 = zoneX1 - (touchesR ? e / 2 : 0);
+    const xInner0 = leftDiv ? Math.max(zoneX0, leftDiv.cx + e / 2) : zoneX0;
+    const xInner1 = rightDiv ? Math.min(zoneX1, rightDiv.cx - e / 2) : zoneX1;
     const innerW = xInner1 - xInner0;
 
     if (zone.kind === 'baskets') {
@@ -285,8 +309,6 @@ export function buildFrontZonesAndHardware(options: {
       zU1 <= stepBL.u + SEGMENT_TOUCH_TOL &&
       Math.abs(zV0 - stepBL.v) <= 0.025;
 
-    const frontX0 = zU0 <= SEGMENT_TOUCH_TOL ? 2 : zoneX0 + 1.5;
-    const frontX1 = zU1 >= 1 - SEGMENT_TOUCH_TOL ? xf - 2 : zoneX1 - 1.5;
     const frontY0 =
       zV0 <= SEGMENT_TOUCH_TOL
         ? 2
@@ -303,6 +325,79 @@ export function buildFrontZonesAndHardware(options: {
           : underStepL && stepL
             ? stepL.yTop - 2
             : zoneY1 - 1.5;
+
+    const hasClosedFrontOnStepSide = (
+      stepU: number,
+      side: 'right' | 'left',
+      yMin: number,
+      yMax: number,
+    ): boolean =>
+      frontZones.some((other) => {
+        if (other.id === zone.id || !isClosedFrontKind(other.kind)) return false;
+        const oU0 = clamp01(Math.min(other.uStart, other.uEnd));
+        const oU1 = clamp01(Math.max(other.uStart, other.uEnd));
+        const oV0 = clamp01(Math.min(other.vStart, other.vEnd));
+        const oV1 = clamp01(Math.max(other.vStart, other.vEnd));
+        const onSide =
+          side === 'right'
+            ? Math.abs(oU0 - stepU) <= 0.025
+            : Math.abs(oU1 - stepU) <= 0.025;
+        if (!onSide) return false;
+        const oY0 = oV0 <= SEGMENT_TOUCH_TOL ? 2 : e + oV0 * yInt - e / 2;
+        const oY1 = oV1 >= 1 - SEGMENT_TOUCH_TOL ? yf - 2 : e + oV1 * yInt + e / 2;
+        return oY0 < yMax - GEOM_EPS && oY1 > yMin + GEOM_EPS;
+      });
+
+    // Cobertura total del canto lateral exterior en torres de escalón `void_outside`
+    const leftOfStepR =
+      stepR !== null &&
+      Math.abs(zU1 - stepR.u) <= 0.02 &&
+      zV0 >= stepR.v - 0.025 &&
+      !hasClosedFrontOnStepSide(stepR.u, 'right', frontY0, frontY1);
+    const rightOfStepL =
+      stepL !== null &&
+      Math.abs(zU0 - stepL.u) <= 0.02 &&
+      zV0 >= stepL.v - 0.025 &&
+      !hasClosedFrontOnStepSide(stepL.u, 'left', frontY0, frontY1);
+    const leftOfStepBR =
+      stepBR !== null &&
+      Math.abs(zU1 - stepBR.u) <= 0.02 &&
+      zV1 <= stepBR.v + 0.025 &&
+      !hasClosedFrontOnStepSide(stepBR.u, 'right', frontY0, frontY1);
+    const rightOfStepBL =
+      stepBL !== null &&
+      Math.abs(zU0 - stepBL.u) <= 0.02 &&
+      zV1 <= stepBL.v + 0.025 &&
+      !hasClosedFrontOnStepSide(stepBL.u, 'left', frontY0, frontY1);
+
+    const rawFrontX0 =
+      zU0 <= SEGMENT_TOUCH_TOL
+        ? omitLeftLateral
+          ? 2
+          : 2
+        : rightOfStepL && stepL
+          ? stepL.x - e / 2 + 2
+          : rightOfStepBL && stepBL
+            ? stepBL.x - e / 2 + 2
+            : zoneX0 + 1.5;
+    const rawFrontX1 =
+      zU1 >= 1 - SEGMENT_TOUCH_TOL
+        ? omitRightLateral
+          ? xf - 2
+          : xf - 2
+        : leftOfStepR && stepR
+          ? stepR.x + e / 2 - 2
+          : leftOfStepBR && stepBR
+            ? stepBR.x + e / 2 - 2
+            : zoneX1 - 1.5;
+    const frontX0 =
+      cornerFrontTrim && cornerFrontTrim.side === 'left' && zU0 <= SEGMENT_TOUCH_TOL
+        ? Math.max(rawFrontX0, cornerFrontTrim.trimMm)
+        : rawFrontX0;
+    const frontX1 =
+      cornerFrontTrim && cornerFrontTrim.side === 'right' && zU1 >= 1 - SEGMENT_TOUCH_TOL
+        ? Math.min(rawFrontX1, xf - cornerFrontTrim.trimMm)
+        : rawFrontX1;
     const frontW = frontX1 - frontX0;
     const frontH = frontY1 - frontY0;
     const frontMat: PieceMaterial = zone.materialOverride ?? mat;
@@ -312,8 +407,24 @@ export function buildFrontZonesAndHardware(options: {
 
     if (zone.kind === 'door_left' || zone.kind === 'door_right' || zone.kind === 'door_glass') {
       const isGlass = zone.kind === 'door_glass';
+      const isRightGlassPairLeaf =
+        isGlass &&
+        zU0 >= 0.45 &&
+        zU1 > 0.95 &&
+        frontZones.some((other) => {
+          if (other.id === zone.id) return false;
+          if (other.kind !== 'door_glass' && other.kind !== 'door_left') return false;
+          const oU1 = clamp01(Math.max(other.uStart, other.uEnd));
+          const oV0 = clamp01(Math.min(other.vStart, other.vEnd));
+          const oV1 = clamp01(Math.max(other.vStart, other.vEnd));
+          return (
+            Math.abs(oU1 - zU0) <= 0.025 &&
+            Math.abs(oV0 - zV0) <= 0.025 &&
+            Math.abs(oV1 - zV1) <= 0.025
+          );
+        });
       const handleSide: 'left' | 'right' =
-        zone.kind === 'door_right' ? 'left' : 'right';
+        zone.kind === 'door_right' || isRightGlassPairLeaf ? 'left' : 'right';
       const label = zone.label ?? (isGlass ? 'Puerta Marco Vidrio' : 'Puerta');
 
       pieces.push({
@@ -419,9 +530,7 @@ export function buildFrontZonesAndHardware(options: {
         // Holgura superior segura contra repisa colindante superior (e = 15, 18, 25 mm) o cajón siguiente
         const topHasNeighborShelf = d === nDrawers - 1 && zV1 < 1 - SEGMENT_TOUCH_TOL;
         const topClearance = topHasNeighborShelf ? Math.max(8, e * 0.5 + 4) : 8;
-        const maxHeightByBand = innerBandY1 - innerBandY0 - 20 - backE;
-        const maxHeightByCeiling = innerBandY1 - topClearance - yBoxBase;
-        const hardMaxBoxH = Math.min(maxHeightByBand, maxHeightByCeiling);
+        const hardMaxBoxH = innerBandY1 - topClearance - yBoxBase;
         const preferredBoxH = Math.min(fh - 34, hardMaxBoxH);
         // Prioriza no colisionar con el techo del cajón sobre el mínimo nominal de 60 mm
         const boxH = Math.min(hardMaxBoxH, Math.max(Math.min(60, hardMaxBoxH), preferredBoxH));

@@ -9,62 +9,88 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
+  CurvedCutSpec,
   DiagonalSegment,
   FrontZone,
   FurnitureTopology,
+  LShapeWingConfig,
   MelamineMaterial,
   NormalizedSegment,
   Point2D,
 } from '../../types/contracts';
-import { cloneQuad } from './geometryHelpers';
+import { cloneQuad, isEditableElement } from './geometryHelpers';
 
 export interface CanvasHistorySnapshot {
   quad: [Point2D, Point2D, Point2D, Point2D];
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
   diagonalDividers: DiagonalSegment[];
+  curvedCuts?: CurvedCutSpec[];
+  lShape?: LShapeWingConfig;
   frontZones: FrontZone[] | undefined;
   cubiertaMaterialOverride?: MelamineMaterial;
   shelfMode: FurnitureTopology['shelfMode'];
   equalShelfCount: number;
+  dims?: { x: number; y: number; z: number };
 }
 
 const MAX_HISTORY_ENTRIES = 40;
 
-export function cloneHistorySnapshot(snap: CanvasHistorySnapshot): CanvasHistorySnapshot {
+function cloneHistorySnapshot(snap: CanvasHistorySnapshot): CanvasHistorySnapshot {
+  const ls = snap.lShape;
   return {
     quad: cloneQuad(snap.quad),
     vDividers: snap.vDividers.map((d) => ({ ...d })),
     hShelves: snap.hShelves.map((s) => ({ ...s })),
     diagonalDividers: snap.diagonalDividers.map((dg) => ({ ...dg })),
+    curvedCuts: snap.curvedCuts
+      ? snap.curvedCuts.map((c) => ({
+          ...c,
+          controlPoints: [
+            { ...c.controlPoints[0] },
+            { ...c.controlPoints[1] },
+            { ...c.controlPoints[2] },
+            { ...c.controlPoints[3] },
+          ],
+        }))
+      : undefined,
+    lShape: ls
+      ? {
+          ...ls,
+          vDividers: ls.vDividers.map((d) => ({ ...d })),
+          hShelves: ls.hShelves.map((s) => ({ ...s })),
+          diagonalDividers: ls.diagonalDividers
+            ? ls.diagonalDividers.map((d) => ({ ...d }))
+            : undefined,
+          frontZones: ls.frontZones ? ls.frontZones.map((z) => ({ ...z })) : undefined,
+        }
+      : undefined,
     frontZones: snap.frontZones ? snap.frontZones.map((z) => ({ ...z })) : undefined,
     cubiertaMaterialOverride: snap.cubiertaMaterialOverride,
     shelfMode: snap.shelfMode,
     equalShelfCount: snap.equalShelfCount,
+    dims: snap.dims ? { ...snap.dims } : undefined,
   };
 }
 
 export function buildSnapshotFromState(
   quad: readonly [Point2D, Point2D, Point2D, Point2D],
   topology: FurnitureTopology,
+  dims?: { x: number; y: number; z: number },
 ): CanvasHistorySnapshot {
   return cloneHistorySnapshot({
     quad: cloneQuad(quad),
     vDividers: topology.vDividers,
     hShelves: topology.hShelves,
     diagonalDividers: topology.diagonalDividers ?? [],
+    curvedCuts: topology.curvedCuts,
+    lShape: topology.lShape,
     frontZones: topology.frontZones,
     cubiertaMaterialOverride: topology.cubiertaMaterialOverride,
     shelfMode: topology.shelfMode,
     equalShelfCount: topology.equalShelfCount,
+    dims,
   });
-}
-
-function isEditableElement(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  const tag = target.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
-  return target.isContentEditable;
 }
 
 export interface UseCanvasHistoryOptions {

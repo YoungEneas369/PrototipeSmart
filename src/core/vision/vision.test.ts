@@ -20,11 +20,15 @@ import {
   extrapolateDimensionsFromSingleMeasure,
   interiorToExteriorPoint,
   interiorToExteriorRect,
+  isHandDrawnSketchImage,
+  makeDrawingMeasurementsReasonable,
   partitionCellsFromVectors,
+  recognizeHandDrawnSketch,
   reconstructStructureFromVectors,
   rectifyImageRGBA,
   runIterativePhotoTo3D,
   snapPointToStrongEdge,
+  synthesize3DFromTriViews,
   vectorizeUserStroke,
 } from './index';
 
@@ -1892,5 +1896,503 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     expect(quadVase.usedFallback).toBe(false);
     // El borde superior detectado debe caer cerca de la cubierta real (y ≈ 145), NO arriba en el jarrón (y = 85)
     expect(quadVase.quadCorners[0].y).toBeGreaterThanOrEqual(130);
+  });
+
+  it('Escenario 31 (Regresión 07_rack_tv_blanco_mixto — rack TV blanco bajo sobre piso madera + alfombra moteada): borde inferior NO baja a la alfombra', () => {
+    const W = 360;
+    const H = 450;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    const rng = createRng(707);
+
+    const fillBuf = (
+      x0: number,
+      y0: number,
+      x1: number,
+      y1: number,
+      rgb: [number, number, number],
+      noiseAmp = 2,
+    ) => {
+      for (let y = Math.max(0, Math.floor(y0)); y < Math.min(H, Math.ceil(y1)); y++) {
+        for (let x = Math.max(0, Math.floor(x0)); x < Math.min(W, Math.ceil(x1)); x++) {
+          const n = (rng() - 0.5) * noiseAmp;
+          const i = (y * W + x) * 4;
+          rgba[i] = Math.max(0, Math.min(255, Math.round(rgb[0] + n)));
+          rgba[i + 1] = Math.max(0, Math.min(255, Math.round(rgb[1] + n)));
+          rgba[i + 2] = Math.max(0, Math.min(255, Math.round(rgb[2] + n)));
+          rgba[i + 3] = 255;
+        }
+      }
+    };
+
+    // Pared beige superior (y = 0..76%)
+    fillBuf(0, 0, W, Math.round(H * 0.77), [194, 189, 183], 3);
+    // TV negra colgada arriba (y = 24..46%)
+    fillBuf(Math.round(W * 0.25), Math.round(H * 0.24), Math.round(W * 0.75), Math.round(H * 0.46), [22, 22, 24], 2);
+    // Piso de madera clara continua de borde a borde (y = 77..86%)
+    fillBuf(0, Math.round(H * 0.77), W, Math.round(H * 0.86), [208, 174, 134], 5);
+    // Alfombra gris moteada de alta textura (alto gradiente Sobel isotrópico) en y = 86..100%
+    for (let y = Math.round(H * 0.86); y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const speckle = ((x * 17 + y * 31) % 3 === 0 ? 34 : -26) + (rng() - 0.5) * 24;
+        const i = (y * W + x) * 4;
+        rgba[i] = Math.max(0, Math.min(255, Math.round(172 + speckle)));
+        rgba[i + 1] = Math.max(0, Math.min(255, Math.round(168 + speckle)));
+        rgba[i + 2] = Math.max(0, Math.min(255, Math.round(160 + speckle)));
+        rgba[i + 3] = 255;
+      }
+    }
+
+    // Rack TV blanco bajo real en x = [7%..93%], y = [60.5%..80%] (aspecto ~3.5)
+    const rx0 = Math.round(W * 0.07);
+    const rx1 = Math.round(W * 0.93);
+    const ry0 = Math.round(H * 0.605);
+    const ry1 = Math.round(H * 0.8);
+    fillBuf(rx0, ry0, rx1, ry1, [232, 229, 225], 2);
+    // Juntas y nicho central oscuro con 1 repisa blanca
+    const div1 = rx0 + Math.round((rx1 - rx0) / 3);
+    const div2 = rx0 + Math.round(((rx1 - rx0) * 2) / 3);
+    const midY = Math.round((ry0 + ry1) / 2);
+    fillBuf(div1 + 4, ry0 + 6, div2 - 4, ry1 - 10, [68, 64, 60], 3);
+    fillBuf(div1 + 4, midY - 3, div2 - 4, midY + 3, [230, 227, 223], 2);
+    fillBuf(rx0 + 4, midY - 1, div1 - 2, midY + 1, [110, 108, 104], 0);
+    fillBuf(div1 - 1, ry0 + 4, div1 + 1, ry1 - 8, [110, 108, 104], 0);
+    fillBuf(div2 - 1, ry0 + 4, div2 + 1, ry1 - 8, [110, 108, 104], 0);
+
+    const aq = autoDetectFurnitureQuad(rgba, W, H);
+    expect(aq.usedFallback).toBe(false);
+    const botNorm = Math.max(aq.quadCorners[2].y, aq.quadCorners[3].y) / H;
+    const topNorm = Math.min(aq.quadCorners[0].y, aq.quadCorners[1].y) / H;
+    // Jamás debe bajar a la alfombra (y = 0.86..1.00) ni incluir el piso completo
+    expect(botNorm).toBeLessThanOrEqual(0.83);
+    expect(topNorm).toBeGreaterThanOrEqual(0.55);
+
+    const ext = extractStructuralVectorLines(rgba, W, H, aq.quadCorners);
+    const finalQuad = ext.refinedBox ?? aq.quadCorners;
+    const aspect = estimateAspectRatioFixedFocal(finalQuad, W, H, 26);
+    expect(aspect).toBeGreaterThanOrEqual(2.8);
+
+    const iter = runIterativePhotoTo3D(rgba, W, H, { overrideQuad: finalQuad });
+    expect(iter).not.toBeNull();
+    expect(iter!.detection.detectedMaterial).toBe('blanco');
+    // Sin falsos cajones roble provenientes del piso de madera
+    expect(
+      iter!.detection.inferredZones.some((z) => z.kind === 'drawers' && z.materialOverride === 'roble'),
+    ).toBe(false);
+  });
+
+  it('Escenario 32 (Blindaje Fase B v8.1): preserva quad proyectivo, confianza honesta < 0.5, puertas blancas interiores, trazos seguros e IoU de zonas', () => {
+    // 1. extractStructuralVectorLines NO aplasta un trapezoide proyectivo real a un AABB
+    const pW = 360;
+    const pH = 280;
+    const perspRgba = new Uint8ClampedArray(pW * pH * 4);
+    const trapQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 96, y: 40 },
+      { x: 264, y: 44 },
+      { x: 300, y: 240 },
+      { x: 60, y: 236 },
+    ];
+    for (let y = 0; y < pH; y++) {
+      for (let x = 0; x < pW; x++) {
+        const i = (y * pW + x) * 4;
+        const inside = y >= 42 && y <= 238 && x >= 80 && x <= 280;
+        perspRgba[i] = inside ? 190 : 242;
+        perspRgba[i + 1] = inside ? 145 : 244;
+        perspRgba[i + 2] = inside ? 96 : 248;
+        perspRgba[i + 3] = 255;
+      }
+    }
+    const extTrap = extractStructuralVectorLines(perspRgba, pW, pH, trapQuad);
+    expect(extTrap.refinedBox).toBeUndefined();
+
+    // 2. runIterativePhotoTo3D preserva confianza honesta < 0.5 en blanco-sobre-blanco sin divisiones reales
+    const flatW = 280;
+    const flatH = 220;
+    const flatRgba = new Uint8ClampedArray(flatW * flatH * 4);
+    for (let i = 0; i < flatW * flatH; i++) {
+      flatRgba[i * 4] = 226;
+      flatRgba[i * 4 + 1] = 226;
+      flatRgba[i * 4 + 2] = 228;
+      flatRgba[i * 4 + 3] = 255;
+    }
+    const flatQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 20, y: 20 },
+      { x: 260, y: 20 },
+      { x: 260, y: 200 },
+      { x: 20, y: 200 },
+    ];
+    const flatRes = runIterativePhotoTo3D(flatRgba, flatW, flatH, { overrideQuad: flatQuad });
+    expect(flatRes).not.toBeNull();
+    expect(flatRes!.detection.confidence).toBeLessThan(0.5);
+
+    // 3. detectStructureInSubRegions NO inyecta líneas fantasma en una sub-región blanca uniforme
+    const subBlank = detectStructureInSubRegions(
+      flatRgba,
+      flatW,
+      flatH,
+      flatQuad,
+      [{ id: 's1', uStart: 0.1, uEnd: 0.9, vStart: 0.1, vEnd: 0.9 }],
+      { vDividers: [], hShelves: [], diagonalDividers: [] },
+      {
+        dimsMm: { x: 1000, y: 800, z: 400 },
+        boardThicknessMm: 18,
+        carcassMaterial: 'blanco',
+        exteriorBgRgb: [226, 226, 228],
+      },
+    );
+    expect(subBlank.addedVCount + subBlank.addedHCount + subBlank.addedDCount).toBe(0);
+
+    // 4. classifyPartitionedZonesFromPhoto muestrea carcasa real en luz interior (puerta blanca real NO se marca 'open')
+    const doorW = 260;
+    const doorH = 220;
+    const indoorWhiteRgba = new Uint8ClampedArray(doorW * doorH * 4);
+    for (let i = 0; i < doorW * doorH; i++) {
+      indoorWhiteRgba[i * 4] = 192;
+      indoorWhiteRgba[i * 4 + 1] = 190;
+      indoorWhiteRgba[i * 4 + 2] = 186;
+      indoorWhiteRgba[i * 4 + 3] = 255;
+    }
+    const doorZones = classifyPartitionedZonesFromPhoto(
+      [
+        { id: 'c1', uStart: 0, uEnd: 0.5, vStart: 0, vEnd: 1 },
+        { id: 'c2', uStart: 0.5, uEnd: 1, vStart: 0, vEnd: 1 },
+      ],
+      indoorWhiteRgba,
+      doorW,
+      doorH,
+      { x: 1000, y: 850 },
+      'blanco',
+      [214, 214, 212],
+      [],
+      18,
+    );
+    expect(doorZones[0].kind).not.toBe('open');
+    expect(doorZones[1].kind).not.toBe('open');
+
+    // 5. vectorizeUserStroke: autoExtend=false sin snap, vertical limpia en rack bajo, diagonal sin imán a divisor ajeno
+    const lowQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 0, y: 0 },
+      { x: 600, y: 0 },
+      { x: 600, y: 160 },
+      { x: 0, y: 160 },
+    ];
+    const lowHom = computeQuadToUnitHomography(lowQuad)!;
+    // Trazo casi vertical en rack 1800×480 con leve temblor horizontal (du ≈ 0.025, dv ≈ 0.85) -> vDivider
+    const lowVert = vectorizeUserStroke(
+      { x: 200, y: 148 },
+      { x: 215, y: 12 },
+      lowHom.toUnit,
+      [],
+      [],
+      18,
+      { x: 1800, y: 480 },
+      0.018,
+      'auto',
+    );
+    expect(lowVert?.kind).toBe('vDivider');
+
+    // autoExtend=false NO imanta a un divisor cercano (a distancia 2.5%)
+    const noSnapShelf = vectorizeUserStroke(
+      { x: 195, y: 80 },
+      { x: 420, y: 80 },
+      lowHom.toUnit,
+      [{ id: 'd_near', position: 0.3, start: 0, end: 1 }],
+      [],
+      18,
+      { x: 1800, y: 480 },
+      false,
+      'ortho',
+    );
+    expect(noSnapShelf?.kind).toBe('hShelf');
+    if (noSnapShelf?.kind === 'hShelf') {
+      expect(Math.abs(noSnapShelf.segment.start - 0.3)).toBeGreaterThan(0.01);
+    }
+
+    // Diagonal en bahía izquierda NO se imanta a repisa parcial existente solo en la bahía derecha
+    const sqHom = computeQuadToUnitHomography([
+      { x: 0, y: 0 },
+      { x: 300, y: 0 },
+      { x: 300, y: 300 },
+      { x: 0, y: 300 },
+    ])!;
+    const diagNoGhost = vectorizeUserStroke(
+      { x: 30, y: 240 },
+      { x: 130, y: 158 }, // y2 ≈ 0.473, cerca de repisa derecha v=0.50 que solo existe en u∈[0.6..1]
+      sqHom.toUnit,
+      [],
+      [{ id: 'r_right_only', position: 0.5, start: 0.6, end: 1 }],
+      18,
+      { x: 1000, y: 1000 },
+      true,
+      'diagonal',
+    );
+    expect(diagNoGhost?.kind).toBe('diagonal');
+    if (diagNoGhost?.kind === 'diagonal') {
+      expect(Math.abs(diagNoGhost.segment.v2 - 0.5)).toBeGreaterThan(0.015);
+    }
+
+    // 6. partitionCellsFromVectors conserva divisores parciales muy cercanos sin hacerlos desaparecer
+    const closePartialCells = partitionCellsFromVectors(
+      [
+        { id: 'd_top', position: 0.5, start: 0.5, end: 1 },
+        { id: 'd_bot', position: 0.508, start: 0, end: 0.5 },
+        { id: 'd_side', position: 0.524, start: 0, end: 1 },
+      ],
+      [{ id: 'r_mid', position: 0.5, start: 0, end: 1 }],
+    );
+    const botLeft = closePartialCells.find((c) => c.uStart === 0 && c.vStart === 0);
+    expect(botLeft).toBeDefined();
+    expect(botLeft!.uEnd).toBeLessThanOrEqual(0.51);
+
+    // 7. classifyZonesUnified preserva zona manual vía IoU >= 0.72 al mover un divisor 6% (> 0.04)
+    const nudgedZones = classifyZonesUnified(
+      [
+        { id: 'z1', uStart: 0, uEnd: 0.56, vStart: 0, vEnd: 1 },
+        { id: 'z2', uStart: 0.56, uEnd: 1, vStart: 0, vEnd: 1 },
+      ],
+      {
+        rectRgba: indoorWhiteRgba,
+        rectW: doorW,
+        rectH: doorH,
+        dimsMm: { x: 1000, y: 850 },
+        boardThicknessMm: 18,
+        carcassMaterial: 'blanco',
+        previousZones: [
+          {
+            id: 'manual_drw',
+            uStart: 0,
+            uEnd: 0.5,
+            vStart: 0,
+            vEnd: 1,
+            kind: 'drawers',
+            drawerCount: 4,
+            materialOverride: 'roble',
+            label: '4 Cajones Roble',
+          },
+        ],
+        modeHint: 'traced',
+      },
+    );
+    expect(nudgedZones[0].kind).toBe('drawers');
+    expect(nudgedZones[0].drawerCount).toBe(4);
+    expect(nudgedZones[0].materialOverride).toBe('roble');
+  });
+
+  it('Escenario 33 (Bocetos a mano XY/XZ, fusión de 3 vistas Frente+Arriba+Lado y botón Medidas Razonables)', () => {
+    const paintPaper = (w: number, h: number): Uint8ClampedArray => {
+      const rgba = new Uint8ClampedArray(w * h * 4);
+      for (let i = 0; i < w * h; i++) {
+        rgba[i * 4] = 248;
+        rgba[i * 4 + 1] = 248;
+        rgba[i * 4 + 2] = 246;
+        rgba[i * 4 + 3] = 255;
+      }
+      return rgba;
+    };
+    const drawInkSegment = (
+      rgba: Uint8ClampedArray,
+      w: number,
+      h: number,
+      x0: number,
+      y0: number,
+      x1: number,
+      y1: number,
+      radius = 2,
+    ) => {
+      const steps = Math.max(8, Math.ceil(Math.hypot(x1 - x0, y1 - y0) * 2));
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps;
+        const cx = Math.round(x0 + (x1 - x0) * t);
+        const cy = Math.round(y0 + (y1 - y0) * t);
+        for (let dy = -radius; dy <= radius; dy++) {
+          for (let dx = -radius; dx <= radius; dx++) {
+            const px = cx + dx;
+            const py = cy + dy;
+            if (px < 0 || px >= w || py < 0 || py >= h) continue;
+            const idx = (py * w + px) * 4;
+            rgba[idx] = 26;
+            rgba[idx + 1] = 30;
+            rgba[idx + 2] = 38;
+          }
+        }
+      }
+    };
+
+    // 1. Dibujo Frontal (XY): rectángulo con divisor central y repisa media
+    const fw = 340;
+    const fh = 260;
+    const frontRgba = paintPaper(fw, fh);
+    drawInkSegment(frontRgba, fw, fh, 30, 24, 310, 24);
+    drawInkSegment(frontRgba, fw, fh, 310, 24, 310, 236);
+    drawInkSegment(frontRgba, fw, fh, 310, 236, 30, 236);
+    drawInkSegment(frontRgba, fw, fh, 30, 236, 30, 24);
+    drawInkSegment(frontRgba, fw, fh, 170, 24, 170, 236);
+    drawInkSegment(frontRgba, fw, fh, 30, 130, 310, 130);
+
+    expect(isHandDrawnSketchImage(frontRgba, fw, fh).isSketch).toBe(true);
+    const frontSk = recognizeHandDrawnSketch(frontRgba, fw, fh, 'xy', 18, { x: 1400, y: 1000 });
+    expect(frontSk.isSketch).toBe(true);
+    expect(frontSk.vDividers.some((d) => Math.abs(d.position - 0.5) < 0.08)).toBe(true);
+    expect(frontSk.hShelves.some((s) => Math.abs(s.position - 0.5) < 0.08)).toBe(true);
+
+    // 2. Dibujo Planta Superior (XZ): mueble en L derecha con curva interior diferencial
+    const tw = 320;
+    const th = 260;
+    const topRgba = paintPaper(tw, th);
+    // Borde superior Ala A, borde derecho hasta abajo, pie Ala B, borde interno derecho, arco curvo y frente Ala A
+    drawInkSegment(topRgba, tw, th, 28, 26, 292, 26);
+    drawInkSegment(topRgba, tw, th, 292, 26, 292, 234);
+    drawInkSegment(topRgba, tw, th, 292, 234, 210, 234);
+    drawInkSegment(topRgba, tw, th, 210, 234, 210, 152);
+    drawInkSegment(topRgba, tw, th, 172, 114, 28, 114);
+    drawInkSegment(topRgba, tw, th, 28, 114, 28, 26);
+    // Curva cuadrática suave conectando (172, 114) -> control (210, 114) -> (210, 152)
+    let prevX = 172;
+    let prevY = 114;
+    for (let s = 1; s <= 16; s++) {
+      const t = s / 16;
+      const omt = 1 - t;
+      const qx = omt * omt * 172 + 2 * omt * t * 210 + t * t * 210;
+      const qy = omt * omt * 114 + 2 * omt * t * 114 + t * t * 152;
+      drawInkSegment(topRgba, tw, th, prevX, prevY, qx, qy);
+      prevX = qx;
+      prevY = qy;
+    }
+
+    const topSk = recognizeHandDrawnSketch(topRgba, tw, th, 'xz', 18, { x: 1400, y: 1200 });
+    expect(topSk.isSketch).toBe(true);
+    expect(topSk.lShapeInference?.side).toBe('right');
+    expect(topSk.lShapeInference?.curvedCorner).toBe(true);
+    expect(topSk.curvedCuts.some((c) => c.cornerTarget === 'l_inner')).toBe(true);
+
+    // 3. Fusión 3-Vistas (Frente + Arriba + Lado Z/Y = 0.50 -> Z ≈ 500 mm)
+    const baseDesp = calculateDespiece(
+      {
+        viewsMode: 1,
+        aspectRatioXY: 1.4,
+        vDividers: [],
+        hShelves: [],
+        shelfMode: 'custom',
+        equalShelfCount: 0,
+        hasBackPanel: true,
+        detectionSource: 'manual',
+      },
+      {
+        targetDimensions: { x: 1400, y: 1000, z: 400 },
+        referenceDimensions: { x: 1400, y: 1000, z: 400 },
+        boardThickness: 18,
+        backPanelThickness: 3,
+        sheetDimensions: { width: 2440, height: 1220 },
+        trimMm: 0,
+        kerf: 4,
+        respectGrain: true,
+        packingStrategy: 'guillotine',
+        cornerJointType: 'topOverSides',
+        edgeBandingMode: 'visibleEdgesOnly',
+        material: 'blanco',
+      },
+    );
+    expect(baseDesp.matrizDespiece.length).toBeGreaterThan(0);
+
+    const triSyn = synthesize3DFromTriViews(
+      {
+        viewsMode: 1,
+        aspectRatioXY: 1.4,
+        vDividers: [],
+        hShelves: [],
+        shelfMode: 'custom',
+        equalShelfCount: 0,
+        hasBackPanel: true,
+        detectionSource: 'manual',
+      },
+      {
+        targetDimensions: { x: 1400, y: 1000, z: 400 },
+        referenceDimensions: { x: 1400, y: 1000, z: 400 },
+        boardThickness: 18,
+        backPanelThickness: 3,
+        sheetDimensions: { width: 2440, height: 1220 },
+        trimMm: 0,
+        kerf: 4,
+        respectGrain: true,
+        packingStrategy: 'guillotine',
+        cornerJointType: 'topOverSides',
+        edgeBandingMode: 'visibleEdgesOnly',
+        material: 'blanco',
+      },
+      {
+        front: frontSk,
+        top: topSk,
+        side: { plane: 'zy', aspectRatio: 0.5 },
+      },
+    );
+    expect(triSyn.topology.viewsMode).toBe(3);
+    expect(triSyn.topology.lShape?.enabled).toBe(true);
+    expect(triSyn.topology.lShape?.side).toBe('right');
+    expect(triSyn.topology.curvedCuts?.some((c) => c.cornerTarget === 'l_inner')).toBe(true);
+    expect(triSyn.params.targetDimensions.z).toBeGreaterThanOrEqual(450);
+
+    // 4. Botón Medidas Razonables: múltiplos de 10 mm, simetría 1/2 + colinealidad e igualación de alas L
+    const messyTopo: FurnitureTopology = {
+      viewsMode: 3,
+      aspectRatioXY: 1197 / 743,
+      vDividers: [{ id: 'dv1', position: 0.491, start: 0, end: 1 }],
+      hShelves: [
+        { id: 'hs_l', position: 0.504, start: 0, end: 0.491 },
+        { id: 'hs_r', position: 0.512, start: 0.491, end: 1 },
+      ],
+      shelfMode: 'custom',
+      equalShelfCount: 0,
+      hasBackPanel: true,
+      detectionSource: 'manual',
+      lShape: {
+        enabled: true,
+        side: 'right',
+        returnLengthMm: 1188,
+        returnDepthMm: 446,
+        returnHeightMm: 762,
+        shelfMode: 'custom',
+        equalShelfCount: 0,
+        vDividers: [],
+        hShelves: [],
+      },
+      curvedCuts: [
+        {
+          id: 'crv1',
+          plane: 'xz',
+          kind: 'corner_fillet',
+          cornerTarget: 'l_inner',
+          radiusMm: 163,
+          controlPoints: [
+            { x: 0.35, y: 0.4 },
+            { x: 0.48, y: 0.4 },
+            { x: 0.56, y: 0.48 },
+            { x: 0.56, y: 0.62 },
+          ],
+        },
+      ],
+    };
+    const messyParams: ScaleAndBoardParams = {
+      targetDimensions: { x: 1197, y: 743, z: 452 },
+      referenceDimensions: { x: 1197, y: 743, z: 452 },
+      boardThickness: 18,
+      backPanelThickness: 3,
+      sheetDimensions: { width: 2440, height: 1220 },
+      trimMm: 0,
+      kerf: 4,
+      respectGrain: true,
+      packingStrategy: 'guillotine',
+      cornerJointType: 'topOverSides',
+      edgeBandingMode: 'visibleEdgesOnly',
+      material: 'blanco',
+    };
+
+    const reasonable = makeDrawingMeasurementsReasonable(messyTopo, messyParams);
+    expect(reasonable.params.targetDimensions).toEqual({ x: 1200, y: 740, z: 450 });
+    expect(reasonable.topology.vDividers[0].position).toBe(0.5);
+    expect(reasonable.topology.hShelves[0].position).toBe(reasonable.topology.hShelves[1].position);
+    expect(reasonable.topology.lShape?.returnHeightMm).toBe(740);
+    expect(reasonable.topology.lShape?.returnDepthMm).toBe(450);
+    expect(reasonable.topology.lShape?.returnLengthMm).toBe(1200);
+    expect(reasonable.topology.curvedCuts?.[0].radiusMm).toBe(160);
+    expect(reasonable.changesSummary.length).toBeGreaterThanOrEqual(3);
   });
 });

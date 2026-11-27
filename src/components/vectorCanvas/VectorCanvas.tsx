@@ -140,13 +140,14 @@ export function VectorCanvas({
   const [traceStep, setTraceStep] = useState<TraceStep>('frame');
   const [frameMode, setFrameMode] = useState<FrameMode>('quad');
   const [pickingCorners, setPickingCorners] = useState<Point2D[] | null>(null);
-  const [linesSubMode, setLinesSubMode] = useState<LinesSubMode>('smart');
-  const [strokeMode, setStrokeMode] = useState<UserStrokeMode>('auto');
+  const [linesSubMode, setLinesSubMode] = useState<LinesSubMode>('draw_only');
+  const [strokeMode, setStrokeMode] = useState<UserStrokeMode>('ortho');
   const [subTool, setSubTool] = useState<SubTool>('none');
   const returnStepRef = useRef<TraceStep>('lines');
 
-  // Imán APAGADO por defecto para trazado 100% fluido y sin saltos inesperados
+  // Papel milimetrado activo por defecto para adaptar líneas a múltiplos limpios; Imán foto OFF por defecto
   const [magneticSnap, setMagneticSnap] = useState<boolean>(false);
+  const [paperGridSnap, setPaperGridSnap] = useState<boolean>(true);
   const [visualLayer, setVisualLayer] = useState<VisualLayerMode>('traced_zones');
   const [showRectPreview, setShowRectPreview] = useState<boolean>(false);
   const [isDragOver, setIsDragOver] = useState<boolean>(false);
@@ -760,7 +761,7 @@ export function VectorCanvas({
     });
     setSelectedLine(null);
     setSubRegions([]);
-    setLinesSubMode('smart');
+    setLinesSubMode('draw_only');
 
     const addedParts: string[] = [];
     if (res.addedVCount > 0) addedParts.push(`${res.addedVCount} divisor(es)`);
@@ -794,6 +795,7 @@ export function VectorCanvas({
     strokeMode,
     subTool,
     magneticSnap,
+    paperGridSnap,
     isSpacePan,
     frontBitmap,
     topBitmap,
@@ -936,7 +938,7 @@ export function VectorCanvas({
       setPhotoVectorLines(extBest.lines);
       setMarginEval(mEval);
       setFrameMode('quad');
-      setLinesSubMode('smart');
+      setLinesSubMode('draw_only');
       setTraceStep('zones');
       setStatusMsg(
         `Foto real cargada (${externalPhotoLabel ?? 'Catálogo QA'}): Márgenes ${mEval.overallScore}%. Edita partes en Paso 3, ajusta líneas en Paso 2 o ejecuta visión real dentro del contorno.`,
@@ -1096,13 +1098,13 @@ export function VectorCanvas({
       };
       if (det.inferredZones.length > 0) setSelectedZone(det.inferredZones[0].id);
 
-      // Mantener en Paso 2 (no expulsar a Paso 3!) y activar modo inteligente para editar/borrar
+      // Mantener en Paso 2 y dejar listo modo Dibujar para seguir conectando esquinas sin mover líneas previas
       if (origin === 'suggest_lines') {
         setTraceStep('lines');
-        setLinesSubMode('smart');
+        setLinesSubMode('draw_only');
       } else if (traceStep === 'frame') {
         setTraceStep('lines');
-        setLinesSubMode('smart');
+        setLinesSubMode('draw_only');
       }
 
       setStatusMsg(
@@ -1213,7 +1215,8 @@ export function VectorCanvas({
         });
         setSelectedZone(initZone.id);
         setTraceStep(isSample ? 'lines' : 'frame');
-        setLinesSubMode('smart');
+        setLinesSubMode('draw_only');
+        setStrokeMode('ortho');
         setStatusMsg(
           isSample
             ? 'Escritorio de muestra cargado. Traza o ajusta líneas en Paso 2 (clic sobre una línea la mueve; arrastrar en libre crea una nueva).'
@@ -1337,7 +1340,7 @@ export function VectorCanvas({
       setFrameMode('quad');
       setTraceStep('lines');
       setLinesSubMode('draw_only');
-      setStrokeMode('auto');
+      setStrokeMode('ortho');
       resetAllTransient();
       clearHistory();
       triViewRef.current = { ...triViewRef.current, front: undefined };
@@ -1380,7 +1383,7 @@ export function VectorCanvas({
       setPlaneLinesXZ([]);
       setTraceStep('lines');
       setLinesSubMode('draw_only');
-      setStrokeMode('auto');
+      setStrokeMode('ortho');
       onUpdateTopology({
         ...topology,
         viewsMode: sideBitmap ? 3 : 2,
@@ -1399,7 +1402,7 @@ export function VectorCanvas({
     setPlaneLinesZY([]);
     setTraceStep('lines');
     setLinesSubMode('draw_only');
-    setStrokeMode('auto');
+    setStrokeMode('ortho');
     onUpdateTopology({
       ...topology,
       viewsMode: topBitmap ? 3 : 2,
@@ -1449,7 +1452,7 @@ export function VectorCanvas({
     onApplyCalibratedDims?.(syn.params.targetDimensions);
     if (viewTab === 'frontal') {
       setTraceStep('lines');
-      setLinesSubMode('smart');
+      setLinesSubMode('draw_only');
     }
     setStatusMsg(
       `Dibujo (${viewTab}) reconocido: ${sk.vDividers.length}V · ${sk.hShelves.length}H · ${sk.curvedCuts.length} curva(s) (confianza ${(sk.confidence * 100).toFixed(0)}%).`,
@@ -1878,6 +1881,7 @@ export function VectorCanvas({
         strokeMode={strokeMode}
         subTool={subTool}
         magneticSnap={magneticSnap}
+        paperGridSnap={paperGridSnap}
         calibRefMm={calibRefMm}
         calibPtsCount={calibPts.length}
         internalLineCount={
@@ -1959,6 +1963,15 @@ export function VectorCanvas({
           setStatusMsg('Marcado paso a paso cancelado.');
         }}
         onToggleMagneticSnap={() => setMagneticSnap((v) => !v)}
+        onTogglePaperGridSnap={() => {
+          const next = !paperGridSnap;
+          setPaperGridSnap(next);
+          setStatusMsg(
+            next
+              ? 'Papel milimetrado activado: cuadrícula visible y líneas adaptadas cada 10 mm.'
+              : 'Papel milimetrado desactivado (trazo libre continuo).',
+          );
+        }}
         onAutoContour={() => {
           if (!frontBitmap) return;
           const aq = autoDetectFurnitureQuad(frontBitmap.rgba, frontBitmap.w, frontBitmap.h);
@@ -1991,7 +2004,19 @@ export function VectorCanvas({
         onRemoveSubRegion={handleRemoveSubRegion}
         onClearSubRegions={handleClearSubRegions}
         onDetectSubRegions={handleDetectSubRegions}
-        onChangeStrokeMode={setStrokeMode}
+        onChangeStrokeMode={(mode) => {
+          setStrokeMode(mode);
+          if (linesSubMode !== 'draw_only') setLinesSubMode('draw_only');
+          setStatusMsg(
+            mode === 'ortho'
+              ? 'Modo Línea recta activo: conecta esquinas y se adapta al papel milimetrado.'
+              : mode === 'curve'
+                ? 'Modo Curva (Bézier diferencial) activo: dibuja cortes o contornos curvos.'
+                : mode === 'diagonal'
+                  ? 'Modo Diagonal activo: traza divisiones inclinadas entre esquinas.'
+                  : 'Modo Automático activo (rectas y diagonales).',
+          );
+        }}
         onAutoSuggestLines={() => runVisionPipeline('suggest_lines')}
         onActivateExternalLegs={
           onToggleExternalLegs ? () => onToggleExternalLegs(true, 150, 4) : undefined
@@ -2009,6 +2034,7 @@ export function VectorCanvas({
         subTool={subTool}
         visualLayer={visualLayer}
         strokeMode={strokeMode}
+        paperGridSnap={paperGridSnap}
         activeQuad={activeDisplayQuad}
         homography={pointer.displayHomography}
         vDividers={activeVDividers}

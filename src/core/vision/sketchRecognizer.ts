@@ -82,7 +82,7 @@ export function isHandDrawnSketchImage(
       const chroma = Math.max(r, g, b) - Math.min(r, g, b);
       total++;
 
-      if (lum >= 182 && chroma <= 32) {
+      if ((lum >= 182 && chroma <= 32) || (lum >= 170 && chroma <= 65)) {
         paperCount++;
         paperLumSum += lum;
       } else if (lum <= 135) {
@@ -159,8 +159,9 @@ export function binarizeSketchInk(
       const curLum = lum[y * w + x];
       const curSat = sat[y * w + x];
 
-      // Trazo oscuro real (lápiz/plumón/tinta digital) respecto al papel local
-      if ((curLum < localMean - 17 && curLum < 185) || (curSat >= 45 && curLum < 165)) {
+      // Ignora cuadrícula pastel de papel milimetrado y detecta solo trazo oscuro real de tinta/lápiz
+      const isGraphGridTint = curLum >= 162 && curSat >= 14 && curSat <= 78 && curLum >= localMean - 22;
+      if (!isGraphGridTint && ((curLum < localMean - 17 && curLum < 185) || (curSat >= 45 && curLum < 155))) {
         mask[y * w + x] = 1;
         inkCount++;
       }
@@ -669,16 +670,28 @@ export function recognizeHandDrawnSketch(
     }
   }
 
+  const snapNormToMillimeterPaper = (normPos: number, extSpanMm: number): number => {
+    const intSpan = Math.max(40, extSpanMm - 2 * boardThicknessMm);
+    const posMm = boardThicknessMm + normPos * intSpan;
+    const gridMm = Math.round(posMm / 10) * 10;
+    const snapped = clamp((gridMm - boardThicknessMm) / intSpan, 0.03, 0.97);
+    return Number(snapped.toFixed(4));
+  };
+
   const vDividers: NormalizedSegment[] = clusterSortedPositions(rawV, 0.035).map((item, idx) => ({
     id: `sk_div_${idx + 1}`,
-    position: Number(item.pos.toFixed(4)),
+    position: badge.isSketch
+      ? snapNormToMillimeterPaper(item.pos, dimsMm.x)
+      : Number(item.pos.toFixed(4)),
     start: item.start <= 0.06 ? 0 : Number(item.start.toFixed(4)),
     end: item.end >= 0.94 ? 1 : Number(item.end.toFixed(4)),
   }));
 
   const hShelves: NormalizedSegment[] = clusterSortedPositions(rawH, 0.035).map((item, idx) => ({
     id: `sk_rep_${idx + 1}`,
-    position: Number(item.pos.toFixed(4)),
+    position: badge.isSketch
+      ? snapNormToMillimeterPaper(item.pos, dimsMm.y)
+      : Number(item.pos.toFixed(4)),
     start: item.start <= 0.06 ? 0 : Number(item.start.toFixed(4)),
     end: item.end >= 0.94 ? 1 : Number(item.end.toFixed(4)),
   }));

@@ -51,6 +51,7 @@ import {
   resizeBoxCorner,
   round4,
   sampleEyedropperMaterial,
+  snapNormToPaperGridMm,
   snapPointInUnitQuad,
   snapPointToStructuralAnchors,
   translateQuad,
@@ -112,6 +113,7 @@ type ActiveDrag =
       startImg: Point2D;
       startU: number;
       startV: number;
+      startAnchored: boolean;
       guidedEndImg: Point2D;
       points: Point2D[];
       plane: CurvePlane;
@@ -151,6 +153,7 @@ export interface UseCanvasPointerControllerOptions {
   strokeMode: UserStrokeMode;
   subTool: SubTool;
   magneticSnap: boolean;
+  paperGridSnap?: boolean;
   isSpacePan: boolean;
   frontBitmap: WorkingBitmap | null;
   topBitmap: WorkingBitmap | null;
@@ -210,6 +213,7 @@ export function useCanvasPointerController({
   strokeMode,
   subTool,
   magneticSnap,
+  paperGridSnap = true,
   isSpacePan,
   frontBitmap,
   topBitmap,
@@ -456,6 +460,7 @@ export function useCanvasPointerController({
           axisLock,
           diags,
           xyCurveEndpoints,
+          { enabled: paperGridSnap && !altKey },
         );
         if (structSnap && structSnap.indicator) {
           return {
@@ -463,6 +468,14 @@ export function useCanvasPointerController({
             u: structSnap.u,
             v: structSnap.v,
             indicator: structSnap.indicator,
+          };
+        }
+        if (structSnap && paperGridSnap && !altKey) {
+          return {
+            pt: structSnap.snappedImg,
+            u: structSnap.u,
+            v: structSnap.v,
+            indicator: null,
           };
         }
       }
@@ -488,6 +501,7 @@ export function useCanvasPointerController({
       snapEdgeIfEnabled,
       topology.diagonalDividers,
       xyCurveEndpoints,
+      paperGridSnap,
     ],
   );
 
@@ -707,8 +721,10 @@ export function useCanvasPointerController({
         }
       }
 
-      // Dibujo con snap a esquinas y vértices existentes en Arriba (XZ) o Lado (ZY)
+      // Dibujo con snap a esquinas, vértices y papel milimetrado en Arriba (XZ) o Lado (ZY)
       const nonFrontPlane: CurvePlane = viewTab === 'superior' ? 'xz' : 'zy';
+      const planeW = nonFrontPlane === 'xz' ? params.targetDimensions.x : params.targetDimensions.z;
+      const planeH = nonFrontPlane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
       const planeHom = computeQuadToUnitHomography(targetQuad);
       const unitSnap =
         planeHom && !e.altKey
@@ -720,6 +736,7 @@ export function useCanvasPointerController({
               scaleX,
               scaleY,
               isTouch ? 16 : 12,
+              { wMm: planeW, hMm: planeH, enabled: paperGridSnap && !e.altKey },
             )
           : null;
       const startPt = unitSnap?.snappedImg ?? rawPt;
@@ -736,6 +753,7 @@ export function useCanvasPointerController({
         startImg: startPt,
         startU: unitSnap?.unitPt.x ?? 0.5,
         startV: unitSnap?.unitPt.y ?? 0.5,
+        startAnchored: Boolean(unitSnap?.indicator),
         guidedEndImg: startPt,
         points: [startPt],
         plane: nonFrontPlane,
@@ -950,6 +968,7 @@ export function useCanvasPointerController({
         startImg: startPt,
         startU,
         startV,
+        startAnchored: Boolean(snappedStart?.indicator),
         guidedEndImg: startPt,
         points: [startPt],
         plane: 'xy',
@@ -1048,6 +1067,8 @@ export function useCanvasPointerController({
         const q = viewTab === 'superior' ? topQuad : sideQuad;
         const planeHom = computeQuadToUnitHomography(q);
         const nonFrontPlane: CurvePlane = viewTab === 'superior' ? 'xz' : 'zy';
+        const pWMm = nonFrontPlane === 'xz' ? params.targetDimensions.x : params.targetDimensions.z;
+        const pHMm = nonFrontPlane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
         const unitSnap =
           planeHom && !e.altKey
             ? snapPointInUnitQuad(
@@ -1058,6 +1079,7 @@ export function useCanvasPointerController({
                 scaleX,
                 scaleY,
                 isTouch ? 16 : 12,
+                { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey },
               )
             : null;
         setHoverTarget({ kind: 'none' });
@@ -1335,6 +1357,8 @@ export function useCanvasPointerController({
       } else if (active.plane !== 'xy') {
         const targetQuad = active.plane === 'xz' ? topQuad : sideQuad;
         const planeHom = computeQuadToUnitHomography(targetQuad);
+        const pWMm = active.plane === 'xz' ? params.targetDimensions.x : params.targetDimensions.z;
+        const pHMm = active.plane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
         const unitSnap =
           planeHom && !e.altKey
             ? snapPointInUnitQuad(
@@ -1345,18 +1369,19 @@ export function useCanvasPointerController({
                 scaleX,
                 scaleY,
                 isTouch ? 16 : 12,
+                { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey },
               )
             : null;
         let endPt = unitSnap?.snappedImg ?? rawPt;
         if (planeHom && strokeMode !== 'curve') {
           const uEnd = unitSnap?.unitPt ?? applyHomography(planeHom.toUnit, rawPt);
-          if (uEnd && !unitSnap?.indicator) {
+          if (uEnd && (strokeMode === 'ortho' || !unitSnap?.indicator)) {
             const du = Math.abs(uEnd.x - active.startU);
             const dv = Math.abs(uEnd.y - active.startV);
             const deg = (Math.atan2(dv, du) * 180) / Math.PI;
-            if (deg <= 12) {
+            if (strokeMode === 'ortho' ? du >= dv : deg <= 12) {
               endPt = applyHomography(planeHom.toCanvas, { x: uEnd.x, y: active.startV }) ?? endPt;
-            } else if (deg >= 78) {
+            } else if (strokeMode === 'ortho' ? dv > du : deg >= 78) {
               endPt = applyHomography(planeHom.toCanvas, { x: active.startU, y: uEnd.y }) ?? endPt;
             }
           }
@@ -1386,12 +1411,20 @@ export function useCanvasPointerController({
       let ind: SnapIndicator | null = null;
 
       if (hit.part === 'body' && hit.kind !== 'diagonal') {
-        // Movimiento suave de cuerpo: sin saltos > 4 px ni jalones a bordes paralelos
+        // Movimiento suave de cuerpo + adaptación a papel milimetrado (si está activo)
         const edgeRes = snapEdgeIfEnabled(rawPt, e.altKey, scaleX, scaleY, 4);
         const unit = applyHomography(displayHomography.toUnit, edgeRes.pt);
         if (!unit) return;
-        u = exteriorToInterior(unit.x, eMm, xf);
-        v = exteriorToInterior(unit.y, eMm, yf);
+        let nextU = exteriorToInterior(unit.x, eMm, xf);
+        let nextV = exteriorToInterior(unit.y, eMm, yf);
+        if (paperGridSnap && !e.altKey) {
+          const xIntMm = Math.max(1, xf - 2 * eMm);
+          const yIntMm = Math.max(1, yf - 2 * eMm);
+          nextU = snapNormToPaperGridMm(nextU, xIntMm, eMm, 0.5, 10);
+          nextV = snapNormToPaperGridMm(nextV, yIntMm, eMm, 0.5, 10);
+        }
+        u = nextU;
+        v = nextV;
         focusPt = edgeRes.pt;
         ind = edgeRes.indicator;
       } else {
@@ -1666,7 +1699,6 @@ export function useCanvasPointerController({
         return;
       }
 
-      const rawStrokePts = [...finished.points, endRaw];
       const planeHom =
         finished.plane === 'xy'
           ? committedHomography
@@ -1686,67 +1718,106 @@ export function useCanvasPointerController({
             ? params.targetDimensions.z
             : params.targetDimensions.y;
 
-      const pointsMm: Point2D[] = [];
-      for (const sp of rawStrokePts) {
-        const uPt = applyHomography(planeHom.toUnit, sp);
-        if (!uPt) continue;
-        const uNorm =
-          finished.plane === 'xy'
-            ? exteriorToInterior(uPt.x, params.boardThickness, params.targetDimensions.x)
-            : clampNum(uPt.x, 0, 1);
-        const vNorm =
-          finished.plane === 'xy'
-            ? exteriorToInterior(uPt.y, params.boardThickness, params.targetDimensions.y)
-            : clampNum(uPt.y, 0, 1);
-        pointsMm.push({ x: uNorm * planeW, y: vNorm * planeH });
-      }
+      const resolvedXY =
+        finished.plane === 'xy' && committedHomography
+          ? resolveGuidedStrokeEnd(
+              finished.startU,
+              finished.startV,
+              endRaw,
+              committedHomography,
+              scaleX,
+              scaleY,
+              e.altKey,
+              isTouch,
+              finished.guidedEndImg,
+            )
+          : null;
 
-      const curveFit = fitDifferentialCurveFromStroke(pointsMm, strokeMode === 'curve');
-      if (curveFit?.isCurved && onCommitCurvedCut) {
-        const toNorm = (pMm: Point2D): Point2D => ({
-          x: Number(clampNum(pMm.x / planeW, 0, 1).toFixed(4)),
-          y: Number(clampNum(pMm.y / planeH, 0, 1).toFixed(4)),
-        });
-        onCommitCurvedCut({
-          id: `usr_curve_${Date.now()}`,
-          plane: finished.plane,
-          kind: 'free_bezier',
-          controlPoints: [
-            toNorm(curveFit.controlPoints[0]),
-            toNorm(curveFit.controlPoints[1]),
-            toNorm(curveFit.controlPoints[2]),
-            toNorm(curveFit.controlPoints[3]),
-          ],
-          label: `Curva ${finished.plane.toUpperCase()} (s=${Math.round(curveFit.arcLengthMm)} mm)`,
-          arcLengthMm: curveFit.arcLengthMm,
-          minRadiusMm: curveFit.minRadiusMm,
-          maxCurvature: curveFit.maxCurvature,
-        });
-        return;
+      const unitSnapNonFront =
+        finished.plane !== 'xy' && !e.altKey
+          ? snapPointInUnitQuad(
+              endRaw,
+              planeHom.toUnit,
+              planeHom.toCanvas,
+              getNonFrontUnitVertices(finished.plane),
+              scaleX,
+              scaleY,
+              isTouch ? 16 : 12,
+              { wMm: planeW, hMm: planeH, enabled: paperGridSnap && !e.altKey },
+            )
+          : null;
+
+      const snappedEndImg =
+        finished.plane === 'xy'
+          ? (resolvedXY?.endPt ?? endRaw)
+          : (unitSnapNonFront?.snappedImg ?? finished.guidedEndImg ?? endRaw);
+
+      if (strokeMode === 'curve' || strokeMode === 'auto') {
+        const rawStrokePts = [
+          finished.startImg,
+          ...(finished.points.length > 2 ? finished.points.slice(1, -1) : []),
+          snappedEndImg,
+        ];
+        const pointsMm: Point2D[] = [];
+        for (const sp of rawStrokePts) {
+          const uPt = applyHomography(planeHom.toUnit, sp);
+          if (!uPt) continue;
+          const uNorm =
+            finished.plane === 'xy'
+              ? exteriorToInterior(uPt.x, params.boardThickness, params.targetDimensions.x)
+              : clampNum(uPt.x, 0, 1);
+          const vNorm =
+            finished.plane === 'xy'
+              ? exteriorToInterior(uPt.y, params.boardThickness, params.targetDimensions.y)
+              : clampNum(uPt.y, 0, 1);
+          pointsMm.push({ x: uNorm * planeW, y: vNorm * planeH });
+        }
+
+        const curveFit = fitDifferentialCurveFromStroke(pointsMm, strokeMode === 'curve');
+        if (curveFit?.isCurved && onCommitCurvedCut) {
+          const toNorm = (pMm: Point2D): Point2D => ({
+            x: Number(clampNum(pMm.x / planeW, 0, 1).toFixed(4)),
+            y: Number(clampNum(pMm.y / planeH, 0, 1).toFixed(4)),
+          });
+          onCommitCurvedCut({
+            id: `usr_curve_${Date.now()}`,
+            plane: finished.plane,
+            kind: 'free_bezier',
+            controlPoints: [
+              toNorm(curveFit.controlPoints[0]),
+              toNorm(curveFit.controlPoints[1]),
+              toNorm(curveFit.controlPoints[2]),
+              toNorm(curveFit.controlPoints[3]),
+            ],
+            label: `Curva ${finished.plane.toUpperCase()} (s=${Math.round(curveFit.arcLengthMm)} mm)`,
+            arcLengthMm: curveFit.arcLengthMm,
+            minRadiusMm: curveFit.minRadiusMm,
+            maxCurvature: curveFit.maxCurvature,
+          });
+          return;
+        }
+        if (strokeMode === 'curve') {
+          onSetStatusMsg(
+            'En modo "Curva" dibuja un arco suave (o pulsa "Línea recta" para trazar divisiones rectas).',
+          );
+          return;
+        }
       }
 
       if (finished.plane !== 'xy') {
         const planeHomXZ = planeHom;
         const nonFrontPlane = finished.plane;
-        const unitSnapEnd = !e.altKey
-          ? snapPointInUnitQuad(
-              endRaw,
-              planeHomXZ.toUnit,
-              planeHomXZ.toCanvas,
-              getNonFrontUnitVertices(nonFrontPlane),
-              scaleX,
-              scaleY,
-              isTouch ? 16 : 12,
-            )
-          : null;
         let endUnit =
-          unitSnapEnd?.unitPt ?? applyHomography(planeHomXZ.toUnit, finished.guidedEndImg);
-        if (endUnit && strokeMode !== 'curve' && !unitSnapEnd?.indicator) {
+          unitSnapNonFront?.unitPt ?? applyHomography(planeHomXZ.toUnit, snappedEndImg);
+        if (endUnit && (strokeMode === 'ortho' || !unitSnapNonFront?.indicator)) {
           const du = Math.abs(endUnit.x - finished.startU);
           const dv = Math.abs(endUnit.y - finished.startV);
           const deg = (Math.atan2(dv, du) * 180) / Math.PI;
-          if (deg <= 12) endUnit = { x: endUnit.x, y: finished.startV };
-          else if (deg >= 78) endUnit = { x: finished.startU, y: endUnit.y };
+          if (strokeMode === 'ortho' ? du >= dv : deg <= 12) {
+            endUnit = { x: endUnit.x, y: finished.startV };
+          } else if (strokeMode === 'ortho' ? dv > du : deg >= 78) {
+            endUnit = { x: finished.startU, y: endUnit.y };
+          }
         }
         if (endUnit && onCommitPlaneLine) {
           const u1 = Number(clampNum(finished.startU, 0, 1).toFixed(4));
@@ -1762,7 +1833,7 @@ export function useCanvasPointerController({
               v2,
             });
             onSetStatusMsg(
-              `Línea trazada en vista ${nonFrontPlane === 'xz' ? 'Arriba (XZ)' : 'Lado (ZY)'} conectada con esquinas.`,
+              `Línea trazada en vista ${nonFrontPlane === 'xz' ? 'Arriba (XZ)' : 'Lado (ZY)'} adaptada a esquinas/papel milimetrado.`,
             );
             return;
           }
@@ -1770,25 +1841,13 @@ export function useCanvasPointerController({
         onSetStatusMsg('Trazo demasiado corto. Arrastra entre dos puntos para dibujar.');
         return;
       }
-      if (!committedHomography) return;
+      if (!committedHomography || !resolvedXY) return;
 
-      const resolved = resolveGuidedStrokeEnd(
-        finished.startU,
-        finished.startV,
-        endRaw,
-        committedHomography,
-        scaleX,
-        scaleY,
-        e.altKey,
-        isTouch,
-        finished.guidedEndImg,
-      );
-
-      // En trazado interactivo directo usamos las coordenadas ya imantadas en píxeles de pantalla
-      // (cero saltos `0.18` hacia paredes lejanas al soltar).
+      // En trazado interactivo directo usamos las coordenadas ya imantadas a esquina/papel milimetrado
+      // y ancladas al vértice inicial para cero saltos al soltar.
       const stroke = vectorizeUserStroke(
         finished.startImg,
-        resolved.endPt,
+        resolvedXY.endPt,
         committedHomography.toUnit,
         materializedBase.vDividers,
         materializedBase.hShelves,
@@ -1796,7 +1855,10 @@ export function useCanvasPointerController({
         params.targetDimensions,
         false,
         strokeMode,
-        { exactStartPos: true },
+        {
+          exactStartPos: true,
+          lockToStart: finished.startAnchored || strokeMode === 'ortho',
+        },
       );
       if (!stroke) {
         onSetStatusMsg('Trazo demasiado corto. Arrastra una línea recta o diagonal sobre la foto.');

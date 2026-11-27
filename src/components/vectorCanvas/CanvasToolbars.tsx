@@ -23,9 +23,11 @@ import {
   Crop,
   Eye,
   GitBranch,
+  Grid,
   Hand,
   LayoutGrid,
   Magnet,
+  Minus,
   MousePointer2,
   PenTool,
   Pipette,
@@ -34,6 +36,7 @@ import {
   Scan,
   SlidersHorizontal,
   Sparkles,
+  Spline,
   Trash2,
   Undo2,
   Wand2,
@@ -65,6 +68,51 @@ function closeParentDetails(e: React.MouseEvent<HTMLElement>): void {
   if (details) details.removeAttribute('open');
 }
 
+function StrokeTypeToggleGroup({
+  strokeMode,
+  paperGridSnap,
+  onChangeStrokeMode,
+  onTogglePaperGridSnap,
+}: {
+  strokeMode: UserStrokeMode;
+  paperGridSnap: boolean;
+  onChangeStrokeMode: (mode: UserStrokeMode) => void;
+  onTogglePaperGridSnap?: () => void;
+}) {
+  return (
+    <>
+      <div className="vc-segmented" role="group" aria-label="Tipo de línea al dibujar">
+        <button
+          type="button"
+          className={strokeMode === 'ortho' ? 'active' : ''}
+          onClick={() => onChangeStrokeMode('ortho')}
+          title="Dibuja líneas rectas horizontales o verticales conectadas a esquinas"
+        >
+          <Minus size={11} /> Línea recta
+        </button>
+        <button
+          type="button"
+          className={strokeMode === 'curve' ? 'active' : ''}
+          onClick={() => onChangeStrokeMode('curve')}
+          title="Dibuja cortes o contornos curvos suaves (Bézier diferencial)"
+        >
+          <Spline size={11} /> Curva
+        </button>
+      </div>
+      {onTogglePaperGridSnap && (
+        <button
+          type="button"
+          className={paperGridSnap ? 'vc-chip active' : 'vc-chip'}
+          onClick={onTogglePaperGridSnap}
+          title="Muestra cuadrícula milimetrada y adapta líneas a múltiplos exactos de 10 mm (Alt para soltar)"
+        >
+          <Grid size={11} /> Milimetrado
+        </button>
+      )}
+    </>
+  );
+}
+
 export interface CanvasTopBarsProps {
   hasPhoto: boolean;
   hasTopPhoto?: boolean;
@@ -77,6 +125,7 @@ export interface CanvasTopBarsProps {
   strokeMode: UserStrokeMode;
   subTool: SubTool;
   magneticSnap: boolean;
+  paperGridSnap?: boolean;
   calibRefMm: number;
   calibPtsCount: number;
   internalLineCount: number;
@@ -124,6 +173,7 @@ export interface CanvasTopBarsProps {
   onStartPickCorners: () => void;
   onCancelPickCorners: () => void;
   onToggleMagneticSnap: () => void;
+  onTogglePaperGridSnap?: () => void;
   onAutoContour: () => void;
   onClearLines: () => void;
   onChangeLinesSubMode: (mode: LinesSubMode) => void;
@@ -148,6 +198,7 @@ export function CanvasTopBars({
   strokeMode,
   subTool,
   magneticSnap,
+  paperGridSnap = true,
   calibRefMm,
   calibPtsCount,
   internalLineCount,
@@ -195,6 +246,7 @@ export function CanvasTopBars({
   onStartPickCorners,
   onCancelPickCorners,
   onToggleMagneticSnap,
+  onTogglePaperGridSnap,
   onAutoContour,
   onClearLines,
   onChangeLinesSubMode,
@@ -218,7 +270,10 @@ export function CanvasTopBars({
   const panActive = panToolActive || isSpacePan;
 
   const hasNonDefaultLineOpt =
-    linesSubMode === 'regions' || strokeMode !== 'auto' || magneticSnap || panToolActive;
+    linesSubMode === 'regions' ||
+    (strokeMode !== 'ortho' && strokeMode !== 'curve') ||
+    magneticSnap ||
+    panToolActive;
   const hasNonDefaultFrameOpt = frameMode !== 'quad' || magneticSnap || panToolActive;
 
   return (
@@ -498,6 +553,14 @@ export function CanvasTopBars({
                   </button>
                 </div>
               )}
+              {traceStep === 'lines' && (
+                <StrokeTypeToggleGroup
+                  strokeMode={strokeMode}
+                  paperGridSnap={paperGridSnap}
+                  onChangeStrokeMode={onChangeStrokeMode}
+                  onTogglePaperGridSnap={onTogglePaperGridSnap}
+                />
+              )}
               {onRecognizeSketch && hasTopPhoto && (
                 <button type="button" className="vc-chip" onClick={onRecognizeSketch}>
                   <Wand2 size={12} /> Reconocer boceto XZ
@@ -559,6 +622,14 @@ export function CanvasTopBars({
                     <Crop size={11} /> Marco
                   </button>
                 </div>
+              )}
+              {traceStep === 'lines' && (
+                <StrokeTypeToggleGroup
+                  strokeMode={strokeMode}
+                  paperGridSnap={paperGridSnap}
+                  onChangeStrokeMode={onChangeStrokeMode}
+                  onTogglePaperGridSnap={onTogglePaperGridSnap}
+                />
               )}
               <button type="button" className="vc-chip" onClick={onUploadSidePhoto}>
                 <Camera size={12} /> {hasSidePhoto ? 'Foto Lateral' : 'Subir Lateral'}
@@ -702,11 +773,17 @@ export function CanvasTopBars({
                   type="button"
                   className={linesSubMode === 'smart' ? 'active' : ''}
                   onClick={() => onChangeLinesSubMode('smart')}
-                  title="Haz clic sobre una línea para moverla o editarla; arrastra en esquinas o libre para dibujar"
+                  title="Haz clic sobre una línea para moverla o editarla; arrastra en esquinas para dibujar"
                 >
                   <MousePointer2 size={11} /> Mover / Editar
                 </button>
               </div>
+              <StrokeTypeToggleGroup
+                strokeMode={strokeMode}
+                paperGridSnap={paperGridSnap}
+                onChangeStrokeMode={onChangeStrokeMode}
+                onTogglePaperGridSnap={onTogglePaperGridSnap}
+              />
               <button
                 type="button"
                 className="vc-chip"
@@ -729,24 +806,20 @@ export function CanvasTopBars({
                 <button
                   type="button"
                   className="vc-chip active"
-                  onClick={() => onChangeLinesSubMode('smart')}
-                  title="Volver al modo normal"
+                  onClick={() => onChangeLinesSubMode('draw_only')}
+                  title="Volver al modo Dibujar"
                 >
                   Secciones auto <X size={10} />
                 </button>
               )}
-              {strokeMode !== 'auto' && linesSubMode !== 'regions' && (
+              {(strokeMode === 'diagonal' || strokeMode === 'auto') && linesSubMode !== 'regions' && (
                 <button
                   type="button"
                   className="vc-chip active"
-                  onClick={() => onChangeStrokeMode('auto')}
-                  title="Volver a detección automática de rectas y diagonales"
+                  onClick={() => onChangeStrokeMode('ortho')}
+                  title="Volver a Línea recta"
                 >
-                  {strokeMode === 'ortho'
-                    ? 'Solo rectas'
-                    : strokeMode === 'diagonal'
-                      ? 'Solo diagonales'
-                      : 'Modo curva'} <X size={10} />
+                  {strokeMode === 'diagonal' ? 'Solo diagonales' : 'Auto Recta/Diag'} <X size={10} />
                 </button>
               )}
               {panToolActive && (

@@ -36,6 +36,8 @@ import {
   VECTOR_ROLE_COLORS,
   ZONE_COLORS,
   ZONE_SHORT_LABELS,
+  computePaperGridSpacing,
+  distScreenPx,
   projectDiagonal,
   projectHShelf,
   projectVDivider,
@@ -90,6 +92,7 @@ export interface CanvasViewportProps {
   subTool: SubTool;
   visualLayer: VisualLayerMode;
   strokeMode: UserStrokeMode;
+  paperGridSnap?: boolean;
   activeQuad: [Point2D, Point2D, Point2D, Point2D];
   homography: { toUnit: Matrix3x3; toCanvas: Matrix3x3 } | null;
   vDividers: NormalizedSegment[];
@@ -151,6 +154,7 @@ export function CanvasViewport({
   subTool,
   visualLayer,
   strokeMode,
+  paperGridSnap = true,
   activeQuad,
   homography,
   vDividers,
@@ -259,8 +263,75 @@ export function CanvasViewport({
     const e = params.boardThickness;
     const xf = params.targetDimensions.x;
     const yf = params.targetDimensions.y;
+    const zf = params.targetDimensions.z;
     const xInt = Math.max(1, xf - 2 * e);
     const yInt = Math.max(1, yf - 2 * e);
+
+    // 3B. Papel milimetrado calibrado proyectado en perspectiva dentro del contorno activo
+    const activePlaneForGrid =
+      viewTab === 'frontal' ? 'xy' : viewTab === 'superior' ? 'xz' : 'zy';
+    const gridHom =
+      viewTab === 'frontal' ? homography : computeQuadToUnitHomography(activeQuad);
+    if (paperGridSnap && gridHom && traceStep !== 'zones') {
+      const spanW =
+        activePlaneForGrid === 'xy' ? xInt : activePlaneForGrid === 'xz' ? xf : zf;
+      const spanH =
+        activePlaneForGrid === 'xy' ? yInt : activePlaneForGrid === 'xz' ? zf : yf;
+      const topWpx = distScreenPx(activeQuad[0], activeQuad[1], screenScaleX, screenScaleY);
+      const botWpx = distScreenPx(activeQuad[3], activeQuad[2], screenScaleX, screenScaleY);
+      const leftHpx = distScreenPx(activeQuad[0], activeQuad[3], screenScaleX, screenScaleY);
+      const rightHpx = distScreenPx(activeQuad[1], activeQuad[2], screenScaleX, screenScaleY);
+      const spacingX = computePaperGridSpacing(spanW, Math.max(80, (topWpx + botWpx) / 2));
+      const spacingY = computePaperGridSpacing(spanH, Math.max(80, (leftHpx + rightHpx) / 2));
+      const mapGridPt = (uVal: number, vVal: number) =>
+        applyHomography(
+          gridHom.toCanvas,
+          activePlaneForGrid === 'xy'
+            ? { x: interiorToExterior(uVal, e, xf), y: interiorToExterior(vVal, e, yf) }
+            : { x: uVal, y: vVal },
+        );
+
+      ctx.save();
+      for (let xMm = spacingX.minorMm; xMm < spanW; xMm += spacingX.minorMm) {
+        const u = xMm / Math.max(1, spanW);
+        const isMajor = xMm % spacingX.majorMm === 0;
+        const p0 = mapGridPt(u, 0);
+        const p1 = mapGridPt(u, 1);
+        if (!p0 || !p1) continue;
+        ctx.strokeStyle = isMajor ? 'rgba(13, 148, 136, 0.30)' : 'rgba(20, 184, 166, 0.13)';
+        ctx.lineWidth = isMajor ? 1.25 : 0.9;
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+        if (isMajor && traceStep === 'lines' && xMm % 100 === 0) {
+          ctx.fillStyle = 'rgba(15, 118, 110, 0.78)';
+          ctx.font = '700 9.5px Consolas, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(String(xMm), p0.x, p0.y + 11);
+        }
+      }
+      for (let yMm = spacingY.minorMm; yMm < spanH; yMm += spacingY.minorMm) {
+        const v = yMm / Math.max(1, spanH);
+        const isMajor = yMm % spacingY.majorMm === 0;
+        const p0 = mapGridPt(0, v);
+        const p1 = mapGridPt(1, v);
+        if (!p0 || !p1) continue;
+        ctx.strokeStyle = isMajor ? 'rgba(13, 148, 136, 0.30)' : 'rgba(20, 184, 166, 0.13)';
+        ctx.lineWidth = isMajor ? 1.25 : 0.9;
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+        if (isMajor && traceStep === 'lines' && yMm % 100 === 0) {
+          ctx.fillStyle = 'rgba(15, 118, 110, 0.78)';
+          ctx.font = '700 9.5px Consolas, monospace';
+          ctx.textAlign = 'right';
+          ctx.fillText(String(yMm), p0.x - 4, p0.y + 3);
+        }
+      }
+      ctx.restore();
+    }
 
     // 4. Capas interiores proyectadas vía homografía
     if (viewTab === 'frontal' && homography) {
@@ -640,7 +711,8 @@ export function CanvasViewport({
         }
         const renderAsFreeCurve =
           pts.length >= 4 &&
-          (strokeMode === 'curve' || maxDevPx >= Math.max(12, chordLenPx * 0.065));
+          (strokeMode === 'curve' ||
+            (strokeMode === 'auto' && maxDevPx >= Math.max(18, chordLenPx * 0.1)));
 
         if (renderAsFreeCurve) {
           ctx.save();
@@ -671,7 +743,7 @@ export function CanvasViewport({
           params.targetDimensions,
           false,
           strokeMode,
-          { exactStartPos: true },
+          { exactStartPos: true, lockToStart: true },
         );
         ctx.save();
         if (previewVec) {
@@ -1186,6 +1258,7 @@ export function CanvasViewport({
     subTool,
     visualLayer,
     strokeMode,
+    paperGridSnap,
     activeQuad,
     homography,
     vDividers,

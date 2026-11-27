@@ -161,7 +161,7 @@ export function vectorizeUserStroke(
   dimsMm: { x: number; y: number },
   autoExtend: boolean | number = true,
   strokeMode: UserStrokeMode = 'auto',
-  interactiveOpts?: { exactStartPos?: boolean },
+  interactiveOpts?: { exactStartPos?: boolean; lockToStart?: boolean },
 ): TracedStrokeResult | null {
   const uA = applyHomography(toUnitHomography, p1);
   const uB = applyHomography(toUnitHomography, p2);
@@ -266,7 +266,10 @@ export function vectorizeUserStroke(
     const posMin = interactiveOpts?.exactStartPos ? 0.005 : 0.04;
     const posMax = interactiveOpts?.exactStartPos ? 0.995 : 0.96;
     const rawV =
-      interactiveOpts?.exactStartPos && Math.abs(y2 - y1) <= 0.03 ? y1 : (y1 + y2) / 2;
+      interactiveOpts?.exactStartPos &&
+      (interactiveOpts.lockToStart || Math.abs(y2 - y1) <= 0.12)
+        ? y1
+        : (y1 + y2) / 2;
     const vPos = clamp(rawV, posMin, posMax);
     const activeVAnchors = [
       0,
@@ -313,7 +316,10 @@ export function vectorizeUserStroke(
   const posMinV = interactiveOpts?.exactStartPos ? 0.005 : 0.04;
   const posMaxV = interactiveOpts?.exactStartPos ? 0.995 : 0.96;
   const rawU =
-    interactiveOpts?.exactStartPos && Math.abs(x2 - x1) <= 0.03 ? x1 : (x1 + x2) / 2;
+    interactiveOpts?.exactStartPos &&
+    (interactiveOpts.lockToStart || Math.abs(x2 - x1) <= 0.12)
+      ? x1
+      : (x1 + x2) / 2;
   const uPos = clamp(rawU, posMinV, posMaxV);
   const activeHAnchors = [
     0,

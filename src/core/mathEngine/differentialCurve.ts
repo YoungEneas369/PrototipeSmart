@@ -235,10 +235,10 @@ export function fitDifferentialCurveFromStroke(
 
   const devRatio = maxChordDeviationMm / Math.max(1, chordLengthMm);
   const arcRatio = rawArcLen / Math.max(1, chordLengthMm);
-  const minDevForCurve = forceCurve ? 5 : Math.max(16, chordLengthMm * 0.065);
+  const minDevForCurve = forceCurve ? 3 : Math.max(16, chordLengthMm * 0.065);
   const isCurved =
     cleaned.length >= 4 &&
-    (maxChordDeviationMm >= minDevForCurve || (forceCurve && (devRatio > 0.015 || arcRatio > 1.01)));
+    (maxChordDeviationMm >= minDevForCurve || (forceCurve && (devRatio > 0.008 || arcRatio > 1.004)));
 
   if (!isCurved) {
     const p1: Point2D = {

@@ -556,7 +556,7 @@ export function hitTestLinesScreenPx(
   isTouch = false,
 ): LineHitResult | null {
   const endTol = isTouch ? 17 : 12;
-  const cornerReserveTol = isTouch ? 14 : 10;
+  const cornerReserveTol = isTouch ? 18 : 14;
   const bodyTol = isTouch ? 14 : 9;
 
   let bestEnd: LineHitResult | null = null;
@@ -592,7 +592,7 @@ export function hitTestLinesScreenPx(
     }
 
     const segPx = distScreenPx(proj.p0, proj.p1, scaleX, scaleY);
-    const effectiveReserve = Math.min(cornerReserveTol, segPx * 0.34);
+    const effectiveReserve = Math.min(cornerReserveTol, segPx * 0.36);
     const nearUnselectedEndpoint = !isSel && (d0 <= effectiveReserve || d1 <= effectiveReserve);
     if (nearUnselectedEndpoint) return;
 
@@ -637,10 +637,60 @@ export function computeAdaptiveAutoExtend(
 }
 
 /**
- * Ajusta un punto interior (u, v) a bordes exteriores (0/1) o a líneas perpendiculares existentes
- * (uniones T) usando tolerancia suave en píxeles de pantalla (por defecto `11 px`).
- * `axisLock` permite anclar solo el eje perpendicular al trazo activo (`'uOnly'` o `'vOnly'`)
- * para no jalar violentamente hacia bordes paralelos mientras se dibuja.
+ * Calcula pasos legibles de papel milimetrado según el tamaño físico en mm y en píxeles de pantalla.
+ */
+export function computePaperGridSpacing(
+  spanMm: number,
+  spanPx: number,
+): { minorMm: number; majorMm: number; snapMm: number } {
+  const pxPerMm = spanPx / Math.max(1, spanMm);
+  const candidates = [10, 20, 25, 50, 100];
+  let minorMm = 100;
+  for (const step of candidates) {
+    if (step * pxPerMm >= 11) {
+      minorMm = step;
+      break;
+    }
+  }
+  const majorMm = minorMm <= 25 ? 50 : 100;
+  const snapMm = pxPerMm >= 0.24 ? 10 : 20;
+  return { minorMm, majorMm, snapMm };
+}
+
+/**
+ * Adapta una coordenada normalizada `[0, 1]` al papel milimetrado en múltiplos exactos de 10 mm
+ * (con imán suave a líneas principales cada 50 mm dentro de `5.5 px`), preservando paredes `0` y `1`.
+ */
+export function snapNormToPaperGridMm(
+  normVal: number,
+  spanMm: number,
+  offsetMm: number,
+  pxPerMm: number,
+  stepMm = 10,
+): number {
+  const c = clampNum(normVal, 0, 1);
+  if (c <= 0.008) return 0;
+  if (c >= 0.992) return 1;
+  const posMm = offsetMm + c * spanMm;
+  const majorMm = 50;
+  const nearestMajor = Math.round(posMm / majorMm) * majorMm;
+  const distMajorPx = Math.abs(posMm - nearestMajor) * Math.max(0.05, pxPerMm);
+  const targetMm =
+    distMajorPx <= 5.5
+      ? nearestMajor
+      : Math.round(posMm / Math.max(5, stepMm)) * Math.max(5, stepMm);
+  return round4(clampNum((targetMm - offsetMm) / Math.max(1, spanMm), 0.005, 0.995));
+}
+
+export interface PaperGridSnapOptions {
+  enabled: boolean;
+  stepMm?: number;
+}
+
+/**
+ * Ajusta un punto interior (u, v) a bordes exteriores (0/1), esquinas (tanto del marco azul exterior
+ * como del vano interior), líneas perpendiculares existentes (uniones T) o cuadrícula de papel
+ * milimetrado (múltiplos exactos de 10 mm / 50 mm).
  */
 export function snapPointToStructuralAnchors(
   rawPtImg: Point2D,
@@ -658,68 +708,86 @@ export function snapPointToStructuralAnchors(
   axisLock: 'both' | 'uOnly' | 'vOnly' = 'both',
   diagonalDividers: readonly DiagonalSegment[] = [],
   extraVertexNorms: readonly Point2D[] = [],
+  paperGrid?: PaperGridSnapOptions,
 ): { snappedImg: Point2D; u: number; v: number; indicator: SnapIndicator | null } | null {
   const unit = applyHomography(toUnit, rawPtImg);
   if (!unit) return null;
   let u = exteriorToInterior(unit.x, e, xf);
   let v = exteriorToInterior(unit.y, e, yf);
 
-  // 1. Prioridad máxima en captura 2D libre: esquinas, extremos de líneas existentes, diagonales e intersecciones
-  if (axisLock === 'both') {
-    const vertexAnchors: Array<{ u: number; v: number; label: string; kind: 'wall' | 'tjunction' }> = [
-      { u: 0, v: 0, label: 'Esquina', kind: 'wall' },
-      { u: 1, v: 0, label: 'Esquina', kind: 'wall' },
-      { u: 1, v: 1, label: 'Esquina', kind: 'wall' },
-      { u: 0, v: 1, label: 'Esquina', kind: 'wall' },
-    ];
-    for (const d of vDividers) {
-      if (d.id === excludeId) continue;
-      vertexAnchors.push({ u: d.position, v: d.start, label: 'Esquina', kind: 'tjunction' });
-      vertexAnchors.push({ u: d.position, v: d.end, label: 'Esquina', kind: 'tjunction' });
-    }
+  const vertexAnchors: Array<{
+    u: number;
+    v: number;
+    label: string;
+    kind: 'wall' | 'tjunction';
+    outerExt?: Point2D;
+  }> = [
+    { u: 0, v: 0, label: 'Esquina', kind: 'wall', outerExt: { x: 0, y: 0 } },
+    { u: 1, v: 0, label: 'Esquina', kind: 'wall', outerExt: { x: 1, y: 0 } },
+    { u: 1, v: 1, label: 'Esquina', kind: 'wall', outerExt: { x: 1, y: 1 } },
+    { u: 0, v: 1, label: 'Esquina', kind: 'wall', outerExt: { x: 0, y: 1 } },
+  ];
+  for (const d of vDividers) {
+    if (d.id === excludeId) continue;
+    vertexAnchors.push({ u: d.position, v: d.start, label: 'Esquina', kind: 'tjunction' });
+    vertexAnchors.push({ u: d.position, v: d.end, label: 'Esquina', kind: 'tjunction' });
+  }
+  for (const s of hShelves) {
+    if (s.id === excludeId) continue;
+    vertexAnchors.push({ u: s.start, v: s.position, label: 'Esquina', kind: 'tjunction' });
+    vertexAnchors.push({ u: s.end, v: s.position, label: 'Esquina', kind: 'tjunction' });
+  }
+  for (const dg of diagonalDividers) {
+    if (dg.id === excludeId) continue;
+    vertexAnchors.push({ u: dg.u1, v: dg.v1, label: 'Esquina', kind: 'tjunction' });
+    vertexAnchors.push({ u: dg.u2, v: dg.v2, label: 'Esquina', kind: 'tjunction' });
+  }
+  for (const d of vDividers) {
+    if (d.id === excludeId) continue;
     for (const s of hShelves) {
       if (s.id === excludeId) continue;
-      vertexAnchors.push({ u: s.start, v: s.position, label: 'Esquina', kind: 'tjunction' });
-      vertexAnchors.push({ u: s.end, v: s.position, label: 'Esquina', kind: 'tjunction' });
-    }
-    for (const dg of diagonalDividers) {
-      if (dg.id === excludeId) continue;
-      vertexAnchors.push({ u: dg.u1, v: dg.v1, label: 'Esquina', kind: 'tjunction' });
-      vertexAnchors.push({ u: dg.u2, v: dg.v2, label: 'Esquina', kind: 'tjunction' });
-    }
-    for (const d of vDividers) {
-      if (d.id === excludeId) continue;
-      for (const s of hShelves) {
-        if (s.id === excludeId) continue;
-        if (
-          d.position >= Math.min(s.start, s.end) - 0.02 &&
-          d.position <= Math.max(s.start, s.end) + 0.02 &&
-          s.position >= Math.min(d.start, d.end) - 0.02 &&
-          s.position <= Math.max(d.start, d.end) + 0.02
-        ) {
-          vertexAnchors.push({ u: d.position, v: s.position, label: 'Unión T', kind: 'tjunction' });
-        }
+      if (
+        d.position >= Math.min(s.start, s.end) - 0.02 &&
+        d.position <= Math.max(s.start, s.end) + 0.02 &&
+        s.position >= Math.min(d.start, d.end) - 0.02 &&
+        s.position <= Math.max(d.start, d.end) + 0.02
+      ) {
+        vertexAnchors.push({ u: d.position, v: s.position, label: 'Unión T', kind: 'tjunction' });
       }
     }
-    for (const ev of extraVertexNorms) {
-      vertexAnchors.push({
-        u: clampNum(ev.x, 0, 1),
-        v: clampNum(ev.y, 0, 1),
-        label: 'Esquina',
-        kind: 'tjunction',
-      });
-    }
+  }
+  for (const ev of extraVertexNorms) {
+    vertexAnchors.push({
+      u: clampNum(ev.x, 0, 1),
+      v: clampNum(ev.y, 0, 1),
+      label: 'Esquina',
+      kind: 'tjunction',
+    });
+  }
 
+  // 1. Prioridad máxima: esquinas (tanto marco exterior azul como vano interior) e intersecciones 2D
+  if (axisLock === 'both') {
     let bestVtxDist = snapTolPx;
-    let bestVtx: { u: number; v: number; img: Point2D; label: string; kind: 'wall' | 'tjunction' } | null =
-      null;
+    let bestVtx: {
+      u: number;
+      v: number;
+      img: Point2D;
+      label: string;
+      kind: 'wall' | 'tjunction';
+    } | null = null;
     for (const va of vertexAnchors) {
       const testImg = applyHomography(toCanvas, {
         x: interiorToExterior(va.u, e, xf),
         y: interiorToExterior(va.v, e, yf),
       });
       if (!testImg) continue;
-      const dist = distScreenPx(rawPtImg, testImg, scaleX, scaleY);
+      let dist = distScreenPx(rawPtImg, testImg, scaleX, scaleY);
+      if (va.outerExt) {
+        const outerImg = applyHomography(toCanvas, va.outerExt);
+        if (outerImg) {
+          dist = Math.min(dist, distScreenPx(rawPtImg, outerImg, scaleX, scaleY));
+        }
+      }
       if (dist <= bestVtxDist) {
         bestVtxDist = dist;
         bestVtx = { u: va.u, v: va.v, img: testImg, label: va.label, kind: va.kind };
@@ -744,12 +812,17 @@ export function snapPointToStructuralAnchors(
   let uKind: 'wall' | 'tjunction' = 'wall';
   let vKind: 'wall' | 'tjunction' = 'wall';
 
-  // Candidatos U (paredes izquierda/derecha + divisores verticales activos en v + extremos de repisas/diagonales)
+  // Candidatos U (incluye vértices/esquinas alineados en el trazo aunque axisLock sea 'uOnly')
   if (axisLock !== 'vOnly') {
     const uAnchors: Array<{ val: number; kind: 'wall' | 'tjunction' }> = [
       { val: 0, kind: 'wall' },
       { val: 1, kind: 'wall' },
     ];
+    for (const va of vertexAnchors) {
+      if (Math.abs(v - va.v) <= 0.1) {
+        uAnchors.push({ val: va.u, kind: va.kind });
+      }
+    }
     for (const d of vDividers) {
       if (d.id === excludeId) continue;
       if (v >= d.start - 0.06 && v <= d.end + 0.06) {
@@ -786,12 +859,17 @@ export function snapPointToStructuralAnchors(
     }
   }
 
-  // Candidatos V (base/cubierta + repisas horizontales activas en u + extremos de divisores/diagonales)
+  // Candidatos V (incluye vértices/esquinas alineados en el trazo aunque axisLock sea 'vOnly')
   if (axisLock !== 'uOnly') {
     const vAnchors: Array<{ val: number; kind: 'wall' | 'tjunction' }> = [
       { val: 0, kind: 'wall' },
       { val: 1, kind: 'wall' },
     ];
+    for (const va of vertexAnchors) {
+      if (Math.abs(u - va.u) <= 0.1) {
+        vAnchors.push({ val: va.v, kind: va.kind });
+      }
+    }
     for (const s of hShelves) {
       if (s.id === excludeId) continue;
       if (u >= s.start - 0.06 && u <= s.end + 0.06) {
@@ -828,7 +906,31 @@ export function snapPointToStructuralAnchors(
     }
   }
 
-  if (!snappedU && !snappedV) {
+  // 3. Adaptación al papel milimetrado en ejes no anclados a esquinas/uniones T
+  let snappedToPaper = false;
+  if (paperGrid?.enabled) {
+    const xInt = Math.max(1, xf - 2 * e);
+    const yInt = Math.max(1, yf - 2 * e);
+    const pLeft = applyHomography(toCanvas, { x: interiorToExterior(0, e, xf), y: 0.5 });
+    const pRight = applyHomography(toCanvas, { x: interiorToExterior(1, e, xf), y: 0.5 });
+    const pBot = applyHomography(toCanvas, { x: 0.5, y: interiorToExterior(0, e, yf) });
+    const pTop = applyHomography(toCanvas, { x: 0.5, y: interiorToExterior(1, e, yf) });
+    const pxW = pLeft && pRight ? distScreenPx(pLeft, pRight, scaleX, scaleY) : 520;
+    const pxH = pBot && pTop ? distScreenPx(pBot, pTop, scaleX, scaleY) : 420;
+    const stepX = paperGrid.stepMm ?? computePaperGridSpacing(xInt, pxW).snapMm;
+    const stepY = paperGrid.stepMm ?? computePaperGridSpacing(yInt, pxH).snapMm;
+
+    if (axisLock !== 'vOnly' && !snappedU) {
+      u = snapNormToPaperGridMm(u, xInt, e, pxW / xInt, stepX);
+      snappedToPaper = true;
+    }
+    if (axisLock !== 'uOnly' && !snappedV) {
+      v = snapNormToPaperGridMm(v, yInt, e, pxH / yInt, stepY);
+      snappedToPaper = true;
+    }
+  }
+
+  if (!snappedU && !snappedV && !snappedToPaper) {
     return { snappedImg: rawPtImg, u, v, indicator: null };
   }
 
@@ -844,9 +946,11 @@ export function snapPointToStructuralAnchors(
       ? isTJunction
         ? 'Unión T'
         : 'Esquina'
-      : isTJunction
-        ? 'Unión T'
-        : 'Borde';
+      : snappedU || snappedV
+        ? isTJunction
+          ? 'Unión T'
+          : 'Borde'
+        : `Milim. ${Math.round(e + u * Math.max(1, xf - 2 * e))}×${Math.round(e + v * Math.max(1, yf - 2 * e))}`;
 
   return {
     snappedImg,
@@ -854,15 +958,15 @@ export function snapPointToStructuralAnchors(
     v,
     indicator: {
       pt: snappedImg,
-      kind: isTJunction ? 'tjunction' : 'wall',
+      kind: isTJunction ? 'tjunction' : snappedU || snappedV ? 'wall' : 'edge',
       label,
     },
   };
 }
 
 /**
- * Snap suave de esquinas, bordes y vértices existentes en espacio unitario [0, 1]^2
- * para las vistas Arriba (XZ) y Lado (ZY), evitando saltos inesperados.
+ * Snap suave de esquinas, bordes, vértices existentes y papel milimetrado en espacio `[0, 1]^2`
+ * para las vistas Arriba (XZ) y Lado (ZY).
  */
 export function snapPointInUnitQuad(
   rawPtImg: Point2D,
@@ -872,6 +976,7 @@ export function snapPointInUnitQuad(
   scaleX: number,
   scaleY: number,
   snapTolPx = 12,
+  paperGridSpan?: { wMm: number; hMm: number; enabled: boolean; stepMm?: number },
 ): { snappedImg: Point2D; unitPt: Point2D; indicator: SnapIndicator | null } | null {
   const unit = applyHomography(toUnit, rawPtImg);
   if (!unit) return null;
@@ -890,7 +995,7 @@ export function snapPointInUnitQuad(
   ];
 
   let bestDist = snapTolPx;
-  let bestCorner: (typeof corners)[number] & { img: Point2D } | null = null;
+  let bestCorner: ((typeof corners)[number] & { img: Point2D }) | null = null;
   for (const c of corners) {
     const img = applyHomography(toCanvas, { x: c.x, y: c.y });
     if (!img) continue;
@@ -908,35 +1013,64 @@ export function snapPointInUnitQuad(
     };
   }
 
-  let u = unit.x;
-  let v = unit.y;
-  let snapped = false;
+  let u = clampNum(unit.x, 0, 1);
+  let v = clampNum(unit.y, 0, 1);
+  let snappedU = false;
+  let snappedV = false;
 
   for (const edgeU of [0, 1]) {
-    const img = applyHomography(toCanvas, { x: edgeU, y: clampNum(v, 0, 1) });
+    const img = applyHomography(toCanvas, { x: edgeU, y: v });
     if (img && distScreenPx(rawPtImg, img, scaleX, scaleY) <= snapTolPx) {
       u = edgeU;
-      snapped = true;
+      snappedU = true;
       break;
     }
   }
   for (const edgeV of [0, 1]) {
-    const img = applyHomography(toCanvas, { x: clampNum(u, 0, 1), y: edgeV });
+    const img = applyHomography(toCanvas, { x: u, y: edgeV });
     if (img && distScreenPx(rawPtImg, img, scaleX, scaleY) <= snapTolPx) {
       v = edgeV;
-      snapped = true;
+      snappedV = true;
       break;
     }
   }
 
-  if (!snapped) {
+  let snappedToPaper = false;
+  if (paperGridSpan?.enabled) {
+    const pL = applyHomography(toCanvas, { x: 0, y: 0.5 });
+    const pR = applyHomography(toCanvas, { x: 1, y: 0.5 });
+    const pB = applyHomography(toCanvas, { x: 0.5, y: 0 });
+    const pT = applyHomography(toCanvas, { x: 0.5, y: 1 });
+    const pxW = pL && pR ? distScreenPx(pL, pR, scaleX, scaleY) : 520;
+    const pxH = pB && pT ? distScreenPx(pB, pT, scaleX, scaleY) : 420;
+    const stepX = paperGridSpan.stepMm ?? computePaperGridSpacing(paperGridSpan.wMm, pxW).snapMm;
+    const stepY = paperGridSpan.stepMm ?? computePaperGridSpacing(paperGridSpan.hMm, pxH).snapMm;
+    if (!snappedU) {
+      u = snapNormToPaperGridMm(u, paperGridSpan.wMm, 0, pxW / paperGridSpan.wMm, stepX);
+      snappedToPaper = true;
+    }
+    if (!snappedV) {
+      v = snapNormToPaperGridMm(v, paperGridSpan.hMm, 0, pxH / paperGridSpan.hMm, stepY);
+      snappedToPaper = true;
+    }
+  }
+
+  if (!snappedU && !snappedV && !snappedToPaper) {
     return { snappedImg: rawPtImg, unitPt: unit, indicator: null };
   }
   const snappedImg = applyHomography(toCanvas, { x: u, y: v }) ?? rawPtImg;
+  const label =
+    snappedU && snappedV
+      ? 'Esquina'
+      : snappedU || snappedV
+        ? 'Borde'
+        : paperGridSpan
+          ? `Milim. ${Math.round(u * paperGridSpan.wMm)}×${Math.round(v * paperGridSpan.hMm)}`
+          : 'Milim.';
   return {
     snappedImg,
     unitPt: { x: u, y: v },
-    indicator: { pt: snappedImg, kind: 'wall', label: 'Borde' },
+    indicator: { pt: snappedImg, kind: snappedU || snappedV ? 'wall' : 'edge', label },
   };
 }
 
@@ -1795,33 +1929,33 @@ export function createBlankSketchBitmap(
   canvas.height = h;
   const ctx = canvas.getContext('2d');
   if (ctx) {
-    ctx.fillStyle = '#f8fafc';
+    ctx.fillStyle = '#f3fbf8';
     ctx.fillRect(0, 0, w, h);
 
-    ctx.strokeStyle = '#e2e8f0';
+    ctx.strokeStyle = 'rgba(20, 184, 166, 0.16)';
     ctx.lineWidth = 1;
-    for (let x = 25; x < w; x += 25) {
+    for (let x = 10; x < w; x += 10) {
       ctx.beginPath();
       ctx.moveTo(x, 0);
       ctx.lineTo(x, h);
       ctx.stroke();
     }
-    for (let y = 25; y < h; y += 25) {
+    for (let y = 10; y < h; y += 10) {
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(w, y);
       ctx.stroke();
     }
 
-    ctx.strokeStyle = '#cbd5e1';
-    ctx.lineWidth = 1.2;
-    for (let x = 100; x < w; x += 100) {
+    ctx.strokeStyle = 'rgba(13, 148, 136, 0.28)';
+    ctx.lineWidth = 1.25;
+    for (let x = 50; x < w; x += 50) {
       ctx.beginPath();
       ctx.moveTo(x, 0);
       ctx.lineTo(x, h);
       ctx.stroke();
     }
-    for (let y = 100; y < h; y += 100) {
+    for (let y = 50; y < h; y += 50) {
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(w, y);
@@ -1830,11 +1964,11 @@ export function createBlankSketchBitmap(
 
     const viewLabel =
       viewTab === 'frontal'
-        ? 'VISTA FRONTAL (XY) — DIBUJO LIBRE'
+        ? 'PAPEL MILIMETRADO · FRENTE (XY)'
         : viewTab === 'superior'
-          ? 'VISTA SUPERIOR / ARRIBA (XZ) — PLANTA'
-          : 'VISTA LATERAL (ZY) — PERFIL';
-    ctx.fillStyle = '#64748b';
+          ? 'PAPEL MILIMETRADO · ARRIBA (XZ)'
+          : 'PAPEL MILIMETRADO · LADO (ZY)';
+    ctx.fillStyle = '#0f766e';
     ctx.font = '700 13px system-ui, sans-serif';
     ctx.fillText(viewLabel, 18, 26);
   }

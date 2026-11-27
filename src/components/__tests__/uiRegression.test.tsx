@@ -17,7 +17,7 @@ import {
   scaleBaseMatrix,
   type PresetKey,
 } from '../../core/mathEngine';
-import { vectorizeUserStroke } from '../../core/vision';
+import { isHandDrawnSketchImage, vectorizeUserStroke } from '../../core/vision';
 import {
   estimateProjectBomAndCost,
   formatClp,
@@ -863,6 +863,8 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
         onStartPickCorners={noop}
         onCancelPickCorners={noop}
         onToggleMagneticSnap={noop}
+        paperGridSnap
+        onTogglePaperGridSnap={noop}
         onAutoContour={noop}
         onClearLines={noop}
         onChangeLinesSubMode={noop}
@@ -879,8 +881,9 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
     expect(barHtml).toContain('2. Arriba (XZ)');
     expect(barHtml).toContain('3. Lado (ZY)');
     expect(barHtml).toContain('Medidas razonables');
-    expect(barHtml).toContain('Modo curva');
+    expect(barHtml).toContain('Línea recta');
     expect(barHtml).toContain('>Curva<');
+    expect(barHtml).toContain('Milimetrado');
 
     const topBarHtml = renderToStaticMarkup(
       <CanvasTopBars
@@ -941,6 +944,8 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
         onStartPickCorners={noop}
         onCancelPickCorners={noop}
         onToggleMagneticSnap={noop}
+        paperGridSnap
+        onTogglePaperGridSnap={noop}
         onAutoContour={noop}
         onClearLines={noop}
         onChangeLinesSubMode={noop}
@@ -974,6 +979,9 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
     expect(barHtml).toContain('Dibujar');
     expect(barHtml).toContain('Mover / Editar');
     expect(topBarHtml).toContain('Marco');
+    expect(topBarHtml).toContain('Línea recta');
+    expect(topBarHtml).toContain('Curva');
+    expect(topBarHtml).toContain('Milimetrado');
   });
 
   it('Trazado consecutivo en esquinas: punta no seleccionada queda libre como esquina y segunda línea conecta sin saltar', () => {
@@ -1119,6 +1127,115 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
     );
     expect(xzSnap?.unitPt).toEqual({ x: 1, y: 0 });
     expect(xzSnap?.indicator?.label).toBe('Esquina');
+
+    // 6. Tocar esquina AZUL exterior del marco (quad[0]) captura esquina interior (0, 1) sin perderla
+    const blueOuterSnap = snapPointToStructuralAnchors(
+      { x: quad[0].x + 2, y: quad[0].y + 2 },
+      hom.toUnit,
+      hom.toCanvas,
+      [],
+      [],
+      e,
+      800,
+      500,
+      1,
+      1,
+      12,
+      undefined,
+      'both',
+    );
+    expect(blueOuterSnap?.u).toBe(0);
+    expect(blueOuterSnap?.v).toBe(1);
+    expect(blueOuterSnap?.indicator?.label).toBe('Esquina');
+
+    // 7. Arrastre horizontal (`uOnly`) sigue capturando esquina/extremo de divisor vertical y lockToStart fija vPos al inicio
+    const partDiv = { id: 'div_part', position: 0.48, start: 0.3, end: 0.72 };
+    const endTipCanvas = {
+      x: hom.toCanvas[0][0] * interiorToExterior(partDiv.position, e, xf) +
+        hom.toCanvas[0][1] * interiorToExterior(partDiv.start, e, yf) +
+        hom.toCanvas[0][2],
+      y: hom.toCanvas[1][0] * interiorToExterior(partDiv.position, e, xf) +
+        hom.toCanvas[1][1] * interiorToExterior(partDiv.start, e, yf) +
+        hom.toCanvas[1][2],
+    };
+    const wEnd = hom.toCanvas[2][0] * interiorToExterior(partDiv.position, e, xf) +
+      hom.toCanvas[2][1] * interiorToExterior(partDiv.start, e, yf) +
+      hom.toCanvas[2][2];
+    const uOnlyEndSnap = snapPointToStructuralAnchors(
+      { x: endTipCanvas.x / wEnd + 4, y: endTipCanvas.y / wEnd - 3 },
+      hom.toUnit,
+      hom.toCanvas,
+      [partDiv],
+      [],
+      e,
+      xf,
+      yf,
+      1,
+      1,
+      12,
+      undefined,
+      'uOnly',
+    );
+    expect(uOnlyEndSnap?.u).toBeCloseTo(partDiv.position, 3);
+
+    const lockedOrtho = vectorizeUserStroke(
+      cornerPx,
+      { x: cornerPx.x + 190, y: cornerPx.y - 26 },
+      hom.toUnit,
+      [],
+      [shelf1],
+      e,
+      { x: xf, y: yf },
+      false,
+      'ortho',
+      { exactStartPos: true, lockToStart: true },
+    );
+    expect(lockedOrtho?.kind).toBe('hShelf');
+    if (lockedOrtho?.kind === 'hShelf') {
+      expect(lockedOrtho.segment.position).toBeCloseTo(0.55, 2);
+    }
+
+    // 8. Adaptación al papel milimetrado redondea coordenadas libres a múltiplos de 10 mm
+    const mmSnap = snapPointToStructuralAnchors(
+      { x: (quad[0].x + quad[2].x) * 0.43, y: (quad[0].y + quad[2].y) * 0.52 },
+      hom.toUnit,
+      hom.toCanvas,
+      [],
+      [],
+      e,
+      xf,
+      yf,
+      1,
+      1,
+      12,
+      undefined,
+      'both',
+      [],
+      [],
+      { enabled: true, stepMm: 10 },
+    );
+    expect(mmSnap).not.toBeNull();
+    const xPosMm = Math.round(e + mmSnap!.u * (xf - 2 * e));
+    const yPosMm = Math.round(e + mmSnap!.v * (yf - 2 * e));
+    expect(xPosMm % 10).toBe(0);
+    expect(yPosMm % 10).toBe(0);
+
+    // 9. Detección de dibujo sobre papel milimetrado pastel (cuadrícula tenue verde-azulada + trazo negro)
+    const gw = 120;
+    const gh = 90;
+    const graphRgba = new Uint8ClampedArray(gw * gh * 4);
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < gw; x++) {
+        const idx = (y * gw + x) * 4;
+        const isGridLine = x % 10 === 0 || y % 10 === 0;
+        const isInk = (x === 20 || x === 100 || y === 15 || y === 75) && x >= 20 && x <= 100 && y >= 15 && y <= 75;
+        graphRgba[idx] = isInk ? 25 : isGridLine ? 190 : 244;
+        graphRgba[idx + 1] = isInk ? 25 : isGridLine ? 236 : 252;
+        graphRgba[idx + 2] = isInk ? 25 : isGridLine ? 228 : 249;
+        graphRgba[idx + 3] = 255;
+      }
+    }
+    expect(isHandDrawnSketchImage(graphRgba, gw, gh).isSketch).toBe(true);
   });
 
   it('edición directa en 3D mueve/quita repisas y divisores, divide zonas y soporta ala L retorno', () => {

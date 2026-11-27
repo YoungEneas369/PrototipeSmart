@@ -8,16 +8,19 @@ import {
   FlipHorizontal2,
   Maximize2,
   Slash,
+  Spline,
   StretchHorizontal,
   StretchVertical,
   X,
 } from 'lucide-react';
 import type {
+  CurvedCutSpec,
   DiagonalSegment,
   FurnitureTopology,
   NormalizedSegment,
   ScaleAndBoardParams,
 } from '../../types/contracts';
+import { buildCornerFilletCutSpec, evaluateBezierDifferential } from '../../core/mathEngine';
 import { NumericInput } from '../NumericInput';
 import { clampNum, round4, type LineRef } from './geometryHelpers';
 
@@ -34,6 +37,10 @@ export interface LineSelectionBarProps {
   onUpdatePlaneLine?: (plane: 'xz' | 'zy', next: DiagonalSegment) => void;
   onDeletePlaneLine?: (plane: 'xz' | 'zy', id: string) => void;
   onDeselectPlaneLine?: () => void;
+  selectedCurve?: CurvedCutSpec | null;
+  onUpdateCurve?: (next: CurvedCutSpec) => void;
+  onDeleteCurve?: (id: string) => void;
+  onDeselectCurve?: () => void;
 }
 
 const NUDGE_STEPS = [-10, -1, 1, 10] as const;
@@ -51,6 +58,10 @@ export function LineSelectionBar({
   onUpdatePlaneLine,
   onDeletePlaneLine,
   onDeselectPlaneLine,
+  selectedCurve = null,
+  onUpdateCurve,
+  onDeleteCurve,
+  onDeselectCurve,
 }: LineSelectionBarProps) {
   const e = params.boardThickness;
   const xf = params.targetDimensions.x;
@@ -60,31 +71,169 @@ export function LineSelectionBar({
   const yInt = Math.max(1, yf - 2 * e);
   const minInnerMm = Math.max(20, Math.round(e * 1.2));
 
+  if (!selectedLine && !selectedPlaneLine && selectedCurve) {
+    const planeLabel =
+      selectedCurve.plane === 'xy'
+        ? 'Frente (XY)'
+        : selectedCurve.plane === 'xz'
+          ? 'Arriba (XZ)'
+          : 'Lado (ZY)';
+    const planeW =
+      selectedCurve.plane === 'xy' ? xInt : selectedCurve.plane === 'xz' ? xf : zf;
+    const planeH =
+      selectedCurve.plane === 'xy' ? yInt : selectedCurve.plane === 'xz' ? zf : yf;
+    const computedDiff =
+      selectedCurve.arcLengthMm !== undefined && selectedCurve.minRadiusMm !== undefined
+        ? null
+        : evaluateBezierDifferential(
+            selectedCurve.controlPoints.map((pt) => ({
+              x: pt.x * planeW,
+              y: pt.y * planeH,
+            })) as [
+              { x: number; y: number },
+              { x: number; y: number },
+              { x: number; y: number },
+              { x: number; y: number },
+            ],
+          );
+    const arcMm = Math.round(selectedCurve.arcLengthMm ?? computedDiff?.arcLengthMm ?? 0);
+    const rawMinR = selectedCurve.minRadiusMm ?? computedDiff?.minRadiusMm ?? 10000;
+    const minRadiusDisplay = rawMinR < 9999 ? `${Math.round(rawMinR)} mm` : '∞';
+    const currentFilletR = Math.round(selectedCurve.radiusMm ?? 120);
+
+    const handleCommitFilletRadius = (nextRadiusMm: number) => {
+      if (!onUpdateCurve) return;
+      const rClamped = Math.round(clampNum(nextRadiusMm, 15, 450));
+      if (selectedCurve.cornerTarget && selectedCurve.cornerTarget !== 'top_arch') {
+        const rebuilt = buildCornerFilletCutSpec({
+          id: selectedCurve.id,
+          cornerTarget: selectedCurve.cornerTarget,
+          radiusMm: rClamped,
+        });
+        onUpdateCurve({
+          ...selectedCurve,
+          ...rebuilt,
+          label: rebuilt.label,
+        });
+      } else {
+        onUpdateCurve({ ...selectedCurve, radiusMm: rClamped });
+      }
+    };
+
+    return (
+      <div
+        className="vc-line-bar"
+        role="region"
+        aria-label={`Propiedades de curva en plano ${selectedCurve.plane.toUpperCase()}`}
+      >
+        <div className="vc-line-bar-head">
+          <span className="vc-line-tag vc-line-tag-c">
+            <Spline size={13} /> Curva {planeLabel}
+          </span>
+          <span className="vc-line-meta">
+            Arco s=<strong>{arcMm} mm</strong> · Radio mín R_min=<strong>{minRadiusDisplay}</strong>
+          </span>
+          <span className="vc-line-hint">
+            {selectedCurve.kind === 'corner_fillet'
+              ? 'Ajusta el radio de empalme o arrastra los nodos P0–P3 · Supr borrar'
+              : 'Arrastra los nodos P0–P3 sobre el lienzo para moldear la curva · Supr borrar'}
+          </span>
+          {onDeselectCurve && (
+            <button
+              type="button"
+              className="vc-icon-btn"
+              onClick={onDeselectCurve}
+              title="Deseleccionar (Esc)"
+              aria-label="Cerrar barra de curva"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
+        <div className="vc-line-bar-body">
+          {selectedCurve.kind === 'corner_fillet' && onUpdateCurve && (
+            <label className="vc-mm-field">
+              <span>Radio:</span>
+              <NumericInput
+                value={currentFilletR}
+                min={15}
+                max={450}
+                step={5}
+                onCommit={handleCommitFilletRadius}
+                className="vc-mm-input vc-mm-input-sm"
+                ariaLabel="Radio de empalme curvo en mm"
+              />
+              <span>mm</span>
+            </label>
+          )}
+          <div className="vc-line-actions">
+            {onDeleteCurve && (
+              <button
+                type="button"
+                className="vc-chip vc-chip-danger-soft"
+                onClick={() => onDeleteCurve(selectedCurve.id)}
+                title="Eliminar esta curva (Supr)"
+              >
+                <X size={12} /> Borrar curva
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (!selectedLine && selectedPlaneLine && onUpdatePlaneLine && onDeletePlaneLine) {
     const { plane, line } = selectedPlaneLine;
-    const planeW = plane === 'xz' ? xf : zf;
-    const planeH = plane === 'xz' ? zf : yf;
-    const x1Mm = Math.round(line.u1 * planeW);
-    const y1Mm = Math.round(line.v1 * planeH);
-    const x2Mm = Math.round(line.u2 * planeW);
-    const y2Mm = Math.round(line.v2 * planeH);
-    const dxMm = x2Mm - x1Mm;
-    const dyMm = y2Mm - y1Mm;
-    const lenMm = Math.round(Math.hypot(dxMm, dyMm));
+    const isXZ = plane === 'xz';
+    const planeW = isXZ ? xf : zf;
+    const planeH = isXZ ? zf : yf;
+    const a1Mm = Math.round(line.u1 * planeW);
+    const b1Mm = isXZ ? Math.round((1 - line.v1) * zf) : Math.round(line.v1 * yf);
+    const a2Mm = Math.round(line.u2 * planeW);
+    const b2Mm = isXZ ? Math.round((1 - line.v2) * zf) : Math.round(line.v2 * yf);
+    const daMm = a2Mm - a1Mm;
+    const dbMm = b2Mm - b1Mm;
+    const lenMm = Math.round(Math.hypot(daMm, dbMm));
+    const angleDeg = Math.round(Math.abs((Math.atan2(dbMm, daMm) * 180) / Math.PI));
+
+    const commitPlaneCoords = (na1: number, nb1: number, na2: number, nb2: number) => {
+      const ca1 = clampNum(na1, 0, planeW);
+      const cb1 = clampNum(nb1, 0, planeH);
+      const ca2 = clampNum(na2, 0, planeW);
+      const cb2 = clampNum(nb2, 0, planeH);
+      if (Math.hypot(ca2 - ca1, cb2 - cb1) < 20) return;
+      onUpdatePlaneLine(plane, {
+        ...line,
+        u1: round4(ca1 / planeW),
+        v1: round4(isXZ ? 1 - cb1 / zf : cb1 / yf),
+        u2: round4(ca2 / planeW),
+        v2: round4(isXZ ? 1 - cb2 / zf : cb2 / yf),
+      });
+    };
 
     const resizePlaneLength = (deltaMm: number) => {
-      const curLen = Math.hypot(dxMm, dyMm);
+      const p1X = line.u1 * planeW;
+      const p1Y = line.v1 * planeH;
+      const p2X = line.u2 * planeW;
+      const p2Y = line.v2 * planeH;
+      const dx = p2X - p1X;
+      const dy = p2Y - p1Y;
+      const curLen = Math.hypot(dx, dy);
       if (curLen < 1) return;
       const nextLen = clampNum(curLen + deltaMm, 30, Math.hypot(planeW, planeH));
       const scale = nextLen / curLen;
-      const nx2 = clampNum(x1Mm + dxMm * scale, 0, planeW);
-      const ny2 = clampNum(y1Mm + dyMm * scale, 0, planeH);
+      const nx2 = clampNum(p1X + dx * scale, 0, planeW);
+      const ny2 = clampNum(p1Y + dy * scale, 0, planeH);
       onUpdatePlaneLine(plane, {
         ...line,
         u2: round4(nx2 / planeW),
         v2: round4(ny2 / planeH),
       });
     };
+
+    const labelA = isXZ ? 'X' : 'Z';
+    const labelB = isXZ ? 'Z' : 'Y';
 
     return (
       <div
@@ -94,10 +243,10 @@ export function LineSelectionBar({
       >
         <div className="vc-line-bar-head">
           <span className="vc-line-tag vc-line-tag-v">
-            Línea {plane === 'xz' ? 'Arriba (XZ)' : 'Lado (ZY)'}
+            Línea {isXZ ? 'Arriba (XZ)' : 'Lado (ZY)'}
           </span>
           <span className="vc-line-meta">
-            Largo: <strong>{lenMm} mm</strong>
+            Largo: <strong>{lenMm} mm</strong> · Ángulo: <strong>{angleDeg}°</strong>
           </span>
           <span className="vc-line-hint">
             Arrastra los círculos azules en las puntas para achicar o alargar · Supr borrar
@@ -115,6 +264,56 @@ export function LineSelectionBar({
           )}
         </div>
         <div className="vc-line-bar-body">
+          <label className="vc-mm-field">
+            <span>{labelA}1:</span>
+            <NumericInput
+              value={a1Mm}
+              min={0}
+              max={planeW}
+              step={5}
+              onCommit={(val) => commitPlaneCoords(val, b1Mm, a2Mm, b2Mm)}
+              className="vc-mm-input vc-mm-input-sm"
+              ariaLabel={`Coordenada ${labelA}1 en mm`}
+            />
+          </label>
+          <label className="vc-mm-field">
+            <span>{labelB}1:</span>
+            <NumericInput
+              value={b1Mm}
+              min={0}
+              max={planeH}
+              step={5}
+              onCommit={(val) => commitPlaneCoords(a1Mm, val, a2Mm, b2Mm)}
+              className="vc-mm-input vc-mm-input-sm"
+              ariaLabel={`Coordenada ${labelB}1 en mm`}
+            />
+          </label>
+          <label className="vc-mm-field">
+            <span>{labelA}2:</span>
+            <NumericInput
+              value={a2Mm}
+              min={0}
+              max={planeW}
+              step={5}
+              onCommit={(val) => commitPlaneCoords(a1Mm, b1Mm, val, b2Mm)}
+              className="vc-mm-input vc-mm-input-sm"
+              ariaLabel={`Coordenada ${labelA}2 en mm`}
+            />
+          </label>
+          <label className="vc-mm-field">
+            <span>{labelB}2:</span>
+            <NumericInput
+              value={b2Mm}
+              min={0}
+              max={planeH}
+              step={5}
+              onCommit={(val) => commitPlaneCoords(a1Mm, b1Mm, a2Mm, val)}
+              className="vc-mm-input vc-mm-input-sm"
+              ariaLabel={`Coordenada ${labelB}2 en mm`}
+            />
+            <span>mm</span>
+          </label>
+
           <div className="vc-nudge-group" role="group" aria-label="Achicar o alargar línea">
             <button
               type="button"

@@ -112,10 +112,10 @@ export interface CurvedCutSpec {
  * Geometría 2D extruida para tableros con perfil curvo en 3D y cálculo exacto de tapacanto por arco.
  */
 export interface BoardCurveProfile {
-  /** Polígono cerrado en coordenadas locales del tablero (mm) en su plano principal (XZ o XY). */
+  /** Polígono cerrado en coordenadas locales del tablero (mm) en su plano principal (XZ, XY o ZY). */
   pointsMm: Point2D[];
   /** Plano de extrusión respecto al centro local de la pieza. */
-  extrudePlane: 'xz' | 'xy';
+  extrudePlane: 'xz' | 'xy' | 'zy';
   /** Espesor de extrusión en mm. */
   extrudeDepthMm: number;
   /** Longitud diferencial total del borde curvo s = ∫ ||r'(t)|| dt (mm). */
@@ -246,6 +246,10 @@ export interface FurnitureTopology {
   hShelves: NormalizedSegment[];
   /** Divisiones o refuerzos diagonales opcionales trazados por el usuario. */
   diagonalDividers?: DiagonalSegment[];
+  /** Líneas vectoriales trazadas en Planta Superior (XZ) normalizadas [0, 1]^2 (u=X, v=1-Z/D). */
+  planeLinesXZ?: DiagonalSegment[];
+  /** Líneas vectoriales trazadas en Perfil Lateral (ZY) normalizadas [0, 1]^2 (u=Z/D, v=Y/H). */
+  planeLinesZY?: DiagonalSegment[];
   shelfMode: 'equidistant' | 'custom';
   equalShelfCount: number;
   hasBackPanel: boolean;

@@ -127,6 +127,12 @@ export default function App() {
   const [lockProportion, setLockProportion] = useState<boolean>(false);
   const [lockedRatioXY, setLockedRatioXY] = useState<number>(initial.topology.aspectRatioXY);
   const [modelKey, setModelKey] = useState<string>('preset_estanteria');
+  const [blankSketchState, setBlankSketchState] = useState<{
+    active: boolean;
+    hasStructure: boolean;
+  }>({ active: false, hasStructure: true });
+  const [presetLoadSeq, setPresetLoadSeq] = useState<number>(0);
+  const isBlankSketchEmpty = blankSketchState.active && !blankSketchState.hasStructure;
 
   // Estado bidireccional compartido 2D ↔ 3D para zonas frontales y ala activa en L
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
@@ -210,6 +216,8 @@ export default function App() {
         : cloned.topology.aspectRatioXY,
     );
     setExplodeFactor(0);
+    setBlankSketchState({ active: false, hasStructure: true });
+    setPresetLoadSeq((n) => n + 1);
     setModelKey(`preset_${key}_${Date.now()}`);
   };
 
@@ -240,6 +248,7 @@ export default function App() {
     setLockProportion(false);
     setLockedRatioXY(catalogRatio);
     setExplodeFactor(0);
+    setBlankSketchState({ active: false, hasStructure: true });
     setModelKey(`catalog_${catalogId}_${Date.now()}`);
     setActiveView('studio');
     setStudioMode('split');
@@ -1847,6 +1856,8 @@ export default function App() {
                   handleSetBaseSupport(checked ? 'legs' : 'none', heightMm, count)
                 }
                 onSelectDepthMm={(z) => updateTargetDim('z', z)}
+                onBlankSketchStateChange={setBlankSketchState}
+                externalResetSeq={presetLoadSeq}
               />
             </div>
 
@@ -1859,6 +1870,7 @@ export default function App() {
                 displayUnit={displayUnit}
                 variant={studioMode === '3d' ? 'solo' : 'default'}
                 modelKey={modelKey}
+                blankSketchEmpty={isBlankSketchEmpty}
                 selectedZoneId={selectedZoneId}
                 hoveredZoneId={hoveredZoneId}
                 onSelectZone={setSelectedZoneId}
@@ -1922,6 +1934,7 @@ export default function App() {
                   displayUnit={displayUnit}
                   variant="compact"
                   modelKey={modelKey}
+                  blankSketchEmpty={isBlankSketchEmpty}
                   selectedZoneId={selectedZoneId}
                   hoveredZoneId={hoveredZoneId}
                   onSelectZone={setSelectedZoneId}

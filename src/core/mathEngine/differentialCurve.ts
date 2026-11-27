@@ -12,6 +12,7 @@
 import type {
   BoardPiece,
   CurvedCutSpec,
+  DiagonalSegment,
   DifferentialMetrics,
   FurnitureTopology,
   Point2D,
@@ -674,7 +675,8 @@ export function applyCurvedCutsToPieces(options: {
     }
 
     // 4. Trazo curvo libre en Planta Superior XZ (`free_bezier` no pre-emparejado):
-    //    Reemplaza el frente (+Z) de cubierta con el contorno curvo libre diseñado arriba.
+    //    Convención XZ unificada: arriba del lienzo (pt.y = 1) es Fondo/Pared (Z = 0 -> local y = -d/2),
+    //    abajo (pt.y = 0) es Frente (Z = +D -> local y = +d/2).
     if (cut.plane === 'xz' && cut.kind === 'free_bezier') {
       const targetCub = pieces.find(
         (p) => p.tipo === 'cubierta' && (!p.wing || p.wing === 'main'),
@@ -683,38 +685,132 @@ export function applyCurvedCutsToPieces(options: {
         const w = targetCub.ancho;
         const d = targetCub.alto;
         const [p0, p1, p2, p3] = cut.controlPoints;
-        // Mapear Y normalizado del frente a la franja delantera de la cubierta en local XZ
         const mapPt = (pt: Point2D): Point2D => ({
           x: (clamp01(pt.x) - 0.5) * w,
-          y: (clamp01(pt.y) - 0.5) * d,
+          y: (0.5 - clamp01(pt.y)) * d,
         });
-        const sortedEnd =
-          p0.x <= p3.x
-            ? ([mapPt(p0), mapPt(p1), mapPt(p2), mapPt(p3)] as [Point2D, Point2D, Point2D, Point2D])
-            : ([mapPt(p3), mapPt(p2), mapPt(p1), mapPt(p0)] as [Point2D, Point2D, Point2D, Point2D]);
+        const isHorizontal = Math.abs(p3.x - p0.x) >= Math.abs(p3.y - p0.y);
+        const sortedEnd: [Point2D, Point2D, Point2D, Point2D] = isHorizontal
+          ? p0.x <= p3.x
+            ? [mapPt(p0), mapPt(p1), mapPt(p2), mapPt(p3)]
+            : [mapPt(p3), mapPt(p2), mapPt(p1), mapPt(p0)]
+          : p0.y >= p3.y
+            ? [mapPt(p0), mapPt(p1), mapPt(p2), mapPt(p3)]
+            : [mapPt(p3), mapPt(p2), mapPt(p1), mapPt(p0)];
         const diff = evaluateBezierDifferential(sortedEnd, 24);
         if (diff.arcLengthMm > GEOM_EPS) {
           const curvePts = diff.samples.map((s) => s.point);
-          const polyPts: Point2D[] = [
-            { x: -w / 2, y: -d / 2 },
-            { x: w / 2, y: -d / 2 },
-            ...curvePts.slice().reverse(),
-          ];
-          targetCub.curveProfile = {
-            pointsMm: polyPts,
-            extrudePlane: 'xz',
-            extrudeDepthMm: e,
-            arcLengthMm: diff.arcLengthMm,
-            minRadiusMm: diff.minRadiusMm,
-            replaceTopEdgeWithArc: true,
-          };
+          let polyPts: Point2D[];
+          let replaceTopEdge = false;
+          if (isHorizontal) {
+            const meanPtY =
+              (clamp01(p0.y) + clamp01(p1.y) + clamp01(p2.y) + clamp01(p3.y)) / 4;
+            if (meanPtY <= 0.65) {
+              polyPts = [
+                { x: -w / 2, y: -d / 2 },
+                { x: w / 2, y: -d / 2 },
+                ...curvePts.slice().reverse(),
+              ];
+              replaceTopEdge = true;
+            } else {
+              polyPts = [
+                ...curvePts,
+                { x: w / 2, y: d / 2 },
+                { x: -w / 2, y: d / 2 },
+              ];
+            }
+          } else {
+            const meanPtX =
+              (clamp01(p0.x) + clamp01(p1.x) + clamp01(p2.x) + clamp01(p3.x)) / 4;
+            if (meanPtX >= 0.5) {
+              polyPts = [
+                { x: -w / 2, y: -d / 2 },
+                ...curvePts,
+                { x: -w / 2, y: d / 2 },
+              ];
+            } else {
+              polyPts = [
+                { x: w / 2, y: -d / 2 },
+                { x: w / 2, y: d / 2 },
+                ...curvePts.slice().reverse(),
+              ];
+            }
+          }
+          const dedupedPoly = deduplicatePolygonPoints(polyPts);
+          if (dedupedPoly.length >= 3) {
+            targetCub.curveProfile = {
+              pointsMm: dedupedPoly,
+              extrudePlane: 'xz',
+              extrudeDepthMm: e,
+              arcLengthMm: diff.arcLengthMm,
+              minRadiusMm: diff.minRadiusMm,
+              replaceTopEdgeWithArc: replaceTopEdge,
+            };
+            recordCurveStats(
+              diff.arcLengthMm,
+              diff.minRadiusMm,
+              diff.maxCurvature,
+              targetCub.id,
+              cut.label,
+            );
+          }
+        }
+      }
+      continue;
+    }
+
+    // 5. Trazo curvo en Perfil Lateral ZY (`cut.plane === 'zy'`):
+    //    Convención ZY unificada: pt.x = 0 -> Fondo (Z = 0 -> local -d/2), pt.x = 1 -> Frente (Z = +D -> local +d/2),
+    //    pt.y = 0 -> Base (Y = 0), pt.y = 1 -> Cubierta (Y = yf).
+    if (cut.plane === 'zy') {
+      const sidePieces = pieces.filter(
+        (p) => p.tipo === 'lateral' && (!p.wing || p.wing === 'main'),
+      );
+      let recordedForCut = false;
+      for (const p of sidePieces) {
+        const hSide = p.ancho;
+        const d = p.alto;
+        const cy = p.posicion3D[1];
+        const mapPt = (pt: Point2D): Point2D => {
+          const localZ = (clamp01(pt.x) - 0.5) * d;
+          const worldY = clamp01(pt.y) * yf;
+          const localY = clamp(worldY - cy, -hSide / 2, hSide / 2);
+          return { x: localZ, y: localY };
+        };
+        const mappedPts: [Point2D, Point2D, Point2D, Point2D] = [
+          mapPt(cut.controlPoints[0]),
+          mapPt(cut.controlPoints[1]),
+          mapPt(cut.controlPoints[2]),
+          mapPt(cut.controlPoints[3]),
+        ];
+        const diff = evaluateBezierDifferential(mappedPts, 24);
+        if (diff.arcLengthMm <= GEOM_EPS) continue;
+
+        const rawCurvePts = diff.samples.map((s) => s.point);
+        const curvePts =
+          rawCurvePts[0].y <= rawCurvePts[rawCurvePts.length - 1].y
+            ? rawCurvePts
+            : rawCurvePts.slice().reverse();
+        const dedupedPoly = buildZySideProfileFromContour(curvePts, d, hSide);
+        if (dedupedPoly.length < 3) continue;
+
+        p.curveProfile = {
+          pointsMm: dedupedPoly,
+          extrudePlane: 'zy',
+          extrudeDepthMm: e,
+          arcLengthMm: diff.arcLengthMm,
+          minRadiusMm: diff.minRadiusMm,
+          replaceTopEdgeWithArc: true,
+        };
+        if (!recordedForCut) {
           recordCurveStats(
             diff.arcLengthMm,
             diff.minRadiusMm,
             diff.maxCurvature,
-            targetCub.id,
+            p.id,
             cut.label,
           );
+          recordedForCut = true;
         }
       }
     }
@@ -731,4 +827,445 @@ export function applyCurvedCutsToPieces(options: {
         },
       }
     : {};
+}
+
+function deduplicatePolygonPoints(pts: readonly Point2D[], tol = 0.5): Point2D[] {
+  const out: Point2D[] = [];
+  for (const pt of pts) {
+    const rounded: Point2D = {
+      x: Number(pt.x.toFixed(2)),
+      y: Number(pt.y.toFixed(2)),
+    };
+    const prev = out[out.length - 1];
+    if (!prev || Math.hypot(rounded.x - prev.x, rounded.y - prev.y) > tol) {
+      out.push(rounded);
+    }
+  }
+  while (
+    out.length > 2 &&
+    Math.hypot(out[0].x - out[out.length - 1].x, out[0].y - out[out.length - 1].y) <= tol
+  ) {
+    out.pop();
+  }
+  return out;
+}
+
+function computePolygonArea(pts: readonly Point2D[]): number {
+  if (pts.length < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(sum) * 0.5;
+}
+
+function clipPolygonByHalfPlane(
+  poly: readonly Point2D[],
+  a: Point2D,
+  b: Point2D,
+  keepPt: Point2D,
+): Point2D[] {
+  if (poly.length < 3) return [...poly];
+  const cross = (p: Point2D): number => (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+  const keepSign = cross(keepPt);
+  if (Math.abs(keepSign) < 1e-6) return [...poly];
+  const isInside = (p: Point2D): boolean => cross(p) * keepSign >= -1e-6;
+
+  const out: Point2D[] = [];
+  for (let i = 0; i < poly.length; i++) {
+    const cur = poly[i];
+    const prev = poly[(i + poly.length - 1) % poly.length];
+    const curIn = isInside(cur);
+    const prevIn = isInside(prev);
+    const intersect = (): Point2D => {
+      const cPrev = cross(prev);
+      const cCur = cross(cur);
+      const denom = cPrev - cCur;
+      if (Math.abs(denom) < 1e-9) return { ...cur };
+      const t = clamp01(cPrev / denom);
+      return {
+        x: prev.x + t * (cur.x - prev.x),
+        y: prev.y + t * (cur.y - prev.y),
+      };
+    };
+    if (curIn) {
+      if (!prevIn) out.push(intersect());
+      out.push(cur);
+    } else if (prevIn) {
+      out.push(intersect());
+    }
+  }
+  return deduplicatePolygonPoints(out);
+}
+
+function buildZySideProfileFromContour(
+  contourPtsLocal: readonly Point2D[],
+  d: number,
+  hSide: number,
+): Point2D[] {
+  if (contourPtsLocal.length < 2) return [];
+  const ptBot = contourPtsLocal[0];
+  const ptTop = contourPtsLocal[contourPtsLocal.length - 1];
+  const polyPts: Point2D[] = [];
+
+  if (ptBot.x > -d / 2 + 1 || ptBot.y <= -hSide / 2 + 1) {
+    polyPts.push({ x: -d / 2, y: -hSide / 2 });
+  }
+  if (ptBot.y > -hSide / 2 + 1 && ptBot.x > -d / 2 + 1) {
+    polyPts.push({ x: ptBot.x, y: -hSide / 2 });
+  }
+  polyPts.push(...contourPtsLocal);
+  if (ptTop.y < hSide / 2 - 1 && ptTop.x > -d / 2 + 1) {
+    polyPts.push({ x: ptTop.x, y: hSide / 2 });
+  }
+  if (ptTop.x > -d / 2 + 1 || ptTop.y >= hSide / 2 - 1) {
+    polyPts.push({ x: -d / 2, y: hSide / 2 });
+  }
+  return deduplicatePolygonPoints(polyPts);
+}
+
+function extractZyFrontContourNorm(
+  lines: readonly DiagonalSegment[],
+  zf: number,
+  yf: number,
+): Point2D[] | null {
+  interface ZySegInfo {
+    a: Point2D;
+    b: Point2D;
+    kind: 'oblique' | 'vStep' | 'hStep';
+    maxU: number;
+    scoreLen: number;
+  }
+
+  const eligible: ZySegInfo[] = [];
+  for (const ln of lines) {
+    const u1 = clamp01(ln.u1);
+    const v1 = clamp01(ln.v1);
+    const u2 = clamp01(ln.u2);
+    const v2 = clamp01(ln.v2);
+    const onSameBorder =
+      (u1 <= 0.02 && u2 <= 0.02) ||
+      (u1 >= 0.98 && u2 >= 0.98) ||
+      (v1 <= 0.02 && v2 <= 0.02) ||
+      (v1 >= 0.98 && v2 >= 0.98);
+    if (onSameBorder) continue;
+
+    const duMm = Math.abs(u2 - u1) * zf;
+    const dvMm = Math.abs(v2 - v1) * yf;
+    const lenMm = Math.hypot(duMm, dvMm);
+    if (lenMm < 20) continue;
+
+    const degMm = (Math.atan2(dvMm, duMm) * 180) / Math.PI;
+    const uSpan = Math.abs(u2 - u1);
+    const vSpan = Math.abs(v2 - v1);
+    const degNorm = (Math.atan2(vSpan, uSpan) * 180) / Math.PI;
+    const uMid = (u1 + u2) / 2;
+
+    const isOblique =
+      uSpan >= 0.06 &&
+      vSpan >= 0.08 &&
+      ((degNorm >= 12 && degNorm <= 78) || (degMm >= 12 && degMm <= 78));
+
+    if (isOblique) {
+      eligible.push({
+        a: { x: u1, y: v1 },
+        b: { x: u2, y: v2 },
+        kind: 'oblique',
+        maxU: Math.max(u1, u2),
+        scoreLen: lenMm,
+      });
+    } else if (degNorm > 78 && vSpan < 0.92 && uMid >= 0.12 && uMid <= 0.92) {
+      eligible.push({
+        a: { x: u1, y: v1 },
+        b: { x: u2, y: v2 },
+        kind: 'vStep',
+        maxU: Math.max(u1, u2),
+        scoreLen: lenMm,
+      });
+    } else if (degNorm < 12 && uSpan < 0.92) {
+      eligible.push({
+        a: { x: u1, y: v1 },
+        b: { x: u2, y: v2 },
+        kind: 'hStep',
+        maxU: Math.max(u1, u2),
+        scoreLen: lenMm,
+      });
+    }
+  }
+
+  if (eligible.length === 0) return null;
+
+  const snapEdge = (v: number): number => (v <= 0.055 ? 0 : v >= 0.945 ? 1 : v);
+  const distPt = (p: Point2D, q: Point2D): number => Math.hypot(p.x - q.x, p.y - q.y);
+  const tol = 0.08;
+
+  // Construir componentes conexas de segmentos elegibles
+  const visited = new Array<boolean>(eligible.length).fill(false);
+  let bestChain: Point2D[] | null = null;
+  let bestScore = -1;
+
+  for (let startIdx = 0; startIdx < eligible.length; startIdx++) {
+    if (visited[startIdx]) continue;
+    const queue = [startIdx];
+    visited[startIdx] = true;
+    const compIndices: number[] = [];
+
+    while (queue.length > 0) {
+      const idx = queue.pop()!;
+      compIndices.push(idx);
+      const s = eligible[idx];
+      for (let j = 0; j < eligible.length; j++) {
+        if (visited[j]) continue;
+        const o = eligible[j];
+        if (
+          distPt(s.a, o.a) <= tol ||
+          distPt(s.a, o.b) <= tol ||
+          distPt(s.b, o.a) <= tol ||
+          distPt(s.b, o.b) <= tol
+        ) {
+          visited[j] = true;
+          queue.push(j);
+        }
+      }
+    }
+
+    const compSegs = compIndices.map((i) => eligible[i]);
+    const hasOblique = compSegs.some((s) => s.kind === 'oblique');
+    const hasV = compSegs.some((s) => s.kind === 'vStep');
+    const hasH = compSegs.some((s) => s.kind === 'hStep');
+    const touchesFrontOrTopBot = compSegs.some(
+      (s) =>
+        Math.max(s.a.x, s.b.x) >= 0.82 ||
+        Math.max(s.a.y, s.b.y) >= 0.88 ||
+        Math.min(s.a.y, s.b.y) <= 0.12,
+    );
+
+    if (!hasOblique && !(hasV && hasH && touchesFrontOrTopBot)) continue;
+
+    // Ordenar la cadena de segmentos desde el extremo inferior (menor v) al superior (mayor v)
+    let orderedPts: Point2D[];
+    if (compSegs.length === 1) {
+      const s = compSegs[0];
+      orderedPts =
+        s.a.y < s.b.y || (Math.abs(s.a.y - s.b.y) < 1e-4 && s.a.x >= s.b.x)
+          ? [s.a, s.b]
+          : [s.b, s.a];
+    } else {
+      const endpoints: Array<{ pt: Point2D; segIdx: number; other: Point2D }> = [];
+      for (let k = 0; k < compSegs.length; k++) {
+        const s = compSegs[k];
+        const degA = compSegs.filter(
+          (o, ok) => ok !== k && (distPt(s.a, o.a) <= tol || distPt(s.a, o.b) <= tol),
+        ).length;
+        const degB = compSegs.filter(
+          (o, ok) => ok !== k && (distPt(s.b, o.a) <= tol || distPt(s.b, o.b) <= tol),
+        ).length;
+        if (degA === 0) endpoints.push({ pt: s.a, segIdx: k, other: s.b });
+        if (degB === 0) endpoints.push({ pt: s.b, segIdx: k, other: s.a });
+      }
+      if (endpoints.length === 0) continue;
+
+      endpoints.sort(
+        (p1, p2) => p1.pt.y - p2.pt.y || p2.pt.x - p1.pt.x,
+      );
+      const startEp = endpoints[0];
+      const usedSeg = new Array<boolean>(compSegs.length).fill(false);
+      usedSeg[startEp.segIdx] = true;
+      orderedPts = [startEp.pt, startEp.other];
+
+      while (usedSeg.some((u) => !u)) {
+        const tip = orderedPts[orderedPts.length - 1];
+        let nextK = -1;
+        let nextDist = tol;
+        let nextPt: Point2D = tip;
+        for (let k = 0; k < compSegs.length; k++) {
+          if (usedSeg[k]) continue;
+          const s = compSegs[k];
+          const da = distPt(tip, s.a);
+          const db = distPt(tip, s.b);
+          if (da <= nextDist) {
+            nextDist = da;
+            nextK = k;
+            nextPt = s.b;
+          }
+          if (db <= nextDist) {
+            nextDist = db;
+            nextK = k;
+            nextPt = s.a;
+          }
+        }
+        if (nextK < 0) break;
+        usedSeg[nextK] = true;
+        orderedPts.push(nextPt);
+      }
+
+      if (orderedPts[0].y > orderedPts[orderedPts.length - 1].y) {
+        orderedPts.reverse();
+      }
+    }
+
+    const totalScore = compSegs.reduce((acc, s) => acc + s.scoreLen, 0) + (hasOblique ? 100 : 0);
+    if (totalScore > bestScore && orderedPts.length >= 2) {
+      bestScore = totalScore;
+      bestChain = orderedPts.map((pt) => ({
+        x: snapEdge(clamp01(pt.x)),
+        y: snapEdge(clamp01(pt.y)),
+      }));
+    }
+  }
+
+  return bestChain;
+}
+
+/**
+ * Conecta geométricamente líneas vectoriales de Planta Superior (`planeLinesXZ`) y Perfil Lateral
+ * (`planeLinesZY`) con `curveProfile` 3D de cubiertas y laterales principales cuando no han sido
+ * cubiertos previamente por `curvedCuts`.
+ */
+export function applyPlaneLinesToPieces(options: {
+  topology: FurnitureTopology;
+  params: ScaleAndBoardParams;
+  lPlan: ResolvedLShapePlan | null;
+  pieces: BoardPiece[];
+}): void {
+  const { topology, params, lPlan, pieces } = options;
+  const { x: xf, y: yf, z: zf } = params.targetDimensions;
+  const e = params.boardThickness;
+
+  // 1. Perfil Lateral ZY (`planeLinesZY`): cortes oblicuos (12°..78°) o escalonados frontales en laterales
+  const zyLines = topology.planeLinesZY ?? [];
+  if (zyLines.length > 0) {
+    const hasZyCurveCut = pieces.some(
+      (p) => p.tipo === 'lateral' && (!p.wing || p.wing === 'main') && p.curveProfile?.extrudePlane === 'zy',
+    );
+    if (!hasZyCurveCut) {
+      const contourNorm = extractZyFrontContourNorm(zyLines, zf, yf);
+      if (contourNorm && contourNorm.length >= 2) {
+        const sidePieces = pieces.filter(
+          (p) => p.tipo === 'lateral' && (!p.wing || p.wing === 'main'),
+        );
+        for (const p of sidePieces) {
+          const hSide = p.ancho;
+          const d = p.alto;
+          const cy = p.posicion3D[1];
+          const mappedContour = contourNorm.map((pt) => ({
+            x: (clamp01(pt.x) - 0.5) * d,
+            y: clamp(clamp01(pt.y) * yf - cy, -hSide / 2, hSide / 2),
+          }));
+          const polyPts = buildZySideProfileFromContour(mappedContour, d, hSide);
+          if (polyPts.length < 3) continue;
+
+          // Longitud física del contorno frontal para tapacanto exacto
+          let frontLenMm = 0;
+          const ptBot = mappedContour[0];
+          const ptTop = mappedContour[mappedContour.length - 1];
+          if (ptBot.y > -hSide / 2 + 1 && ptBot.x > -d / 2 + 1) {
+            frontLenMm += ptBot.y - -hSide / 2;
+          }
+          for (let i = 1; i < mappedContour.length; i++) {
+            frontLenMm += Math.hypot(
+              mappedContour[i].x - mappedContour[i - 1].x,
+              mappedContour[i].y - mappedContour[i - 1].y,
+            );
+          }
+          if (ptTop.y < hSide / 2 - 1 && ptTop.x > -d / 2 + 1) {
+            frontLenMm += hSide / 2 - ptTop.y;
+          }
+
+          p.curveProfile = {
+            pointsMm: polyPts,
+            extrudePlane: 'zy',
+            extrudeDepthMm: e,
+            arcLengthMm: Number(Math.max(1, frontLenMm).toFixed(2)),
+            minRadiusMm: 10000,
+            replaceTopEdgeWithArc: true,
+          };
+        }
+      }
+    }
+  }
+
+  // 2. Planta Superior XZ (`planeLinesXZ`): recorta/achaflana esquinas diagonales (12°..78°) en cubierta
+  const xzLines = topology.planeLinesXZ ?? [];
+  if (xzLines.length > 0) {
+    const targetCub = pieces.find(
+      (p) => p.tipo === 'cubierta' && (!p.wing || p.wing === 'main'),
+    );
+    if (targetCub && targetCub.curveProfile?.extrudePlane !== 'xz') {
+      const w = targetCub.ancho;
+      const d = targetCub.alto;
+      const totalL2 = lPlan?.enabled ? lPlan.zStartB + lPlan.netLengthMm : zf;
+
+      let poly: Point2D[] = [
+        { x: -w / 2, y: -d / 2 },
+        { x: w / 2, y: -d / 2 },
+        { x: w / 2, y: d / 2 },
+        { x: -w / 2, y: d / 2 },
+      ];
+      const baseArea = w * d;
+      let appliedChamfer = false;
+      let chamferLenSum = 0;
+
+      for (const ln of xzLines) {
+        const u1 = clamp01(ln.u1);
+        const v1 = clamp01(ln.v1);
+        const u2 = clamp01(ln.u2);
+        const v2 = clamp01(ln.v2);
+        const du = Math.abs(u2 - u1);
+        const dv = Math.abs(v2 - v1);
+        const dxMm = du * xf;
+        const dzMm = dv * totalL2;
+        const lenMm = Math.hypot(dxMm, dzMm);
+        if (lenMm < 30 || du < 0.06 || dv < 0.06) continue;
+
+        const degNorm = (Math.atan2(dv, du) * 180) / Math.PI;
+        const degMm = (Math.atan2(dzMm, dxMm) * 180) / Math.PI;
+        if (!((degNorm >= 12 && degNorm <= 78) || (degMm >= 12 && degMm <= 78))) continue;
+
+        const toLocalCub = (u: number, v: number): Point2D => ({
+          x: u * xf - targetCub.posicion3D[0],
+          y: (1 - v) * totalL2 - targetCub.posicion3D[2],
+        });
+        const pA = toLocalCub(u1, v1);
+        const pB = toLocalCub(u2, v2);
+        const midX = (pA.x + pB.x) / 2;
+        const midY = (pA.y + pB.y) / 2;
+
+        // Solo recortar líneas que caigan dentro de la huella de `targetCub`
+        if (
+          Math.min(pA.y, pB.y) > d / 2 + 5 ||
+          Math.max(pA.y, pB.y) < -d / 2 - 5 ||
+          Math.min(pA.x, pB.x) > w / 2 + 5 ||
+          Math.max(pA.x, pB.x) < -w / 2 - 5
+        ) {
+          continue;
+        }
+
+        const keepPt: Point2D = {
+          x: midX >= 0 ? -w / 2 : w / 2,
+          y: midY >= 0 ? -d / 2 : d / 2,
+        };
+        const nextPoly = clipPolygonByHalfPlane(poly, pA, pB, keepPt);
+        const nextArea = computePolygonArea(nextPoly);
+        if (nextPoly.length >= 3 && nextArea >= baseArea * 0.2 && nextArea < computePolygonArea(poly) - 4) {
+          poly = nextPoly;
+          appliedChamfer = true;
+          chamferLenSum += lenMm;
+        }
+      }
+
+      if (appliedChamfer) {
+        targetCub.curveProfile = {
+          pointsMm: poly,
+          extrudePlane: 'xz',
+          extrudeDepthMm: e,
+          arcLengthMm: Number(chamferLenSum.toFixed(2)),
+          minRadiusMm: 10000,
+          replaceTopEdgeWithArc: false,
+        };
+      }
+    }
+  }
 }

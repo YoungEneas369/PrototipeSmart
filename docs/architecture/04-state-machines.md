@@ -61,14 +61,21 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> NoPhoto : Sin vista frontal cargada (selector de 3 vistas siempre accesible)
 
-    NoPhoto --> Step1Frame : Sube foto o boceto en papel (Frente XY, Arriba XZ o Lado ZY)
-    NoPhoto --> Step2Lines : Pulsa Dibujar en lienzo libre (createBlankSketchBitmap con cuadrícula)
+    NoPhoto --> Step1Frame : Sube foto o boceto en papel (Frente XY, Arriba XZ o Lado ZY, frontZones = [])
+    NoPhoto --> BlankOpenSketch : Pulsa Dibujar en lienzo libre (3 vistas XY/XZ/ZY limpias, blankSketchHasStructure = false)
+
+    state "Boceto Libre Abierto (frontIsBlankSketch = true, blankSketchHasStructure = false)" as BlankOpenSketch {
+        [*] --> OpenLines : Lienzo blanco cuadriculado sin marco impuesto, sin traced_zone_1 y sin sólido fantasma en Viewer3D (0 piezas)
+        OpenLines --> OpenLines : Traza rectas/curvas abiertas (frontZones = [], hasBackPanel = false, sin sobrescribir trazos)
+    }
+    BlankOpenSketch --> Step2Lines : Cierra contorno (detectDrawnClosedStructure rect/stepped/curved_top) -> blankSketchHasStructure = true
+    BlankOpenSketch --> Step1Frame : Usuario activa Paso 1 Contorno explícito -> blankSketchHasStructure = true
 
     state "Vista Activa (viewTab: frontal XY | superior XZ | lateral ZY)" as ViewTabs {
         state "frontal (Alzado XY · líneas, diagonales, curvas top/arco)" as TabFront
-        state "superior (Planta XZ · L derecha/izquierda y empalme curvo L)" as TabTop
-        state "lateral (Perfil ZY · calibración profundidad Z)" as TabSide
-        TabFront --> TabTop : Pestaña 2. Arriba (XZ)
+        state "superior (Planta XZ · Fondo Z=0 arriba, Frente +Z abajo, XLINEs XY y chaflanes/L)" as TabTop
+        state "lateral (Perfil ZY · Fondo Z=0 izq, Frente +Z der, XLINEs XY/XZ y perfil lateral)" as TabSide
+        TabFront --> TabTop : Pestaña 2. Arriba (XZ) resetea traceStep = lines si estaba en zones
         TabTop --> TabSide : Pestaña 3. Lado (ZY)
         TabSide --> TabFront : Pestaña 1. Frente (XY)
     }
@@ -87,11 +94,11 @@ stateDiagram-v2
     }
 
     state "Paso 2 — lines (Trazado en Vivo + Curvas Diferenciales Bézier)" as Step2Lines {
-        [*] --> DrawConnect : linesSubMode = draw_only (Dibujar · libre desde cualquier esquina) o smart (Mover / Editar)
-        DrawConnect --> DrawStroke : Arrastra desde esquina, punta existente o vacío (snap 12 px sin salto de soltar)
-        DrawConnect --> DragSegment : En Mover/Editar arrastra cuerpo (o extremo de línea ya seleccionada)
-        DrawStroke --> DrawConnect : PointerUp (vectorizeUserStroke exactStartPos / fitDifferentialCurveFromStroke + UndoStack)
-        DragSegment --> DrawConnect : PointerUp (actualiza segmento, commit UndoStack)
+        [*] --> DrawConnect : linesSubMode = draw_only (Dibujar · libre) o smart (Mover / Editar líneas y nodos Bézier)
+        DrawConnect --> DrawStroke : Arrastra en XY, XZ o ZY (Lupa 4x + cuadrícula 0-based en los 3 planos, Space+Drag sobre activeBmp)
+        DrawConnect --> DragSegment : En Mover/Editar arrastra línea, extremo o nodo Bézier P0..P3 en XY/XZ/ZY
+        DrawStroke --> DrawConnect : PointerUp (vectorizeUserStroke / fitDifferentialCurveFromStroke / planeLinesXZ / planeLinesZY + UndoStack)
+        DragSegment --> DrawConnect : PointerUp (actualiza segmento/curva + synthesize3DFromTriViews + UndoStack)
         DrawConnect --> AutoSuggesting : Pulsa Sugerir líneas o Reconocer boceto (sketchRecognizer + photoPipeline)
         AutoSuggesting --> DrawConnect : Aplica candidatos, curvas e inferencia L + commit UndoStack
         DrawConnect --> ReasonableNorm : Pulsa Medidas razonables (simetría, colinealidad, alas L iguales, 10 mm)
@@ -113,11 +120,11 @@ stateDiagram-v2
         state "viewTab = lateral (Vista Lateral ZY desde Avanzado)" as LateralZY
     }
 
-    Step1Frame --> Step2Lines : Siguiente paso (contorno válido)
-    Step2Lines --> Step3Zones : Siguiente paso (partición planar lista)
-    Step3Zones --> Step2Lines : Volver a Líneas
-    Step2Lines --> Step1Frame : Volver a Contorno
-    Step3Zones --> Step1Frame : Volver a Contorno
+    Step1Frame --> Step2Lines : Siguiente paso (contorno válido, sin mostrar frontZones)
+    Step2Lines --> Step3Zones : Siguiente paso (solo si !isBlankSketch || blankSketchHasStructure y con partición lista)
+    Step3Zones --> Step2Lines : Volver a Líneas (oculta frontZones y ZoneInspector de inmediato)
+    Step2Lines --> Step1Frame : Volver a Contorno (permanece en viewTab activo para XZ/ZY)
+    Step3Zones --> Step1Frame : Volver a Contorno (oculta frontZones y ZoneInspector de inmediato)
 
     Step1Frame --> CalibA4 : Activa calibración A4 desde CalibrationBar
     Step2Lines --> CalibA4 : Activa calibración A4 desde CalibrationBar
@@ -131,20 +138,20 @@ stateDiagram-v2
 
     Step1Frame --> LateralZY : Abre Vista Lateral ZY (Avanzado en CalibrationBar)
     Step2Lines --> LateralZY : Abre Vista Lateral ZY (Avanzado en CalibrationBar)
-    LateralZY --> Step1Frame : Vuelve a Vista Frontal XY (estima profundidad Z)
+    LateralZY --> Step1Frame : Vuelve a Vista Frontal XY (synthesize3DFromTriViews actualiza Z y topología)
 
     note right of Step2Lines
         Pila Undo / Redo (Deshacer y Rehacer Ctrl+Z / Ctrl+Y) activa en las 3 vistas (XY, XZ, ZY), 4 toques y los 3 pasos:
         Restaura snapshot inmutable de
         (quad, topQuad, sideQuad, vDividers, hShelves, diagonalDividers,
-        planeLinesXZ, planeLinesZY, curvedCuts, lShape, frontZones,
+        planeLinesXZ, planeLinesZY, blankSketchHasStructure, curvedCuts, lShape, frontZones,
         cubiertaMaterialOverride, shelfMode, equalShelfCount y dims)
     end note
 ```
 
 ## Invariantes de Interacción v8.0
 
-1. **Lienzo Limpio sin Barras Innecesarias + Barra Superior de 3 Vistas:** Sin vista cargada en `frontal`, solo se muestran las pestañas `1. Frente (XY)`, `2. Arriba (XZ)`, `3. Lado (ZY)`, `"Medidas razonables"` y el acceso directo `"Dibujar en lienzo libre"`.
-2. **Sincronización Automática 3-Vistas y Cálculo Diferencial:** Ajustar `quad` (XY), `topQuad` (XZ) o `sideQuad` (ZY) ejecuta `synthesize3DFromTriViews`, sincronizando proporción `Alto Y`, profundidad `Z`, topología en L y curvas Bézier (`s = ∫ds`, `κ = 1/R`) en tiempo real.
-3. **Revelación Progresiva, Cuadrícula Redimensionable y Cero Duplicación:** En Paso 2 (`lines`), la barra visible inicia en `Dibujar` (`draw_only`) junto al selector explícito `Línea recta | Curva`, el botón `Milimetrado` y los controles `- / +` para agrandar o achicar la cuadrícula (`10..200 mm`) en `XY`, `XZ` y `ZY` (con zoom `0.5×..5×`), manteniendo `Mover / Editar` separado para que ninguna línea previa secuestre al trazar en una esquina; al tocar una línea cualquiera se selecciona (`selectedLine` / `selectedPlaneLineId`) y permite achicar o alargar arrastrando directamente sus puntas azules o usando `−10 largo` / `+10 largo` en `XY`, `XZ` y `ZY`.
-4. **Historial Unificado (`Undo/Redo` en XY/XZ/ZY + 4 Toques):** Toda mutación confirmada (contorno, líneas en `Frente`/`Arriba`/`Lado`, curvas, zonas y toques de esquina) guarda estado reversible con `Deshacer` (`Ctrl+Z`) y `Rehacer` (`Ctrl+Y`) incluyendo `dims`, `topQuad`, `sideQuad`, `planeLinesXZ`, `planeLinesZY`, `cubiertaMaterialOverride`, `curvedCuts` y `lShape`.
+1. **Lienzo Limpio sin Barras Innecesarias, 3 Vistas Coherentes y Estado Vacío Real:** Al iniciar `"Dibujar en lienzo libre (3 vistas)"`, se crean los 3 lienzos ortogonales (`XY`, `XZ`, `ZY`) alineados sin marco sólido impuesto, sin sombreado fuera del marco, sin `traced_zone_1`, sin `hasBackPanel: true` y con `Viewer3D` en estado de espera (`0 piezas`, sin mueble fantasma) hasta detectar un contorno cerrado (`detectDrawnClosedStructure`) o confirmar `1. Contorno`.
+2. **Separación Estricta de Partes (`3. Partes`) vs Dibujo (`1. Contorno` / `2. Líneas`):** `frontZones` y `ZoneInspector` solo se muestran cuando `traceStep === 'zones' && viewTab === 'frontal' && hasPhoto && (!isBlankSketch || blankSketchHasStructure)`. Al cambiar a `Arriba (XZ)` o `Lado (ZY)`, cualquier estado `'zones'` se normaliza automáticamente a `'lines'`, y `BARRA 1` conserva la pestaña activa al alternar `1. Contorno` / `2. Líneas`.
+3. **Coherencia Ortogonal (`XLINE`), Cuadrícula `0-based` y Curvas Diferenciales en 3 Planos:** `Arriba (XZ)` ubica Fondo (`Z = 0`) arriba y Frente (`Z = +D`) abajo compartiendo `X` con `XY`; `Lado (ZY)` ubica Fondo (`Z = 0`) a la izquierda y Frente (`Z = +D`) a la derecha compartiendo `Y` con `XY`. La cuadrícula milimetrada es `0-based` exterior `[0..xf]×[0..yf]` sin desfase de `18 mm`, las proyecciones `XLINE` reflejan divisores/repisas/profundidad entre planos, `Lupa 4×` y `Space + Arrastrar` operan en los 3 planos, `planeLinesXZ`/`planeLinesZY` y curvas `zy` recortan piezas 3D reales en `differentialCurve.ts`/`Viewer3D`, y los nodos Bézier `P0..P3` son seleccionables y editables en `2D` y `LineSelectionBar`.
+4. **Historial Unificado (`Undo/Redo` en XY/XZ/ZY + 4 Toques):** Toda mutación confirmada (contorno, líneas en `Frente`/`Arriba`/`Lado`, curvas, zonas, `blankSketchHasStructure` y toques de esquina) guarda estado reversible con `Deshacer` (`Ctrl+Z`) y `Rehacer` (`Ctrl+Y`).

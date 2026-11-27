@@ -20,6 +20,7 @@ import {
   extrapolateDimensionsFromSingleMeasure,
   interiorToExteriorPoint,
   interiorToExteriorRect,
+  inferLShapeFromPlaneLinesXZ,
   isHandDrawnSketchImage,
   makeDrawingMeasurementsReasonable,
   partitionCellsFromVectors,
@@ -2394,5 +2395,122 @@ describe('SmartFurniture Módulo Visión Offline (`src/core/vision/`) — v3.0',
     expect(reasonable.topology.lShape?.returnLengthMm).toBe(1200);
     expect(reasonable.topology.curvedCuts?.[0].radiusMm).toBe(160);
     expect(reasonable.changesSummary.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('Escenario 34 (Auditoría P1.1/P1.2: reconocimiento ZY, inferencia L desde planeLinesXZ sin corromper Z y preservación de XY manual)', () => {
+    // 1) Dibujo lateral ZY inclinado en papel cuadriculado detecta líneas en planeLinesZY / curvas ZY
+    const w = 420;
+    const h = 340;
+    const rgba = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < w * h; i++) {
+      rgba[i * 4] = 246;
+      rgba[i * 4 + 1] = 250;
+      rgba[i * 4 + 2] = 248;
+      rgba[i * 4 + 3] = 255;
+    }
+    const drawSeg = (x0: number, y0: number, x1: number, y1: number) => {
+      const steps = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0)) * 2;
+      for (let i = 0; i <= steps; i++) {
+        const t = i / Math.max(1, steps);
+        const px = Math.round(x0 + (x1 - x0) * t);
+        const py = Math.round(y0 + (y1 - y0) * t);
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            const xx = px + dx;
+            const yy = py + dy;
+            if (xx >= 0 && xx < w && yy >= 0 && yy < h) {
+              const idx = (yy * w + xx) * 4;
+              rgba[idx] = 22;
+              rgba[idx + 1] = 26;
+              rgba[idx + 2] = 34;
+            }
+          }
+        }
+      }
+    };
+    // Perfil lateral trapecio (atrás vertical Z=0, base abajo, arriba corto, frente inclinado)
+    drawSeg(90, 50, 90, 290);
+    drawSeg(90, 290, 310, 290);
+    drawSeg(90, 50, 200, 50);
+    drawSeg(310, 290, 200, 50);
+
+    const zySk = recognizeHandDrawnSketch(rgba, w, h, 'zy', 18, { x: 450, y: 900 });
+    expect(zySk.plane).toBe('zy');
+    expect(zySk.inkPixelCount).toBeGreaterThan(200);
+    expect((zySk.planeLinesZY?.length ?? 0) + zySk.curvedCuts.length).toBeGreaterThan(0);
+
+    // 2) Inferencia de planta en L desde `planeLinesXZ` sin inflar `targetDimensions.z` al largo total del ala L
+    const lPlaneLines = [
+      { id: 'xz_top', u1: 0, v1: 1, u2: 1, v2: 1 },
+      { id: 'xz_left', u1: 0, v1: 1, u2: 0, v2: 0.65 },
+      { id: 'xz_inner_h', u1: 0, v1: 0.65, u2: 0.65, v2: 0.65 },
+      { id: 'xz_inner_v', u1: 0.65, v1: 0.65, u2: 0.65, v2: 0 },
+      { id: 'xz_ret_bot', u1: 0.65, v1: 0, u2: 1, v2: 0 },
+      { id: 'xz_right', u1: 1, v1: 1, u2: 1, v2: 0 },
+    ];
+    const lInf = inferLShapeFromPlaneLinesXZ(lPlaneLines, 1.0);
+    expect(lInf?.side).toBe('right');
+    expect(lInf?.mainDepthFrac).toBeCloseTo(0.35, 1);
+
+    const manualFrontTopo: FurnitureTopology = {
+      viewsMode: 2,
+      aspectRatioXY: 1400 / 750,
+      vDividers: [{ id: 'dv_manual', position: 0.5, start: 0, end: 1 }],
+      hShelves: [{ id: 'hs_manual', position: 0.4, start: 0, end: 0.5 }],
+      planeLinesXZ: lPlaneLines,
+      shelfMode: 'custom',
+      equalShelfCount: 0,
+      hasBackPanel: false,
+      frontZones: [
+        { id: 'z_keep', uStart: 0, uEnd: 0.5, vStart: 0, vEnd: 0.4, kind: 'drawers', drawerCount: 2, label: 'Cajones manuales' },
+        { id: 'z_open', uStart: 0.5, uEnd: 1, vStart: 0, vEnd: 1, kind: 'open', label: 'Vano' },
+      ],
+      detectionSource: 'manual',
+    };
+    const baseParams: ScaleAndBoardParams = {
+      targetDimensions: { x: 1400, y: 750, z: 500 },
+      referenceDimensions: { x: 1400, y: 750, z: 500 },
+      boardThickness: 18,
+      backPanelThickness: 3,
+      sheetDimensions: { width: 2440, height: 1220 },
+      trimMm: 0,
+      kerf: 4,
+      respectGrain: true,
+      packingStrategy: 'guillotine',
+      cornerJointType: 'topOverSides',
+      edgeBandingMode: 'visibleEdgesOnly',
+      material: 'roble',
+    };
+    const syn = synthesize3DFromTriViews(manualFrontTopo, baseParams, {
+      front: {
+        plane: 'xy',
+        aspectRatio: 1400 / 750,
+        vDividers: manualFrontTopo.vDividers,
+        hShelves: manualFrontTopo.hShelves,
+        frontZones: manualFrontTopo.frontZones,
+      },
+      top: {
+        plane: 'xz',
+        aspectRatio: 1.0,
+        planeLinesXZ: lPlaneLines,
+      },
+    });
+    expect(syn.topology.lShape?.enabled).toBe(true);
+    expect(syn.topology.lShape?.side).toBe('right');
+    // Profundidad principal Z debe mantenerse cerca de 1400 * 0.35 = 490 mm (NO 1400 mm!)
+    expect(syn.params.targetDimensions.z).toBeLessThan(650);
+    expect(syn.params.targetDimensions.z).toBeGreaterThanOrEqual(420);
+    // Ediciones manuales de XY deben conservarse intactas
+    expect(syn.topology.vDividers).toHaveLength(1);
+    expect(syn.topology.frontZones?.some((z) => z.kind === 'drawers')).toBe(true);
+    expect(syn.topology.planeLinesXZ).toHaveLength(lPlaneLines.length);
+
+    // 3) makeDrawingMeasurementsReasonable conserva `planeLinesXZ` y `planeLinesZY`
+    const normRes = makeDrawingMeasurementsReasonable(
+      { ...syn.topology, planeLinesZY: [{ id: 'zy_1', u1: 0.91, v1: 0, u2: 0.51, v2: 1 }] },
+      syn.params,
+    );
+    expect(normRes.topology.planeLinesXZ?.length).toBe(lPlaneLines.length);
+    expect(normRes.topology.planeLinesZY?.length).toBe(1);
   });
 });

@@ -975,7 +975,7 @@ export function classifyZonesUnified(
     }
   }
 
-  if (!rectRgba || rectW < 20 || rectH < 20) {
+  if (!rectRgba || rectW < 20 || rectH < 20 || rectRgba.length < rectW * rectH * 4) {
     return cells.map((cell, idx) => {
       const preserved = prevMatches[idx];
       if (preserved) {

@@ -21,7 +21,7 @@ import {
   computeSupportLegCoordsMm,
   resolveBaseSupport,
 } from './baseSupport';
-import { applyCurvedCutsToPieces } from './differentialCurve';
+import { applyCurvedCutsToPieces, applyPlaneLinesToPieces } from './differentialCurve';
 import {
   extractReturnWingTopology,
   mergeLShapeHardwareSummaries,
@@ -102,6 +102,8 @@ export {
 } from './lShapeBuilder';
 export {
   MIN_SAFE_EDGE_BANDING_RADIUS_MM,
+  applyCurvedCutsToPieces,
+  applyPlaneLinesToPieces,
   buildCornerFilletCutSpec,
   buildFilletBezier,
   evaluateBezierDifferential,
@@ -1355,6 +1357,14 @@ export function calculateDespiece(
       pieces,
       alerts,
     });
+    if ((topology.planeLinesXZ?.length ?? 0) > 0 || (topology.planeLinesZY?.length ?? 0) > 0) {
+      applyPlaneLinesToPieces({
+        topology,
+        params,
+        lPlan: null,
+        pieces,
+      });
+    }
     return finalizeDespieceResult(
       mainRes.scaleFactors,
       mainRes.shelfProgression,
@@ -1477,6 +1487,14 @@ export function calculateDespiece(
     pieces: combinedPieces,
     alerts: combinedAlerts,
   });
+  if ((topology.planeLinesXZ?.length ?? 0) > 0 || (topology.planeLinesZY?.length ?? 0) > 0) {
+    applyPlaneLinesToPieces({
+      topology,
+      params,
+      lPlan: effectivePlan,
+      pieces: combinedPieces,
+    });
+  }
 
   return finalizeDespieceResult(
     mainRes.scaleFactors,

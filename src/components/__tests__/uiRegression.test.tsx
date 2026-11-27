@@ -46,10 +46,13 @@ import {
 } from '../viewer3d/viewer3dEditHelpers';
 import {
   PAPER_GRID_STEP_PRESETS,
+  computeAlignedBlankSketchQuads,
   computePaperGridSpacing,
+  detectDrawnClosedStructure,
   findMergeableNeighbors,
   fitBlankSketchDrawnOuterBox,
   getZoneInteriorDimsMm,
+  hitTestCurvesScreenPx,
   hitTestFrameScreenPx,
   hitTestLinesScreenPx,
   hitTestPlaneLinesScreenPx,
@@ -1567,7 +1570,345 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
     expect(desp.matrizDespiece.filter((p) => p.tipo === 'division_vertical')).toHaveLength(1);
     expect(desp.matrizDespiece.filter((p) => p.tipo === 'repisa')).toHaveLength(2);
   });
+
+  it('Auditoría P0/P1/P2: lienzo libre abierto no inventa sólido, detecta cerrado/escalonado/curvo, alinea 3 vistas y edita curvas XZ/ZY sin desfase de 18 mm', () => {
+    const dims = { x: 1200, y: 900, z: 450 };
+    const e = 18;
+
+    // 1. P1.1: Proyección diédrica alineada en los 3 marcos (XY, XZ, ZY)
+    const aligned = computeAlignedBlankSketchQuads(dims, 900, 680);
+    const xyW = aligned.quad[1].x - aligned.quad[0].x;
+    const xyH = aligned.quad[3].y - aligned.quad[0].y;
+    const xzW = aligned.topQuad[1].x - aligned.topQuad[0].x;
+    const xzD = aligned.topQuad[3].y - aligned.topQuad[0].y;
+    const zyD = aligned.sideQuad[1].x - aligned.sideQuad[0].x;
+    const zyH = aligned.sideQuad[3].y - aligned.sideQuad[0].y;
+    expect(xyW).toBeCloseTo(xzW, 4);
+    expect(xyH).toBeCloseTo(zyH, 4);
+    expect(xzD).toBeCloseTo(zyD, 4);
+
+    // 2. P0.3: Bocetos abiertos retornan `null` sin destruir líneas; contornos cerrados (escalonado y techo curvo) convierten limpio
+    expect(
+      detectDrawnClosedStructure(
+        [{ id: 'v_only', position: 0.2, start: 0.1, end: 0.8 }],
+        [{ id: 'h_only', position: 0.1, start: 0.2, end: 0.7 }],
+        [],
+        [],
+        aligned.quad,
+        dims,
+        e,
+      ),
+    ).toBeNull();
+
+    // Contorno cerrado escalonado en L frontal
+    const steppedRes = detectDrawnClosedStructure(
+      [
+        { id: 'v1', position: 0.2, start: 0.2, end: 0.8 },
+        { id: 'v2', position: 0.5, start: 0.5, end: 0.8 },
+        { id: 'v3', position: 0.8, start: 0.2, end: 0.5 },
+      ],
+      [
+        { id: 'h1', position: 0.2, start: 0.2, end: 0.8 },
+        { id: 'h2', position: 0.5, start: 0.5, end: 0.8 },
+        { id: 'h3', position: 0.8, start: 0.2, end: 0.5 },
+      ],
+      [],
+      [],
+      aligned.quad,
+      dims,
+      e,
+    );
+    expect(steppedRes?.kind).toBe('stepped');
+    expect(steppedRes!.voidZones.some((vz) => vz.kind === 'void_outside')).toBe(true);
+
+    // Contorno con base + 2 costados + curva superior en XY
+    const curvedTopRes = detectDrawnClosedStructure(
+      [
+        { id: 'vL', position: 0.2, start: 0.2, end: 0.65 },
+        { id: 'vR', position: 0.8, start: 0.2, end: 0.65 },
+      ],
+      [{ id: 'hBot', position: 0.2, start: 0.2, end: 0.8 }],
+      [],
+      [
+        {
+          id: 'top_arc_1',
+          plane: 'xy',
+          kind: 'free_bezier',
+          controlPoints: [
+            { x: 0.2, y: 0.65 },
+            { x: 0.4, y: 0.82 },
+            { x: 0.6, y: 0.82 },
+            { x: 0.8, y: 0.65 },
+          ],
+        },
+      ],
+      aligned.quad,
+      dims,
+      e,
+    );
+    expect(curvedTopRes?.kind).toBe('curved_top');
+
+    // 3. P2.1: Cuadrícula milimetrada 0-based exterior (línea visual a 100 mm -> uInt en 100 mm exactos, sin desfase de 18 mm)
+    const xIntMm = dims.x - 2 * e;
+    const gridSnapExt = snapNormToPaperGridMm(100 / dims.x, dims.x, 0, 0.5, 50);
+    expect(Math.round(gridSnapExt * dims.x)).toBe(100);
+    const uIntAtVisual100 = (100 - e) / xIntMm;
+    const snappedUInt = snapNormToPaperGridMm(uIntAtVisual100, xIntMm, e, 0.5, 50);
+    expect(Math.round(e + snappedUInt * xIntMm)).toBe(100);
+
+    // 4. P0.2 & P2.2: Toolbar deshabilita `3. Partes` en lienzo abierto y permite `Marco` / `Dibujar` / `Mover / Editar` en XZ/ZY
+    const est = clonePreset('estanteria');
+    const htmlBlankOpen = renderToStaticMarkup(
+      <CanvasTopBars
+        hasPhoto={true}
+        hasTopPhoto={true}
+        hasSidePhoto={true}
+        viewTab="frontal"
+        traceStep="lines"
+        frameMode="quad"
+        pickingCorners={null}
+        linesSubMode="draw_only"
+        strokeMode="ortho"
+        subTool="none"
+        magneticSnap={false}
+        paperGridSnap={true}
+        paperGridStepMm={50}
+        calibRefMm={297}
+        calibPtsCount={0}
+        internalLineCount={0}
+        zonesCount={0}
+        isBlankSketch={true}
+        blankSketchHasStructure={false}
+        subRegions={[]}
+        xIntMm={1164}
+        yIntMm={864}
+        canUndo={false}
+        canRedo={false}
+        undoCount={0}
+        redoCount={0}
+        zoom={1}
+        panToolActive={false}
+        isSpacePan={false}
+        legHintDetected={false}
+        hasExternalLegs={false}
+        isCatalogReference={false}
+        ranRealVisionOnCatalog={false}
+        onSelectStep={() => {}}
+        onUndo={() => {}}
+        onRedo={() => {}}
+        onZoomIn={() => {}}
+        onZoomOut={() => {}}
+        onZoomReset={() => {}}
+        onTogglePanTool={() => {}}
+        onUploadFrontPhoto={() => {}}
+        onUploadSidePhoto={() => {}}
+        onReturnToFrontal={() => {}}
+        onChangeCalibRefMm={() => {}}
+        onApplyCalibA4={() => {}}
+        onExitSubTool={() => {}}
+        onToggleSubTool={() => {}}
+        onToggleFrameMode={() => {}}
+        onStartPickCorners={() => {}}
+        onCancelPickCorners={() => {}}
+        onToggleMagneticSnap={() => {}}
+        onAutoContour={() => {}}
+        onClearLines={() => {}}
+        onChangeLinesSubMode={() => {}}
+        onRemoveSubRegion={() => {}}
+        onClearSubRegions={() => {}}
+        onDetectSubRegions={() => {}}
+        onChangeStrokeMode={() => {}}
+        onAutoSuggestLines={() => {}}
+        onRunRealVisionOnCatalog={() => {}}
+      />,
+    );
+    expect(htmlBlankOpen).toContain('3. Partes (0)');
+    expect(htmlBlankOpen).toContain('disabled=""');
+    expect(htmlBlankOpen).toContain('Cierra primero el contorno del mueble para definir sus partes');
+
+    const htmlSup = renderToStaticMarkup(
+      <CanvasTopBars
+        hasPhoto={true}
+        hasTopPhoto={true}
+        hasSidePhoto={true}
+        viewTab="superior"
+        traceStep="lines"
+        frameMode="quad"
+        pickingCorners={null}
+        linesSubMode="draw_only"
+        strokeMode="curve"
+        subTool="none"
+        magneticSnap={false}
+        paperGridSnap={true}
+        paperGridStepMm={50}
+        calibRefMm={297}
+        calibPtsCount={0}
+        internalLineCount={0}
+        activeViewCurvedCount={1}
+        zonesCount={0}
+        isBlankSketch={true}
+        blankSketchHasStructure={false}
+        subRegions={[]}
+        xIntMm={1164}
+        yIntMm={864}
+        canUndo={false}
+        canRedo={false}
+        undoCount={0}
+        redoCount={0}
+        zoom={1}
+        panToolActive={false}
+        isSpacePan={false}
+        legHintDetected={false}
+        hasExternalLegs={false}
+        isCatalogReference={false}
+        ranRealVisionOnCatalog={false}
+        onSelectStep={() => {}}
+        onSetPlaneTraceStep={() => {}}
+        onUndo={() => {}}
+        onRedo={() => {}}
+        onZoomIn={() => {}}
+        onZoomOut={() => {}}
+        onZoomReset={() => {}}
+        onTogglePanTool={() => {}}
+        onUploadFrontPhoto={() => {}}
+        onUploadSidePhoto={() => {}}
+        onReturnToFrontal={() => {}}
+        onChangeCalibRefMm={() => {}}
+        onApplyCalibA4={() => {}}
+        onExitSubTool={() => {}}
+        onToggleSubTool={() => {}}
+        onToggleFrameMode={() => {}}
+        onStartPickCorners={() => {}}
+        onCancelPickCorners={() => {}}
+        onToggleMagneticSnap={() => {}}
+        onAutoContour={() => {}}
+        onClearLines={() => {}}
+        onChangeLinesSubMode={() => {}}
+        onRemoveSubRegion={() => {}}
+        onClearSubRegions={() => {}}
+        onDetectSubRegions={() => {}}
+        onChangeStrokeMode={() => {}}
+        onAutoSuggestLines={() => {}}
+        onRunRealVisionOnCatalog={() => {}}
+      />,
+    );
+    expect(htmlSup).toContain('Marco');
+    expect(htmlSup).toContain('Dibujar');
+    expect(htmlSup).toContain('Mover / Editar');
+    expect(htmlSup).toContain('Curva');
+    expect(htmlSup).toContain('Limpiar');
+
+    // 5. P2.2: Hit-test de nodos Bézier P0..P3 + barra de edición para curvas y líneas XZ/ZY
+    const curveCut = {
+      id: 'crv_test_zy',
+      plane: 'zy' as const,
+      kind: 'free_bezier' as const,
+      label: 'Curva ZY',
+      controlPoints: [
+        { x: 0.9, y: 0.1 },
+        { x: 0.8, y: 0.4 },
+        { x: 0.5, y: 0.7 },
+        { x: 0.3, y: 0.95 },
+      ] as [Point2D, Point2D, Point2D, Point2D],
+      arcLengthMm: 420,
+      minRadiusMm: 185,
+    };
+    const sideHom = computeQuadToUnitHomography(aligned.sideQuad)!;
+    const p1Img = applyHomographySafe(sideHom.toCanvas, curveCut.controlPoints[1]);
+    const hitP1 = hitTestCurvesScreenPx(
+      p1Img,
+      [curveCut],
+      sideHom.toCanvas,
+      false,
+      e,
+      dims.x,
+      dims.y,
+      1,
+      1,
+      curveCut.id,
+    );
+    expect(hitP1).toMatchObject({ id: 'crv_test_zy', part: 'p1' });
+
+    const curveBarHtml = renderToStaticMarkup(
+      <LineSelectionBar
+        selectedLine={null}
+        topology={est.topology}
+        params={est.params}
+        onUpdateVDivider={() => {}}
+        onUpdateHShelf={() => {}}
+        onUpdateDiagonal={() => {}}
+        onDeleteSelected={() => {}}
+        onDeselect={() => {}}
+        selectedCurve={curveCut}
+        onUpdateCurve={() => {}}
+        onDeleteCurve={() => {}}
+        onDeselectCurve={() => {}}
+      />,
+    );
+    expect(curveBarHtml).toContain('Curva');
+    expect(curveBarHtml).toContain('Borrar curva');
+
+    const zyLineHtml = renderToStaticMarkup(
+      <LineSelectionBar
+        selectedLine={null}
+        topology={est.topology}
+        params={est.params}
+        onUpdateVDivider={() => {}}
+        onUpdateHShelf={() => {}}
+        onUpdateDiagonal={() => {}}
+        onDeleteSelected={() => {}}
+        onDeselect={() => {}}
+        selectedPlaneLine={{
+          plane: 'zy',
+          line: { id: 'pl_zy_1', u1: 0.85, v1: 0.1, u2: 0.4, v2: 0.9 },
+        }}
+        onUpdatePlaneLine={() => {}}
+        onDeletePlaneLine={() => {}}
+        onDeselectPlaneLine={() => {}}
+      />,
+    );
+    expect(zyLineHtml).toContain('Línea Lado (ZY)');
+    expect(zyLineHtml).toContain('Ángulo:');
+    expect(zyLineHtml).toContain('Z1:');
+    expect(zyLineHtml).toContain('Y1:');
+
+    // 6. Snapshot history preserva `planeLinesXZ`, `planeLinesZY` y `blankSketchHasStructure` + Viewer3DProps acepta `blankSketchEmpty`
+    const snap = buildSnapshotFromState(aligned.quad, est.topology, dims, {
+      topQuad: aligned.topQuad,
+      sideQuad: aligned.sideQuad,
+      planeLinesXZ: [{ id: 'xz_1', u1: 0, v1: 1, u2: 1, v2: 1 }],
+      planeLinesZY: [{ id: 'zy_1', u1: 0.9, v1: 0, u2: 0.4, v2: 1 }],
+      blankSketchHasStructure: false,
+    });
+    expect(snap.blankSketchHasStructure).toBe(false);
+    expect(snap.planeLinesXZ).toHaveLength(1);
+    expect(snap.planeLinesZY).toHaveLength(1);
+
+    const _v3Props: Viewer3DProps = {
+      despiece: calculateDespiece(est.topology, est.params),
+      topology: est.topology,
+      params: est.params,
+      explodeFactor: 0,
+      blankSketchEmpty: true,
+    };
+    expect(_v3Props.blankSketchEmpty).toBe(true);
+  });
 });
+
+function applyHomographySafe(
+  m: ReturnType<typeof computeQuadToUnitHomography> extends infer R
+    ? R extends { toCanvas: infer C }
+      ? C
+      : never
+    : never,
+  pt: Point2D,
+): Point2D {
+  const w = m[2][0] * pt.x + m[2][1] * pt.y + m[2][2];
+  return {
+    x: (m[0][0] * pt.x + m[0][1] * pt.y + m[0][2]) / w,
+    y: (m[1][0] * pt.x + m[1][1] * pt.y + m[1][2]) / w,
+  };
+}
 
 function despOrFail(despiece: ReturnType<typeof calculateDespiece>) {
   expect(despiece.matrizDespiece.length).toBeGreaterThan(0);

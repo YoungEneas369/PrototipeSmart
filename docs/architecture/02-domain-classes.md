@@ -181,6 +181,8 @@ classDiagram
         +NormalizedSegment[] vDividers
         +NormalizedSegment[] hShelves
         +DiagonalSegment[] diagonalDividers
+        +DiagonalSegment[] planeLinesXZ
+        +DiagonalSegment[] planeLinesZY
         +string shelfMode
         +number equalShelfCount
         +boolean hasBackPanel
@@ -299,7 +301,7 @@ classDiagram
     class BoardCurveProfile {
         <<interface>>
         +Point2D[] pointsMm
-        +string extrudePlane
+        +CurvePlane extrudePlane
         +number extrudeDepthMm
         +number arcLengthMm
         +number minRadiusMm

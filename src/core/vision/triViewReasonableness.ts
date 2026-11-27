@@ -16,19 +16,20 @@ import type {
   DiagonalSegment,
   FrontZone,
   FurnitureTopology,
+  LShapeSide,
   NormalizedSegment,
   Point2D,
   ScaleAndBoardParams,
 } from '../../types/contracts';
 import { buildDefaultLShapeConfig, evaluateBezierDifferential } from '../mathEngine';
 import { clamp } from './imageOps';
-import type { SketchRecognitionResult } from './sketchRecognizer';
+import type { SketchLShapeInference, SketchRecognitionResult } from './sketchRecognizer';
 import { partitionCellsFromVectors } from './userVectorTrace';
 
 export interface TriViewCaptureInput {
   front?: Partial<SketchRecognitionResult> | null;
-  top?: Partial<SketchRecognitionResult> | null;
-  side?: Partial<SketchRecognitionResult> | null;
+  top?: (Partial<SketchRecognitionResult> & { planeLinesXZ?: readonly DiagonalSegment[] }) | null;
+  side?: (Partial<SketchRecognitionResult> & { planeLinesZY?: readonly DiagonalSegment[] }) | null;
 }
 
 export interface ReasonableResult {
@@ -42,6 +43,195 @@ function roundStep(val: number, step: number): number {
 }
 
 /**
+ * Infiere silueta en L (Derecha / Izquierda, profundidad de ala principal y profundidad de retorno)
+ * a partir de líneas vectoriales trazadas en Planta Superior (`Arriba XZ`).
+ */
+export function inferLShapeFromPlaneLinesXZ(
+  lines: readonly DiagonalSegment[],
+  aspectRatioXZ?: number,
+): SketchLShapeInference | undefined {
+  if (lines.length < 2) return undefined;
+
+  interface NormSeg {
+    uMin: number;
+    uMax: number;
+    vMin: number;
+    vMax: number;
+    uMid: number;
+    vMid: number;
+    du: number;
+    dv: number;
+  }
+
+  const hSegs: NormSeg[] = [];
+  const vSegs: NormSeg[] = [];
+
+  for (const ln of lines) {
+    const u1 = clamp(ln.u1, 0, 1);
+    const v1 = clamp(ln.v1, 0, 1);
+    const u2 = clamp(ln.u2, 0, 1);
+    const v2 = clamp(ln.v2, 0, 1);
+    const du = Math.abs(u2 - u1);
+    const dv = Math.abs(v2 - v1);
+    const seg: NormSeg = {
+      uMin: Math.min(u1, u2),
+      uMax: Math.max(u1, u2),
+      vMin: Math.min(v1, v2),
+      vMax: Math.max(v1, v2),
+      uMid: (u1 + u2) / 2,
+      vMid: (v1 + v2) / 2,
+      du,
+      dv,
+    };
+    if (dv <= 0.06 && du >= 0.16) {
+      hSegs.push(seg);
+    } else if (du <= 0.06 && dv >= 0.16) {
+      vSegs.push(seg);
+    }
+  }
+
+  if (hSegs.length === 0 || vSegs.length === 0) return undefined;
+
+  const cornerTol = 0.12;
+  let bestCandidate:
+    | {
+        side: LShapeSide;
+        mainDepthFrac: number;
+        returnDepthFrac: number;
+        returnLengthFrac: number;
+        score: number;
+      }
+    | undefined;
+
+  for (const h of hSegs) {
+    if (h.vMid < 0.18 || h.vMid > 0.85) continue;
+
+    for (const v of vSegs) {
+      if (v.uMid < 0.12 || v.uMid > 0.88) continue;
+      if (v.vMin > 0.22 || v.vMax < 0.18 || v.vMax > 0.9) continue;
+      if (Math.abs(v.vMax - h.vMid) > cornerTol) continue;
+
+      // L Derecha: ala principal arriba [vMid..1], retorno baja por derecha [uMid..1]
+      const matchesRight =
+        h.uMin <= 0.16 &&
+        h.uMax >= v.uMid - cornerTol &&
+        v.uMid >= 0.22 &&
+        v.uMid <= 0.88;
+      if (matchesRight) {
+        const leftWallBlocksVoid = vSegs.some(
+          (ov) => ov.uMid <= 0.12 && ov.vMin < h.vMid - 0.1,
+        );
+        const botWallBlocksVoid = hSegs.some(
+          (oh) => oh.vMid <= 0.12 && oh.uMin < v.uMid - 0.12,
+        );
+        if (!leftWallBlocksVoid && !botWallBlocksVoid) {
+          const retLenFrac = v.vMin <= 0.08 ? 1 : clamp(1 - v.vMin, 0.45, 1);
+          const score =
+            h.du +
+            v.dv -
+            Math.abs(v.vMax - h.vMid) -
+            (h.uMax <= v.uMid + cornerTol ? 0 : 0.15);
+          if (!bestCandidate || score > bestCandidate.score) {
+            bestCandidate = {
+              side: 'right',
+              mainDepthFrac: clamp(1 - h.vMid, 0.2, 0.78),
+              returnDepthFrac: clamp(1 - v.uMid, 0.2, 0.72),
+              returnLengthFrac: retLenFrac,
+              score,
+            };
+          }
+        }
+      }
+
+      // L Izquierda: ala principal arriba [vMid..1], retorno baja por izquierda [0..uMid]
+      const matchesLeft =
+        h.uMax >= 0.84 &&
+        h.uMin <= v.uMid + cornerTol &&
+        v.uMid >= 0.12 &&
+        v.uMid <= 0.78;
+      if (matchesLeft) {
+        const rightWallBlocksVoid = vSegs.some(
+          (ov) => ov.uMid >= 0.88 && ov.vMin < h.vMid - 0.1,
+        );
+        const botWallBlocksVoid = hSegs.some(
+          (oh) => oh.vMid <= 0.12 && oh.uMax > v.uMid + 0.12,
+        );
+        if (!rightWallBlocksVoid && !botWallBlocksVoid) {
+          const retLenFrac = v.vMin <= 0.08 ? 1 : clamp(1 - v.vMin, 0.45, 1);
+          const score =
+            h.du +
+            v.dv -
+            Math.abs(v.vMax - h.vMid) -
+            (h.uMin >= v.uMid - cornerTol ? 0 : 0.15);
+          if (!bestCandidate || score > bestCandidate.score) {
+            bestCandidate = {
+              side: 'left',
+              mainDepthFrac: clamp(1 - h.vMid, 0.2, 0.78),
+              returnDepthFrac: clamp(v.uMid, 0.2, 0.72),
+              returnLengthFrac: retLenFrac,
+              score,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  if (!bestCandidate) return undefined;
+  void aspectRatioXZ;
+
+  return {
+    side: bestCandidate.side,
+    mainDepthFrac: Number(bestCandidate.mainDepthFrac.toFixed(3)),
+    returnLengthFrac: Number(bestCandidate.returnLengthFrac.toFixed(3)),
+    returnDepthFrac: Number(bestCandidate.returnDepthFrac.toFixed(3)),
+    curvedCorner: false,
+    filletRadiusFrac: 0,
+  };
+}
+
+function detectClosedRectFrac(
+  lines: readonly DiagonalSegment[] | undefined,
+): { du: number; dv: number } | null {
+  if (!lines || lines.length < 3) return null;
+
+  let hCount = 0;
+  let vCount = 0;
+  let uMin = 1;
+  let uMax = 0;
+  let vMin = 1;
+  let vMax = 0;
+
+  for (const ln of lines) {
+    const u1 = clamp(ln.u1, 0, 1);
+    const v1 = clamp(ln.v1, 0, 1);
+    const u2 = clamp(ln.u2, 0, 1);
+    const v2 = clamp(ln.v2, 0, 1);
+    const du = Math.abs(u2 - u1);
+    const dv = Math.abs(v2 - v1);
+    // Cualquier línea oblicua indica chaflán/corte inclinado, no rectángulo cerrado
+    if (du > 0.08 && dv > 0.08) return null;
+    if (du >= 0.15 && dv <= 0.05) hCount++;
+    else if (dv >= 0.15 && du <= 0.05) vCount++;
+    uMin = Math.min(uMin, u1, u2);
+    uMax = Math.max(uMax, u1, u2);
+    vMin = Math.min(vMin, v1, v2);
+    vMax = Math.max(vMax, v1, v2);
+  }
+
+  if (hCount === 0 || vCount === 0) return null;
+  const rectDu = uMax - uMin;
+  const rectDv = vMax - vMin;
+  if (rectDu < 0.15 || rectDv < 0.15) return null;
+
+  const isClosedBox =
+    (hCount >= 2 && vCount >= 2) ||
+    (hCount >= 1 && vCount >= 2 && rectDu >= 0.85) ||
+    (vCount >= 1 && hCount >= 2 && rectDv >= 0.85);
+  return isClosedBox ? { du: rectDu, dv: rectDv } : null;
+}
+
+/**
  * Reconcilia medidas, silueta en L y cortes desde las vistas disponibles (`Frente`, `Arriba`, `Lado`).
  */
 export function synthesize3DFromTriViews(
@@ -50,7 +240,7 @@ export function synthesize3DFromTriViews(
   views: TriViewCaptureInput,
 ): { topology: FurnitureTopology; params: ScaleAndBoardParams; notes: string[] } {
   const notes: string[] = [];
-  let nextX = baseParams.targetDimensions.x;
+  const nextX = baseParams.targetDimensions.x;
   let nextY = baseParams.targetDimensions.y;
   let nextZ = baseParams.targetDimensions.z;
   let viewsUsed = 0;
@@ -62,18 +252,46 @@ export function synthesize3DFromTriViews(
     notes.push(`Frente XY aplicado (W/H=${arXY.toFixed(2)})`);
   }
 
+  const topLinesForInfer = views.top?.planeLinesXZ ?? baseTopology.planeLinesXZ;
+  const inferredL = views.top
+    ? (views.top.lShapeInference ??
+      (topLinesForInfer && topLinesForInfer.length >= 2
+        ? inferLShapeFromPlaneLinesXZ(topLinesForInfer, views.top.aspectRatio)
+        : undefined))
+    : undefined;
+
   let zFromTop: number | null = null;
+  let totalL2FromTop = nextZ;
   if (views.top) {
     viewsUsed++;
     const arXZ = clamp(views.top.aspectRatio ?? nextX / Math.max(1, nextZ), 0.3, 5);
-    zFromTop = clamp(Math.round(nextX / arXZ), 180, 900);
+    const totalBoxHeightMm = nextX / arXZ;
+    totalL2FromTop = totalBoxHeightMm;
+
+    if (inferredL) {
+      if (inferredL.mainDepthFrac !== undefined && inferredL.mainDepthFrac > 0) {
+        zFromTop = clamp(Math.round(totalBoxHeightMm * inferredL.mainDepthFrac), 180, 900);
+      }
+    } else {
+      let rawZTop = clamp(Math.round(totalBoxHeightMm), 180, 900);
+      const closedXZ = detectClosedRectFrac(views.top.planeLinesXZ);
+      if (closedXZ && closedXZ.dv < 0.88) {
+        rawZTop = clamp(Math.round(rawZTop * closedXZ.dv), 180, 900);
+      }
+      zFromTop = rawZTop;
+    }
   }
 
   let zFromSide: number | null = null;
   if (views.side) {
     viewsUsed++;
     const arZY = clamp(views.side.aspectRatio ?? nextZ / Math.max(1, nextY), 0.15, 2.5);
-    zFromSide = clamp(Math.round(nextY * arZY), 180, 900);
+    let rawZSide = clamp(Math.round(nextY * arZY), 180, 900);
+    const closedZY = detectClosedRectFrac(views.side.planeLinesZY);
+    if (closedZY && closedZY.du < 0.88) {
+      rawZSide = clamp(Math.round(rawZSide * closedZY.du), 180, 900);
+    }
+    zFromSide = rawZSide;
   }
 
   if (zFromTop !== null && zFromSide !== null) {
@@ -94,7 +312,7 @@ export function synthesize3DFromTriViews(
 
   let nextTop: FurnitureTopology = {
     ...baseTopology,
-    viewsMode: (Math.min(3, Math.max(1, viewsUsed)) as 1 | 2 | 3),
+    viewsMode: Math.min(3, Math.max(1, viewsUsed)) as 1 | 2 | 3,
     aspectRatioXY: nextY > 0 ? nextX / nextY : baseTopology.aspectRatioXY,
     ...(zFromSide !== null && nextY > 0 ? { aspectRatioZY: nextZ / nextY } : {}),
   };
@@ -103,10 +321,22 @@ export function synthesize3DFromTriViews(
     const vDivs = views.front.vDividers ?? nextTop.vDividers;
     const hShs = views.front.hShelves ?? nextTop.hShelves;
     const diags = views.front.diagonalDividers ?? nextTop.diagonalDividers;
+    const incomingZones = views.front.frontZones;
+    const baseHasCustomZones = (baseTopology.frontZones ?? []).some(
+      (z) =>
+        z.kind !== 'open' ||
+        z.materialOverride !== undefined ||
+        (z.internalShelves ?? 0) > 0,
+    );
+    const incomingAllOpen =
+      incomingZones !== undefined && incomingZones.every((z) => z.kind === 'open');
     const zones =
-      views.front.frontZones && views.front.frontZones.length > 0
-        ? views.front.frontZones
+      incomingZones && incomingZones.length > 0
+        ? baseHasCustomZones && incomingAllOpen
+          ? preserveZoneKindsByCentroid(incomingZones, baseTopology.frontZones)
+          : incomingZones
         : nextTop.frontZones;
+
     nextTop = {
       ...nextTop,
       vDividers: vDivs.map((d) => ({ ...d })),
@@ -117,12 +347,32 @@ export function synthesize3DFromTriViews(
     };
   }
 
+  // Sincronizar planeLinesXZ y planeLinesZY preservando ediciones previas si no se sobrescriben
+  const nextPlaneLinesXZ =
+    views.top?.planeLinesXZ !== undefined
+      ? views.top.planeLinesXZ.map((l) => ({ ...l }))
+      : nextTop.planeLinesXZ?.map((l) => ({ ...l }));
+  const nextPlaneLinesZY =
+    views.side?.planeLinesZY !== undefined
+      ? views.side.planeLinesZY.map((l) => ({ ...l }))
+      : nextTop.planeLinesZY?.map((l) => ({ ...l }));
+
+  nextTop = {
+    ...nextTop,
+    ...(nextPlaneLinesXZ && nextPlaneLinesXZ.length > 0
+      ? { planeLinesXZ: nextPlaneLinesXZ }
+      : { planeLinesXZ: undefined }),
+    ...(nextPlaneLinesZY && nextPlaneLinesZY.length > 0
+      ? { planeLinesZY: nextPlaneLinesZY }
+      : { planeLinesZY: undefined }),
+  };
+
   // Combinar curvas por plano sin perder las de las demás vistas
   const nonOverwrittenCurves = (nextTop.curvedCuts ?? []).filter(
     (c) =>
-      !(views.front?.curvedCuts && c.plane === 'xy') &&
-      !(views.top?.curvedCuts && c.plane === 'xz') &&
-      !(views.side?.curvedCuts && c.plane === 'zy'),
+      !(views.front?.curvedCuts && views.front.curvedCuts.length > 0 && c.plane === 'xy') &&
+      !(views.top?.curvedCuts && views.top.curvedCuts.length > 0 && c.plane === 'xz') &&
+      !(views.side?.curvedCuts && views.side.curvedCuts.length > 0 && c.plane === 'zy'),
   );
   const addedCurves = [
     ...(views.front?.curvedCuts ?? []),
@@ -136,26 +386,49 @@ export function synthesize3DFromTriViews(
     };
   }
 
-  if (views.top?.lShapeInference) {
-    const inf = views.top.lShapeInference;
-    const defaultL = buildDefaultLShapeConfig(inf.side, nextTop, nextParams);
-    const estRetDepth = clamp(Math.round(nextX * inf.returnDepthFrac / 10) * 10, 220, 750);
+  if (inferredL) {
+    const sameSideExisting =
+      baseTopology.lShape && baseTopology.lShape.side === inferredL.side
+        ? baseTopology.lShape
+        : undefined;
+    const defaultL = buildDefaultLShapeConfig(
+      inferredL.side,
+      sameSideExisting ? nextTop : { ...nextTop, lShape: undefined },
+      nextParams,
+    );
+    const estRetDepth = clamp(roundStep(nextX * inferredL.returnDepthFrac, 10), 220, 750);
     const estRetLen = clamp(
-      Math.max(nextZ + 380, Math.round((nextX / Math.max(0.35, views.top.aspectRatio ?? 1.2)) / 10) * 10),
-      nextZ + 320,
+      roundStep(Math.max(nextZ + 220, totalL2FromTop), 10),
+      nextZ + 180,
       2400,
     );
     nextTop = {
       ...nextTop,
       lShape: {
         ...defaultL,
+        ...(sameSideExisting
+          ? {
+              vDividers: sameSideExisting.vDividers.map((d) => ({ ...d })),
+              hShelves: sameSideExisting.hShelves.map((s) => ({ ...s })),
+              diagonalDividers: sameSideExisting.diagonalDividers?.map((dg) => ({ ...dg })),
+              frontZones: sameSideExisting.frontZones?.map((z) => ({ ...z })),
+              openCorner: sameSideExisting.openCorner,
+              shelfMode: sameSideExisting.shelfMode,
+              equalShelfCount: sameSideExisting.equalShelfCount,
+              hasBackPanel: sameSideExisting.hasBackPanel,
+              cubiertaMaterialOverride: sameSideExisting.cubiertaMaterialOverride,
+              returnHeightMm: sameSideExisting.returnHeightMm,
+            }
+          : {}),
         enabled: true,
-        side: inf.side,
+        side: inferredL.side,
         returnDepthMm: estRetDepth,
         returnLengthMm: estRetLen,
       },
     };
-    notes.push(`Planta en L (${inf.side === 'right' ? 'Derecha' : 'Izquierda'}) detectada en vista Arriba`);
+    notes.push(
+      `Planta en L (${inferredL.side === 'right' ? 'Derecha' : 'Izquierda'}) detectada en vista Arriba`,
+    );
   }
 
   return { topology: nextTop, params: nextParams, notes };
@@ -452,7 +725,8 @@ export function makeDrawingMeasurementsReasonable(
         snapPt(c.controlPoints[3]),
       ];
       const scaleW = c.plane === 'xy' || c.plane === 'xz' ? nextX : nextZ;
-      const scaleH = c.plane === 'xz' ? nextZ : nextY;
+      const scaleH =
+        c.plane === 'xz' ? (nextLShape?.enabled ? nextLShape.returnLengthMm : nextZ) : nextY;
       const mmPts: [Point2D, Point2D, Point2D, Point2D] = [
         { x: pts[0].x * scaleW, y: pts[0].y * scaleH },
         { x: pts[1].x * scaleW, y: pts[1].y * scaleH },
@@ -471,6 +745,57 @@ export function makeDrawingMeasurementsReasonable(
     });
   }
 
+  // 5. Líneas vectoriales en Planta Superior XZ y Perfil Lateral ZY: redondear a múltiplos de 10 mm
+  const roundPlaneLinesTo10Mm = (
+    lines: readonly DiagonalSegment[] | undefined,
+    spanUMm: number,
+    spanVMm: number,
+  ): { lines: DiagonalSegment[] | undefined; changed: boolean } => {
+    if (!lines || lines.length === 0) {
+      return { lines: lines ? [] : undefined, changed: false };
+    }
+    let changed = false;
+    const snapCoord = (norm: number, spanMm: number): number => {
+      const mm = roundStep(clamp(norm, 0, 1) * spanMm, 10);
+      return Number(clamp(mm / Math.max(1, spanMm), 0, 1).toFixed(4));
+    };
+    const out = lines.map((ln) => {
+      let u1 = snapCoord(ln.u1, spanUMm);
+      let v1 = snapCoord(ln.v1, spanVMm);
+      let u2 = snapCoord(ln.u2, spanUMm);
+      let v2 = snapCoord(ln.v2, spanVMm);
+      if (Math.abs(v2 - v1) <= 0.025 && Math.abs(u2 - u1) > 0.05) {
+        const vAvg = snapCoord((v1 + v2) / 2, spanVMm);
+        v1 = vAvg;
+        v2 = vAvg;
+      } else if (Math.abs(u2 - u1) <= 0.025 && Math.abs(v2 - v1) > 0.05) {
+        const uAvg = snapCoord((u1 + u2) / 2, spanUMm);
+        u1 = uAvg;
+        u2 = uAvg;
+      }
+      if (
+        Math.abs(u1 - ln.u1) > 0.001 ||
+        Math.abs(v1 - ln.v1) > 0.001 ||
+        Math.abs(u2 - ln.u2) > 0.001 ||
+        Math.abs(v2 - ln.v2) > 0.001
+      ) {
+        changed = true;
+      }
+      return { ...ln, u1, v1, u2, v2 };
+    });
+    return { lines: out, changed };
+  };
+
+  const xzSpanMm = nextLShape?.enabled ? nextLShape.returnLengthMm : nextZ;
+  const roundedXZ = roundPlaneLinesTo10Mm(topology.planeLinesXZ, nextX, xzSpanMm);
+  if (roundedXZ.changed) {
+    changesSummary.push('Líneas de Planta XZ ajustadas a múltiplos de 10 mm');
+  }
+  const roundedZY = roundPlaneLinesTo10Mm(topology.planeLinesZY, nextZ, nextY);
+  if (roundedZY.changed) {
+    changesSummary.push('Líneas de Perfil ZY ajustadas a múltiplos de 10 mm');
+  }
+
   if (changesSummary.length === 0) {
     changesSummary.push('Medidas y simetría ya se encuentran cuadradas al estándar de taller.');
   }
@@ -482,6 +807,8 @@ export function makeDrawingMeasurementsReasonable(
       vDividers: mainRat.vDividers,
       hShelves: mainRat.hShelves,
       diagonalDividers: nextDiags,
+      ...(roundedXZ.lines !== undefined ? { planeLinesXZ: roundedXZ.lines } : {}),
+      ...(roundedZY.lines !== undefined ? { planeLinesZY: roundedZY.lines } : {}),
       frontZones: nextMainZones,
       lShape: nextLShape,
       curvedCuts: nextCurved,

@@ -36,6 +36,7 @@ export interface CanvasHistorySnapshot {
   shelfMode: FurnitureTopology['shelfMode'];
   equalShelfCount: number;
   dims?: { x: number; y: number; z: number };
+  blankSketchHasStructure?: boolean;
 }
 
 const MAX_HISTORY_ENTRIES = 40;
@@ -78,6 +79,7 @@ function cloneHistorySnapshot(snap: CanvasHistorySnapshot): CanvasHistorySnapsho
     shelfMode: snap.shelfMode,
     equalShelfCount: snap.equalShelfCount,
     dims: snap.dims ? { ...snap.dims } : undefined,
+    blankSketchHasStructure: snap.blankSketchHasStructure,
   };
 }
 
@@ -90,6 +92,7 @@ export function buildSnapshotFromState(
     sideQuad?: readonly [Point2D, Point2D, Point2D, Point2D];
     planeLinesXZ?: readonly DiagonalSegment[];
     planeLinesZY?: readonly DiagonalSegment[];
+    blankSketchHasStructure?: boolean;
   },
 ): CanvasHistorySnapshot {
   return cloneHistorySnapshot({
@@ -108,6 +111,7 @@ export function buildSnapshotFromState(
     shelfMode: topology.shelfMode,
     equalShelfCount: topology.equalShelfCount,
     dims,
+    blankSketchHasStructure: extraPlanes?.blankSketchHasStructure,
   });
 }
 

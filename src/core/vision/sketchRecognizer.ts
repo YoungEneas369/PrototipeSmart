@@ -32,6 +32,7 @@ export interface SketchDetectionBadge {
 
 export interface SketchLShapeInference {
   side: LShapeSide;
+  mainDepthFrac?: number;
   returnLengthFrac: number;
   returnDepthFrac: number;
   curvedCorner: boolean;
@@ -46,6 +47,8 @@ export interface SketchRecognitionResult {
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
   diagonalDividers: DiagonalSegment[];
+  planeLinesXZ?: DiagonalSegment[];
+  planeLinesZY?: DiagonalSegment[];
   curvedCuts: CurvedCutSpec[];
   frontZones: FrontZone[];
   lShapeInference?: SketchLShapeInference;
@@ -210,6 +213,10 @@ function extractInteriorFreeStrokes(
   const diagonals: DiagonalSegment[] = [];
   const curves: CurvedCutSpec[] = [];
 
+  const isXY = plane === 'xy';
+  const xSpan = isXY ? Math.max(1, dimsMm.x - 2 * boardThicknessMm) : Math.max(1, dimsMm.x);
+  const ySpan = isXY ? Math.max(1, dimsMm.y - 2 * boardThicknessMm) : Math.max(1, dimsMm.y);
+
   // Rejilla gruesa de muestreo sobre interior excluyendo bordes exteriores y líneas H/V detectadas
   const gw = clamp(Math.round(bw / 3), 24, 140);
   const gh = clamp(Math.round(bh / 3), 24, 140);
@@ -226,20 +233,20 @@ function extractInteriorFreeStrokes(
       const vNorm = 1 - (gy + 0.5) / gh;
       if (uNorm < 0.045 || uNorm > 0.955 || vNorm < 0.045 || vNorm > 0.955) continue;
 
-      const uInt = exteriorToInterior(uNorm, boardThicknessMm, dimsMm.x);
-      const vInt = exteriorToInterior(vNorm, boardThicknessMm, dimsMm.y);
+      const uPlane = isXY ? exteriorToInterior(uNorm, boardThicknessMm, dimsMm.x) : uNorm;
+      const vPlane = isXY ? exteriorToInterior(vNorm, boardThicknessMm, dimsMm.y) : vNorm;
 
       const onKnownV = vDividers.some(
         (d) =>
-          Math.abs(d.position - uInt) <= 0.04 &&
-          vInt >= Math.min(d.start, d.end) - 0.04 &&
-          vInt <= Math.max(d.start, d.end) + 0.04,
+          Math.abs(d.position - uPlane) <= 0.04 &&
+          vPlane >= Math.min(d.start, d.end) - 0.04 &&
+          vPlane <= Math.max(d.start, d.end) + 0.04,
       );
       const onKnownH = hShelves.some(
         (s) =>
-          Math.abs(s.position - vInt) <= 0.04 &&
-          uInt >= Math.min(s.start, s.end) - 0.04 &&
-          uInt <= Math.max(s.start, s.end) + 0.04,
+          Math.abs(s.position - vPlane) <= 0.04 &&
+          uPlane >= Math.min(s.start, s.end) - 0.04 &&
+          uPlane <= Math.max(s.start, s.end) + 0.04,
       );
       if (onKnownV || onKnownH) continue;
 
@@ -324,21 +331,24 @@ function extractInteriorFreeStrokes(
           const gy = sortByX ? avg : k;
           const uExt = (gx + 0.5) / gw;
           const vExt = 1 - (gy + 0.5) / gh;
-          const uInt = exteriorToInterior(uExt, boardThicknessMm, dimsMm.x);
-          const vInt = exteriorToInterior(vExt, boardThicknessMm, dimsMm.y);
-          return { x: uInt * dimsMm.x, y: vInt * dimsMm.y };
+          const uPlane = isXY ? exteriorToInterior(uExt, boardThicknessMm, dimsMm.x) : uExt;
+          const vPlane = isXY ? exteriorToInterior(vExt, boardThicknessMm, dimsMm.y) : vExt;
+          return { x: uPlane * xSpan, y: vPlane * ySpan };
         });
 
       const fit = fitDifferentialCurveFromStroke(orderedMm);
       if (!fit) continue;
 
+      const snapNonXyEdge = (v: number): number =>
+        !isXY ? (v <= 0.065 ? 0 : v >= 0.935 ? 1 : v) : v;
+
       if (fit.isCurved) {
         const toNorm = (pt: Point2D): Point2D => ({
-          x: Number(clamp(pt.x / Math.max(1, dimsMm.x), 0, 1).toFixed(4)),
-          y: Number(clamp(pt.y / Math.max(1, dimsMm.y), 0, 1).toFixed(4)),
+          x: Number(snapNonXyEdge(clamp(pt.x / xSpan, 0, 1)).toFixed(4)),
+          y: Number(snapNonXyEdge(clamp(pt.y / ySpan, 0, 1)).toFixed(4)),
         });
         curves.push({
-          id: `sk_curve_${idxCounter++}`,
+          id: `sk_curve_${plane}_${idxCounter++}`,
           plane,
           kind: 'free_bezier',
           controlPoints: [
@@ -347,7 +357,7 @@ function extractInteriorFreeStrokes(
             toNorm(fit.controlPoints[2]),
             toNorm(fit.controlPoints[3]),
           ],
-          label: `Curva reconocida #${curves.length + 1}`,
+          label: `Curva reconocida (${plane.toUpperCase()}) #${curves.length + 1}`,
           arcLengthMm: fit.arcLengthMm,
           minRadiusMm: fit.minRadiusMm,
           maxCurvature: fit.maxCurvature,
@@ -355,14 +365,16 @@ function extractInteriorFreeStrokes(
       } else {
         const p0 = fit.controlPoints[0];
         const p3 = fit.controlPoints[3];
-        const u1 = clamp(p0.x / Math.max(1, dimsMm.x), 0, 1);
-        const v1 = clamp(p0.y / Math.max(1, dimsMm.y), 0, 1);
-        const u2 = clamp(p3.x / Math.max(1, dimsMm.x), 0, 1);
-        const v2 = clamp(p3.y / Math.max(1, dimsMm.y), 0, 1);
+        const u1 = snapNonXyEdge(clamp(p0.x / xSpan, 0, 1));
+        const v1 = snapNonXyEdge(clamp(p0.y / ySpan, 0, 1));
+        const u2 = snapNonXyEdge(clamp(p3.x / xSpan, 0, 1));
+        const v2 = snapNonXyEdge(clamp(p3.y / ySpan, 0, 1));
         const angleDeg = (Math.atan2(Math.abs(p3.y - p0.y), Math.abs(p3.x - p0.x)) * 180) / Math.PI;
-        if (angleDeg >= 16 && angleDeg <= 74) {
+        const minDeg = isXY ? 16 : 12;
+        const maxDeg = isXY ? 74 : 78;
+        if (angleDeg >= minDeg && angleDeg <= maxDeg) {
           diagonals.push({
-            id: `sk_diag_${idxCounter++}`,
+            id: `sk_diag_${plane}_${idxCounter++}`,
             u1: Number(u1.toFixed(4)),
             v1: Number(v1.toFixed(4)),
             u2: Number(u2.toFixed(4)),
@@ -546,12 +558,12 @@ export function recognizeHandDrawnSketch(
 
       lShapeInference = {
         side,
+        mainDepthFrac: Number(z1Frac.toFixed(3)),
         returnLengthFrac: 1,
         returnDepthFrac: Number(returnDepthFrac.toFixed(3)),
         curvedCorner,
         filletRadiusFrac: curvedCorner ? 0.18 : 0,
       };
-      void z1Frac;
 
       if (curvedCorner) {
         const radiusMm = Math.round(Math.min(dimsMm.x, dimsMm.y) * 0.14);
@@ -573,11 +585,16 @@ export function recognizeHandDrawnSketch(
     }
   }
 
-  // En vista Frontal (`xy`) o Libre: detectar líneas internas H, V, Diagonales y Curvas
+  // En vista Frontal (`xy`) o Perfil Lateral (`zy` en boceto): detectar líneas internas H, V, Diagonales y Curvas
+  const isSketchLike = badge.isSketch || (badge.paperRatio >= 0.68 && inkCount >= 40);
+  const scanHV = plane === 'xy' || (plane === 'zy' && isSketchLike);
   const rawV: Array<{ pos: number; start: number; end: number; score: number }> = [];
   const rawH: Array<{ pos: number; start: number; end: number; score: number }> = [];
 
-  if (plane === 'xy') {
+  if (scanHV) {
+    const isXY = plane === 'xy';
+    const toPlane = (extVal: number, dimMm: number): number =>
+      isXY ? exteriorToInterior(extVal, boardThicknessMm, dimMm) : extVal;
     const innerX0 = xMin + Math.round(bw * 0.045);
     const innerX1 = xMax - Math.round(bw * 0.045);
     const innerY0 = yMin + Math.round(bh * 0.045);
@@ -600,9 +617,9 @@ export function recognizeHandDrawnSketch(
             const vStartExt = 1 - (y - 1 - yMin) / bh;
             const vEndExt = 1 - (curStart - yMin) / bh;
             rawV.push({
-              pos: clamp(exteriorToInterior(uExt, boardThicknessMm, dimsMm.x), 0.04, 0.96),
-              start: clamp(exteriorToInterior(vStartExt, boardThicknessMm, dimsMm.y), 0, 1),
-              end: clamp(exteriorToInterior(vEndExt, boardThicknessMm, dimsMm.y), 0, 1),
+              pos: clamp(toPlane(uExt, dimsMm.x), 0.04, 0.96),
+              start: clamp(toPlane(vStartExt, dimsMm.y), 0, 1),
+              end: clamp(toPlane(vEndExt, dimsMm.y), 0, 1),
               score: curHits,
             });
           }
@@ -617,9 +634,9 @@ export function recognizeHandDrawnSketch(
           const vStartExt = 1 - (innerY1 - yMin) / bh;
           const vEndExt = 1 - (curStart - yMin) / bh;
           rawV.push({
-            pos: clamp(exteriorToInterior(uExt, boardThicknessMm, dimsMm.x), 0.04, 0.96),
-            start: clamp(exteriorToInterior(vStartExt, boardThicknessMm, dimsMm.y), 0, 1),
-            end: clamp(exteriorToInterior(vEndExt, boardThicknessMm, dimsMm.y), 0, 1),
+            pos: clamp(toPlane(uExt, dimsMm.x), 0.04, 0.96),
+            start: clamp(toPlane(vStartExt, dimsMm.y), 0, 1),
+            end: clamp(toPlane(vEndExt, dimsMm.y), 0, 1),
             score: curHits,
           });
         }
@@ -643,9 +660,9 @@ export function recognizeHandDrawnSketch(
             const uStartExt = (curStart - xMin) / bw;
             const uEndExt = (x - 1 - xMin) / bw;
             rawH.push({
-              pos: clamp(exteriorToInterior(vExt, boardThicknessMm, dimsMm.y), 0.04, 0.96),
-              start: clamp(exteriorToInterior(uStartExt, boardThicknessMm, dimsMm.x), 0, 1),
-              end: clamp(exteriorToInterior(uEndExt, boardThicknessMm, dimsMm.x), 0, 1),
+              pos: clamp(toPlane(vExt, dimsMm.y), 0.04, 0.96),
+              start: clamp(toPlane(uStartExt, dimsMm.x), 0, 1),
+              end: clamp(toPlane(uEndExt, dimsMm.x), 0, 1),
               score: curHits,
             });
           }
@@ -660,9 +677,9 @@ export function recognizeHandDrawnSketch(
           const uStartExt = (curStart - xMin) / bw;
           const uEndExt = (innerX1 - xMin) / bw;
           rawH.push({
-            pos: clamp(exteriorToInterior(vExt, boardThicknessMm, dimsMm.y), 0.04, 0.96),
-            start: clamp(exteriorToInterior(uStartExt, boardThicknessMm, dimsMm.x), 0, 1),
-            end: clamp(exteriorToInterior(uEndExt, boardThicknessMm, dimsMm.x), 0, 1),
+            pos: clamp(toPlane(vExt, dimsMm.y), 0.04, 0.96),
+            start: clamp(toPlane(uStartExt, dimsMm.x), 0, 1),
+            end: clamp(toPlane(uEndExt, dimsMm.x), 0, 1),
             score: curHits,
           });
         }
@@ -678,26 +695,62 @@ export function recognizeHandDrawnSketch(
     return Number(snapped.toFixed(4));
   };
 
-  const vDividers: NormalizedSegment[] = clusterSortedPositions(rawV, 0.035).map((item, idx) => ({
-    id: `sk_div_${idx + 1}`,
-    position: badge.isSketch
-      ? snapNormToMillimeterPaper(item.pos, dimsMm.x)
-      : Number(item.pos.toFixed(4)),
-    start: item.start <= 0.06 ? 0 : Number(item.start.toFixed(4)),
-    end: item.end >= 0.94 ? 1 : Number(item.end.toFixed(4)),
-  }));
+  const snapExtToMillimeter = (normPos: number, spanMm: number): number => {
+    const gridMm = Math.round(normPos * spanMm / 10) * 10;
+    return Number(clamp(gridMm / Math.max(1, spanMm), 0.03, 0.97).toFixed(4));
+  };
 
-  const hShelves: NormalizedSegment[] = clusterSortedPositions(rawH, 0.035).map((item, idx) => ({
-    id: `sk_rep_${idx + 1}`,
-    position: badge.isSketch
-      ? snapNormToMillimeterPaper(item.pos, dimsMm.y)
-      : Number(item.pos.toFixed(4)),
-    start: item.start <= 0.06 ? 0 : Number(item.start.toFixed(4)),
-    end: item.end >= 0.94 ? 1 : Number(item.end.toFixed(4)),
-  }));
+  const clusteredV = clusterSortedPositions(rawV, 0.035);
+  const clusteredH = clusterSortedPositions(rawH, 0.035);
+
+  const vDividers: NormalizedSegment[] =
+    plane === 'xy'
+      ? clusteredV.map((item, idx) => ({
+          id: `sk_div_${idx + 1}`,
+          position: badge.isSketch
+            ? snapNormToMillimeterPaper(item.pos, dimsMm.x)
+            : Number(item.pos.toFixed(4)),
+          start: item.start <= 0.06 ? 0 : Number(item.start.toFixed(4)),
+          end: item.end >= 0.94 ? 1 : Number(item.end.toFixed(4)),
+        }))
+      : [];
+
+  const hShelves: NormalizedSegment[] =
+    plane === 'xy'
+      ? clusteredH.map((item, idx) => ({
+          id: `sk_rep_${idx + 1}`,
+          position: badge.isSketch
+            ? snapNormToMillimeterPaper(item.pos, dimsMm.y)
+            : Number(item.pos.toFixed(4)),
+          start: item.start <= 0.06 ? 0 : Number(item.start.toFixed(4)),
+          end: item.end >= 0.94 ? 1 : Number(item.end.toFixed(4)),
+        }))
+      : [];
+
+  const zyKnownV: NormalizedSegment[] =
+    plane === 'zy'
+      ? clusteredV.map((item, idx) => ({
+          id: `sk_zy_v_${idx + 1}`,
+          position: snapExtToMillimeter(item.pos, dimsMm.x),
+          start: item.start <= 0.065 ? 0 : Number(item.start.toFixed(4)),
+          end: item.end >= 0.935 ? 1 : Number(item.end.toFixed(4)),
+        }))
+      : [];
+
+  const zyKnownH: NormalizedSegment[] =
+    plane === 'zy'
+      ? clusteredH.map((item, idx) => ({
+          id: `sk_zy_h_${idx + 1}`,
+          position: snapExtToMillimeter(item.pos, dimsMm.y),
+          start: item.start <= 0.065 ? 0 : Number(item.start.toFixed(4)),
+          end: item.end >= 0.935 ? 1 : Number(item.end.toFixed(4)),
+        }))
+      : [];
 
   const freeRes =
-    plane === 'xy' || (plane === 'xz' && !lShapeInference)
+    plane === 'xy' ||
+    (plane === 'xz' && !lShapeInference) ||
+    (plane === 'zy' && isSketchLike)
       ? extractInteriorFreeStrokes(
           mask,
           w,
@@ -709,11 +762,38 @@ export function recognizeHandDrawnSketch(
           dimsMm,
           boardThicknessMm,
           plane,
-          vDividers,
-          hShelves,
+          plane === 'zy' ? zyKnownV : vDividers,
+          plane === 'zy' ? zyKnownH : hShelves,
         )
       : { diagonals: [], curves: [] };
 
+  const planeLinesXZ: DiagonalSegment[] | undefined =
+    plane === 'xz' && freeRes.diagonals.length > 0 ? freeRes.diagonals : undefined;
+
+  const zyCombinedLines: DiagonalSegment[] =
+    plane === 'zy'
+      ? [
+          ...zyKnownV.map((seg) => ({
+            id: seg.id,
+            u1: seg.position,
+            v1: seg.start,
+            u2: seg.position,
+            v2: seg.end,
+          })),
+          ...zyKnownH.map((seg) => ({
+            id: seg.id,
+            u1: seg.start,
+            v1: seg.position,
+            u2: seg.end,
+            v2: seg.position,
+          })),
+          ...freeRes.diagonals,
+        ]
+      : [];
+  const planeLinesZY: DiagonalSegment[] | undefined =
+    plane === 'zy' && zyCombinedLines.length > 0 ? zyCombinedLines : undefined;
+
+  const diagonalDividers = plane === 'xy' ? freeRes.diagonals : [];
   const allCurves = [...curvedCuts, ...freeRes.curves];
   const cells = partitionCellsFromVectors(vDividers, hShelves);
   const frontZones: FrontZone[] = cells.map((c, idx) => ({
@@ -729,7 +809,9 @@ export function recognizeHandDrawnSketch(
   const featureCount =
     vDividers.length +
     hShelves.length +
-    freeRes.diagonals.length +
+    diagonalDividers.length +
+    (planeLinesXZ?.length ?? 0) +
+    (planeLinesZY?.length ?? 0) +
     allCurves.length +
     (lShapeInference ? 2 : 0);
   const confidence = badge.isSketch
@@ -743,7 +825,9 @@ export function recognizeHandDrawnSketch(
     quadCorners,
     vDividers,
     hShelves,
-    diagonalDividers: freeRes.diagonals,
+    diagonalDividers,
+    ...(planeLinesXZ ? { planeLinesXZ } : {}),
+    ...(planeLinesZY ? { planeLinesZY } : {}),
     curvedCuts: allCurves,
     frontZones,
     lShapeInference,

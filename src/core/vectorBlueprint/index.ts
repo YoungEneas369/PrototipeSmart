@@ -413,6 +413,7 @@ function drawSideProfileView(cfg: {
   isWheels: boolean;
   dimTopY: number;
   headingText?: string;
+  wingPieces?: readonly BoardPiece[];
 }): void {
   const {
     lines,
@@ -429,6 +430,7 @@ function drawSideProfileView(cfg: {
     isWheels,
     dimTopY,
     headingText = 'PERFIL LATERAL (ZY)',
+    wingPieces,
   } = cfg;
   const sw = zf * sc;
   const fh = yf * sc;
@@ -437,13 +439,36 @@ function drawSideProfileView(cfg: {
   const yInt = Math.max(1, yf - 2 * e);
   const mapV = (v: number): number => sideY + fh - (e + v * yInt) * sc;
   const stepVoidZones = zones.filter((z) => z.kind === 'void_outside');
+  const curvedSide = wingPieces?.find(
+    (p) =>
+      p.tipo === 'lateral' &&
+      (!p.wing || p.wing === 'main') &&
+      p.curveProfile?.extrudePlane === 'zy',
+  );
 
   lines.push(
     `<text x="${(sideX + sw / 2).toFixed(1)}" y="${(sideY - 26).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">${escapeXml(headingText)}</text>`,
   );
-  lines.push(
-    `<rect x="${sideX.toFixed(2)}" y="${sideY.toFixed(2)}" width="${sw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#0f172a" stroke-width="1.8" />`,
-  );
+  if (curvedSide?.curveProfile && curvedSide.curveProfile.pointsMm.length >= 3) {
+    lines.push(
+      `<rect x="${sideX.toFixed(2)}" y="${sideY.toFixed(2)}" width="${sw.toFixed(2)}" height="${fh.toFixed(2)}" fill="none" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="3,2" />`,
+    );
+    const ptsWorld: Point2D[] = curvedSide.curveProfile.pointsMm.map((pt) => ({
+      x: sideX + (curvedSide.posicion3D[2] + pt.x) * sc,
+      y: sideY + fh - (curvedSide.posicion3D[1] + pt.y) * sc,
+    }));
+    const dPoly =
+      ptsWorld
+        .map((pt, i) => `${i === 0 ? 'M' : 'L'} ${pt.x.toFixed(2)} ${pt.y.toFixed(2)}`)
+        .join(' ') + ' Z';
+    lines.push(
+      `<path class="side-curve-piece" d="${dPoly}" fill="rgba(217, 70, 239, 0.14)" stroke="#0f172a" stroke-width="1.8" />`,
+    );
+  } else {
+    lines.push(
+      `<rect x="${sideX.toFixed(2)}" y="${sideY.toFixed(2)}" width="${sw.toFixed(2)}" height="${fh.toFixed(2)}" fill="#f8fafc" stroke="#0f172a" stroke-width="1.8" />`,
+    );
+  }
   if (hasBackPanel) {
     lines.push(
       `<rect x="${(sideX - 3).toFixed(2)}" y="${sideY.toFixed(2)}" width="3" height="${fh.toFixed(2)}" fill="#b45309" />`,
@@ -547,24 +572,33 @@ export function renderFurnitureVectorBlueprintSvg(
   const lPlan = resolveLShapePlan(topology, params);
   const isL = Boolean(lPlan?.enabled);
 
+  const mainPieces = despiece.matrizDespiece.filter((p) => p.wing !== 'return');
+  const returnPieces = despiece.matrizDespiece.filter((p) => p.wing === 'return');
+  const curvedTopStraight =
+    !isL
+      ? mainPieces.find(
+          (p) =>
+            p.tipo === 'cubierta' &&
+            (!p.wing || p.wing === 'main') &&
+            p.curveProfile?.extrudePlane === 'xz',
+        )
+      : undefined;
+
   const svgW = 920;
-  const svgH = isL ? 720 : 540;
+  const svgH = isL ? 720 : curvedTopStraight ? 660 : 540;
   const lines: string[] = [];
   const title = opts.title ?? topology.furnitureProfileLabel ?? 'Modelo Vectorial SmartFurniture';
   const stage = opts.stageLabel ?? 'MODELO VECTORIAL 2D ACOTADO';
 
-  const mainPieces = despiece.matrizDespiece.filter((p) => p.wing !== 'return');
-  const returnPieces = despiece.matrizDespiece.filter((p) => p.wing === 'return');
-
   let scHeader = 0.25;
-  let cartelaY = 446;
+  let cartelaY = curvedTopStraight ? 566 : 446;
 
   if (!isL || !lPlan) {
     const drawLeft = 92;
     const drawTop = 78;
     const maxFrontW = 510;
     const maxSideW = 190;
-    const maxBodyH = 320;
+    const maxBodyH = curvedTopStraight ? 300 : 320;
 
     const scaleX = maxFrontW / Math.max(300, xf);
     const scaleSide = maxSideW / Math.max(200, zf);
@@ -590,7 +624,7 @@ export function renderFurnitureVectorBlueprintSvg(
     lines.push(
       `<text x="${svgW - 18}" y="27" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#38bdf8">ESCALA 1:${Math.max(1, Math.round(1 / scHeader))}</text>`,
     );
-    lines.push(`<rect x="18" y="54" width="${svgW - 36}" height="384" fill="url(#bpGrid)" stroke="#e2e8f0" />`);
+    lines.push(`<rect x="18" y="54" width="${svgW - 36}" height="${curvedTopStraight ? 502 : 384}" fill="url(#bpGrid)" stroke="#e2e8f0" />`);
 
     drawElevationView({
       lines,
@@ -628,7 +662,44 @@ export function renderFurnitureVectorBlueprintSvg(
       toeH,
       isWheels,
       dimTopY: frontY - 12,
+      wingPieces: mainPieces,
     });
+
+    if (curvedTopStraight?.curveProfile && curvedTopStraight.curveProfile.pointsMm.length >= 3) {
+      const planMaxW = 510;
+      const planMaxH = 104;
+      const scPlan = Math.min(planMaxW / Math.max(300, xf), planMaxH / Math.max(180, zf));
+      const planW = xf * scPlan;
+      const planD = zf * scPlan;
+      const pxOrigin = drawLeft + (planMaxW - planW) / 2;
+      const pyOrigin = 428 + (planMaxH - planD) / 2;
+
+      lines.push(
+        `<text x="${(pxOrigin + planW / 2).toFixed(1)}" y="${(pyOrigin - 10).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#0f2b4c">PLANTA SUPERIOR (PLANO XZ — CUBIERTA CURVA/CHAFLÁN)</text>`,
+      );
+      if (topology.hasBackPanel) {
+        lines.push(
+          `<rect x="${pxOrigin.toFixed(2)}" y="${(pyOrigin - 3).toFixed(2)}" width="${planW.toFixed(2)}" height="3" fill="#b45309" />`,
+        );
+      }
+      lines.push(
+        `<rect x="${pxOrigin.toFixed(2)}" y="${pyOrigin.toFixed(2)}" width="${planW.toFixed(2)}" height="${planD.toFixed(2)}" fill="none" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="3,2" />`,
+      );
+      const ptsWorld: Point2D[] = curvedTopStraight.curveProfile.pointsMm.map((pt) => ({
+        x: pxOrigin + (curvedTopStraight.posicion3D[0] + pt.x) * scPlan,
+        y: pyOrigin + (curvedTopStraight.posicion3D[2] + pt.y) * scPlan,
+      }));
+      const dPoly =
+        ptsWorld
+          .map((pt, i) => `${i === 0 ? 'M' : 'L'} ${pt.x.toFixed(2)} ${pt.y.toFixed(2)}`)
+          .join(' ') + ' Z';
+      lines.push(
+        `<path class="plan-curve-piece" d="${dPoly}" fill="rgba(217, 70, 239, 0.14)" stroke="#a21caf" stroke-width="1.6" />`,
+      );
+      lines.push(
+        `<text x="${(pxOrigin + planW / 2).toFixed(1)}" y="${(pyOrigin + planD + 13).toFixed(1)}" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9.5" font-weight="700" fill="#7c3aed">X = ${Math.round(xf)} mm · Z = ${Math.round(zf)} mm</text>`,
+      );
+    }
   } else {
     // MODO MUEBLE EN L (90° EN XZ): Planta Superior + Alzado Ala Principal + Alzado Ala Retorno + Perfil ZY
     let zStartB = lPlan.zStartB;
@@ -842,6 +913,7 @@ export function renderFurnitureVectorBlueprintSvg(
       isWheels,
       dimTopY: mainFrontY - 12,
       headingText: 'PERFIL LATERAL (ZY · ALA A)',
+      wingPieces: mainPieces,
     });
 
     cartelaY = 626;

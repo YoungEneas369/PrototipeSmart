@@ -57,9 +57,14 @@
   transition: background 0.14s ease, color 0.14s ease;
 }
 
-.vc-step-btn:hover {
+.vc-step-btn:hover:not(:disabled) {
   background: var(--sf-border-soft, #e2e8f0);
   color: var(--sf-text, #0f172a);
+}
+
+.vc-step-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .vc-step-btn.active {
@@ -801,6 +806,10 @@
 
 .vc-line-tag-d {
   background: #a21caf;
+}
+
+.vc-line-tag-c {
+  background: #0284c7;
 }
 
 .vc-line-meta {

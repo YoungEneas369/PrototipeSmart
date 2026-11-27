@@ -65,6 +65,7 @@ export interface Viewer3DProps {
   onUpdateMaterialOnly?: (material: MelamineMaterial) => void;
   onChangeBaseSupport?: (type: BaseSupportType) => void;
   onToggleLInnerCurve?: (enabled: boolean) => void;
+  blankSketchEmpty?: boolean;
 }
 
 type CameraPreset = 'iso' | 'front' | 'side';
@@ -172,6 +173,7 @@ function CurvedBoardMesh({
   const geom = useMemo(() => {
     const shape = new THREE.Shape();
     const isXZ = curveProfile.extrudePlane === 'xz';
+    const isZY = curveProfile.extrudePlane === 'zy';
     curveProfile.pointsMm.forEach((pt, idx) => {
       const sx = pt.x / 1000;
       const sy = isXZ ? -pt.y / 1000 : pt.y / 1000;
@@ -189,6 +191,8 @@ function CurvedBoardMesh({
     extruded.translate(0, 0, -depthM / 2);
     if (isXZ) {
       extruded.rotateX(-Math.PI / 2);
+    } else if (isZY) {
+      extruded.rotateY(-Math.PI / 2);
     }
     extruded.computeVertexNormals();
     return extruded;
@@ -1260,6 +1264,7 @@ export function Viewer3D({
   onUpdateMaterialOnly,
   onChangeBaseSupport,
   onToggleLInnerCurve,
+  blankSketchEmpty = false,
 }: Viewer3DProps) {
   const [camPreset, setCamPreset] = useState<CameraPreset>('iso');
   const [camTrigger, setCamTrigger] = useState<number>(0);
@@ -1471,17 +1476,25 @@ export function Viewer3D({
         <div className="viewer3d-badges">
           <span
             className="viewer3d-pill"
-            title="Haz clic sobre cualquier placa para inspeccionar medidas de corte"
+            title={
+              blankSketchEmpty
+                ? 'Dibuja un contorno cerrado en el lienzo 2D para generar piezas 3D'
+                : 'Haz clic sobre cualquier placa para inspeccionar medidas de corte'
+            }
           >
-            {despiece.matrizDespiece.length} piezas
+            {blankSketchEmpty ? '0 piezas' : `${despiece.matrizDespiece.length} piezas`}
           </span>
-          {(supportSummary.type === 'legs' || supportSummary.type === 'wheels') && (
-            <span className="badge-legs">
-              {supportSummary.type === 'wheels' ? 'Ruedas' : 'Patas'} ({supportSummary.count} ×{' '}
-              {format3DDim(supportSummary.heightMm, displayUnit)})
-            </span>
+          {blankSketchEmpty && (
+            <span className="badge-support">Boceto abierto · esperando contorno</span>
           )}
-          {supportSummary.type === 'toe_kick' && hasToeKickPieces && (
+          {!blankSketchEmpty &&
+            (supportSummary.type === 'legs' || supportSummary.type === 'wheels') && (
+              <span className="badge-legs">
+                {supportSummary.type === 'wheels' ? 'Ruedas' : 'Patas'} ({supportSummary.count} ×{' '}
+                {format3DDim(supportSummary.heightMm, displayUnit)})
+              </span>
+            )}
+          {!blankSketchEmpty && supportSummary.type === 'toe_kick' && hasToeKickPieces && (
             <span className="badge-support">
               Zócalo ({format3DDim(supportSummary.heightMm, displayUnit)})
             </span>
@@ -1568,7 +1581,14 @@ export function Viewer3D({
         </div>
       </div>
 
-      {(selectedPiece || activeZoneEntry || pandeoAlerts.length > 0) && (
+      {blankSketchEmpty && (
+        <div className="viewer3d-blank-empty-banner" role="status" aria-live="polite">
+          <strong>Lienzo libre limpio</strong>
+          <span>Dibuja líneas cerradas o contorno para generar el modelo 3D</span>
+        </div>
+      )}
+
+      {!blankSketchEmpty && (selectedPiece || activeZoneEntry || pandeoAlerts.length > 0) && (
         <div className="viewer3d-bottom-stack">
           {(selectedPiece || activeZoneEntry) && (
             <div className="viewer3d-piece-hud">
@@ -1974,23 +1994,25 @@ export function Viewer3D({
         <directionalLight position={[4, 7, 5]} intensity={1.1} castShadow />
         <directionalLight position={[-4, 3, -3]} intensity={0.4} />
         <gridHelper args={[6, 24, '#94a3b8', '#cbd5e1']} position={[0, -0.001, 0]} />
-        <FurnitureMeshGroup
-          despiece={despiece}
-          topology={topology}
-          params={params}
-          support={supportSummary}
-          hasToeKickPieces={hasToeKickPieces}
-          displayUnit={displayUnit}
-          explodeFactor={explodeFactor}
-          showDimensions={showDimensions}
-          selectedPieceId={selectedPieceId}
-          selectedZoneId={selectedZoneId}
-          hoveredZoneId={hoveredZoneId}
-          onSelectPiece={setSelectedPieceId}
-          onSelectZone={onSelectZone}
-          onHoverZone={onHoverZone}
-          onNudgePiece3D={onUpdateTopology ? handleNudgePiece : undefined}
-        />
+        {!blankSketchEmpty && (
+          <FurnitureMeshGroup
+            despiece={despiece}
+            topology={topology}
+            params={params}
+            support={supportSummary}
+            hasToeKickPieces={hasToeKickPieces}
+            displayUnit={displayUnit}
+            explodeFactor={explodeFactor}
+            showDimensions={showDimensions}
+            selectedPieceId={selectedPieceId}
+            selectedZoneId={selectedZoneId}
+            hoveredZoneId={hoveredZoneId}
+            onSelectPiece={setSelectedPieceId}
+            onSelectZone={onSelectZone}
+            onHoverZone={onHoverZone}
+            onNudgePiece3D={onUpdateTopology ? handleNudgePiece : undefined}
+          />
+        )}
         <CameraRig
           preset={camPreset}
           presetTrigger={camTrigger}

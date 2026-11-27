@@ -72,6 +72,7 @@ export type {
 } from './sketchRecognizer';
 
 export {
+  inferLShapeFromPlaneLinesXZ,
   makeDrawingMeasurementsReasonable,
   synthesize3DFromTriViews,
 } from './triViewReasonableness';

@@ -19,6 +19,7 @@ import type {
 import {
   applyHomography,
   computeQuadToUnitHomography,
+  evaluateBezierDifferential,
   exteriorToInterior,
   fitDifferentialCurveFromStroke,
   interiorToExterior,
@@ -45,6 +46,7 @@ import {
   computeSmoothOrthoGuide,
   distScreenPx,
   dragQuadEdge,
+  hitTestCurvesScreenPx,
   hitTestFrameScreenPx,
   hitTestLinesScreenPx,
   hitTestPlaneLinesScreenPx,
@@ -123,6 +125,7 @@ type ActiveDrag =
       startClient: Point2D;
       clickFallbackLine: LineRef | null;
       clickFallbackPlaneLineId?: string | null;
+      clickFallbackCurveId?: string | null;
       pointerId: number;
     }
   | {
@@ -147,6 +150,15 @@ type ActiveDrag =
       startU: number;
       startV: number;
       baseLines: DiagonalSegment[];
+      pointerId: number;
+    }
+  | {
+      kind: 'editCurve';
+      plane: CurvePlane;
+      curveId: string;
+      part: 'p0' | 'p1' | 'p2' | 'p3' | 'body';
+      startNorm: Point2D;
+      baseCurves: CurvedCutSpec[];
       pointerId: number;
     }
   | {
@@ -216,6 +228,9 @@ export interface UseCanvasPointerControllerOptions {
   onSetSelectedPlaneLineId?: (id: string | null) => void;
   onUpdatePlaneLine?: (plane: 'xz' | 'zy', updated: DiagonalSegment) => void;
   onCommitPlaneLine?: (plane: 'xz' | 'zy', seg: DiagonalSegment) => void;
+  selectedCurveId?: string | null;
+  onSetSelectedCurveId?: (id: string | null) => void;
+  onUpdateCurvedCut?: (cut: CurvedCutSpec) => void;
   onCommitCurvedCut?: (cut: CurvedCutSpec) => void;
   onSetStatusMsg: (msg: string) => void;
 }
@@ -265,6 +280,9 @@ export function useCanvasPointerController({
   onSetSelectedPlaneLineId,
   onUpdatePlaneLine,
   onCommitPlaneLine,
+  selectedCurveId = null,
+  onSetSelectedCurveId,
+  onUpdateCurvedCut,
   onCommitCurvedCut,
   onSetStatusMsg,
 }: UseCanvasPointerControllerOptions) {
@@ -284,6 +302,7 @@ export function useCanvasPointerController({
     plane: 'xz' | 'zy';
     lines: DiagonalSegment[];
   } | null>(null);
+  const [draftCurves, setDraftCurves] = useState<CurvedCutSpec[] | null>(null);
   const [draftRegion, setDraftRegion] = useState<DraftSubRegion | null>(null);
   const displayHomography = useMemo(
     () => computeQuadToUnitHomography(draftQuad ?? quad),
@@ -295,6 +314,10 @@ export function useCanvasPointerController({
   const [loupeSide, setLoupeSide] = useState<'left' | 'right'>('right');
   const [eyedropperPreview, setEyedropperPreview] = useState<EyedropperPreview | null>(null);
   const [hoverTarget, setHoverTarget] = useState<ActiveHoverTarget>({ kind: 'none' });
+  const [hoverCurveHandle, setHoverCurveHandle] = useState<{
+    id: string;
+    part: 'p0' | 'p1' | 'p2' | 'p3' | 'body';
+  } | null>(null);
   const [isDraggingState, setIsDraggingState] = useState<boolean>(false);
   const [isPanningState, setIsPanningState] = useState<boolean>(false);
 
@@ -307,6 +330,7 @@ export function useCanvasPointerController({
     plane: 'xz' | 'zy';
     lines: DiagonalSegment[];
   } | null>(null);
+  const draftCurvesRef = useRef<CurvedCutSpec[] | null>(null);
   const draftRegionRef = useRef<DraftSubRegion | null>(null);
   const activeTouchMapRef = useRef<Map<number, Point2D>>(new Map());
   const pinchWasActiveRef = useRef<boolean>(false);
@@ -368,18 +392,21 @@ export function useCanvasPointerController({
     draftSideQuadRef.current = null;
     draftLinesRef.current = null;
     draftPlaneLinesRef.current = null;
+    draftCurvesRef.current = null;
     draftRegionRef.current = null;
     setDraftQuad(null);
     setDraftTopQuad(null);
     setDraftSideQuad(null);
     setDraftLines(null);
     setDraftPlaneLines(null);
+    setDraftCurves(null);
     setDraftRegion(null);
     setLiveStroke(null);
     setSnapIndicator(null);
     setLoupeFocusPt(null);
     setEyedropperPreview(null);
     setHoverTarget({ kind: 'none' });
+    setHoverCurveHandle(null);
     setIsDraggingState(false);
     setIsPanningState(false);
   }, [canvasRef]);
@@ -729,6 +756,105 @@ export function useCanvasPointerController({
     ],
   );
 
+  const findCurveHitForPlane = useCallback(
+    (
+      rawPt: Point2D,
+      plane: CurvePlane,
+      toCanvas: Matrix3x3,
+      scaleX: number,
+      scaleY: number,
+      isTouch: boolean,
+    ) => {
+      const planeCurves = (topology.curvedCuts ?? []).filter((c) => c.plane === plane);
+      if (planeCurves.length === 0) return null;
+      return hitTestCurvesScreenPx(
+        rawPt,
+        planeCurves,
+        toCanvas,
+        plane === 'xy',
+        params.boardThickness,
+        params.targetDimensions.x,
+        params.targetDimensions.y,
+        scaleX,
+        scaleY,
+        selectedCurveId,
+        isTouch,
+      );
+    },
+    [
+      topology.curvedCuts,
+      params.boardThickness,
+      params.targetDimensions.x,
+      params.targetDimensions.y,
+      selectedCurveId,
+    ],
+  );
+
+  const rawToCurveNorm = useCallback(
+    (rawPt: Point2D, toUnit: Matrix3x3, plane: CurvePlane): Point2D | null => {
+      const unit = applyHomography(toUnit, rawPt);
+      if (!unit) return null;
+      if (plane === 'xy') {
+        return {
+          x: clampNum(
+            exteriorToInterior(unit.x, params.boardThickness, params.targetDimensions.x),
+            0,
+            1,
+          ),
+          y: clampNum(
+            exteriorToInterior(unit.y, params.boardThickness, params.targetDimensions.y),
+            0,
+            1,
+          ),
+        };
+      }
+      return {
+        x: clampNum(unit.x, 0, 1),
+        y: clampNum(unit.y, 0, 1),
+      };
+    },
+    [params.boardThickness, params.targetDimensions.x, params.targetDimensions.y],
+  );
+
+  const beginCurveEditDrag = (
+    canvas: HTMLCanvasElement,
+    pointerId: number,
+    rawPt: Point2D,
+    plane: CurvePlane,
+    toUnit: Matrix3x3,
+    cHit: { id: string; part: 'p0' | 'p1' | 'p2' | 'p3' | 'body' },
+  ): boolean => {
+    const startNorm = rawToCurveNorm(rawPt, toUnit, plane);
+    if (!startNorm) return false;
+    const baseCurves: CurvedCutSpec[] = (topology.curvedCuts ?? []).map((c) => ({
+      ...c,
+      controlPoints: [
+        { ...c.controlPoints[0] },
+        { ...c.controlPoints[1] },
+        { ...c.controlPoints[2] },
+        { ...c.controlPoints[3] },
+      ] as [Point2D, Point2D, Point2D, Point2D],
+    }));
+    onSetSelectedLine(null);
+    onSetSelectedPlaneLineId?.(null);
+    onSetSelectedCurveId?.(cHit.id);
+    draftCurvesRef.current = baseCurves;
+    setDraftCurves(baseCurves);
+    dragRef.current = {
+      kind: 'editCurve',
+      plane,
+      curveId: cHit.id,
+      part: cHit.part,
+      startNorm,
+      baseCurves,
+      pointerId,
+    };
+    setIsDraggingState(true);
+    setLoupeFocusPt(rawPt);
+    canvas.setPointerCapture(pointerId);
+    return true;
+  };
+
   const handlePointerCancel = useCallback(() => {
     cancelActiveDragOnly();
   }, [cancelActiveDragOnly]);
@@ -829,13 +955,16 @@ export function useCanvasPointerController({
         }
       }
 
-      // Selección o achicar/alargar de líneas trazadas en Arriba (XZ) o Lado (ZY)
+      // Selección o achicar/alargar de líneas y curvas trazadas en Arriba (XZ) o Lado (ZY)
       const nonFrontPlane: CurvePlane = viewTab === 'superior' ? 'xz' : 'zy';
       const planeW = nonFrontPlane === 'xz' ? params.targetDimensions.x : params.targetDimensions.z;
       const planeH = nonFrontPlane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
       const plines = nonFrontPlane === 'xz' ? planeLinesXZ : planeLinesZY;
       const planeHom = computeQuadToUnitHomography(targetQuad);
       const allowUnselectedEnds = linesSubMode === 'smart';
+      const cHit = planeHom
+        ? findCurveHitForPlane(rawPt, nonFrontPlane, planeHom.toCanvas, scaleX, scaleY, isTouch)
+        : null;
       const pHit = planeHom
         ? hitTestPlaneLinesScreenPx(
             rawPt,
@@ -866,16 +995,32 @@ export function useCanvasPointerController({
         pHit !== null &&
         selectedPlaneLineId === pHit.id &&
         (pHit.part === 'start' || pHit.part === 'end');
+      const isSelCurveHandle =
+        cHit !== null && selectedCurveId === cHit.id && cHit.part !== 'body';
+      const shouldEditCurve =
+        planeHom !== null && cHit !== null && (isSelCurveHandle || linesSubMode === 'smart');
+      const shouldEditPlaneLine =
+        planeHom !== null &&
+        pHit !== null &&
+        strokeMode !== 'curve' &&
+        (linesSubMode === 'smart' || isSelPlaneEnd);
 
       if (
         planeHom &&
-        pHit &&
-        strokeMode !== 'curve' &&
-        (linesSubMode === 'smart' || isSelPlaneEnd)
+        cHit &&
+        (isSelCurveHandle ||
+          (shouldEditCurve && (!shouldEditPlaneLine || !pHit || cHit.distPx <= pHit.distPx)))
       ) {
+        if (beginCurveEditDrag(canvas, e.pointerId, rawPt, nonFrontPlane, planeHom.toUnit, cHit)) {
+          return;
+        }
+      }
+
+      if (shouldEditPlaneLine && planeHom && pHit) {
         const unit = applyHomography(planeHom.toUnit, rawPt);
         if (unit) {
           const baseCopy = plines.map((ln) => ({ ...ln }));
+          onSetSelectedCurveId?.(null);
           onSetSelectedPlaneLineId?.(pHit.id);
           draftPlaneLinesRef.current = { plane: nonFrontPlane, lines: baseCopy };
           setDraftPlaneLines(draftPlaneLinesRef.current);
@@ -909,6 +1054,7 @@ export function useCanvasPointerController({
             )
           : null;
       const startPt = unitSnap?.snappedImg ?? rawPt;
+      const curveWinsTap = cHit !== null && (!pTapHit || cHit.distPx <= pTapHit.distPx);
       setSnapIndicator(unitSnap?.indicator ?? null);
       setLoupeFocusPt(startPt);
       setLiveStroke({
@@ -928,7 +1074,8 @@ export function useCanvasPointerController({
         plane: nonFrontPlane,
         startClient: { x: e.clientX, y: e.clientY },
         clickFallbackLine: null,
-        clickFallbackPlaneLineId: pTapHit?.id ?? null,
+        clickFallbackPlaneLineId: curveWinsTap ? null : (pTapHit?.id ?? null),
+        clickFallbackCurveId: curveWinsTap ? cHit.id : null,
         pointerId: e.pointerId,
       };
       setIsDraggingState(true);
@@ -1069,6 +1216,7 @@ export function useCanvasPointerController({
       }
 
       const allowUnselectedEnds = linesSubMode === 'smart';
+      const cHit = findCurveHitForPlane(rawPt, 'xy', displayHomography.toCanvas, scaleX, scaleY, isTouch);
       const hit = hitTestLinesScreenPx(
         rawPt,
         vDivs,
@@ -1103,18 +1251,33 @@ export function useCanvasPointerController({
         );
 
       // En 'smart': editar cuerpo o extremos. En 'draw_only': al tocar los extremos de la línea YA
-      // seleccionada (`isSelectedEndpointHit`), se permite achicar o alargar sin afectar las esquinas libres.
+      // seleccionada (`isSelectedEndpointHit`) o los manejadores Bézier de la curva seleccionada (`isSelCurveHandle`),
+      // se permite achicar, alargar o moldear tangentes sin cambiar de herramienta.
       const isSelectedEndpointHit =
         hit !== null &&
         selectedLine !== null &&
         hit.kind === selectedLine.kind &&
         hit.id === selectedLine.id &&
         (hit.part === 'start' || hit.part === 'end');
+      const isSelCurveHandle =
+        cHit !== null && selectedCurveId === cHit.id && cHit.part !== 'body';
 
+      const shouldEditCurve =
+        cHit !== null && (isSelCurveHandle || linesSubMode === 'smart');
       const shouldEditLine =
         hit !== null &&
         strokeMode !== 'curve' &&
         (linesSubMode === 'smart' || isSelectedEndpointHit);
+
+      if (
+        cHit &&
+        (isSelCurveHandle ||
+          (shouldEditCurve && (!shouldEditLine || !hit || cHit.distPx <= hit.distPx)))
+      ) {
+        if (beginCurveEditDrag(canvas, e.pointerId, rawPt, 'xy', displayHomography.toUnit, cHit)) {
+          return;
+        }
+      }
 
       if (shouldEditLine && hit) {
         const unit = applyHomography(displayHomography.toUnit, rawPt);
@@ -1124,6 +1287,7 @@ export function useCanvasPointerController({
           hShelves: hShs.map((s) => ({ ...s })),
           diagonalDividers: diags.map((dg) => ({ ...dg })),
         };
+        onSetSelectedCurveId?.(null);
         onSetSelectedLine({ kind: hit.kind, id: hit.id });
         draftLinesRef.current = baseLines;
         setDraftLines(baseLines);
@@ -1158,6 +1322,7 @@ export function useCanvasPointerController({
       const startUnit = applyHomography(displayHomography.toUnit, startPt);
       const startU = snappedStart?.u ?? (startUnit ? exteriorToInterior(startUnit.x, eMm, xf) : 0.5);
       const startV = snappedStart?.v ?? (startUnit ? exteriorToInterior(startUnit.y, eMm, yf) : 0.5);
+      const curveWinsTap = cHit !== null && (!tapHit || cHit.distPx <= tapHit.distPx);
       setSnapIndicator(snappedStart?.indicator ?? null);
       setLoupeFocusPt(startPt);
       setLiveStroke({ startImg: startPt, currentImg: startPt, points: [startPt], orthoGuide: null });
@@ -1171,7 +1336,12 @@ export function useCanvasPointerController({
         points: [startPt],
         plane: 'xy',
         startClient: { x: e.clientX, y: e.clientY },
-        clickFallbackLine: tapHit ? { kind: tapHit.kind, id: tapHit.id } : null,
+        clickFallbackLine: curveWinsTap
+          ? null
+          : tapHit
+            ? { kind: tapHit.kind, id: tapHit.id }
+            : null,
+        clickFallbackCurveId: curveWinsTap ? cHit.id : null,
         pointerId: e.pointerId,
       };
       setIsDraggingState(true);
@@ -1245,6 +1415,7 @@ export function useCanvasPointerController({
         else if (hit.kind === 'corner') setHoverTarget({ kind: 'corner', idx: hit.idx });
         else if (hit.kind === 'edge') setHoverTarget({ kind: 'edge', edgeIdx: hit.edgeIdx });
         else setHoverTarget({ kind: 'frameInterior' });
+        setHoverCurveHandle(null);
         setLoupeFocusPt(null);
         setSnapIndicator(null);
         return;
@@ -1256,31 +1427,52 @@ export function useCanvasPointerController({
         const pWMm = nonFrontPlane === 'xz' ? params.targetDimensions.x : params.targetDimensions.z;
         const pHMm = nonFrontPlane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
         const plines = nonFrontPlane === 'xz' ? planeLinesXZ : planeLinesZY;
-        if (planeHom && strokeMode !== 'curve') {
-          const pHit = hitTestPlaneLinesScreenPx(
-            rawPt,
-            plines,
-            planeHom.toCanvas,
-            scaleX,
-            scaleY,
-            selectedPlaneLineId,
-            isTouch,
-            linesSubMode === 'smart',
+        const cHit = planeHom
+          ? findCurveHitForPlane(rawPt, nonFrontPlane, planeHom.toCanvas, scaleX, scaleY, isTouch)
+          : null;
+        const showCurveHover =
+          cHit !== null &&
+          ((selectedCurveId === cHit.id && cHit.part !== 'body') || linesSubMode === 'smart');
+        const pHit =
+          planeHom && strokeMode !== 'curve'
+            ? hitTestPlaneLinesScreenPx(
+                rawPt,
+                plines,
+                planeHom.toCanvas,
+                scaleX,
+                scaleY,
+                selectedPlaneLineId,
+                isTouch,
+                linesSubMode === 'smart',
+              )
+            : null;
+        const showPlaneHover =
+          pHit !== null &&
+          (linesSubMode === 'smart' ||
+            (selectedPlaneLineId === pHit.id && pHit.part !== 'body'));
+
+        if (showCurveHover && cHit && (!showPlaneHover || !pHit || cHit.distPx <= pHit.distPx)) {
+          setHoverCurveHandle((prev) =>
+            prev && prev.id === cHit.id && prev.part === cHit.part
+              ? prev
+              : { id: cHit.id, part: cHit.part },
           );
-          const showPlaneHover =
-            pHit !== null &&
-            (linesSubMode === 'smart' ||
-              (selectedPlaneLineId === pHit.id && pHit.part !== 'body'));
-          if (showPlaneHover && pHit) {
-            setHoverTarget({
-              kind: pHit.part === 'body' ? 'lineBody' : 'lineEnd',
-              lineRef: { kind: 'diagonal', id: pHit.id },
-              linePart: pHit.part,
-            });
-            setSnapIndicator(null);
-            setLoupeFocusPt(null);
-            return;
-          }
+          setHoverTarget({ kind: 'none' });
+          setSnapIndicator(null);
+          setLoupeFocusPt(null);
+          return;
+        }
+        setHoverCurveHandle(null);
+
+        if (showPlaneHover && pHit) {
+          setHoverTarget({
+            kind: pHit.part === 'body' ? 'lineBody' : 'lineEnd',
+            lineRef: { kind: 'diagonal', id: pHit.id },
+            linePart: pHit.part,
+          });
+          setSnapIndicator(null);
+          setLoupeFocusPt(null);
+          return;
         }
         const unitSnap =
           planeHom && !e.altKey
@@ -1302,6 +1494,7 @@ export function useCanvasPointerController({
       }
       if (viewTab === 'frontal' && traceStep === 'lines' && displayHomography) {
         if (linesSubMode === 'regions') {
+          setHoverCurveHandle(null);
           const unit = applyHomography(displayHomography.toUnit, rawPt);
           if (unit) {
             const u = exteriorToInterior(unit.x, params.boardThickness, params.targetDimensions.x);
@@ -1318,39 +1511,65 @@ export function useCanvasPointerController({
           return;
         }
 
-        if (strokeMode !== 'curve' && (linesSubMode === 'smart' || selectedLine !== null)) {
-          const hit = hitTestLinesScreenPx(
-            rawPt,
-            materializedBase.vDividers,
-            materializedBase.hShelves,
-            topology.diagonalDividers ?? [],
-            displayHomography.toCanvas,
-            params.boardThickness,
-            params.targetDimensions.x,
-            params.targetDimensions.y,
-            scaleX,
-            scaleY,
-            selectedLine,
-            isTouch,
-            linesSubMode === 'smart',
+        const cHit = findCurveHitForPlane(
+          rawPt,
+          'xy',
+          displayHomography.toCanvas,
+          scaleX,
+          scaleY,
+          isTouch,
+        );
+        const showCurveHover =
+          cHit !== null &&
+          ((selectedCurveId === cHit.id && cHit.part !== 'body') || linesSubMode === 'smart');
+        const hit =
+          strokeMode !== 'curve' && (linesSubMode === 'smart' || selectedLine !== null)
+            ? hitTestLinesScreenPx(
+                rawPt,
+                materializedBase.vDividers,
+                materializedBase.hShelves,
+                topology.diagonalDividers ?? [],
+                displayHomography.toCanvas,
+                params.boardThickness,
+                params.targetDimensions.x,
+                params.targetDimensions.y,
+                scaleX,
+                scaleY,
+                selectedLine,
+                isTouch,
+                linesSubMode === 'smart',
+              )
+            : null;
+        const showLineHover =
+          hit !== null &&
+          (linesSubMode === 'smart' ||
+            (selectedLine !== null &&
+              hit.kind === selectedLine.kind &&
+              hit.id === selectedLine.id &&
+              hit.part !== 'body'));
+
+        if (showCurveHover && cHit && (!showLineHover || !hit || cHit.distPx <= hit.distPx)) {
+          setHoverCurveHandle((prev) =>
+            prev && prev.id === cHit.id && prev.part === cHit.part
+              ? prev
+              : { id: cHit.id, part: cHit.part },
           );
-          const showLineHover =
-            hit !== null &&
-            (linesSubMode === 'smart' ||
-              (selectedLine !== null &&
-                hit.kind === selectedLine.kind &&
-                hit.id === selectedLine.id &&
-                hit.part !== 'body'));
-          if (showLineHover && hit) {
-            setHoverTarget({
-              kind: hit.part === 'body' ? 'lineBody' : 'lineEnd',
-              lineRef: { kind: hit.kind, id: hit.id },
-              linePart: hit.part,
-            });
-            setSnapIndicator(null);
-            setLoupeFocusPt(null);
-            return;
-          }
+          setHoverTarget({ kind: 'none' });
+          setSnapIndicator(null);
+          setLoupeFocusPt(null);
+          return;
+        }
+        setHoverCurveHandle(null);
+
+        if (showLineHover && hit) {
+          setHoverTarget({
+            kind: hit.part === 'body' ? 'lineBody' : 'lineEnd',
+            lineRef: { kind: hit.kind, id: hit.id },
+            linePart: hit.part,
+          });
+          setSnapIndicator(null);
+          setLoupeFocusPt(null);
+          return;
         }
 
         setHoverTarget({ kind: 'none' });
@@ -1371,6 +1590,7 @@ export function useCanvasPointerController({
         return;
       }
       if (viewTab === 'frontal' && traceStep === 'zones' && displayHomography) {
+        setHoverCurveHandle(null);
         const unit = applyHomography(displayHomography.toUnit, rawPt);
         if (unit) {
           const u = exteriorToInterior(unit.x, params.boardThickness, params.targetDimensions.x);
@@ -1650,8 +1870,26 @@ export function useCanvasPointerController({
           const xIntMm = Math.max(1, xf - 2 * eMm);
           const yIntMm = Math.max(1, yf - 2 * eMm);
           const gridStep = paperGridStepMm ?? 10;
-          nextU = snapNormToPaperGridMm(nextU, xIntMm, eMm, 0.5, gridStep);
-          nextV = snapNormToPaperGridMm(nextV, yIntMm, eMm, 0.5, gridStep);
+          const pLeft = applyHomography(displayHomography.toCanvas, {
+            x: interiorToExterior(0, eMm, xf),
+            y: 0.5,
+          });
+          const pRight = applyHomography(displayHomography.toCanvas, {
+            x: interiorToExterior(1, eMm, xf),
+            y: 0.5,
+          });
+          const pBot = applyHomography(displayHomography.toCanvas, {
+            x: 0.5,
+            y: interiorToExterior(0, eMm, yf),
+          });
+          const pTop = applyHomography(displayHomography.toCanvas, {
+            x: 0.5,
+            y: interiorToExterior(1, eMm, yf),
+          });
+          const pxW = pLeft && pRight ? distScreenPx(pLeft, pRight, scaleX, scaleY) : 520;
+          const pxH = pBot && pTop ? distScreenPx(pBot, pTop, scaleX, scaleY) : 420;
+          nextU = snapNormToPaperGridMm(nextU, xIntMm, eMm, pxW / xIntMm, gridStep);
+          nextV = snapNormToPaperGridMm(nextV, yIntMm, eMm, pxH / yIntMm, gridStep);
         }
         u = nextU;
         v = nextV;
@@ -1824,6 +2062,103 @@ export function useCanvasPointerController({
       setDraftPlaneLines(draftPlaneLinesRef.current);
       return;
     }
+
+    if (active.kind === 'editCurve') {
+      const planeHom =
+        active.plane === 'xy'
+          ? displayHomography
+          : computeQuadToUnitHomography(active.plane === 'xz' ? topQuad : sideQuad);
+      if (!planeHom) return;
+
+      let focusPt = rawPt;
+      let ind: SnapIndicator | null = null;
+      let normPt: Point2D | null = null;
+
+      if (active.part === 'p0' || active.part === 'p3') {
+        if (active.plane === 'xy') {
+          const snapped = snapForLineOperation(
+            rawPt,
+            scaleX,
+            scaleY,
+            e.altKey,
+            materializedBase.vDividers,
+            materializedBase.hShelves,
+            undefined,
+            'both',
+            isTouch ? 24 : 12,
+            topology.diagonalDividers ?? [],
+          );
+          if (!snapped) return;
+          normPt = {
+            x: round4(clampNum(snapped.u, 0, 1)),
+            y: round4(clampNum(snapped.v, 0, 1)),
+          };
+          focusPt = snapped.pt;
+          ind = snapped.indicator;
+        } else {
+          const pWMm = active.plane === 'xz' ? params.targetDimensions.x : params.targetDimensions.z;
+          const pHMm = active.plane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
+          const unitSnap = !e.altKey
+            ? snapPointInUnitQuad(
+                rawPt,
+                planeHom.toUnit,
+                planeHom.toCanvas,
+                getNonFrontUnitVertices(active.plane),
+                scaleX,
+                scaleY,
+                isTouch ? 24 : 12,
+                { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
+              )
+            : null;
+          const rawUnit = applyHomography(planeHom.toUnit, rawPt);
+          if (!rawUnit && !unitSnap) return;
+          normPt = {
+            x: round4(clampNum(unitSnap?.unitPt.x ?? rawUnit!.x, 0, 1)),
+            y: round4(clampNum(unitSnap?.unitPt.y ?? rawUnit!.y, 0, 1)),
+          };
+          focusPt = unitSnap?.snappedImg ?? rawPt;
+          ind = unitSnap?.indicator ?? null;
+        }
+      } else {
+        const mapped = rawToCurveNorm(rawPt, planeHom.toUnit, active.plane);
+        if (!mapped) return;
+        normPt = { x: round4(mapped.x), y: round4(mapped.y) };
+      }
+
+      if (!normPt) return;
+      setSnapIndicator(ind);
+      setLoupeFocusPt(focusPt);
+
+      const nextCurves = active.baseCurves.map((c) => {
+        if (c.id !== active.curveId) return c;
+        const pts: [Point2D, Point2D, Point2D, Point2D] = [
+          { ...c.controlPoints[0] },
+          { ...c.controlPoints[1] },
+          { ...c.controlPoints[2] },
+          { ...c.controlPoints[3] },
+        ];
+        if (active.part === 'p0') pts[0] = normPt;
+        else if (active.part === 'p1') pts[1] = normPt;
+        else if (active.part === 'p2') pts[2] = normPt;
+        else if (active.part === 'p3') pts[3] = normPt;
+        else {
+          const xs = pts.map((p) => p.x);
+          const ys = pts.map((p) => p.y);
+          const effDu = clampNum(normPt.x - active.startNorm.x, -Math.min(...xs), 1 - Math.max(...xs));
+          const effDv = clampNum(normPt.y - active.startNorm.y, -Math.min(...ys), 1 - Math.max(...ys));
+          for (let i = 0; i < 4; i++) {
+            pts[i] = {
+              x: round4(clampNum(pts[i].x + effDu, 0, 1)),
+              y: round4(clampNum(pts[i].y + effDv, 0, 1)),
+            };
+          }
+        }
+        return { ...c, controlPoints: pts };
+      });
+      draftCurvesRef.current = nextCurves;
+      setDraftCurves(nextCurves);
+      return;
+    }
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -1993,6 +2328,16 @@ export function useCanvasPointerController({
         e.clientY - finished.startClient.y,
       );
       if (distScreen < (isTouch ? 12 : 5)) {
+        if (finished.clickFallbackCurveId) {
+          onSetSelectedLine(null);
+          onSetSelectedPlaneLineId?.(null);
+          onSetSelectedCurveId?.(finished.clickFallbackCurveId);
+          onSetStatusMsg(
+            'Curva seleccionada: arrastra los extremos cuadrados o manejadores circulares para editarla.',
+          );
+          return;
+        }
+        onSetSelectedCurveId?.(null);
         if (finished.plane !== 'xy') {
           if (finished.clickFallbackPlaneLineId) {
             onSetSelectedPlaneLineId?.(finished.clickFallbackPlaneLineId);
@@ -2106,31 +2451,71 @@ export function useCanvasPointerController({
         }
 
         const curveFit = fitDifferentialCurveFromStroke(pointsMm, strokeMode === 'curve');
-        if (curveFit?.isCurved && onCommitCurvedCut) {
+        if ((curveFit?.isCurved || (strokeMode === 'curve' && curveFit !== null)) && curveFit && onCommitCurvedCut) {
+          let ctrlPtsMm: [Point2D, Point2D, Point2D, Point2D] = curveFit.controlPoints;
+          let arcLengthMm = curveFit.arcLengthMm;
+          let minRadiusMm = curveFit.minRadiusMm;
+          let maxCurvature = curveFit.maxCurvature;
+
+          if (!curveFit.isCurved) {
+            const p0 = curveFit.controlPoints[0];
+            const p3 = curveFit.controlPoints[3];
+            const dx = p3.x - p0.x;
+            const dy = p3.y - p0.y;
+            const chord = Math.max(1, Math.hypot(dx, dy));
+            const nx = -dy / chord;
+            const ny = dx / chord;
+            const midX = (p0.x + p3.x) * 0.5;
+            const midY = (p0.y + p3.y) * 0.5;
+            const sign =
+              (planeW * 0.5 - midX) * nx + (planeH * 0.5 - midY) * ny >= 0 ? 1 : -1;
+            const bow = Math.min(35, chord * 0.12) * sign;
+            const p1: Point2D = {
+              x: clampNum(p0.x + dx / 3 + nx * bow, 0, planeW),
+              y: clampNum(p0.y + dy / 3 + ny * bow, 0, planeH),
+            };
+            const p2: Point2D = {
+              x: clampNum(p0.x + (2 * dx) / 3 + nx * bow, 0, planeW),
+              y: clampNum(p0.y + (2 * dy) / 3 + ny * bow, 0, planeH),
+            };
+            ctrlPtsMm = [p0, p1, p2, p3];
+            const diff = evaluateBezierDifferential(ctrlPtsMm, 40);
+            arcLengthMm = diff.arcLengthMm;
+            minRadiusMm = diff.minRadiusMm;
+            maxCurvature = diff.maxCurvature;
+          }
+
           const toNorm = (pMm: Point2D): Point2D => ({
             x: Number(clampNum(pMm.x / planeW, 0, 1).toFixed(4)),
             y: Number(clampNum(pMm.y / planeH, 0, 1).toFixed(4)),
           });
+          const newCurveId = `usr_curve_${Date.now()}`;
           onCommitCurvedCut({
-            id: `usr_curve_${Date.now()}`,
+            id: newCurveId,
             plane: finished.plane,
             kind: 'free_bezier',
             controlPoints: [
-              toNorm(curveFit.controlPoints[0]),
-              toNorm(curveFit.controlPoints[1]),
-              toNorm(curveFit.controlPoints[2]),
-              toNorm(curveFit.controlPoints[3]),
+              toNorm(ctrlPtsMm[0]),
+              toNorm(ctrlPtsMm[1]),
+              toNorm(ctrlPtsMm[2]),
+              toNorm(ctrlPtsMm[3]),
             ],
-            label: `Curva ${finished.plane.toUpperCase()} (s=${Math.round(curveFit.arcLengthMm)} mm)`,
-            arcLengthMm: curveFit.arcLengthMm,
-            minRadiusMm: curveFit.minRadiusMm,
-            maxCurvature: curveFit.maxCurvature,
+            label: `Curva ${finished.plane.toUpperCase()} (s=${Math.round(arcLengthMm)} mm)`,
+            arcLengthMm,
+            minRadiusMm,
+            maxCurvature,
           });
+          onSetSelectedLine(null);
+          onSetSelectedPlaneLineId?.(null);
+          onSetSelectedCurveId?.(newCurveId);
+          onSetStatusMsg(
+            `Curva ${finished.plane.toUpperCase()} creada (s=${Math.round(arcLengthMm)} mm). Arrastra los manejadores para ajustarla.`,
+          );
           return;
         }
         if (strokeMode === 'curve') {
           onSetStatusMsg(
-            'En modo "Curva" dibuja un arco suave (o pulsa "Línea recta" para trazar divisiones rectas).',
+            'En modo "Curva" traza al menos 25 mm para crear una curva Bézier editable.',
           );
           return;
         }
@@ -2273,6 +2658,52 @@ export function useCanvasPointerController({
       }
       return;
     }
+
+    if (finished.kind === 'editCurve') {
+      const finalCurves = draftCurvesRef.current;
+      draftCurvesRef.current = null;
+      setDraftCurves(null);
+      if (finalCurves && onUpdateCurvedCut) {
+        const updated = finalCurves.find((c) => c.id === finished.curveId);
+        const orig = finished.baseCurves.find((c) => c.id === finished.curveId);
+        if (
+          updated &&
+          orig &&
+          JSON.stringify(updated.controlPoints) !== JSON.stringify(orig.controlPoints)
+        ) {
+          const planeW =
+            finished.plane === 'xy'
+              ? Math.max(1, params.targetDimensions.x - 2 * params.boardThickness)
+              : finished.plane === 'xz'
+                ? params.targetDimensions.x
+                : params.targetDimensions.z;
+          const planeH =
+            finished.plane === 'xy'
+              ? Math.max(1, params.targetDimensions.y - 2 * params.boardThickness)
+              : finished.plane === 'xz'
+                ? params.targetDimensions.z
+                : params.targetDimensions.y;
+          const ptsMm: [Point2D, Point2D, Point2D, Point2D] = [
+            { x: updated.controlPoints[0].x * planeW, y: updated.controlPoints[0].y * planeH },
+            { x: updated.controlPoints[1].x * planeW, y: updated.controlPoints[1].y * planeH },
+            { x: updated.controlPoints[2].x * planeW, y: updated.controlPoints[2].y * planeH },
+            { x: updated.controlPoints[3].x * planeW, y: updated.controlPoints[3].y * planeH },
+          ];
+          const diff = evaluateBezierDifferential(ptsMm, 48);
+          onUpdateCurvedCut({
+            ...updated,
+            arcLengthMm: Number(diff.arcLengthMm.toFixed(1)),
+            minRadiusMm: Number(diff.minRadiusMm.toFixed(1)),
+            maxCurvature: Number(diff.maxCurvature.toFixed(6)),
+            label: `Curva ${finished.plane.toUpperCase()} (s=${Math.round(diff.arcLengthMm)} mm)`,
+          });
+          onSetStatusMsg(
+            `Curva actualizada (s=${Math.round(diff.arcLengthMm)} mm · R_mín=${Math.round(diff.minRadiusMm)} mm).`,
+          );
+        }
+      }
+      return;
+    }
   };
 
   const handlePointerLeave = useCallback(() => {
@@ -2281,6 +2712,7 @@ export function useCanvasPointerController({
       setSnapIndicator(null);
       setEyedropperPreview(null);
       setHoverTarget({ kind: 'none' });
+      setHoverCurveHandle(null);
       if (traceStep === 'zones') onHoverZone(null);
     }
   }, [traceStep, onHoverZone]);
@@ -2299,12 +2731,18 @@ export function useCanvasPointerController({
       return frameMode === 'box' || strokeMode === 'curve' ? 'crosshair' : 'default';
     }
     if (viewTab !== 'frontal') {
+      if (traceStep === 'lines' && hoverCurveHandle) {
+        return hoverCurveHandle.part === 'body' ? 'move' : 'grab';
+      }
       if (traceStep === 'lines' && hoverTarget.kind === 'lineEnd') return 'grab';
       if (traceStep === 'lines' && hoverTarget.kind === 'lineBody') return 'move';
       return 'crosshair';
     }
     if (traceStep === 'lines') {
       if (linesSubMode === 'regions') return 'crosshair';
+      if (hoverCurveHandle) {
+        return hoverCurveHandle.part === 'body' ? 'move' : 'grab';
+      }
       if (hoverTarget.kind === 'lineEnd') return 'grab';
       if (linesSubMode === 'smart' && hoverTarget.kind === 'lineBody') {
         if (hoverTarget.lineRef?.kind === 'vDivider') return 'ew-resize';
@@ -2323,7 +2761,9 @@ export function useCanvasPointerController({
     traceStep,
     pickingCorners,
     hoverTarget,
+    hoverCurveHandle,
     frameMode,
+    strokeMode,
     linesSubMode,
   ]);
 
@@ -2340,6 +2780,7 @@ export function useCanvasPointerController({
     draftSideQuad,
     draftLines,
     draftPlaneLines,
+    draftCurves,
     draftRegion,
     liveStroke,
     snapIndicator,
@@ -2349,6 +2790,7 @@ export function useCanvasPointerController({
     eyedropperPreview,
     setEyedropperPreview,
     hoverTarget,
+    hoverCurveHandle,
     isDraggingState,
     isPanning: isPanningState,
     canvasCursor,

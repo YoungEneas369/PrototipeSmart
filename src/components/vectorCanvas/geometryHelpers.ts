@@ -6,6 +6,7 @@
  */
 import type {
   CanvasViewTab,
+  CurvedCutSpec,
   DiagonalSegment,
   FrontModuleKind,
   FrontZone,
@@ -19,6 +20,8 @@ import {
   applyHomography,
   calculateShelfProgression,
   computeQuadToUnitHomography,
+  evaluateBezierDifferential,
+  evaluateCubicBezierDerivatives,
   exteriorToInterior,
   interiorToExterior,
   type Matrix3x3,
@@ -682,6 +685,99 @@ export function hitTestPlaneLinesScreenPx(
   }
 
   return bestEnd ?? bestBody;
+}
+
+export interface CurveHitResult {
+  id: string;
+  part: 'p0' | 'p1' | 'p2' | 'p3' | 'body';
+  distPx: number;
+}
+
+/**
+ * Hit-testing en píxeles reales de pantalla para curvas Bézier cúbicas en los 3 planos (`xy`, `xz`, `zy`).
+ * Cuando la curva está seleccionada prioriza los 4 manejadores (`p0`, `p1`, `p2`, `p3`);
+ * si no está seleccionada evalúa extremos (`p0`, `p3`) y muestreo de 20 tramos sobre el cuerpo.
+ */
+export function hitTestCurvesScreenPx(
+  ptImg: Point2D,
+  curves: readonly CurvedCutSpec[],
+  toCanvas: Matrix3x3,
+  isFrontXY: boolean,
+  e: number,
+  xf: number,
+  yf: number,
+  scaleX: number,
+  scaleY: number,
+  selectedCurveId: string | null = null,
+  isTouch = false,
+): CurveHitResult | null {
+  const selHandleTol = isTouch ? 28 : 15;
+  const endTol = isTouch ? 24 : 13;
+  const bodyTol = isTouch ? 18 : 10;
+
+  let bestHandle: CurveHitResult | null = null;
+  let bestBody: CurveHitResult | null = null;
+
+  for (const c of curves) {
+    const mapped = c.controlPoints.map((pt) =>
+      applyHomography(
+        toCanvas,
+        isFrontXY
+          ? {
+              x: interiorToExterior(pt.x, e, xf),
+              y: interiorToExterior(pt.y, e, yf),
+            }
+          : pt,
+      ),
+    );
+    if (!mapped.every((m): m is Point2D => m !== null)) continue;
+    const [cp0, cp1, cp2, cp3] = mapped as [Point2D, Point2D, Point2D, Point2D];
+
+    const isSel = selectedCurveId === c.id;
+    const activeHandles: Array<{ pt: Point2D; part: 'p0' | 'p1' | 'p2' | 'p3'; tol: number }> =
+      isSel
+        ? [
+            { pt: cp0, part: 'p0', tol: selHandleTol },
+            { pt: cp1, part: 'p1', tol: selHandleTol },
+            { pt: cp2, part: 'p2', tol: selHandleTol },
+            { pt: cp3, part: 'p3', tol: selHandleTol },
+          ]
+        : [
+            { pt: cp0, part: 'p0', tol: endTol },
+            { pt: cp3, part: 'p3', tol: endTol },
+          ];
+
+    for (const h of activeHandles) {
+      const d = distScreenPx(ptImg, h.pt, scaleX, scaleY);
+      if (d <= h.tol) {
+        const score = d - (isSel ? 4 : 1);
+        if (!bestHandle || score < bestHandle.distPx) {
+          bestHandle = { id: c.id, part: h.part, distPx: score };
+        }
+      }
+    }
+
+    const steps = 20;
+    const samples: Point2D[] = [];
+    for (let i = 0; i <= steps; i++) {
+      samples.push(evaluateCubicBezierDerivatives([cp0, cp1, cp2, cp3], i / steps).r);
+    }
+
+    let minDist = Infinity;
+    for (let i = 0; i < steps; i++) {
+      const db = pointToSegmentDistScreenPx(ptImg, samples[i], samples[i + 1], scaleX, scaleY);
+      if (db < minDist) minDist = db;
+    }
+
+    if (minDist <= bodyTol + (isSel ? 2 : 0)) {
+      const score = minDist - (isSel ? 2 : 0);
+      if (!bestBody || score < bestBody.distPx) {
+        bestBody = { id: c.id, part: 'body', distPx: score };
+      }
+    }
+  }
+
+  return bestHandle ?? bestBody;
 }
 
 /**
@@ -2054,6 +2150,61 @@ export interface BlankSketchAutoBoxResult {
   nextDims: { x: number; y: number; z: number };
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
+  diagonalDividers?: DiagonalSegment[];
+}
+
+export interface DrawnClosedStructureResult {
+  fitted: BlankSketchAutoBoxResult;
+  kind: 'rect' | 'stepped' | 'curved_top';
+  voidZones: FrontZone[];
+  remappedCurves: CurvedCutSpec[];
+}
+
+/**
+ * Calcula los 3 marcos ortogonales alineados en proyección diédrica (XY, XZ, ZY) con una
+ * escala común `s`:
+ *  - `quad` (XY) y `topQuad` (XZ) comparten exactamente `leftX..rightX` (ancho `dims.x * s`),
+ *  - `quad` (XY) y `sideQuad` (ZY) comparten exactamente `topY..botY` (alto `dims.y * s`),
+ *  - alto de `topQuad` === ancho de `sideQuad` (`dims.z * s`).
+ */
+export function computeAlignedBlankSketchQuads(
+  dims: { x: number; y: number; z: number },
+  canvasW = 900,
+  canvasH = 680,
+): {
+  quad: [Point2D, Point2D, Point2D, Point2D];
+  topQuad: [Point2D, Point2D, Point2D, Point2D];
+  sideQuad: [Point2D, Point2D, Point2D, Point2D];
+} {
+  const safeW = Math.max(200, canvasW);
+  const safeH = Math.max(200, canvasH);
+  const dx = Math.max(100, Number.isFinite(dims.x) ? dims.x : 1000);
+  const dy = Math.max(100, Number.isFinite(dims.y) ? dims.y : 800);
+  const dz = Math.max(100, Number.isFinite(dims.z) ? dims.z : 400);
+
+  const maxW = safeW * 0.7;
+  const maxH = safeH * 0.7;
+  const s = Math.min(maxW / Math.max(dx, dz), maxH / Math.max(dy, dz));
+
+  const wX = dx * s;
+  const hY = dy * s;
+  const dZ = dz * s;
+
+  const leftX = (safeW - wX) / 2;
+  const rightX = (safeW + wX) / 2;
+  const topY = (safeH - hY) / 2;
+  const botY = (safeH + hY) / 2;
+
+  const topZ0 = (safeH - dZ) / 2;
+  const topZ1 = (safeH + dZ) / 2;
+  const sideZ0 = (safeW - dZ) / 2;
+  const sideZ1 = (safeW + dZ) / 2;
+
+  return {
+    quad: makeAxisAlignedQuad(leftX, topY, rightX, botY),
+    topQuad: makeAxisAlignedQuad(leftX, topZ0, rightX, topZ1),
+    sideQuad: makeAxisAlignedQuad(sideZ0, topY, sideZ1, botY),
+  };
 }
 
 function mergedCoverageFraction(
@@ -2087,25 +2238,219 @@ function mergedCoverageFraction(
   return covered / total;
 }
 
-/**
- * Cuando el usuario dibuja un mueble completo con contorno cerrado en el lienzo en blanco
- * (`2+` verticales y `2+` horizontales formando los 4 muros exteriores dentro de la hoja),
- * ajusta el marco `quad` y las dimensiones `nextDims` exactamente a ese dibujo para evitar
- * generar un mueble gigante alrededor de la hoja con compartimentos flotando adentro.
- */
-export function fitBlankSketchDrawnOuterBox(
+const snapEdge01 = (val: number): number => (val <= 0.03 ? 0 : val >= 0.97 ? 1 : round4(val));
+
+function clipDiagonalToUnitBox(
+  diag: DiagonalSegment,
+  uMin: number,
+  uMax: number,
+  vMin: number,
+  vMax: number,
+): DiagonalSegment | null {
+  const wSpan = uMax - uMin;
+  const hSpan = vMax - vMin;
+  if (wSpan <= 1e-4 || hSpan <= 1e-4) return null;
+
+  const x0 = (diag.u1 - uMin) / wSpan;
+  const y0 = (diag.v1 - vMin) / hSpan;
+  const x1 = (diag.u2 - uMin) / wSpan;
+  const y1 = (diag.v2 - vMin) / hSpan;
+
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const tol = 0.035;
+  let t0 = 0;
+  let t1 = 1;
+
+  const clipTest = (p: number, q: number): boolean => {
+    if (Math.abs(p) < 1e-8) return q >= 0;
+    const r = q / p;
+    if (p < 0) {
+      if (r > t1) return false;
+      if (r > t0) t0 = r;
+    } else {
+      if (r < t0) return false;
+      if (r < t1) t1 = r;
+    }
+    return true;
+  };
+
+  if (
+    !clipTest(-dx, x0 + tol) ||
+    !clipTest(dx, 1 + tol - x0) ||
+    !clipTest(-dy, y0 + tol) ||
+    !clipTest(dy, 1 + tol - y0)
+  ) {
+    return null;
+  }
+
+  const u1 = snapEdge01(clampNum(x0 + t0 * dx, 0, 1));
+  const v1 = snapEdge01(clampNum(y0 + t0 * dy, 0, 1));
+  const u2 = snapEdge01(clampNum(x0 + t1 * dx, 0, 1));
+  const v2 = snapEdge01(clampNum(y0 + t1 * dy, 0, 1));
+  if (Math.hypot(u2 - u1, v2 - v1) < 0.04) return null;
+
+  return { ...diag, u1, v1, u2, v2 };
+}
+
+function buildFittedBoxForBounds(
   vDividers: readonly NormalizedSegment[],
   hShelves: readonly NormalizedSegment[],
   diagonalDividers: readonly DiagonalSegment[],
   currentQuad: readonly [Point2D, Point2D, Point2D, Point2D],
   currentDims: { x: number; y: number; z: number },
   boardThickness: number,
+  bounds: { uMin: number; uMax: number; vMin: number; vMax: number },
+  skipTopBoundary = true,
 ): BlankSketchAutoBoxResult | null {
-  if (diagonalDividers.length > 0) return null;
-  if (vDividers.length < 2 || hShelves.length < 2) return null;
+  const { uMin, uMax, vMin, vMax } = bounds;
+  const wSpan = uMax - uMin;
+  const hSpan = vMax - vMin;
+  if (wSpan < 0.12 || hSpan < 0.12) return null;
 
   const hom = computeQuadToUnitHomography(currentQuad);
   if (!hom) return null;
+
+  const xf = currentDims.x;
+  const yf = currentDims.y;
+  const xInt = Math.max(40, xf - 2 * boardThickness);
+  const yInt = Math.max(40, yf - 2 * boardThickness);
+
+  const tl = applyHomography(hom.toCanvas, {
+    x: interiorToExterior(uMin, boardThickness, xf),
+    y: interiorToExterior(vMax, boardThickness, yf),
+  });
+  const tr = applyHomography(hom.toCanvas, {
+    x: interiorToExterior(uMax, boardThickness, xf),
+    y: interiorToExterior(vMax, boardThickness, yf),
+  });
+  const br = applyHomography(hom.toCanvas, {
+    x: interiorToExterior(uMax, boardThickness, xf),
+    y: interiorToExterior(vMin, boardThickness, yf),
+  });
+  const bl = applyHomography(hom.toCanvas, {
+    x: interiorToExterior(uMin, boardThickness, xf),
+    y: interiorToExterior(vMin, boardThickness, yf),
+  });
+  if (!tl || !tr || !br || !bl) return null;
+  const nextQuad: [Point2D, Point2D, Point2D, Point2D] = [tl, tr, br, bl];
+  if (!isConvexQuad(nextQuad)) return null;
+
+  let dimX = Math.max(40, Math.round((wSpan * xInt) / 10) * 10);
+  let dimY = Math.max(40, Math.round((hSpan * yInt) / 10) * 10);
+  const minDim = Math.min(dimX, dimY);
+  if (minDim > 0 && minDim < 300) {
+    const lift = 300 / minDim;
+    dimX = Math.round((dimX * lift) / 10) * 10;
+    dimY = Math.round((dimY * lift) / 10) * 10;
+  }
+  const nextDims = {
+    x: clampNum(dimX, 300, 2400),
+    y: clampNum(dimY, 300, 2400),
+    z: clampNum(Math.round(currentDims.z), 200, 900),
+  };
+
+  const edgeTol = 0.025;
+  const nextVDividers: NormalizedSegment[] = [];
+  for (const d of vDividers) {
+    if (Math.abs(d.position - uMin) <= edgeTol || Math.abs(d.position - uMax) <= edgeTol) {
+      continue;
+    }
+    const pos = round4((d.position - uMin) / wSpan);
+    if (pos <= 0.025 || pos >= 0.975) continue;
+    const s0 = snapEdge01(clampNum((Math.min(d.start, d.end) - vMin) / hSpan, 0, 1));
+    const s1 = snapEdge01(clampNum((Math.max(d.start, d.end) - vMin) / hSpan, 0, 1));
+    if (s1 - s0 >= 0.04) {
+      nextVDividers.push({ ...d, position: pos, start: s0, end: s1 });
+    }
+  }
+
+  const nextHShelves: NormalizedSegment[] = [];
+  for (const s of hShelves) {
+    if (
+      Math.abs(s.position - vMin) <= edgeTol ||
+      (skipTopBoundary && Math.abs(s.position - vMax) <= edgeTol)
+    ) {
+      continue;
+    }
+    const pos = round4((s.position - vMin) / hSpan);
+    if (pos <= 0.025 || pos >= 0.975) continue;
+    const s0 = snapEdge01(clampNum((Math.min(s.start, s.end) - uMin) / wSpan, 0, 1));
+    const s1 = snapEdge01(clampNum((Math.max(s.start, s.end) - uMin) / wSpan, 0, 1));
+    if (s1 - s0 >= 0.04) {
+      nextHShelves.push({ ...s, position: pos, start: s0, end: s1 });
+    }
+  }
+
+  const nextDiagonals: DiagonalSegment[] = [];
+  for (const dg of diagonalDividers) {
+    const clipped = clipDiagonalToUnitBox(dg, uMin, uMax, vMin, vMax);
+    if (clipped) nextDiagonals.push(clipped);
+  }
+
+  return {
+    nextQuad,
+    nextDims,
+    vDividers: nextVDividers,
+    hShelves: nextHShelves,
+    diagonalDividers: nextDiagonals,
+  };
+}
+
+function remapCurvesToBounds(
+  curvedCuts: readonly CurvedCutSpec[],
+  bounds: { uMin: number; uMax: number; vMin: number; vMax: number },
+  nextDims: { x: number; y: number; z: number },
+  boardThickness: number,
+): CurvedCutSpec[] {
+  const { uMin, uMax, vMin, vMax } = bounds;
+  const wSpan = Math.max(1e-4, uMax - uMin);
+  const hSpan = Math.max(1e-4, vMax - vMin);
+  const xIntNext = Math.max(40, nextDims.x - 2 * boardThickness);
+  const yIntNext = Math.max(40, nextDims.y - 2 * boardThickness);
+
+  return curvedCuts.map((c) => {
+    if (c.plane !== 'xy') {
+      return {
+        ...c,
+        controlPoints: c.controlPoints.map((pt) => ({ ...pt })) as [
+          Point2D,
+          Point2D,
+          Point2D,
+          Point2D,
+        ],
+      };
+    }
+    const nextCp = c.controlPoints.map((pt) => ({
+      x: snapEdge01(clampNum((pt.x - uMin) / wSpan, 0, 1)),
+      y: snapEdge01(clampNum((pt.y - vMin) / hSpan, 0, 1)),
+    })) as [Point2D, Point2D, Point2D, Point2D];
+
+    const ptsMm = nextCp.map((pt) => ({
+      x: pt.x * xIntNext,
+      y: pt.y * yIntNext,
+    })) as [Point2D, Point2D, Point2D, Point2D];
+    const diff = evaluateBezierDifferential(ptsMm);
+
+    return {
+      ...c,
+      controlPoints: nextCp,
+      arcLengthMm: diff.arcLengthMm,
+      minRadiusMm: diff.minRadiusMm,
+      maxCurvature: diff.maxCurvature,
+    };
+  });
+}
+
+function fitBlankSketchRectWithBounds(
+  vDividers: readonly NormalizedSegment[],
+  hShelves: readonly NormalizedSegment[],
+  diagonalDividers: readonly DiagonalSegment[],
+  currentQuad: readonly [Point2D, Point2D, Point2D, Point2D],
+  currentDims: { x: number; y: number; z: number },
+  boardThickness: number,
+): { fitted: BlankSketchAutoBoxResult; bounds: { uMin: number; uMax: number; vMin: number; vMax: number } } | null {
+  if (vDividers.length < 2 || hShelves.length < 2) return null;
 
   const uMin = Math.min(...vDividers.map((d) => d.position));
   const uMax = Math.max(...vDividers.map((d) => d.position));
@@ -2116,9 +2461,9 @@ export function fitBlankSketchDrawnOuterBox(
   const hSpan = vMax - vMin;
   if (wSpan < 0.12 || hSpan < 0.12) return null;
 
-  // Solo activar si la caja dibujada está contenida dentro de la hoja (no si ya coincide con los bordes)
-  const insetMargins = uMin >= 0.035 || uMax <= 0.965 || vMin >= 0.035 || vMax <= 0.965;
-  if (!insetMargins || wSpan * hSpan > 0.8) return null;
+  // Solo activar si la caja dibujada está contenida dentro de la hoja (no si ya coincide con todos los bordes)
+  const insetMargins = uMin >= 0.02 || uMax <= 0.98 || vMin >= 0.02 || vMax <= 0.98;
+  if (!insetMargins || wSpan * hSpan > 0.98) return null;
 
   const boundTol = 0.035;
   for (const d of vDividers) {
@@ -2166,79 +2511,459 @@ export function fitBlankSketchDrawnOuterBox(
     return null;
   }
 
-  const xf = currentDims.x;
-  const yf = currentDims.y;
-  const xInt = Math.max(40, xf - 2 * boardThickness);
-  const yInt = Math.max(40, yf - 2 * boardThickness);
+  const bounds = { uMin, uMax, vMin, vMax };
+  const fitted = buildFittedBoxForBounds(
+    vDividers,
+    hShelves,
+    diagonalDividers,
+    currentQuad,
+    currentDims,
+    boardThickness,
+    bounds,
+    true,
+  );
+  return fitted ? { fitted, bounds } : null;
+}
 
-  const tl = applyHomography(hom.toCanvas, {
-    x: interiorToExterior(uMin, boardThickness, xf),
-    y: interiorToExterior(vMax, boardThickness, yf),
-  });
-  const tr = applyHomography(hom.toCanvas, {
-    x: interiorToExterior(uMax, boardThickness, xf),
-    y: interiorToExterior(vMax, boardThickness, yf),
-  });
-  const br = applyHomography(hom.toCanvas, {
-    x: interiorToExterior(uMax, boardThickness, xf),
-    y: interiorToExterior(vMin, boardThickness, yf),
-  });
-  const bl = applyHomography(hom.toCanvas, {
-    x: interiorToExterior(uMin, boardThickness, xf),
-    y: interiorToExterior(vMin, boardThickness, yf),
-  });
-  if (!tl || !tr || !br || !bl) return null;
-  const nextQuad: [Point2D, Point2D, Point2D, Point2D] = [tl, tr, br, bl];
-  if (!isConvexQuad(nextQuad)) return null;
+/**
+ * Cuando el usuario dibuja un mueble completo con contorno cerrado en el lienzo en blanco
+ * (`2+` verticales y `2+` horizontales formando los 4 muros exteriores dentro de la hoja),
+ * ajusta el marco `quad` y las dimensiones `nextDims` exactamente a ese dibujo para evitar
+ * generar un mueble gigante alrededor de la hoja con compartimentos flotando adentro.
+ * Re-mapea también las `diagonalDividers` válidas contenidas en el contorno cerrado.
+ */
+export function fitBlankSketchDrawnOuterBox(
+  vDividers: readonly NormalizedSegment[],
+  hShelves: readonly NormalizedSegment[],
+  diagonalDividers: readonly DiagonalSegment[],
+  currentQuad: readonly [Point2D, Point2D, Point2D, Point2D],
+  currentDims: { x: number; y: number; z: number },
+  boardThickness: number,
+): BlankSketchAutoBoxResult | null {
+  const res = fitBlankSketchRectWithBounds(
+    vDividers,
+    hShelves,
+    diagonalDividers,
+    currentQuad,
+    currentDims,
+    boardThickness,
+  );
+  return res ? res.fitted : null;
+}
 
-  let dimX = Math.max(40, Math.round((wSpan * xInt) / 10) * 10);
-  let dimY = Math.max(40, Math.round((hSpan * yInt) / 10) * 10);
-  const minDim = Math.min(dimX, dimY);
-  if (minDim > 0 && minDim < 300) {
-    const lift = 300 / minDim;
-    dimX = Math.round((dimX * lift) / 10) * 10;
-    dimY = Math.round((dimY * lift) / 10) * 10;
+function clusterAxisCoords(
+  primaryAnchors: readonly number[],
+  secondaryCoords: readonly number[],
+  tol = 0.025,
+): number[] {
+  const clusters: number[] = [];
+  const pushVal = (v: number) => {
+    const clamped = clampNum(v, 0, 1);
+    for (const c of clusters) {
+      if (Math.abs(c - clamped) <= tol) return;
+    }
+    clusters.push(clamped);
+  };
+  for (const a of primaryAnchors) pushVal(a);
+  for (const s of secondaryCoords) pushVal(s);
+  return clusters.sort((a, b) => a - b);
+}
+
+function mergeRectVoidCells(
+  cells: Array<{ uStart: number; uEnd: number; vStart: number; vEnd: number }>,
+): FrontZone[] {
+  const list = cells
+    .filter((c) => c.uEnd - c.uStart > 0.03 && c.vEnd - c.vStart > 0.03)
+    .map((c) => ({ ...c }));
+  let changed = true;
+  const tol = 0.015;
+  while (changed) {
+    changed = false;
+    for (let i = 0; i < list.length && !changed; i++) {
+      for (let j = i + 1; j < list.length && !changed; j++) {
+        const a = list[i];
+        const b = list[j];
+        const sameV =
+          Math.abs(a.vStart - b.vStart) <= tol && Math.abs(a.vEnd - b.vEnd) <= tol;
+        const touchU =
+          Math.abs(a.uEnd - b.uStart) <= tol || Math.abs(b.uEnd - a.uStart) <= tol;
+        const sameU =
+          Math.abs(a.uStart - b.uStart) <= tol && Math.abs(a.uEnd - b.uEnd) <= tol;
+        const touchV =
+          Math.abs(a.vEnd - b.vStart) <= tol || Math.abs(b.vEnd - a.vStart) <= tol;
+        if ((sameV && touchU) || (sameU && touchV)) {
+          a.uStart = Math.min(a.uStart, b.uStart);
+          a.uEnd = Math.max(a.uEnd, b.uEnd);
+          a.vStart = Math.min(a.vStart, b.vStart);
+          a.vEnd = Math.max(a.vEnd, b.vEnd);
+          list.splice(j, 1);
+          changed = true;
+        }
+      }
+    }
   }
-  const nextDims = {
-    x: clampNum(dimX, 300, 2400),
-    y: clampNum(dimY, 300, 2400),
-    z: clampNum(Math.round(currentDims.z), 200, 900),
+  return list.map((c, idx) => ({
+    id: `void_step_${idx + 1}`,
+    uStart: round4(c.uStart),
+    uEnd: round4(c.uEnd),
+    vStart: round4(c.vStart),
+    vEnd: round4(c.vEnd),
+    kind: 'void_outside' as const,
+    label: 'Recorte vacío',
+  }));
+}
+
+function detectSteppedClosedStructure(
+  vDividers: readonly NormalizedSegment[],
+  hShelves: readonly NormalizedSegment[],
+  diagonalDividers: readonly DiagonalSegment[],
+  curvedCuts: readonly CurvedCutSpec[],
+  currentQuad: readonly [Point2D, Point2D, Point2D, Point2D],
+  currentDims: { x: number; y: number; z: number },
+  boardThickness: number,
+): DrawnClosedStructureResult | null {
+  if (vDividers.length < 2 || hShelves.length < 2) return null;
+
+  const us = clusterAxisCoords(
+    vDividers.map((d) => d.position),
+    hShelves.flatMap((s) => [s.start, s.end]),
+    0.025,
+  );
+  const vs = clusterAxisCoords(
+    hShelves.map((s) => s.position),
+    vDividers.flatMap((d) => [d.start, d.end]),
+    0.025,
+  );
+
+  if (us.length < 3 || vs.length < 3) return null;
+  const cols = us.length - 1;
+  const rows = vs.length - 1;
+  const uMin = us[0];
+  const uMax = us[us.length - 1];
+  const vMin = vs[0];
+  const vMax = vs[vs.length - 1];
+  const wSpan = uMax - uMin;
+  const hSpan = vMax - vMin;
+  if (wSpan < 0.12 || hSpan < 0.12) return null;
+
+  const posTol = 0.026;
+  const hasH: boolean[][] = Array.from({ length: vs.length }, (_, j) =>
+    Array.from({ length: cols }, (__, i) => {
+      const segW = us[i + 1] - us[i];
+      if (segW <= 1e-5) return false;
+      return hShelves.some((s) => {
+        if (Math.abs(s.position - vs[j]) > posTol) return false;
+        const s0 = Math.min(s.start, s.end);
+        const s1 = Math.max(s.start, s.end);
+        const ov = Math.min(s1, us[i + 1]) - Math.max(s0, us[i]);
+        return ov >= segW * 0.65;
+      });
+    }),
+  );
+
+  const hasV: boolean[][] = Array.from({ length: rows }, (_, j) =>
+    Array.from({ length: us.length }, (__, i) => {
+      const segH = vs[j + 1] - vs[j];
+      if (segH <= 1e-5) return false;
+      return vDividers.some((d) => {
+        if (Math.abs(d.position - us[i]) > posTol) return false;
+        const s0 = Math.min(d.start, d.end);
+        const s1 = Math.max(d.start, d.end);
+        const ov = Math.min(s1, vs[j + 1]) - Math.max(s0, vs[j]);
+        return ov >= segH * 0.65;
+      });
+    }),
+  );
+
+  // Verificar que no existan puntas sueltas (grado === 1) y que todos los vértices activos formen 1 componente conexo
+  const activeVertices: Array<[number, number]> = [];
+  for (let j = 0; j < vs.length; j++) {
+    for (let i = 0; i < us.length; i++) {
+      let deg = 0;
+      if (i > 0 && hasH[j][i - 1]) deg++;
+      if (i < cols && hasH[j][i]) deg++;
+      if (j > 0 && hasV[j - 1][i]) deg++;
+      if (j < rows && hasV[j][i]) deg++;
+      if (deg === 1) return null;
+      if (deg >= 2) activeVertices.push([i, j]);
+    }
+  }
+  if (activeVertices.length < 6) return null;
+
+  // Conectividad del grafo de vértices activos
+  const visitedV = new Set<string>();
+  const vQueue: Array<[number, number]> = [activeVertices[0]];
+  visitedV.add(`${activeVertices[0][0]},${activeVertices[0][1]}`);
+  while (vQueue.length > 0) {
+    const [ci, cj] = vQueue.pop()!;
+    const neighbors: Array<[number, number, boolean]> = [
+      [ci - 1, cj, ci > 0 && hasH[cj][ci - 1]],
+      [ci + 1, cj, ci < cols && hasH[cj][ci]],
+      [ci, cj - 1, cj > 0 && hasV[cj - 1][ci]],
+      [ci, cj + 1, cj < rows && hasV[cj][ci]],
+    ];
+    for (const [ni, nj, edgeOk] of neighbors) {
+      if (!edgeOk) continue;
+      const key = `${ni},${nj}`;
+      if (!visitedV.has(key)) {
+        visitedV.add(key);
+        vQueue.push([ni, nj]);
+      }
+    }
+  }
+  if (visitedV.size !== activeVertices.length) return null;
+
+  // Flood-fill BFS desde el exterior de la caja envolvente para separar interior vs recorte vacío
+  const outsideVisited = Array.from({ length: rows }, () => new Uint8Array(cols));
+  const cQueue: Array<[number, number]> = [];
+  const pushOutside = (ci: number, cj: number) => {
+    if (ci < 0 || ci >= cols || cj < 0 || cj >= rows) return;
+    if (outsideVisited[cj][ci] === 1) return;
+    outsideVisited[cj][ci] = 1;
+    cQueue.push([ci, cj]);
   };
 
-  const snapEdge01 = (val: number): number => (val <= 0.03 ? 0 : val >= 0.97 ? 1 : round4(val));
+  for (let i = 0; i < cols; i++) {
+    if (!hasH[0][i]) pushOutside(i, 0);
+    if (!hasH[rows][i]) pushOutside(i, rows - 1);
+  }
+  for (let j = 0; j < rows; j++) {
+    if (!hasV[j][0]) pushOutside(0, j);
+    if (!hasV[j][cols]) pushOutside(cols - 1, j);
+  }
 
-  const nextVDividers: NormalizedSegment[] = [];
-  for (const d of vDividers) {
-    if (Math.abs(d.position - uMin) <= edgeTol || Math.abs(d.position - uMax) <= edgeTol) {
-      continue;
-    }
-    const pos = round4((d.position - uMin) / wSpan);
-    if (pos <= 0.025 || pos >= 0.975) continue;
-    const s0 = snapEdge01(clampNum((Math.min(d.start, d.end) - vMin) / hSpan, 0, 1));
-    const s1 = snapEdge01(clampNum((Math.max(d.start, d.end) - vMin) / hSpan, 0, 1));
-    if (s1 - s0 >= 0.04) {
-      nextVDividers.push({ ...d, position: pos, start: s0, end: s1 });
+  while (cQueue.length > 0) {
+    const [ci, cj] = cQueue.pop()!;
+    if (ci > 0 && !hasV[cj][ci]) pushOutside(ci - 1, cj);
+    if (ci + 1 < cols && !hasV[cj][ci + 1]) pushOutside(ci + 1, cj);
+    if (cj > 0 && !hasH[cj][ci]) pushOutside(ci, cj - 1);
+    if (cj + 1 < rows && !hasH[cj + 1][ci]) pushOutside(ci, cj + 1);
+  }
+
+  const rawOutsideCells: Array<{ uStart: number; uEnd: number; vStart: number; vEnd: number }> = [];
+  let insideCount = 0;
+  for (let j = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++) {
+      if (outsideVisited[j][i] === 1) {
+        rawOutsideCells.push({
+          uStart: snapEdge01(clampNum((us[i] - uMin) / wSpan, 0, 1)),
+          uEnd: snapEdge01(clampNum((us[i + 1] - uMin) / wSpan, 0, 1)),
+          vStart: snapEdge01(clampNum((vs[j] - vMin) / hSpan, 0, 1)),
+          vEnd: snapEdge01(clampNum((vs[j + 1] - vMin) / hSpan, 0, 1)),
+        });
+      } else {
+        insideCount++;
+      }
     }
   }
 
-  const nextHShelves: NormalizedSegment[] = [];
-  for (const s of hShelves) {
-    if (Math.abs(s.position - vMin) <= edgeTol || Math.abs(s.position - vMax) <= edgeTol) {
-      continue;
-    }
-    const pos = round4((s.position - vMin) / hSpan);
-    if (pos <= 0.025 || pos >= 0.975) continue;
-    const s0 = snapEdge01(clampNum((Math.min(s.start, s.end) - uMin) / wSpan, 0, 1));
-    const s1 = snapEdge01(clampNum((Math.max(s.start, s.end) - uMin) / wSpan, 0, 1));
-    if (s1 - s0 >= 0.04) {
-      nextHShelves.push({ ...s, position: pos, start: s0, end: s1 });
-    }
-  }
+  if (insideCount === 0 || rawOutsideCells.length === 0) return null;
+  const voidZones = mergeRectVoidCells(rawOutsideCells);
+  if (voidZones.length === 0) return null;
+
+  const bounds = { uMin, uMax, vMin, vMax };
+  const fitted = buildFittedBoxForBounds(
+    vDividers,
+    hShelves,
+    diagonalDividers,
+    currentQuad,
+    currentDims,
+    boardThickness,
+    bounds,
+    true,
+  );
+  if (!fitted) return null;
 
   return {
-    nextQuad,
-    nextDims,
-    vDividers: nextVDividers,
-    hShelves: nextHShelves,
+    fitted,
+    kind: 'stepped',
+    voidZones,
+    remappedCurves: remapCurvesToBounds(curvedCuts, bounds, fitted.nextDims, boardThickness),
   };
+}
+
+function detectCurvedTopClosedStructure(
+  vDividers: readonly NormalizedSegment[],
+  hShelves: readonly NormalizedSegment[],
+  diagonalDividers: readonly DiagonalSegment[],
+  curvedCuts: readonly CurvedCutSpec[],
+  currentQuad: readonly [Point2D, Point2D, Point2D, Point2D],
+  currentDims: { x: number; y: number; z: number },
+  boardThickness: number,
+): DrawnClosedStructureResult | null {
+  if (vDividers.length < 2 || hShelves.length < 1) return null;
+  const xyCurves = curvedCuts.filter(
+    (c) => c.plane === 'xy' && (c.kind === 'free_bezier' || c.kind === 'top_arc'),
+  );
+  if (xyCurves.length === 0) return null;
+
+  const uMin = Math.min(...vDividers.map((d) => d.position));
+  const uMax = Math.max(...vDividers.map((d) => d.position));
+  const vMin = Math.min(...hShelves.map((s) => s.position));
+  const wSpan = uMax - uMin;
+  if (wSpan < 0.12) return null;
+
+  const edgeTol = 0.028;
+  const botCov = mergedCoverageFraction(
+    hShelves
+      .filter((s) => Math.abs(s.position - vMin) <= edgeTol)
+      .map((s): [number, number] => [s.start, s.end]),
+    uMin,
+    uMax,
+  );
+  if (botCov < 0.82) return null;
+
+  const leftSegs = vDividers.filter((d) => Math.abs(d.position - uMin) <= edgeTol);
+  const rightSegs = vDividers.filter((d) => Math.abs(d.position - uMax) <= edgeTol);
+  if (leftSegs.length === 0 || rightSegs.length === 0) return null;
+
+  const leftBot = Math.min(...leftSegs.map((d) => Math.min(d.start, d.end)));
+  const leftTop = Math.max(...leftSegs.map((d) => Math.max(d.start, d.end)));
+  const rightBot = Math.min(...rightSegs.map((d) => Math.min(d.start, d.end)));
+  const rightTop = Math.max(...rightSegs.map((d) => Math.max(d.start, d.end)));
+
+  if (Math.abs(leftBot - vMin) > 0.045 || Math.abs(rightBot - vMin) > 0.045) return null;
+  if (leftTop - vMin < 0.1 || rightTop - vMin < 0.1) return null;
+
+  const leftCov = mergedCoverageFraction(
+    leftSegs.map((d): [number, number] => [d.start, d.end]),
+    vMin,
+    leftTop,
+  );
+  const rightCov = mergedCoverageFraction(
+    rightSegs.map((d): [number, number] => [d.start, d.end]),
+    vMin,
+    rightTop,
+  );
+  if (leftCov < 0.82 || rightCov < 0.82) return null;
+
+  for (const c of xyCurves) {
+    const p0 = c.controlPoints[0];
+    const p3 = c.controlPoints[3];
+    const epL = p0.x <= p3.x ? p0 : p3;
+    const epR = p0.x <= p3.x ? p3 : p0;
+    if (
+      Math.abs(epL.x - uMin) > 0.06 ||
+      Math.abs(epR.x - uMax) > 0.06 ||
+      Math.abs(epL.y - leftTop) > 0.075 ||
+      Math.abs(epR.y - rightTop) > 0.075
+    ) {
+      continue;
+    }
+
+    let curveMaxY = Math.max(leftTop, rightTop);
+    let curveMinY = Math.min(epL.y, epR.y);
+    for (let i = 0; i <= 20; i++) {
+      const pt = evaluateCubicBezierDerivatives(c.controlPoints, i / 20).r;
+      if (pt.y > curveMaxY) curveMaxY = pt.y;
+      if (pt.y < curveMinY) curveMinY = pt.y;
+    }
+    if (curveMinY < vMin - 0.025) continue;
+
+    const vMax = Math.max(leftTop, rightTop, curveMaxY);
+    const hSpan = vMax - vMin;
+    if (hSpan < 0.12) continue;
+
+    const insetMargins = uMin >= 0.02 || uMax <= 0.98 || vMin >= 0.02 || vMax <= 0.98;
+    if (!insetMargins || wSpan * hSpan > 0.98) continue;
+
+    const boundTol = 0.035;
+    const allWithinBounds =
+      vDividers.every(
+        (d) => Math.min(d.start, d.end) >= vMin - boundTol && Math.max(d.start, d.end) <= vMax + boundTol,
+      ) &&
+      hShelves.every(
+        (s) => Math.min(s.start, s.end) >= uMin - boundTol && Math.max(s.start, s.end) <= uMax + boundTol,
+      );
+    if (!allWithinBounds) continue;
+
+    const bounds = { uMin, uMax, vMin, vMax };
+    const fitted = buildFittedBoxForBounds(
+      vDividers,
+      hShelves,
+      diagonalDividers,
+      currentQuad,
+      currentDims,
+      boardThickness,
+      bounds,
+      false,
+    );
+    if (!fitted) continue;
+
+    return {
+      fitted,
+      kind: 'curved_top',
+      voidZones: [],
+      remappedCurves: remapCurvesToBounds(curvedCuts, bounds, fitted.nextDims, boardThickness),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Detecta si los trazos dibujados en el lienzo libre forman una estructura cerrada válida:
+ *  1) Caja rectangular cerrada (`kind: 'rect'`)
+ *  2) Polilínea cerrada escalonada / perfil en L sin puntas sueltas (`kind: 'stepped'` con `void_outside`)
+ *  3) Base + costados cerrados y curva `free_bezier` superior en `'xy'` (`kind: 'curved_top'`)
+ * Si el boceto aún está abierto, retorna `null` para no inventar paredes ni zonas antes de cerrar.
+ */
+export function detectDrawnClosedStructure(
+  vDividers: readonly NormalizedSegment[],
+  hShelves: readonly NormalizedSegment[],
+  diagonalDividers: readonly DiagonalSegment[],
+  curvedCuts: readonly CurvedCutSpec[],
+  currentQuad: readonly [Point2D, Point2D, Point2D, Point2D],
+  currentDims: { x: number; y: number; z: number },
+  boardThickness: number,
+): DrawnClosedStructureResult | null {
+  // 1) Caja rectangular cerrada
+  const rectRes = fitBlankSketchRectWithBounds(
+    vDividers,
+    hShelves,
+    diagonalDividers,
+    currentQuad,
+    currentDims,
+    boardThickness,
+  );
+  if (rectRes) {
+    return {
+      fitted: rectRes.fitted,
+      kind: 'rect',
+      voidZones: [],
+      remappedCurves: remapCurvesToBounds(
+        curvedCuts,
+        rectRes.bounds,
+        rectRes.fitted.nextDims,
+        boardThickness,
+      ),
+    };
+  }
+
+  // 2) Polilínea cerrada escalonada (perfil en L / escalón)
+  const steppedRes = detectSteppedClosedStructure(
+    vDividers,
+    hShelves,
+    diagonalDividers,
+    curvedCuts,
+    currentQuad,
+    currentDims,
+    boardThickness,
+  );
+  if (steppedRes) return steppedRes;
+
+  // 3) Base + costados + arco/curva superior en XY
+  const curvedTopRes = detectCurvedTopClosedStructure(
+    vDividers,
+    hShelves,
+    diagonalDividers,
+    curvedCuts,
+    currentQuad,
+    currentDims,
+    boardThickness,
+  );
+  if (curvedTopRes) return curvedTopRes;
+
+  // 4) Boceto abierto
+  return null;
 }

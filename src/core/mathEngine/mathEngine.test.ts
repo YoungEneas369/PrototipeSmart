@@ -1146,4 +1146,86 @@ describe('SmartFurniture Bloque 1 — Motor Matemático y Homografía (v3.0)', (
     );
     expect(despTight.alerts.some((a) => a.tipo === 'dimension_invalida')).toBe(true);
   });
+
+  it('28. Auditoría P1.1/P1.2: convención +Z en XZ, curva lateral ZY y consumo real de planeLinesXZ / planeLinesZY en 3D', () => {
+    const est = clonePreset('estanteria');
+
+    // A) Convención XZ: arriba (pt.y = 1) = Fondo (localZ < 0), abajo (pt.y = 0) = Frente (localZ > 0)
+    const xzDesp = calculateDespiece(
+      {
+        ...est.topology,
+        curvedCuts: [
+          {
+            id: 'xz_back_wave',
+            plane: 'xz',
+            kind: 'free_bezier',
+            label: 'Curva frente XZ',
+            controlPoints: [
+              { x: 0, y: 0.2 },
+              { x: 0.35, y: 0.05 },
+              { x: 0.65, y: 0.05 },
+              { x: 1, y: 0.2 },
+            ],
+          },
+        ],
+      },
+      est.params,
+    );
+    const cubXz = xzDesp.matrizDespiece.find((p) => p.tipo === 'cubierta');
+    expect(cubXz?.curveProfile?.extrudePlane).toBe('xz');
+    // Un trazo en el borde inferior (pt.y ≈ 0.05..0.2) debe conservar la pared trasera (-d/2 < 0) y curvar el frente (+Z)
+    const backWallPts = cubXz!.curveProfile!.pointsMm.filter((pt) => pt.y < -150);
+    const frontCurvePts = cubXz!.curveProfile!.pointsMm.filter((pt) => pt.y > 50);
+    expect(backWallPts.length).toBeGreaterThanOrEqual(2);
+    expect(frontCurvePts.length).toBeGreaterThanOrEqual(5);
+
+    // B) Curva lateral ZY (`cut.plane === 'zy'`) recorta los costados (`lateral`) con `extrudePlane: 'zy'`
+    const zyDesp = calculateDespiece(
+      {
+        ...est.topology,
+        curvedCuts: [
+          {
+            id: 'zy_slope',
+            plane: 'zy',
+            kind: 'free_bezier',
+            label: 'Perfil curvo lateral',
+            controlPoints: [
+              { x: 0.95, y: 0 },
+              { x: 0.85, y: 0.4 },
+              { x: 0.55, y: 0.75 },
+              { x: 0.35, y: 1 },
+            ],
+          },
+        ],
+      },
+      est.params,
+    );
+    const zySides = zyDesp.matrizDespiece.filter((p) => p.tipo === 'lateral');
+    expect(zySides.length).toBe(2);
+    for (const side of zySides) {
+      expect(side.curveProfile?.extrudePlane).toBe('zy');
+      expect(side.curveProfile!.pointsMm.length).toBeGreaterThanOrEqual(5);
+    }
+    expect(zyDesp.differentialMetrics?.curvedCutCount).toBe(1);
+
+    // C) Líneas rectas/diagonales en `planeLinesZY` y `planeLinesXZ` recortan laterales y cubierta en 3D
+    const planeLinesDesp = calculateDespiece(
+      {
+        ...est.topology,
+        planeLinesZY: [
+          { id: 'zy_cut_1', u1: 0.92, v1: 0.1, u2: 0.45, v2: 0.95 },
+        ],
+        planeLinesXZ: [
+          { id: 'xz_chamfer_1', u1: 0.75, v1: 0, u2: 1, v2: 0.45 },
+        ],
+      },
+      est.params,
+    );
+    const latCut = planeLinesDesp.matrizDespiece.find((p) => p.tipo === 'lateral');
+    const cubChamfer = planeLinesDesp.matrizDespiece.find((p) => p.tipo === 'cubierta');
+    expect(latCut?.curveProfile?.extrudePlane).toBe('zy');
+    expect(cubChamfer?.curveProfile?.extrudePlane).toBe('xz');
+    expect(cubChamfer!.curveProfile!.pointsMm.length).toBeGreaterThanOrEqual(5);
+    assertNo3DOverlap(planeLinesDesp.matrizDespiece);
+  });
 });

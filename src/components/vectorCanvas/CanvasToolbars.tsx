@@ -171,6 +171,93 @@ function StrokeTypeToggleGroup({
   );
 }
 
+function StrokeModePopoverSection({
+  strokeMode,
+  onChangeStrokeMode,
+}: {
+  strokeMode: UserStrokeMode;
+  onChangeStrokeMode: (mode: UserStrokeMode) => void;
+}) {
+  return (
+    <div className="vc-more-section">
+      <span className="vc-more-label">Tipo de trazo</span>
+      <div className="vc-segmented vc-segmented-soft" role="group" aria-label="Tipo de trazo">
+        {(
+          [
+            ['auto', 'Auto'],
+            ['ortho', 'Recta'],
+            ['diagonal', 'Diagonal'],
+            ['curve', 'Curva'],
+          ] as const
+        ).map(([mode, label]) => (
+          <button
+            key={mode}
+            type="button"
+            className={strokeMode === mode ? 'active' : ''}
+            onClick={(e) => {
+              onChangeStrokeMode(mode);
+              closeParentDetails(e);
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PlaneExtraOptionsMenu({
+  strokeMode,
+  magneticSnap,
+  panActive,
+  hasNonDefaultLineOpt,
+  onChangeStrokeMode,
+  onToggleMagneticSnap,
+  onTogglePanTool,
+}: {
+  strokeMode: UserStrokeMode;
+  magneticSnap: boolean;
+  panActive: boolean;
+  hasNonDefaultLineOpt: boolean;
+  onChangeStrokeMode: (mode: UserStrokeMode) => void;
+  onToggleMagneticSnap: () => void;
+  onTogglePanTool: () => void;
+}) {
+  return (
+    <details className="vc-more-menu">
+      <summary className={`vc-chip${hasNonDefaultLineOpt ? ' is-modified' : ''}`}>
+        <SlidersHorizontal size={11} /> Opciones
+      </summary>
+      <div className="vc-more-popover">
+        <StrokeModePopoverSection
+          strokeMode={strokeMode}
+          onChangeStrokeMode={onChangeStrokeMode}
+        />
+        <div className="vc-more-row">
+          <button
+            type="button"
+            className={magneticSnap ? 'vc-chip active' : 'vc-chip'}
+            onClick={onToggleMagneticSnap}
+          >
+            <Magnet size={11} /> Imán {magneticSnap ? 'ON' : 'OFF'}
+          </button>
+          <button
+            type="button"
+            className={panActive ? 'vc-chip active' : 'vc-chip'}
+            onClick={(e) => {
+              onTogglePanTool();
+              closeParentDetails(e);
+            }}
+          >
+            <Hand size={11} /> Mover foto
+          </button>
+        </div>
+      </div>
+    </details>
+  );
+}
+
 export interface CanvasTopBarsProps {
   hasPhoto: boolean;
   hasTopPhoto?: boolean;
@@ -189,7 +276,10 @@ export interface CanvasTopBarsProps {
   calibPtsCount: number;
   internalLineCount: number;
   curvedCount?: number;
+  activeViewCurvedCount?: number;
   zonesCount: number;
+  isBlankSketch?: boolean;
+  blankSketchHasStructure?: boolean;
   subRegions: SelectedSubRegion[];
   xIntMm: number;
   yIntMm: number;
@@ -265,7 +355,10 @@ export function CanvasTopBars({
   calibPtsCount,
   internalLineCount,
   curvedCount = 0,
+  activeViewCurvedCount,
   zonesCount,
+  isBlankSketch = false,
+  blankSketchHasStructure = false,
   subRegions,
   xIntMm,
   yIntMm,
@@ -343,6 +436,10 @@ export function CanvasTopBars({
     panToolActive;
   const hasNonDefaultFrameOpt = frameMode !== 'quad' || magneticSnap || panToolActive;
 
+  const partsDisabled = Boolean(isBlankSketch && !blankSketchHasStructure);
+  const effectivePlaneCurvedCount = activeViewCurvedCount ?? curvedCount;
+  const planeHasLinesOrCurves = internalLineCount + (activeViewCurvedCount ?? 0) > 0;
+
   return (
     <>
       {/* BARRA 0 (3 VISTAS ORTOGONALES + MEDIDAS RAZONABLES): Frente / Arriba / Lado */}
@@ -398,9 +495,9 @@ export function CanvasTopBars({
           <button
             type="button"
             role="tab"
-            aria-selected={traceStep === 'frame' && subTool === 'none' && viewTab === 'frontal'}
+            aria-selected={traceStep === 'frame' && subTool === 'none'}
             className={
-              traceStep === 'frame' && subTool === 'none' && viewTab === 'frontal'
+              traceStep === 'frame' && subTool === 'none'
                 ? 'vc-step-btn active'
                 : 'vc-step-btn'
             }
@@ -411,16 +508,16 @@ export function CanvasTopBars({
           <button
             type="button"
             role="tab"
-            aria-selected={traceStep === 'lines' && subTool === 'none' && viewTab === 'frontal'}
+            aria-selected={traceStep === 'lines' && subTool === 'none'}
             className={
-              traceStep === 'lines' && subTool === 'none' && viewTab === 'frontal'
+              traceStep === 'lines' && subTool === 'none'
                 ? 'vc-step-btn active'
                 : 'vc-step-btn'
             }
             onClick={() => onSelectStep('lines')}
           >
             <PenTool size={13} />{' '}
-            <span>2. Líneas ({internalLineCount + curvedCount})</span>
+            <span>2. Líneas ({internalLineCount + effectivePlaneCurvedCount})</span>
           </button>
           <button
             type="button"
@@ -430,6 +527,12 @@ export function CanvasTopBars({
               traceStep === 'zones' && subTool === 'none' && viewTab === 'frontal'
                 ? 'vc-step-btn active'
                 : 'vc-step-btn'
+            }
+            disabled={partsDisabled}
+            title={
+              partsDisabled
+                ? 'Cierra primero el contorno del mueble para definir sus partes'
+                : undefined
             }
             onClick={() => onSelectStep('zones')}
           >
@@ -621,14 +724,53 @@ export function CanvasTopBars({
                 </div>
               )}
               {traceStep === 'lines' ? (
-                <StrokeTypeToggleGroup
-                  strokeMode={strokeMode}
-                  paperGridSnap={paperGridSnap}
-                  paperGridStepMm={paperGridStepMm}
-                  onChangeStrokeMode={onChangeStrokeMode}
-                  onTogglePaperGridSnap={onTogglePaperGridSnap}
-                  onStepPaperGridSize={onStepPaperGridSize}
-                />
+                <>
+                  <div className="vc-segmented" role="group" aria-label="Acción al arrastrar líneas">
+                    <button
+                      type="button"
+                      className={linesSubMode === 'draw_only' ? 'active' : ''}
+                      onClick={() => onChangeLinesSubMode('draw_only')}
+                      title="Dibuja líneas y curvas nuevas conectando esquinas"
+                    >
+                      <PenTool size={11} /> Dibujar
+                    </button>
+                    <button
+                      type="button"
+                      className={linesSubMode === 'smart' ? 'active' : ''}
+                      onClick={() => onChangeLinesSubMode('smart')}
+                      title="Haz clic sobre una línea o curva para moverla o editar sus nodos"
+                    >
+                      <MousePointer2 size={11} /> Mover / Editar
+                    </button>
+                  </div>
+                  <StrokeTypeToggleGroup
+                    strokeMode={strokeMode}
+                    paperGridSnap={paperGridSnap}
+                    paperGridStepMm={paperGridStepMm}
+                    onChangeStrokeMode={onChangeStrokeMode}
+                    onTogglePaperGridSnap={onTogglePaperGridSnap}
+                    onStepPaperGridSize={onStepPaperGridSize}
+                  />
+                  {planeHasLinesOrCurves && (
+                    <button
+                      type="button"
+                      className="vc-chip"
+                      onClick={onClearLines}
+                      title="Limpiar líneas y curvas de esta vista"
+                    >
+                      <Trash2 size={11} /> Limpiar
+                    </button>
+                  )}
+                  <PlaneExtraOptionsMenu
+                    strokeMode={strokeMode}
+                    magneticSnap={magneticSnap}
+                    panActive={panActive}
+                    hasNonDefaultLineOpt={hasNonDefaultLineOpt}
+                    onChangeStrokeMode={onChangeStrokeMode}
+                    onToggleMagneticSnap={onToggleMagneticSnap}
+                    onTogglePanTool={onTogglePanTool}
+                  />
+                </>
               ) : (
                 <PaperGridSizeControls
                   paperGridSnap={paperGridSnap}
@@ -700,14 +842,53 @@ export function CanvasTopBars({
                 </div>
               )}
               {traceStep === 'lines' ? (
-                <StrokeTypeToggleGroup
-                  strokeMode={strokeMode}
-                  paperGridSnap={paperGridSnap}
-                  paperGridStepMm={paperGridStepMm}
-                  onChangeStrokeMode={onChangeStrokeMode}
-                  onTogglePaperGridSnap={onTogglePaperGridSnap}
-                  onStepPaperGridSize={onStepPaperGridSize}
-                />
+                <>
+                  <div className="vc-segmented" role="group" aria-label="Acción al arrastrar líneas">
+                    <button
+                      type="button"
+                      className={linesSubMode === 'draw_only' ? 'active' : ''}
+                      onClick={() => onChangeLinesSubMode('draw_only')}
+                      title="Dibuja líneas y curvas nuevas conectando esquinas"
+                    >
+                      <PenTool size={11} /> Dibujar
+                    </button>
+                    <button
+                      type="button"
+                      className={linesSubMode === 'smart' ? 'active' : ''}
+                      onClick={() => onChangeLinesSubMode('smart')}
+                      title="Haz clic sobre una línea o curva para moverla o editar sus nodos"
+                    >
+                      <MousePointer2 size={11} /> Mover / Editar
+                    </button>
+                  </div>
+                  <StrokeTypeToggleGroup
+                    strokeMode={strokeMode}
+                    paperGridSnap={paperGridSnap}
+                    paperGridStepMm={paperGridStepMm}
+                    onChangeStrokeMode={onChangeStrokeMode}
+                    onTogglePaperGridSnap={onTogglePaperGridSnap}
+                    onStepPaperGridSize={onStepPaperGridSize}
+                  />
+                  {planeHasLinesOrCurves && (
+                    <button
+                      type="button"
+                      className="vc-chip"
+                      onClick={onClearLines}
+                      title="Limpiar líneas y curvas de esta vista"
+                    >
+                      <Trash2 size={11} /> Limpiar
+                    </button>
+                  )}
+                  <PlaneExtraOptionsMenu
+                    strokeMode={strokeMode}
+                    magneticSnap={magneticSnap}
+                    panActive={panActive}
+                    hasNonDefaultLineOpt={hasNonDefaultLineOpt}
+                    onChangeStrokeMode={onChangeStrokeMode}
+                    onToggleMagneticSnap={onToggleMagneticSnap}
+                    onTogglePanTool={onTogglePanTool}
+                  />
+                </>
               ) : (
                 <PaperGridSizeControls
                   paperGridSnap={paperGridSnap}
@@ -715,6 +896,11 @@ export function CanvasTopBars({
                   onTogglePaperGridSnap={onTogglePaperGridSnap}
                   onStepPaperGridSize={onStepPaperGridSize}
                 />
+              )}
+              {onRecognizeSketch && hasSidePhoto && (
+                <button type="button" className="vc-chip" onClick={onRecognizeSketch}>
+                  <Wand2 size={12} /> Reconocer boceto ZY
+                </button>
               )}
               <button type="button" className="vc-chip" onClick={onUploadSidePhoto}>
                 <Camera size={12} /> {hasSidePhoto ? 'Foto Lateral' : 'Subir Lateral'}
@@ -888,7 +1074,7 @@ export function CanvasTopBars({
               <button
                 type="button"
                 className="vc-chip"
-                disabled={internalLineCount === 0}
+                disabled={internalLineCount + effectivePlaneCurvedCount === 0}
                 onClick={onClearLines}
                 title="Limpiar todas las líneas internas (con Deshacer)"
               >
@@ -945,51 +1131,10 @@ export function CanvasTopBars({
                     </button>
                   </div>
 
-                  <div className="vc-more-section">
-                    <span className="vc-more-label">Tipo de trazo</span>
-                    <div className="vc-segmented vc-segmented-soft" role="group" aria-label="Tipo de trazo">
-                      <button
-                        type="button"
-                        className={strokeMode === 'auto' ? 'active' : ''}
-                        onClick={(e) => {
-                          onChangeStrokeMode('auto');
-                          closeParentDetails(e);
-                        }}
-                      >
-                        Auto
-                      </button>
-                      <button
-                        type="button"
-                        className={strokeMode === 'ortho' ? 'active' : ''}
-                        onClick={(e) => {
-                          onChangeStrokeMode('ortho');
-                          closeParentDetails(e);
-                        }}
-                      >
-                        Recta
-                      </button>
-                      <button
-                        type="button"
-                        className={strokeMode === 'diagonal' ? 'active' : ''}
-                        onClick={(e) => {
-                          onChangeStrokeMode('diagonal');
-                          closeParentDetails(e);
-                        }}
-                      >
-                        Diagonal
-                      </button>
-                      <button
-                        type="button"
-                        className={strokeMode === 'curve' ? 'active' : ''}
-                        onClick={(e) => {
-                          onChangeStrokeMode('curve');
-                          closeParentDetails(e);
-                        }}
-                      >
-                        Curva
-                      </button>
-                    </div>
-                  </div>
+                  <StrokeModePopoverSection
+                    strokeMode={strokeMode}
+                    onChangeStrokeMode={onChangeStrokeMode}
+                  />
 
                   <div className="vc-more-row">
                     <button
@@ -1026,6 +1171,12 @@ export function CanvasTopBars({
             <button
               type="button"
               className="vc-btn vc-btn-primary vc-btn-xs"
+              disabled={partsDisabled}
+              title={
+                partsDisabled
+                  ? 'Cierra primero el contorno del mueble para definir sus partes'
+                  : undefined
+              }
               onClick={() => onSelectStep('zones')}
             >
               Siguiente: Partes <ArrowRight size={12} />

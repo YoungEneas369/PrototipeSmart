@@ -373,6 +373,18 @@ export function partitionCellsFromVectors(
   vDividers: readonly NormalizedSegment[],
   hShelves: readonly NormalizedSegment[],
 ): PartitionRectCell[] {
+  const safeVDivs = vDividers.filter(
+    (d) =>
+      Number.isFinite(d.position) &&
+      Number.isFinite(d.start) &&
+      Number.isFinite(d.end),
+  );
+  const safeHShelves = hShelves.filter(
+    (s) =>
+      Number.isFinite(s.position) &&
+      Number.isFinite(s.start) &&
+      Number.isFinite(s.end),
+  );
   const dedupeEps = 0.01;
   const dedupeSorted = (vals: number[], eps = dedupeEps): number[] => {
     const sorted = [...vals].sort((a, b) => a - b);
@@ -384,13 +396,13 @@ export function partitionCellsFromVectors(
     }
     if (out[0] > 0.001) out.unshift(0);
     else out[0] = 0;
-    if (out[out.length - 1] < 0.999) out.push(1);
+    if (out[out.length - 1] < 1 - eps - 1e-6) out.push(1);
     else out[out.length - 1] = 1;
     return out;
   };
 
-  const us = dedupeSorted([0, 1, ...vDividers.map((d) => clamp(d.position, 0.01, 0.99))]);
-  const vs = dedupeSorted([0, 1, ...hShelves.map((s) => clamp(s.position, 0.01, 0.99))]);
+  const us = dedupeSorted([0, 1, ...safeVDivs.map((d) => clamp(d.position, 0.01, 0.99))]);
+  const vs = dedupeSorted([0, 1, ...safeHShelves.map((s) => clamp(s.position, 0.01, 0.99))]);
 
   const cols = us.length - 1;
   const rows = vs.length - 1;
@@ -413,8 +425,8 @@ export function partitionCellsFromVectors(
     return bestIdx;
   };
 
-  const vDividerGridIdx = vDividers.map((d) => nearestGridIdx(clamp(d.position, 0.01, 0.99), us));
-  const hShelfGridIdx = hShelves.map((s) => nearestGridIdx(clamp(s.position, 0.01, 0.99), vs));
+  const vDividerGridIdx = safeVDivs.map((d) => nearestGridIdx(clamp(d.position, 0.01, 0.99), us));
+  const hShelfGridIdx = safeHShelves.map((s) => nearestGridIdx(clamp(s.position, 0.01, 0.99), vs));
 
   const hasVertWall = (colBorderIdx: number, r: number): boolean => {
     const uWall = us[colBorderIdx];
@@ -422,7 +434,7 @@ export function partitionCellsFromVectors(
     const v1 = vs[r + 1];
     const cellH = v1 - v0;
     const posTol = Math.max(dedupeEps + 0.002, 0.015);
-    return vDividers.some((d, idx) => {
+    return safeVDivs.some((d, idx) => {
       if (vDividerGridIdx[idx] !== colBorderIdx) return false;
       if (Math.abs(d.position - uWall) > posTol) return false;
       const dStart = Math.min(d.start, d.end);
@@ -438,7 +450,7 @@ export function partitionCellsFromVectors(
     const u1 = us[c + 1];
     const cellW = u1 - u0;
     const posTol = Math.max(dedupeEps + 0.002, 0.015);
-    return hShelves.some((s, idx) => {
+    return safeHShelves.some((s, idx) => {
       if (hShelfGridIdx[idx] !== rowBorderIdx) return false;
       if (Math.abs(s.position - vWall) > posTol) return false;
       const sStart = Math.min(s.start, s.end);

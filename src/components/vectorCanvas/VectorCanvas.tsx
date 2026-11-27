@@ -59,7 +59,9 @@ import { ZoneInspector } from './ZoneInspector';
 import {
   CORNER_STEP_NAMES,
   PAPER_GRID_STEP_PRESETS,
+  computeAlignedBlankSketchQuads,
   createBlankSketchBitmap,
+  detectDrawnClosedStructure,
   fitBlankSketchDrawnOuterBox,
   MELAMINE_LABELS,
   clampCalibratedDims,
@@ -91,6 +93,21 @@ import {
 import { useCanvasPointerController } from './useCanvasPointerController';
 import './vectorCanvas.css';
 
+function mergeVoidZonesFromClosed(
+  zones: FrontZone[],
+  voidZones: readonly FrontZone[],
+): FrontZone[] {
+  if (voidZones.length === 0) return zones;
+  return zones.map((z) => {
+    const cu = (z.uStart + z.uEnd) / 2;
+    const cv = (z.vStart + z.vEnd) / 2;
+    const isVoid = voidZones.some(
+      (vz) => cu >= vz.uStart && cu <= vz.uEnd && cv >= vz.vStart && cv <= vz.vEnd,
+    );
+    return isVoid ? { ...z, kind: 'void_outside' as const, label: 'Recorte vacío' } : z;
+  });
+}
+
 export interface VectorCanvasProps {
   topology: FurnitureTopology;
   params: ScaleAndBoardParams;
@@ -114,6 +131,8 @@ export interface VectorCanvasProps {
   onUpdateMaterialOnly?: (material: MelamineMaterial) => void;
   onToggleExternalLegs?: (hasLegs: boolean, heightMm?: number, count?: number) => void;
   onSelectDepthMm?: (depthMm: number) => void;
+  onBlankSketchStateChange?: (state: { active: boolean; hasStructure: boolean }) => void;
+  externalResetSeq?: number;
 }
 
 export function VectorCanvas({
@@ -136,6 +155,8 @@ export function VectorCanvas({
   onUpdateMaterialOnly,
   onToggleExternalLegs,
   onSelectDepthMm,
+  onBlankSketchStateChange,
+  externalResetSeq = 0,
 }: VectorCanvasProps) {
   // Pasos y herramientas activas
   const [viewTab, setViewTab] = useState<CanvasViewTab>('frontal');
@@ -190,10 +211,14 @@ export function VectorCanvas({
 
   const [selectedLine, setSelectedLine] = useState<LineRef | null>(null);
   const [selectedPlaneLineId, setSelectedPlaneLineId] = useState<string | null>(null);
+  const [selectedCurveId, setSelectedCurveId] = useState<string | null>(null);
 
   // Estado de fotografía y visión
   const [frontBitmap, setFrontBitmap] = useState<WorkingBitmap | null>(null);
   const [frontIsBlankSketch, setFrontIsBlankSketch] = useState<boolean>(false);
+  const [blankSketchHasStructure, setBlankSketchHasStructure] = useState<boolean>(true);
+  const [topIsBlankSketch, setTopIsBlankSketch] = useState<boolean>(false);
+  const [sideIsBlankSketch, setSideIsBlankSketch] = useState<boolean>(false);
   const imgW = frontBitmap?.w ?? 900;
   const imgH = frontBitmap?.h ?? 680;
   const [exteriorBgRgb, setExteriorBgRgb] = useState<[number, number, number]>([242, 244, 248]);
@@ -357,6 +382,62 @@ export function VectorCanvas({
     [onUpdateFrontZones, onUpdateTopology, topology],
   );
 
+  useEffect(() => {
+    onBlankSketchStateChange?.({
+      active: frontIsBlankSketch,
+      hasStructure: !frontIsBlankSketch || blankSketchHasStructure,
+    });
+  }, [frontIsBlankSketch, blankSketchHasStructure, onBlankSketchStateChange]);
+
+  const syncFrontTriView = useCallback(
+    (overrides?: {
+      quadCorners?: [Point2D, Point2D, Point2D, Point2D];
+      aspectRatio?: number;
+      vDividers?: NormalizedSegment[];
+      hShelves?: NormalizedSegment[];
+      diagonalDividers?: DiagonalSegment[];
+      frontZones?: FrontZone[];
+      curvedCuts?: CurvedCutSpec[];
+      hasStructure?: boolean;
+    }) => {
+      const hasStruct =
+        overrides?.hasStructure ?? (!frontIsBlankSketch || blankSketchHasStructure);
+      if (!frontBitmap || !hasStruct) {
+        triViewRef.current = { ...triViewRef.current, front: undefined };
+        return;
+      }
+      const qNow = overrides?.quadCorners ?? quad;
+      const arNow = overrides?.aspectRatio ?? topology.aspectRatioXY ?? estimatedAspectXY;
+      const cutsNow = overrides?.curvedCuts ?? topology.curvedCuts ?? [];
+      triViewRef.current = {
+        ...triViewRef.current,
+        front: {
+          plane: 'xy',
+          aspectRatio: arNow,
+          quadCorners: qNow,
+          vDividers: overrides?.vDividers ?? materializedBase.vDividers,
+          hShelves: overrides?.hShelves ?? materializedBase.hShelves,
+          diagonalDividers: overrides?.diagonalDividers ?? topology.diagonalDividers,
+          frontZones: overrides?.frontZones ?? topology.frontZones,
+          curvedCuts: cutsNow.filter((c) => c.plane === 'xy'),
+        },
+      };
+    },
+    [
+      frontBitmap,
+      frontIsBlankSketch,
+      blankSketchHasStructure,
+      quad,
+      topology.aspectRatioXY,
+      topology.diagonalDividers,
+      topology.frontZones,
+      topology.curvedCuts,
+      estimatedAspectXY,
+      materializedBase.vDividers,
+      materializedBase.hShelves,
+    ],
+  );
+
   // Historial Undo/Redo completo (incluye 3 vistas XY/XZ/ZY, líneas y proporciones 3D sincronizadas)
   const getCurrentSnapshot = useCallback(
     (): CanvasHistorySnapshot =>
@@ -365,8 +446,18 @@ export function VectorCanvas({
         sideQuad,
         planeLinesXZ,
         planeLinesZY,
+        blankSketchHasStructure,
       }),
-    [quad, topology, params.targetDimensions, topQuad, sideQuad, planeLinesXZ, planeLinesZY],
+    [
+      quad,
+      topology,
+      params.targetDimensions,
+      topQuad,
+      sideQuad,
+      planeLinesXZ,
+      planeLinesZY,
+      blankSketchHasStructure,
+    ],
   );
 
   const commitOuterFrameRef = useRef<
@@ -388,13 +479,19 @@ export function VectorCanvas({
     (snap: CanvasHistorySnapshot, direction: 'undo' | 'redo') => {
       const hom = computeQuadToUnitHomography(snap.quad);
       const nextRatio = estimateAspectRatioFixedFocal(snap.quad, imgW, imgH, focal35mm);
+      const nextXZ = snap.planeLinesXZ ?? [];
+      const nextZY = snap.planeLinesZY ?? [];
       setQuad(snap.quad);
       if (snap.topQuad) setTopQuad(snap.topQuad);
       if (snap.sideQuad) setSideQuad(snap.sideQuad);
-      if (snap.planeLinesXZ) setPlaneLinesXZ(snap.planeLinesXZ);
-      if (snap.planeLinesZY) setPlaneLinesZY(snap.planeLinesZY);
+      setPlaneLinesXZ(nextXZ);
+      setPlaneLinesZY(nextZY);
+      if (snap.blankSketchHasStructure !== undefined) {
+        setBlankSketchHasStructure(snap.blankSketchHasStructure);
+      }
       setSelectedLine(null);
       setSelectedPlaneLineId(null);
+      setSelectedCurveId(null);
 
       const prevSelected = (topology.frontZones ?? []).find(
         (z) => z.id === effectiveSelectedZoneId,
@@ -412,10 +509,14 @@ export function VectorCanvas({
         vDividers: snap.vDividers,
         hShelves: snap.hShelves,
         diagonalDividers: snap.diagonalDividers,
+        planeLinesXZ: nextXZ.length > 0 ? nextXZ : undefined,
+        planeLinesZY: nextZY.length > 0 ? nextZY : undefined,
         frontZones: snap.frontZones,
         cubiertaMaterialOverride: snap.cubiertaMaterialOverride,
         curvedCuts: snap.curvedCuts,
         lShape: snap.lShape,
+        hasBackPanel:
+          snap.blankSketchHasStructure === false ? false : topology.hasBackPanel,
       });
       if (
         snap.dims &&
@@ -534,6 +635,7 @@ export function VectorCanvas({
             sideQuad,
             planeLinesXZ,
             planeLinesZY,
+            blankSketchHasStructure,
           }),
         );
       }
@@ -583,6 +685,23 @@ export function VectorCanvas({
       if (matchedZone !== effectiveSelectedZoneId) setSelectedZone(matchedZone);
 
       setQuad(nextQuad);
+      if (frontIsBlankSketch) {
+        setBlankSketchHasStructure(true);
+        if (topIsBlankSketch || sideIsBlankSketch) {
+          const aligned = computeAlignedBlankSketchQuads(syncedDims, bmp.w, bmp.h);
+          if (topIsBlankSketch) setTopQuad(aligned.topQuad);
+          if (sideIsBlankSketch) setSideQuad(aligned.sideQuad);
+        }
+      }
+      syncFrontTriView({
+        quadCorners: nextQuad,
+        aspectRatio: ratio,
+        vDividers: nextVDivs,
+        hShelves: nextHShelves,
+        diagonalDividers: nextDiags,
+        frontZones: zones,
+        hasStructure: true,
+      });
       onUpdateTopology({
         ...topology,
         aspectRatioXY: ratio,
@@ -595,7 +714,7 @@ export function VectorCanvas({
         diagonalDividers: nextDiags,
         frontZones: zones,
         hasBackPanel: frontIsBlankSketch
-          ? !hasLegVoid && topology.hasBackPanel !== false
+          ? !hasLegVoid && topology.hasBackPanel === true
           : hasLegVoid
             ? false
             : topology.hasBackPanel,
@@ -631,6 +750,10 @@ export function VectorCanvas({
       materializedBase.vDividers,
       materializedBase.hShelves,
       frontIsBlankSketch,
+      blankSketchHasStructure,
+      topIsBlankSketch,
+      sideIsBlankSketch,
+      syncFrontTriView,
       effectiveSelectedZoneId,
       setSelectedZone,
       pushSnapshot,
@@ -653,6 +776,125 @@ export function VectorCanvas({
       opts: { preserveZones?: boolean; recordUndo?: boolean } = {},
     ) => {
       if (opts.recordUndo) pushSnapshot();
+
+      if (frontIsBlankSketch && !blankSketchHasStructure) {
+        const closedRes = detectDrawnClosedStructure(
+          nextVDivs,
+          nextHShelves,
+          nextDiags,
+          topology.curvedCuts ?? [],
+          quad,
+          params.targetDimensions,
+          params.boardThickness,
+        );
+        if (!closedRes) {
+          setSelectedZone(null);
+          syncFrontTriView({ hasStructure: false });
+          onUpdateTopology({
+            ...topology,
+            aspectRatioXY: estimatedAspectXY,
+            quadCorners: quad,
+            homographyMatrix: committedHomography
+              ? committedHomography.toUnit.map((r) => [...r])
+              : topology.homographyMatrix,
+            shelfMode: 'custom',
+            equalShelfCount: 0,
+            vDividers: nextVDivs,
+            hShelves: nextHShelves,
+            diagonalDividers: nextDiags,
+            frontZones: [],
+            hasBackPanel: false,
+            detectionSource: 'manual',
+            detectionConfidence: 0.9,
+          });
+          const openCount = nextVDivs.length + nextHShelves.length + nextDiags.length;
+          setStatusMsg(
+            openCount === 0
+              ? 'Lienzo libre limpio. Dibuja líneas cerradas o activa "1. Contorno" para generar el modelo 3D.'
+              : `Boceto abierto (${openCount} trazo(s)): dibuja un contorno cerrado para generar la estructura 3D.`,
+          );
+          return;
+        }
+
+        const fittedHom = computeQuadToUnitHomography(closedRes.fitted.nextQuad);
+        const fittedRatio = estimateAspectRatioFixedFocal(
+          closedRes.fitted.nextQuad,
+          frontBitmap?.w ?? 900,
+          frontBitmap?.h ?? 680,
+          focal35mm,
+        );
+        const rawCells = partitionCellsFromVectors(
+          closedRes.fitted.vDividers,
+          closedRes.fitted.hShelves,
+        );
+        const rawZones = classifyPartitionedZonesFromPhoto(
+          rawCells,
+          null,
+          0,
+          0,
+          closedRes.fitted.nextDims,
+          params.material,
+          exteriorBgRgb,
+          [],
+          params.boardThickness,
+        );
+        const zones = mergeVoidZonesFromClosed(rawZones, closedRes.voidZones);
+        const hasLegVoid = zones.some((z) => z.kind === 'leg_void');
+        setBlankSketchHasStructure(true);
+        setQuad(closedRes.fitted.nextQuad);
+        if (topIsBlankSketch || sideIsBlankSketch) {
+          const aligned = computeAlignedBlankSketchQuads(
+            closedRes.fitted.nextDims,
+            frontBitmap?.w ?? 900,
+            frontBitmap?.h ?? 680,
+          );
+          if (topIsBlankSketch) setTopQuad(aligned.topQuad);
+          if (sideIsBlankSketch) setSideQuad(aligned.sideQuad);
+        }
+        setSelectedLine(null);
+        setSelectedZone(matchZoneIdByCentroid(undefined, zones));
+        const closedCurves = closedRes.remappedCurves;
+        syncFrontTriView({
+          quadCorners: closedRes.fitted.nextQuad,
+          aspectRatio: fittedRatio,
+          vDividers: closedRes.fitted.vDividers,
+          hShelves: closedRes.fitted.hShelves,
+          diagonalDividers: closedRes.fitted.diagonalDividers ?? [],
+          frontZones: zones,
+          curvedCuts: closedCurves,
+          hasStructure: true,
+        });
+        onApplyCalibratedDims(closedRes.fitted.nextDims);
+        onUpdateTopology({
+          ...topology,
+          aspectRatioXY: fittedRatio,
+          quadCorners: closedRes.fitted.nextQuad,
+          homographyMatrix: fittedHom
+            ? fittedHom.toUnit.map((r) => [...r])
+            : topology.homographyMatrix,
+          shelfMode: 'custom',
+          equalShelfCount: 0,
+          vDividers: closedRes.fitted.vDividers,
+          hShelves: closedRes.fitted.hShelves,
+          diagonalDividers: closedRes.fitted.diagonalDividers ?? [],
+          curvedCuts: closedCurves.length > 0 ? closedCurves : undefined,
+          frontZones: zones,
+          hasBackPanel: hasLegVoid ? false : topology.hasBackPanel === true,
+          detectionSource: 'manual',
+          detectionConfidence: 0.96,
+        });
+        const kindLabel =
+          closedRes.kind === 'stepped'
+            ? 'escalonado'
+            : closedRes.kind === 'curved_top'
+              ? 'techo curvo'
+              : 'rectangular';
+        setStatusMsg(
+          `Contorno cerrado ${kindLabel} reconocido (${closedRes.fitted.nextDims.x} × ${closedRes.fitted.nextDims.y} mm) → modelo 3D actualizado.`,
+        );
+        return;
+      }
+
       const prevZones = topology.frontZones ?? [];
       const cells = partitionCellsFromVectors(nextVDivs, nextHShelves);
       const zones = classifyPartitionedZonesFromPhoto(
@@ -673,6 +915,12 @@ export function VectorCanvas({
       );
       if (matchedZone !== effectiveSelectedZoneId) setSelectedZone(matchedZone);
 
+      syncFrontTriView({
+        vDividers: nextVDivs,
+        hShelves: nextHShelves,
+        diagonalDividers: nextDiags,
+        frontZones: zones,
+      });
       onUpdateTopology({
         ...topology,
         aspectRatioXY: estimatedAspectXY,
@@ -687,7 +935,7 @@ export function VectorCanvas({
         diagonalDividers: nextDiags,
         frontZones: zones,
         hasBackPanel: frontIsBlankSketch
-          ? !hasLegVoid && topology.hasBackPanel !== false
+          ? !hasLegVoid && topology.hasBackPanel === true
           : hasLegVoid
             ? false
             : topology.hasBackPanel,
@@ -697,46 +945,139 @@ export function VectorCanvas({
     },
     [
       pushSnapshot,
-      topology,
       frontIsBlankSketch,
-      rectifiedPreview,
+      blankSketchHasStructure,
+      topIsBlankSketch,
+      sideIsBlankSketch,
+      topology,
+      quad,
       params.targetDimensions,
-      params.material,
       params.boardThickness,
+      params.material,
+      frontBitmap,
+      focal35mm,
+      rectifiedPreview,
       exteriorBgRgb,
       effectiveSelectedZoneId,
       setSelectedZone,
+      syncFrontTriView,
+      onApplyCalibratedDims,
       onUpdateTopology,
       estimatedAspectXY,
-      quad,
       committedHomography,
+    ],
+  );
+
+  const applyPlaneLinesUpdate = useCallback(
+    (plane: 'xz' | 'zy', nextList: DiagonalSegment[], recordUndo: boolean) => {
+      if (recordUndo) pushSnapshot();
+      const nextXZ = plane === 'xz' ? nextList : planeLinesXZ;
+      const nextZY = plane === 'zy' ? nextList : planeLinesZY;
+      if (plane === 'xz') setPlaneLinesXZ(nextXZ);
+      else setPlaneLinesZY(nextZY);
+
+      const topoWithLines: FurnitureTopology = {
+        ...topology,
+        planeLinesXZ: nextXZ.length > 0 ? nextXZ : undefined,
+        planeLinesZY: nextZY.length > 0 ? nextZY : undefined,
+      };
+
+      syncFrontTriView();
+      const ratioXZ = estimateAspectRatioFixedFocal(
+        topQuad,
+        topBitmap?.w ?? 900,
+        topBitmap?.h ?? 680,
+        26,
+      );
+      const ratioZY = estimateAspectRatioFixedFocal(
+        sideQuad,
+        sideBitmap?.w ?? 900,
+        sideBitmap?.h ?? 680,
+        26,
+      );
+      const allCuts = topology.curvedCuts ?? [];
+      triViewRef.current = {
+        ...triViewRef.current,
+        top: topBitmap
+          ? {
+              ...(triViewRef.current.top ?? {}),
+              plane: 'xz',
+              aspectRatio: triViewRef.current.top?.aspectRatio ?? ratioXZ,
+              quadCorners: topQuad,
+              planeLinesXZ: nextXZ,
+              curvedCuts: allCuts.filter((c) => c.plane === 'xz'),
+            }
+          : undefined,
+        side: sideBitmap
+          ? {
+              ...(triViewRef.current.side ?? {}),
+              plane: 'zy',
+              aspectRatio: triViewRef.current.side?.aspectRatio ?? ratioZY,
+              quadCorners: sideQuad,
+              planeLinesZY: nextZY,
+              curvedCuts: allCuts.filter((c) => c.plane === 'zy'),
+            }
+          : undefined,
+      };
+
+      if (triViewRef.current.top || triViewRef.current.side) {
+        const syn = synthesize3DFromTriViews(topoWithLines, params, triViewRef.current);
+        onUpdateTopology({
+          ...syn.topology,
+          planeLinesXZ: nextXZ.length > 0 ? nextXZ : undefined,
+          planeLinesZY: nextZY.length > 0 ? nextZY : undefined,
+        });
+        if (
+          syn.params.targetDimensions.x !== params.targetDimensions.x ||
+          syn.params.targetDimensions.y !== params.targetDimensions.y ||
+          syn.params.targetDimensions.z !== params.targetDimensions.z
+        ) {
+          onApplyCalibratedDims(syn.params.targetDimensions);
+        }
+      } else {
+        onUpdateTopology(topoWithLines);
+      }
+    },
+    [
+      pushSnapshot,
+      planeLinesXZ,
+      planeLinesZY,
+      topology,
+      syncFrontTriView,
+      topQuad,
+      topBitmap,
+      sideQuad,
+      sideBitmap,
+      params,
+      onUpdateTopology,
+      onApplyCalibratedDims,
     ],
   );
 
   const handleUpdatePlaneLine = useCallback(
     (plane: 'xz' | 'zy', updated: DiagonalSegment) => {
-      pushSnapshot();
-      if (plane === 'xz') {
-        setPlaneLinesXZ((prev) => prev.map((ln) => (ln.id === updated.id ? updated : ln)));
-      } else {
-        setPlaneLinesZY((prev) => prev.map((ln) => (ln.id === updated.id ? updated : ln)));
-      }
+      const current = plane === 'xz' ? planeLinesXZ : planeLinesZY;
+      applyPlaneLinesUpdate(
+        plane,
+        current.map((ln) => (ln.id === updated.id ? updated : ln)),
+        true,
+      );
     },
-    [pushSnapshot],
+    [planeLinesXZ, planeLinesZY, applyPlaneLinesUpdate],
   );
 
   const handleDeletePlaneLine = useCallback(
     (plane: 'xz' | 'zy', id: string) => {
-      pushSnapshot();
-      if (plane === 'xz') {
-        setPlaneLinesXZ((prev) => prev.filter((ln) => ln.id !== id));
-      } else {
-        setPlaneLinesZY((prev) => prev.filter((ln) => ln.id !== id));
-      }
+      const current = plane === 'xz' ? planeLinesXZ : planeLinesZY;
+      applyPlaneLinesUpdate(
+        plane,
+        current.filter((ln) => ln.id !== id),
+        true,
+      );
       setSelectedPlaneLineId(null);
       setStatusMsg('Línea eliminada de vista Arriba / Lado (Ctrl+Z para deshacer).');
     },
-    [pushSnapshot],
+    [planeLinesXZ, planeLinesZY, applyPlaneLinesUpdate],
   );
 
   const handleStepPaperGridSize = useCallback(
@@ -762,6 +1103,7 @@ export function VectorCanvas({
     (nextSide: [Point2D, Point2D, Point2D, Point2D], ratioZY: number, estDepth: number) => {
       pushSnapshot();
       setSideQuad(nextSide);
+      syncFrontTriView();
       const existingViews = triViewRef.current;
       triViewRef.current = {
         ...existingViews,
@@ -770,25 +1112,26 @@ export function VectorCanvas({
           plane: 'zy',
           aspectRatio: ratioZY,
           quadCorners: nextSide,
+          planeLinesZY,
+          curvedCuts: (topology.curvedCuts ?? []).filter((c) => c.plane === 'zy'),
         },
       };
-      const viewsUsed: 1 | 2 | 3 =
-        triViewRef.current.front && triViewRef.current.top ? 3 : 2;
-      onUpdateTopology({
-        ...topology,
-        viewsMode: viewsUsed,
-        aspectRatioZY: ratioZY,
-      });
-      onSelectDepthMm?.(estDepth);
-      setStatusMsg(`Profundidad Z estimada desde vista lateral: ${estDepth} mm.`);
+      const syn = synthesize3DFromTriViews(topology, params, triViewRef.current);
+      onUpdateTopology(syn.topology);
+      const nextDims = syn.params.targetDimensions;
+      onApplyCalibratedDims(nextDims);
+      setStatusMsg(
+        `Profundidad Z estimada desde vista lateral: ${nextDims.z} mm (ref. ${estDepth} mm).`,
+      );
     },
-    [topology, pushSnapshot, onUpdateTopology, onSelectDepthMm],
+    [topology, params, planeLinesZY, pushSnapshot, syncFrontTriView, onUpdateTopology, onApplyCalibratedDims],
   );
 
   const handleCommitTopQuad = useCallback(
     (nextTop: [Point2D, Point2D, Point2D, Point2D], ratioXZ: number) => {
       pushSnapshot();
       setTopQuad(nextTop);
+      syncFrontTriView();
       triViewRef.current = {
         ...triViewRef.current,
         top: {
@@ -796,31 +1139,195 @@ export function VectorCanvas({
           plane: 'xz',
           aspectRatio: ratioXZ,
           quadCorners: nextTop,
+          planeLinesXZ,
+          curvedCuts: (topology.curvedCuts ?? []).filter((c) => c.plane === 'xz'),
         },
       };
       const syn = synthesize3DFromTriViews(topology, params, triViewRef.current);
       onUpdateTopology(syn.topology);
-      onApplyCalibratedDims?.(syn.params.targetDimensions);
+      onApplyCalibratedDims(syn.params.targetDimensions);
       setStatusMsg(`Planta Arriba (XZ) actualizada (razón X/Z = ${ratioXZ.toFixed(2)}).`);
     },
-    [topology, params, pushSnapshot, onUpdateTopology, onApplyCalibratedDims],
+    [topology, params, planeLinesXZ, pushSnapshot, syncFrontTriView, onUpdateTopology, onApplyCalibratedDims],
   );
 
   const handleCommitCurvedCut = useCallback(
     (cut: CurvedCutSpec) => {
       const prevCuts = topology.curvedCuts ?? [];
       const nextCuts = [
-        ...prevCuts.filter((c) => c.id !== cut.id && !(cut.cornerTarget && c.cornerTarget === cut.cornerTarget)),
+        ...prevCuts.filter(
+          (c) => c.id !== cut.id && !(cut.cornerTarget && c.cornerTarget === cut.cornerTarget),
+        ),
         cut,
       ];
-      const nextTopo: FurnitureTopology = { ...topology, curvedCuts: nextCuts };
       pushSnapshot();
+
+      if (frontIsBlankSketch && !blankSketchHasStructure && cut.plane === 'xy') {
+        const closedRes = detectDrawnClosedStructure(
+          materializedBase.vDividers,
+          materializedBase.hShelves,
+          topology.diagonalDividers ?? [],
+          nextCuts,
+          quad,
+          params.targetDimensions,
+          params.boardThickness,
+        );
+        if (closedRes) {
+          const fittedHom = computeQuadToUnitHomography(closedRes.fitted.nextQuad);
+          const fittedRatio = estimateAspectRatioFixedFocal(
+            closedRes.fitted.nextQuad,
+            frontBitmap?.w ?? 900,
+            frontBitmap?.h ?? 680,
+            focal35mm,
+          );
+          const rawCells = partitionCellsFromVectors(
+            closedRes.fitted.vDividers,
+            closedRes.fitted.hShelves,
+          );
+          const rawZones = classifyPartitionedZonesFromPhoto(
+            rawCells,
+            null,
+            0,
+            0,
+            closedRes.fitted.nextDims,
+            params.material,
+            exteriorBgRgb,
+            [],
+            params.boardThickness,
+          );
+          const zones = mergeVoidZonesFromClosed(rawZones, closedRes.voidZones);
+          const hasLegVoid = zones.some((z) => z.kind === 'leg_void');
+          setBlankSketchHasStructure(true);
+          setQuad(closedRes.fitted.nextQuad);
+          if (topIsBlankSketch || sideIsBlankSketch) {
+            const aligned = computeAlignedBlankSketchQuads(
+              closedRes.fitted.nextDims,
+              frontBitmap?.w ?? 900,
+              frontBitmap?.h ?? 680,
+            );
+            if (topIsBlankSketch) setTopQuad(aligned.topQuad);
+            if (sideIsBlankSketch) setSideQuad(aligned.sideQuad);
+          }
+          setSelectedCurveId(cut.id);
+          setSelectedZone(matchZoneIdByCentroid(undefined, zones));
+          const closedCurves = closedRes.remappedCurves;
+          syncFrontTriView({
+            quadCorners: closedRes.fitted.nextQuad,
+            aspectRatio: fittedRatio,
+            vDividers: closedRes.fitted.vDividers,
+            hShelves: closedRes.fitted.hShelves,
+            diagonalDividers: closedRes.fitted.diagonalDividers ?? [],
+            frontZones: zones,
+            curvedCuts: closedCurves,
+            hasStructure: true,
+          });
+          onApplyCalibratedDims(closedRes.fitted.nextDims);
+          onUpdateTopology({
+            ...topology,
+            aspectRatioXY: fittedRatio,
+            quadCorners: closedRes.fitted.nextQuad,
+            homographyMatrix: fittedHom
+              ? fittedHom.toUnit.map((r) => [...r])
+              : topology.homographyMatrix,
+            shelfMode: 'custom',
+            equalShelfCount: 0,
+            vDividers: closedRes.fitted.vDividers,
+            hShelves: closedRes.fitted.hShelves,
+            diagonalDividers: closedRes.fitted.diagonalDividers ?? [],
+            curvedCuts: closedCurves,
+            frontZones: zones,
+            hasBackPanel: hasLegVoid ? false : topology.hasBackPanel === true,
+            detectionSource: 'manual',
+            detectionConfidence: 0.96,
+          });
+          setStatusMsg(
+            `Techo curvo cerrado reconocido (${closedRes.fitted.nextDims.x} × ${closedRes.fitted.nextDims.y} mm) → modelo 3D generado.`,
+          );
+          return;
+        }
+        setSelectedCurveId(cut.id);
+        onUpdateTopology({ ...topology, curvedCuts: nextCuts, frontZones: [], hasBackPanel: false });
+        setStatusMsg(
+          `Curva dibujada en boceto abierto (${cut.plane.toUpperCase()}). Cierra base y costados para generar el 3D.`,
+        );
+        return;
+      }
+
+      const nextTopo: FurnitureTopology = { ...topology, curvedCuts: nextCuts };
+      setSelectedCurveId(cut.id);
+      if (cut.plane === 'xy') {
+        syncFrontTriView({ curvedCuts: nextCuts });
+      } else if (cut.plane === 'xz' && triViewRef.current.top) {
+        triViewRef.current = {
+          ...triViewRef.current,
+          top: {
+            ...triViewRef.current.top,
+            curvedCuts: nextCuts.filter((c) => c.plane === 'xz'),
+          },
+        };
+      } else if (cut.plane === 'zy' && triViewRef.current.side) {
+        triViewRef.current = {
+          ...triViewRef.current,
+          side: {
+            ...triViewRef.current.side,
+            curvedCuts: nextCuts.filter((c) => c.plane === 'zy'),
+          },
+        };
+      }
       onUpdateTopology(nextTopo);
       setStatusMsg(
         `Curva diferencial agregada en plano ${cut.plane.toUpperCase()} (${cut.label ?? cut.kind}).`,
       );
     },
-    [topology, pushSnapshot, onUpdateTopology],
+    [
+      topology,
+      pushSnapshot,
+      frontIsBlankSketch,
+      blankSketchHasStructure,
+      topIsBlankSketch,
+      sideIsBlankSketch,
+      materializedBase.vDividers,
+      materializedBase.hShelves,
+      quad,
+      params.targetDimensions,
+      params.boardThickness,
+      params.material,
+      frontBitmap,
+      focal35mm,
+      exteriorBgRgb,
+      setSelectedZone,
+      syncFrontTriView,
+      onApplyCalibratedDims,
+      onUpdateTopology,
+    ],
+  );
+
+  const handleUpdateCurvedCut = useCallback(
+    (nextCut: CurvedCutSpec) => {
+      const prevCuts = topology.curvedCuts ?? [];
+      const nextCuts = prevCuts.some((c) => c.id === nextCut.id)
+        ? prevCuts.map((c) => (c.id === nextCut.id ? nextCut : c))
+        : [...prevCuts, nextCut];
+      pushSnapshot();
+      if (nextCut.plane === 'xy') syncFrontTriView({ curvedCuts: nextCuts });
+      onUpdateTopology({ ...topology, curvedCuts: nextCuts });
+    },
+    [topology, pushSnapshot, syncFrontTriView, onUpdateTopology],
+  );
+
+  const handleDeleteCurve = useCallback(
+    (id: string) => {
+      const nextCuts = (topology.curvedCuts ?? []).filter((c) => c.id !== id);
+      pushSnapshot();
+      setSelectedCurveId((cur) => (cur === id ? null : cur));
+      syncFrontTriView({ curvedCuts: nextCuts });
+      onUpdateTopology({
+        ...topology,
+        curvedCuts: nextCuts.length > 0 ? nextCuts : undefined,
+      });
+      setStatusMsg('Curva eliminada (Ctrl+Z para deshacer).');
+    },
+    [topology, pushSnapshot, syncFrontTriView, onUpdateTopology],
   );
 
   // Acciones de selección Multi-Sección (Paso 2 / Paso 3)
@@ -989,10 +1496,12 @@ export function VectorCanvas({
     onSetSelectedPlaneLineId: setSelectedPlaneLineId,
     onUpdatePlaneLine: handleUpdatePlaneLine,
     onCommitPlaneLine: (plane, seg) => {
-      pushSnapshot();
-      if (plane === 'xz') setPlaneLinesXZ((prev) => [...prev, seg]);
-      else setPlaneLinesZY((prev) => [...prev, seg]);
+      const current = plane === 'xz' ? planeLinesXZ : planeLinesZY;
+      applyPlaneLinesUpdate(plane, [...current, seg], true);
     },
+    selectedCurveId,
+    onSetSelectedCurveId: setSelectedCurveId,
+    onUpdateCurvedCut: handleUpdateCurvedCut,
     onCommitCurvedCut: handleCommitCurvedCut,
     onSetStatusMsg: setStatusMsg,
   });
@@ -1004,6 +1513,7 @@ export function VectorCanvas({
     resetViewport();
     setSelectedLine(null);
     setSelectedPlaneLineId(null);
+    setSelectedCurveId(null);
     setPickingCorners(null);
     setRedoCorners([]);
     setSubRegions([]);
@@ -1021,7 +1531,12 @@ export function VectorCanvas({
       if (lastExternalUrlRef.current !== null) {
         lastExternalUrlRef.current = null;
         setFrontBitmap(null);
+        setTopBitmap(null);
+        setSideBitmap(null);
         setFrontIsBlankSketch(false);
+        setBlankSketchHasStructure(true);
+        setTopIsBlankSketch(false);
+        setSideIsBlankSketch(false);
         setPhotoVectorLines([]);
         setMarginEval(null);
         setRanRealVisionOnCatalog(false);
@@ -1044,6 +1559,9 @@ export function VectorCanvas({
       }
       setFrontBitmap(bmp);
       setFrontIsBlankSketch(false);
+      setBlankSketchHasStructure(true);
+      setTopIsBlankSketch(false);
+      setSideIsBlankSketch(false);
       setViewTab('frontal');
       setRanRealVisionOnCatalog(false);
       resetAllTransient();
@@ -1104,6 +1622,27 @@ export function VectorCanvas({
     };
   }, [externalPhotoUrl, externalPhotoLabel, resetAllTransient, clearHistory]);
 
+  const prevExternalResetSeqRef = useRef<number>(externalResetSeq);
+  useEffect(() => {
+    if (externalResetSeq === prevExternalResetSeqRef.current) return;
+    prevExternalResetSeqRef.current = externalResetSeq;
+    lastExternalUrlRef.current = null;
+    setFrontBitmap(null);
+    setTopBitmap(null);
+    setSideBitmap(null);
+    setFrontIsBlankSketch(false);
+    setBlankSketchHasStructure(true);
+    setTopIsBlankSketch(false);
+    setSideIsBlankSketch(false);
+    setPhotoVectorLines([]);
+    setMarginEval(null);
+    setRanRealVisionOnCatalog(false);
+    setViewTab('frontal');
+    setTraceStep('frame');
+    resetAllTransient();
+    clearHistory();
+  }, [externalResetSeq, resetAllTransient, clearHistory]);
+
   // Subherramientas temporales con restauración garantizada de returnStep
   const toggleSubTool = useCallback(
     (next: SubTool) => {
@@ -1141,21 +1680,87 @@ export function VectorCanvas({
 
   // Acciones de barra y visión
   const handleClearLines = useCallback(() => {
+    if (viewTab === 'superior') {
+      const hasXzCuts = (topology.curvedCuts ?? []).some((c) => c.plane === 'xz');
+      if (planeLinesXZ.length === 0 && !hasXzCuts) return;
+      pushSnapshot();
+      setSelectedPlaneLineId(null);
+      setSelectedCurveId(null);
+      setPlaneLinesXZ([]);
+      const remainingCuts = (topology.curvedCuts ?? []).filter((c) => c.plane !== 'xz');
+      const nextTopo: FurnitureTopology = {
+        ...topology,
+        planeLinesXZ: undefined,
+        curvedCuts: remainingCuts.length > 0 ? remainingCuts : undefined,
+      };
+      syncFrontTriView({ curvedCuts: remainingCuts });
+      if (triViewRef.current.top) {
+        triViewRef.current = {
+          ...triViewRef.current,
+          top: { ...triViewRef.current.top, planeLinesXZ: [], curvedCuts: [] },
+        };
+      }
+      onUpdateTopology(nextTopo);
+      setStatusMsg('Líneas y curvas de Planta Arriba (XZ) limpiadas (Ctrl+Z para restaurar).');
+      return;
+    }
+    if (viewTab === 'lateral') {
+      const hasZyCuts = (topology.curvedCuts ?? []).some((c) => c.plane === 'zy');
+      if (planeLinesZY.length === 0 && !hasZyCuts) return;
+      pushSnapshot();
+      setSelectedPlaneLineId(null);
+      setSelectedCurveId(null);
+      setPlaneLinesZY([]);
+      const remainingCuts = (topology.curvedCuts ?? []).filter((c) => c.plane !== 'zy');
+      const nextTopo: FurnitureTopology = {
+        ...topology,
+        planeLinesZY: undefined,
+        curvedCuts: remainingCuts.length > 0 ? remainingCuts : undefined,
+      };
+      syncFrontTriView({ curvedCuts: remainingCuts });
+      if (triViewRef.current.side) {
+        triViewRef.current = {
+          ...triViewRef.current,
+          side: { ...triViewRef.current.side, planeLinesZY: [], curvedCuts: [] },
+        };
+      }
+      onUpdateTopology(nextTopo);
+      setStatusMsg('Líneas y curvas de Lado (ZY) limpiadas (Ctrl+Z para restaurar).');
+      return;
+    }
+
     if (
       materializedBase.vDividers.length === 0 &&
       materializedBase.hShelves.length === 0 &&
       (topology.diagonalDividers?.length ?? 0) === 0 &&
-      (topology.curvedCuts?.length ?? 0) === 0 &&
-      planeLinesXZ.length === 0 &&
-      planeLinesZY.length === 0
+      (topology.curvedCuts ?? []).every((c) => c.plane !== 'xy')
     ) {
       return;
     }
     pushSnapshot();
     setSelectedLine(null);
-    setSelectedPlaneLineId(null);
-    setPlaneLinesXZ([]);
-    setPlaneLinesZY([]);
+    setSelectedCurveId(null);
+    const remainingCuts = (topology.curvedCuts ?? []).filter((c) => c.plane !== 'xy');
+    if (frontIsBlankSketch) {
+      setBlankSketchHasStructure(false);
+      setSelectedZone(null);
+      syncFrontTriView({ hasStructure: false, curvedCuts: remainingCuts });
+      onUpdateTopology({
+        ...topology,
+        shelfMode: 'custom',
+        equalShelfCount: 0,
+        vDividers: [],
+        hShelves: [],
+        diagonalDividers: [],
+        curvedCuts: remainingCuts.length > 0 ? remainingCuts : undefined,
+        frontZones: [],
+        hasBackPanel: false,
+        detectionSource: 'manual',
+      });
+      setStatusMsg('Lienzo frontal limpio. Dibuja líneas cerradas para generar el modelo 3D.');
+      return;
+    }
+
     const singleZone: FrontZone = {
       id: 'traced_zone_1',
       uStart: 0,
@@ -1165,6 +1770,13 @@ export function VectorCanvas({
       kind: 'open',
       label: 'Vano 1',
     };
+    syncFrontTriView({
+      vDividers: [],
+      hShelves: [],
+      diagonalDividers: [],
+      frontZones: [singleZone],
+      curvedCuts: remainingCuts,
+    });
     onUpdateTopology({
       ...topology,
       shelfMode: 'custom',
@@ -1172,17 +1784,20 @@ export function VectorCanvas({
       vDividers: [],
       hShelves: [],
       diagonalDividers: [],
-      curvedCuts: undefined,
+      curvedCuts: remainingCuts.length > 0 ? remainingCuts : undefined,
       frontZones: [singleZone],
       detectionSource: 'manual',
     });
     setSelectedZone(singleZone.id);
-    setStatusMsg('Líneas y curvas limpiadas (Ctrl+Z para restaurar).');
+    setStatusMsg('Líneas y curvas frontales limpiadas (Ctrl+Z para restaurar).');
   }, [
+    viewTab,
     materializedBase,
     topology,
     planeLinesXZ.length,
     planeLinesZY.length,
+    frontIsBlankSketch,
+    syncFrontTriView,
     pushSnapshot,
     onUpdateTopology,
     setSelectedZone,
@@ -1298,6 +1913,9 @@ export function VectorCanvas({
 
         setFrontBitmap(bmp);
         setFrontIsBlankSketch(false);
+        setBlankSketchHasStructure(true);
+        setTopIsBlankSketch(false);
+        setSideIsBlankSketch(false);
         setViewTab('frontal');
         setFrameMode('quad');
         setRanRealVisionOnCatalog(false);
@@ -1335,15 +1953,19 @@ export function VectorCanvas({
           : 'roble';
 
         onAutoPhotoReconstructed?.(autoDims, estMat);
-        const initZone: FrontZone = {
-          id: 'traced_zone_1',
-          uStart: 0,
-          uEnd: 1,
-          vStart: 0,
-          vEnd: 1,
-          kind: 'open',
-          label: 'Cuerpo',
-        };
+        const initZones: FrontZone[] = isSample
+          ? [
+              {
+                id: 'traced_zone_1',
+                uStart: 0,
+                uEnd: 1,
+                vStart: 0,
+                vEnd: 1,
+                kind: 'open',
+                label: 'Cuerpo',
+              },
+            ]
+          : [];
         onUpdateTopology({
           ...topology,
           aspectRatioXY: ratio,
@@ -1354,7 +1976,9 @@ export function VectorCanvas({
           vDividers: [],
           hShelves: [],
           diagonalDividers: [],
-          frontZones: [initZone],
+          planeLinesXZ: undefined,
+          planeLinesZY: undefined,
+          frontZones: initZones,
           baseSupportType: 'none',
           hasExternalLegs: false,
           externalLegHeightMm: undefined,
@@ -1369,7 +1993,7 @@ export function VectorCanvas({
           detectionSource: 'manual',
           detectionConfidence: 0.9,
         });
-        setSelectedZone(initZone.id);
+        setSelectedZone(initZones[0]?.id ?? null);
         setTraceStep(isSample ? 'lines' : 'frame');
         setLinesSubMode('draw_only');
         setStrokeMode('ortho');
@@ -1402,8 +2026,12 @@ export function VectorCanvas({
         if (topBlobUrlRef.current) URL.revokeObjectURL(topBlobUrlRef.current);
         topBlobUrlRef.current = url;
         setTopBitmap(bmp);
+        setTopIsBlankSketch(false);
         setPlaneLinesXZ([]);
+        setSelectedPlaneLineId(null);
+        setSelectedCurveId(null);
         setViewTab('superior');
+        if (traceStep === 'zones') setTraceStep('lines');
         const sk = recognizeHandDrawnSketch(
           bmp.rgba,
           bmp.w,
@@ -1422,8 +2050,13 @@ export function VectorCanvas({
                 Math.round(bmp.h * 0.8),
               );
         setTopQuad(initQuad);
+        syncFrontTriView();
         triViewRef.current = { ...triViewRef.current, top: sk };
-        const syn = synthesize3DFromTriViews(topology, params, triViewRef.current);
+        const syn = synthesize3DFromTriViews(
+          { ...topology, planeLinesXZ: undefined },
+          params,
+          triViewRef.current,
+        );
         pushSnapshot();
         onUpdateTopology(syn.topology);
         onApplyCalibratedDims?.(syn.params.targetDimensions);
@@ -1435,7 +2068,7 @@ export function VectorCanvas({
       };
       img.src = url;
     },
-    [topology, params, pushSnapshot, onUpdateTopology, onApplyCalibratedDims],
+    [topology, params, traceStep, syncFrontTriView, pushSnapshot, onUpdateTopology, onApplyCalibratedDims],
   );
 
   const loadSideFromFile = useCallback(
@@ -1447,8 +2080,12 @@ export function VectorCanvas({
         if (sideBlobUrlRef.current) URL.revokeObjectURL(sideBlobUrlRef.current);
         sideBlobUrlRef.current = url;
         setSideBitmap(bmp);
+        setSideIsBlankSketch(false);
         setPlaneLinesZY([]);
+        setSelectedPlaneLineId(null);
+        setSelectedCurveId(null);
         setViewTab('lateral');
+        if (traceStep === 'zones') setTraceStep('lines');
         const sk = recognizeHandDrawnSketch(
           bmp.rgba,
           bmp.w,
@@ -1467,8 +2104,13 @@ export function VectorCanvas({
                 Math.round(bmp.h * 0.86),
               );
         setSideQuad(nextSideQuad);
+        syncFrontTriView();
         triViewRef.current = { ...triViewRef.current, side: sk };
-        const syn = synthesize3DFromTriViews(topology, params, triViewRef.current);
+        const syn = synthesize3DFromTriViews(
+          { ...topology, planeLinesZY: undefined },
+          params,
+          triViewRef.current,
+        );
         pushSnapshot();
         onUpdateTopology(syn.topology);
         onSelectDepthMm?.(syn.params.targetDimensions.z);
@@ -1480,45 +2122,68 @@ export function VectorCanvas({
       };
       img.src = url;
     },
-    [topology, params, pushSnapshot, onUpdateTopology, onSelectDepthMm],
+    [topology, params, traceStep, syncFrontTriView, pushSnapshot, onUpdateTopology, onSelectDepthMm],
   );
 
   const handleStartBlankSketch = useCallback(() => {
-    const bmp = createBlankSketchBitmap(viewTab);
-    if (viewTab === 'frontal') {
+    if (viewTab === 'frontal' || (!frontBitmap && !topBitmap && !sideBitmap)) {
       if (frontBlobUrlRef.current) {
         URL.revokeObjectURL(frontBlobUrlRef.current);
         frontBlobUrlRef.current = null;
       }
-      const blankQuad = makeAxisAlignedQuad(140, 100, 760, 580);
-      const hom = computeQuadToUnitHomography(blankQuad);
+      if (topBlobUrlRef.current) {
+        URL.revokeObjectURL(topBlobUrlRef.current);
+        topBlobUrlRef.current = null;
+      }
+      if (sideBlobUrlRef.current) {
+        URL.revokeObjectURL(sideBlobUrlRef.current);
+        sideBlobUrlRef.current = null;
+      }
+      const frontBmp = createBlankSketchBitmap('frontal');
+      const topBmp = createBlankSketchBitmap('superior');
+      const sideBmp = createBlankSketchBitmap('lateral');
       const blankDims = {
-        x: 1240,
-        y: 960,
+        x: 1200,
+        y: 900,
         z: clampNum(Math.round(params.targetDimensions.z), 300, 600),
       };
-      setFrontBitmap(bmp);
+      const aligned = computeAlignedBlankSketchQuads(blankDims, frontBmp.w, frontBmp.h);
+      const hom = computeQuadToUnitHomography(aligned.quad);
+
+      setFrontBitmap(frontBmp);
+      setTopBitmap(topBmp);
+      setSideBitmap(sideBmp);
       setFrontIsBlankSketch(true);
-      setQuad(blankQuad);
+      setBlankSketchHasStructure(false);
+      setTopIsBlankSketch(true);
+      setSideIsBlankSketch(true);
+      setViewTab('frontal');
+      setQuad(aligned.quad);
+      setTopQuad(aligned.topQuad);
+      setSideQuad(aligned.sideQuad);
       setFrameMode('quad');
       setTraceStep('lines');
       setLinesSubMode('draw_only');
       setStrokeMode('ortho');
       resetAllTransient();
       clearHistory();
-      triViewRef.current = { ...triViewRef.current, front: undefined };
+      setSelectedZone(null);
+      triViewRef.current = {};
       onApplyCalibratedDims(blankDims);
       onUpdateTopology({
         ...topology,
-        viewsMode: topBitmap && sideBitmap ? 3 : topBitmap || sideBitmap ? 2 : 1,
+        viewsMode: 3,
         aspectRatioXY: blankDims.x / blankDims.y,
-        quadCorners: blankQuad,
+        aspectRatioZY: blankDims.z / blankDims.y,
+        quadCorners: aligned.quad,
         homographyMatrix: hom ? hom.toUnit.map((r) => [...r]) : undefined,
         shelfMode: 'custom',
         equalShelfCount: 0,
         vDividers: [],
         hShelves: [],
         diagonalDividers: [],
+        planeLinesXZ: undefined,
+        planeLinesZY: undefined,
         curvedCuts: undefined,
         lShape: undefined,
         baseSupportType: 'none',
@@ -1528,67 +2193,73 @@ export function VectorCanvas({
         toeKickHeightMm: undefined,
         cubiertaMaterialOverride: undefined,
         hardwareItems: [],
-        hasBackPanel: true,
-        frontZones: [
-          {
-            id: 'traced_zone_1',
-            uStart: 0,
-            uEnd: 1,
-            vStart: 0,
-            vEnd: 1,
-            kind: 'open',
-            label: 'Cuerpo libre',
-          },
-        ],
+        hasBackPanel: false,
+        frontZones: [],
         detectionSource: 'manual',
       });
       setStatusMsg(
-        'Lienzo frontal cuadriculado 1:1 (1240 × 960 mm) listo. Dibuja rectas desde cualquier esquina; si cierras los 4 lados de tu mueble, se ajustará al instante.',
+        'Lienzo libre limpio (3 vistas XY/XZ/ZY). Dibuja líneas cerradas o activa "1. Contorno" para generar el modelo 3D.',
       );
       return;
     }
+
+    const aligned = computeAlignedBlankSketchQuads(params.targetDimensions, 900, 680);
     if (viewTab === 'superior') {
+      const topBmp = createBlankSketchBitmap('superior');
       if (topBlobUrlRef.current) {
         URL.revokeObjectURL(topBlobUrlRef.current);
         topBlobUrlRef.current = null;
       }
-      setTopBitmap(bmp);
-      setTopQuad(makeAxisAlignedQuad(160, 110, 740, 520));
+      setTopBitmap(topBmp);
+      setTopIsBlankSketch(true);
+      setTopQuad(aligned.topQuad);
       setPlaneLinesXZ([]);
+      setSelectedPlaneLineId(null);
+      setSelectedCurveId(null);
       setTraceStep('lines');
       setLinesSubMode('draw_only');
       setStrokeMode('ortho');
       onUpdateTopology({
         ...topology,
         viewsMode: sideBitmap ? 3 : 2,
+        planeLinesXZ: undefined,
       });
       setStatusMsg(
-        'Lienzo de Planta Arriba (XZ) listo. Dibuja rectas desde cualquier esquina o cambia a "Curva" en Opciones.',
+        'Lienzo de Planta Arriba (XZ) listo. Arriba=Fondo (Z=0), Abajo=Frente (+Z).',
       );
       return;
     }
+
+    const sideBmp = createBlankSketchBitmap('lateral');
     if (sideBlobUrlRef.current) {
       URL.revokeObjectURL(sideBlobUrlRef.current);
       sideBlobUrlRef.current = null;
     }
-    setSideBitmap(bmp);
-    setSideQuad(makeAxisAlignedQuad(220, 100, 680, 580));
+    setSideBitmap(sideBmp);
+    setSideIsBlankSketch(true);
+    setSideQuad(aligned.sideQuad);
     setPlaneLinesZY([]);
+    setSelectedPlaneLineId(null);
+    setSelectedCurveId(null);
     setTraceStep('lines');
     setLinesSubMode('draw_only');
     setStrokeMode('ortho');
     onUpdateTopology({
       ...topology,
       viewsMode: topBitmap ? 3 : 2,
+      planeLinesZY: undefined,
     });
-    setStatusMsg('Lienzo lateral (ZY) listo. Dibuja líneas desde cualquier esquina o cambia a "Marco" para ajustar profundidad Z.');
+    setStatusMsg('Lienzo lateral (ZY) listo. Izquierda=Fondo (Z=0), Derecha=Frente (+Z).');
   }, [
     viewTab,
     topology,
     params.targetDimensions,
+    frontBitmap,
     topBitmap,
     sideBitmap,
+    resetAllTransient,
     clearHistory,
+    setSelectedZone,
     onApplyCalibratedDims,
     onUpdateTopology,
   ]);
@@ -1613,11 +2284,14 @@ export function VectorCanvas({
     );
     if (viewTab === 'frontal') {
       setQuad(sk.quadCorners);
+      if (frontIsBlankSketch) setBlankSketchHasStructure(true);
       triViewRef.current = { ...triViewRef.current, front: sk };
     } else if (viewTab === 'superior') {
+      syncFrontTriView();
       setTopQuad(sk.quadCorners);
       triViewRef.current = { ...triViewRef.current, top: sk };
     } else {
+      syncFrontTriView();
       setSideQuad(sk.quadCorners);
       triViewRef.current = { ...triViewRef.current, side: sk };
     }
@@ -1637,8 +2311,10 @@ export function VectorCanvas({
     frontBitmap,
     topBitmap,
     sideBitmap,
+    frontIsBlankSketch,
     params,
     topology,
+    syncFrontTriView,
     pushSnapshot,
     onUpdateTopology,
     onApplyCalibratedDims,
@@ -1672,7 +2348,17 @@ export function VectorCanvas({
           [],
           params.boardThickness,
         );
+        setBlankSketchHasStructure(true);
         setQuad(autoBox.nextQuad);
+        if (topIsBlankSketch || sideIsBlankSketch) {
+          const aligned = computeAlignedBlankSketchQuads(
+            autoBox.nextDims,
+            frontBitmap?.w ?? 900,
+            frontBitmap?.h ?? 680,
+          );
+          if (topIsBlankSketch) setTopQuad(aligned.topQuad);
+          if (sideIsBlankSketch) setSideQuad(aligned.sideQuad);
+        }
         baseTopo = {
           ...topology,
           aspectRatioXY: autoBox.nextDims.x / Math.max(1, autoBox.nextDims.y),
@@ -1685,7 +2371,7 @@ export function VectorCanvas({
           vDividers: autoBox.vDividers,
           hShelves: autoBox.hShelves,
           frontZones: fittedZones,
-          hasBackPanel: true,
+          hasBackPanel: topology.hasBackPanel === true,
         };
         baseParams = { ...params, targetDimensions: autoBox.nextDims };
         adjustedMsg = `Contorno ajustado a caja (${autoBox.nextDims.x} × ${autoBox.nextDims.y} mm) · `;
@@ -1704,6 +2390,9 @@ export function VectorCanvas({
     topology,
     params,
     frontIsBlankSketch,
+    topIsBlankSketch,
+    sideIsBlankSketch,
+    frontBitmap,
     materializedBase.vDividers,
     materializedBase.hShelves,
     quad,
@@ -1898,11 +2587,14 @@ export function VectorCanvas({
   // Atajos de teclado del lienzo (solo activos cuando isVisible !== false y sin foco en inputs)
   useEffect(() => {
     if (!isVisible) return;
+    const hasViewBmp = Boolean(
+      viewTab === 'frontal' ? frontBitmap : viewTab === 'superior' ? topBitmap : sideBitmap,
+    );
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (isEditableElement(e.target)) return;
 
-      if (e.code === 'Space' && !e.repeat && frontBitmap) {
+      if (e.code === 'Space' && !e.repeat && hasViewBmp) {
         e.preventDefault();
         setIsSpacePan(true);
         return;
@@ -1931,12 +2623,28 @@ export function VectorCanvas({
           setSelectedPlaneLineId(null);
           return;
         }
+        if (selectedCurveId) {
+          e.preventDefault();
+          setSelectedCurveId(null);
+          return;
+        }
         if (traceStep === 'lines' && linesSubMode === 'regions') {
           e.preventDefault();
           setLinesSubMode('smart');
           setStatusMsg('Modo Editar / Trazar restaurado.');
           return;
         }
+      }
+
+      if (
+        traceStep === 'lines' &&
+        selectedCurveId &&
+        subTool === 'none' &&
+        (e.key === 'Delete' || e.key === 'Backspace')
+      ) {
+        e.preventDefault();
+        handleDeleteCurve(selectedCurveId);
+        return;
       }
 
       if (
@@ -2044,10 +2752,13 @@ export function VectorCanvas({
   }, [
     isVisible,
     frontBitmap,
+    topBitmap,
+    sideBitmap,
     subTool,
     pickingCorners,
     selectedLine,
     selectedPlaneLineId,
+    selectedCurveId,
     viewTab,
     traceStep,
     linesSubMode,
@@ -2059,6 +2770,7 @@ export function VectorCanvas({
     exitSubTool,
     handleDeleteSelectedLine,
     handleDeletePlaneLine,
+    handleDeleteCurve,
     handleUpdateVDivider,
     handleUpdateHShelf,
     handleUpdateDiagonal,
@@ -2094,6 +2806,15 @@ export function VectorCanvas({
             return ln ? { plane: 'zy' as const, line: ln } : null;
           })()
         : null;
+  const activePlaneKey =
+    viewTab === 'frontal' ? 'xy' : viewTab === 'superior' ? 'xz' : 'zy';
+  const activeCurvesPool = pointer.draftCurves ?? topology.curvedCuts ?? [];
+  const selectedCurve = selectedCurveId
+    ? (activeCurvesPool.find((c) => c.id === selectedCurveId && c.plane === activePlaneKey) ?? null)
+    : null;
+  const activeViewCurvedCount = (topology.curvedCuts ?? []).filter(
+    (c) => c.plane === activePlaneKey,
+  ).length;
   const activeDisplayQuad =
     viewTab === 'frontal'
       ? (pointer.draftQuad ?? quad)
@@ -2161,7 +2882,10 @@ export function VectorCanvas({
               : planeLinesZY.length
         }
         curvedCount={topology.curvedCuts?.length ?? 0}
+        activeViewCurvedCount={activeViewCurvedCount}
         zonesCount={zones.length}
+        isBlankSketch={frontIsBlankSketch}
+        blankSketchHasStructure={!frontIsBlankSketch || blankSketchHasStructure}
         subRegions={subRegions}
         xIntMm={Math.max(1, params.targetDimensions.x - 2 * params.boardThickness)}
         yIntMm={Math.max(1, params.targetDimensions.y - 2 * params.boardThickness)}
@@ -2186,11 +2910,24 @@ export function VectorCanvas({
           setRedoCorners([]);
           setSelectedLine(null);
           setSelectedPlaneLineId(null);
+          setSelectedCurveId(null);
+          setIsSpacePan(false);
+          if (tab !== 'frontal' && traceStep === 'zones') {
+            setTraceStep('lines');
+          }
           setViewTab(tab);
         }}
         onSetPlaneTraceStep={(step) => setTraceStep(step)}
         onSelectStep={(step) => {
-          setViewTab('frontal');
+          if (step === 'zones' && frontIsBlankSketch && !blankSketchHasStructure) {
+            setStatusMsg(
+              'Cierra primero un contorno o activa "1. Contorno" para definir partes en Paso 3.',
+            );
+            return;
+          }
+          if (step === 'zones') {
+            setViewTab('frontal');
+          }
           setSubTool('none');
           if (step !== 'frame') {
             setPickingCorners(null);
@@ -2199,6 +2936,7 @@ export function VectorCanvas({
           if (step !== 'lines') {
             setSelectedLine(null);
             setSelectedPlaneLineId(null);
+            setSelectedCurveId(null);
           }
           setTraceStep(step);
           setStatusMsg(
@@ -2323,6 +3061,11 @@ export function VectorCanvas({
         hShelves={activeHShelves}
         diagonalDividers={activeDiagonals}
         curvedCuts={topology.curvedCuts}
+        draftCurves={pointer.draftCurves}
+        selectedCurveId={selectedCurveId}
+        hoverCurveHandle={pointer.hoverCurveHandle}
+        isBlankSketch={frontIsBlankSketch}
+        blankSketchHasStructure={!frontIsBlankSketch || blankSketchHasStructure}
         planeLinesXZ={activePlaneLinesXZ}
         planeLinesZY={activePlaneLinesZY}
         selectedPlaneLineId={selectedPlaneLineId}
@@ -2383,27 +3126,33 @@ export function VectorCanvas({
         onLoadSample={() => loadFrontalFromUrl(generateSampleFurnitureDataUrl(), true, false)}
       />
 
-      {((hasPhoto && viewTab === 'frontal' && traceStep === 'lines' && selectedLine) ||
-        (viewTab !== 'frontal' && traceStep === 'lines' && activeSelectedPlaneLine)) && (
-        <LineSelectionBar
-          selectedLine={viewTab === 'frontal' ? selectedLine : null}
-          topology={{
-            ...topology,
-            vDividers: materializedBase.vDividers,
-            hShelves: materializedBase.hShelves,
-          }}
-          params={params}
-          onUpdateVDivider={handleUpdateVDivider}
-          onUpdateHShelf={handleUpdateHShelf}
-          onUpdateDiagonal={handleUpdateDiagonal}
-          onDeleteSelected={handleDeleteSelectedLine}
-          onDeselect={() => setSelectedLine(null)}
-          selectedPlaneLine={activeSelectedPlaneLine}
-          onUpdatePlaneLine={handleUpdatePlaneLine}
-          onDeletePlaneLine={handleDeletePlaneLine}
-          onDeselectPlaneLine={() => setSelectedPlaneLineId(null)}
-        />
-      )}
+      {traceStep === 'lines' &&
+        (Boolean(selectedCurve) ||
+          (hasPhoto && viewTab === 'frontal' && Boolean(selectedLine)) ||
+          (viewTab !== 'frontal' && Boolean(activeSelectedPlaneLine))) && (
+          <LineSelectionBar
+            selectedLine={viewTab === 'frontal' ? selectedLine : null}
+            topology={{
+              ...topology,
+              vDividers: materializedBase.vDividers,
+              hShelves: materializedBase.hShelves,
+            }}
+            params={params}
+            onUpdateVDivider={handleUpdateVDivider}
+            onUpdateHShelf={handleUpdateHShelf}
+            onUpdateDiagonal={handleUpdateDiagonal}
+            onDeleteSelected={handleDeleteSelectedLine}
+            onDeselect={() => setSelectedLine(null)}
+            selectedPlaneLine={activeSelectedPlaneLine}
+            onUpdatePlaneLine={handleUpdatePlaneLine}
+            onDeletePlaneLine={handleDeletePlaneLine}
+            onDeselectPlaneLine={() => setSelectedPlaneLineId(null)}
+            selectedCurve={selectedCurve}
+            onUpdateCurve={handleUpdateCurvedCut}
+            onDeleteCurve={handleDeleteCurve}
+            onDeselectCurve={() => setSelectedCurveId(null)}
+          />
+        )}
 
       {hasPhoto && viewTab === 'frontal' && (
         <CanvasMetricsStrip
@@ -2422,24 +3171,27 @@ export function VectorCanvas({
         />
       )}
 
-      {(traceStep === 'zones' || !hasPhoto) && viewTab === 'frontal' && (
-        <ZoneInspector
-          topology={topology}
-          params={params}
-          selectedZoneId={effectiveSelectedZoneId}
-          hoveredZoneId={effectiveHoveredZoneId}
-          onSelectZone={setSelectedZone}
-          onHoverZone={setHoveredZone}
-          onUpdateTopology={(next) => {
-            pushSnapshot();
-            onUpdateTopology(next);
-          }}
-          onUpdateFrontZones={(nextZones) => {
-            pushSnapshot();
-            commitFrontZones(nextZones);
-          }}
-        />
-      )}
+      {hasPhoto &&
+        traceStep === 'zones' &&
+        viewTab === 'frontal' &&
+        (!frontIsBlankSketch || blankSketchHasStructure) && (
+          <ZoneInspector
+            topology={topology}
+            params={params}
+            selectedZoneId={effectiveSelectedZoneId}
+            hoveredZoneId={effectiveHoveredZoneId}
+            onSelectZone={setSelectedZone}
+            onHoverZone={setHoveredZone}
+            onUpdateTopology={(next) => {
+              pushSnapshot();
+              onUpdateTopology(next);
+            }}
+            onUpdateFrontZones={(nextZones) => {
+              pushSnapshot();
+              commitFrontZones(nextZones);
+            }}
+          />
+        )}
 
       <CalibrationBar
         viewTab={viewTab}
@@ -2459,6 +3211,12 @@ export function VectorCanvas({
           setSubTool('none');
           setPickingCorners(null);
           setSelectedLine(null);
+          setSelectedPlaneLineId(null);
+          setSelectedCurveId(null);
+          setIsSpacePan(false);
+          if (tab !== 'frontal' && traceStep === 'zones') {
+            setTraceStep('lines');
+          }
           setViewTab(tab);
         }}
       />

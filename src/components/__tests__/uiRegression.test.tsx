@@ -17,7 +17,7 @@ import {
   scaleBaseMatrix,
   type PresetKey,
 } from '../../core/mathEngine';
-import { isHandDrawnSketchImage, vectorizeUserStroke } from '../../core/vision';
+import { isHandDrawnSketchImage, vectorizeUserStroke, classifyPartitionedZonesFromPhoto, partitionCellsFromVectors } from '../../core/vision';
 import {
   estimateProjectBomAndCost,
   formatClp,
@@ -28,6 +28,7 @@ import { NumericInput } from '../NumericInput';
 import { ZoneInspector } from '../vectorCanvas/ZoneInspector';
 import { LineSelectionBar } from '../vectorCanvas/LineSelectionBar';
 import { CanvasTopBars } from '../vectorCanvas/CanvasToolbars';
+import { buildSnapshotFromState } from '../vectorCanvas/useCanvasHistory';
 import { MathPanel } from '../mathPanel/MathPanel';
 import { VectorBlueprintPanel } from '../vectorBlueprint/VectorBlueprintPanel';
 import type { Viewer3DProps } from '../viewer3d/Viewer3D';
@@ -44,7 +45,10 @@ import {
   updateZoneFrom3D,
 } from '../viewer3d/viewer3dEditHelpers';
 import {
+  PAPER_GRID_STEP_PRESETS,
+  computePaperGridSpacing,
   findMergeableNeighbors,
+  fitBlankSketchDrawnOuterBox,
   getZoneInteriorDimsMm,
   hitTestFrameScreenPx,
   hitTestLinesScreenPx,
@@ -827,9 +831,9 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
         xIntMm={1364}
         yIntMm={732}
         canUndo={false}
-        canRedo={false}
+        canRedo
         undoCount={0}
-        redoCount={0}
+        redoCount={2}
         zoom={1}
         panToolActive={false}
         isSpacePan={false}
@@ -865,7 +869,9 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
         onCancelPickCorners={noop}
         onToggleMagneticSnap={noop}
         paperGridSnap
+        paperGridStepMm={100}
         onTogglePaperGridSnap={noop}
+        onStepPaperGridSize={noop}
         onAutoContour={noop}
         onClearLines={noop}
         onChangeLinesSubMode={noop}
@@ -885,6 +891,10 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
     expect(barHtml).toContain('Línea recta');
     expect(barHtml).toContain('>Curva<');
     expect(barHtml).toContain('Milimetrado');
+    expect(barHtml).toContain('Rehacer (2)');
+    expect(barHtml).toContain('Agrandar cuadrícula');
+    expect(barHtml).toContain('Achicar cuadrícula');
+    expect(barHtml).toContain('100mm');
 
     const topBarHtml = renderToStaticMarkup(
       <CanvasTopBars
@@ -908,9 +918,9 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
         xIntMm={1364}
         yIntMm={732}
         canUndo={false}
-        canRedo={false}
+        canRedo
         undoCount={0}
-        redoCount={0}
+        redoCount={2}
         zoom={1}
         panToolActive={false}
         isSpacePan={false}
@@ -946,7 +956,9 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
         onCancelPickCorners={noop}
         onToggleMagneticSnap={noop}
         paperGridSnap
+        paperGridStepMm={100}
         onTogglePaperGridSnap={noop}
+        onStepPaperGridSize={noop}
         onAutoContour={noop}
         onClearLines={noop}
         onChangeLinesSubMode={noop}
@@ -1407,6 +1419,128 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
       onToggleLInnerCurve: () => undefined,
     };
     expect(typeof propsCheck.onUpdateTopology).toBe('function');
+  });
+
+  it('Historial Deshacer/Rehacer multi-vista (XY, XZ, ZY) y cuadrícula redimensionable (10..200 mm)', () => {
+    expect([...PAPER_GRID_STEP_PRESETS]).toEqual([10, 20, 25, 50, 100, 200]);
+
+    const autoSpacing = computePaperGridSpacing(1200, 500);
+    const enlargedSpacing = computePaperGridSpacing(1200, 500, 100);
+    expect(enlargedSpacing.minorMm).toBe(100);
+    expect(enlargedSpacing.majorMm).toBe(200);
+    expect(enlargedSpacing.snapMm).toBe(100);
+    expect(enlargedSpacing.minorMm).toBeGreaterThan(autoSpacing.minorMm);
+
+    const desk = clonePreset('escritorio_l');
+    const quad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 100, y: 100 },
+      { x: 700, y: 100 },
+      { x: 700, y: 500 },
+      { x: 100, y: 500 },
+    ];
+    const topQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 140, y: 120 },
+      { x: 720, y: 120 },
+      { x: 720, y: 480 },
+      { x: 140, y: 480 },
+    ];
+    const sideQuad: [Point2D, Point2D, Point2D, Point2D] = [
+      { x: 220, y: 100 },
+      { x: 660, y: 100 },
+      { x: 660, y: 520 },
+      { x: 220, y: 520 },
+    ];
+    const planeLinesXZ = [{ id: 'xz_1', u1: 0, v1: 0.4, u2: 0.8, v2: 0.4 }];
+    const planeLinesZY = [{ id: 'zy_1', u1: 0.2, v1: 0, u2: 0.2, v2: 1 }];
+
+    const snap = buildSnapshotFromState(quad, desk.topology, desk.params.targetDimensions, {
+      topQuad,
+      sideQuad,
+      planeLinesXZ,
+      planeLinesZY,
+    });
+    expect(snap.topQuad).toEqual(topQuad);
+    expect(snap.sideQuad).toEqual(sideQuad);
+    expect(snap.planeLinesXZ).toEqual(planeLinesXZ);
+    expect(snap.planeLinesZY).toEqual(planeLinesZY);
+
+    // Verificar inmutabilidad del snapshot ante mutaciones posteriores de arrays origen
+    planeLinesXZ[0].u2 = 0.2;
+    topQuad[0].x = 999;
+    expect(snap.planeLinesXZ?.[0].u2).toBe(0.8);
+    expect(snap.topQuad?.[0].x).toBe(140);
+  });
+
+  it('Dibujo 2x2 cerrado en lienzo libre: cero leg_void/void_outside fantasmas y contorno ajustado exacto', () => {
+    const est = clonePreset('estanteria');
+    const sheetQuad = makeAxisAlignedQuad(140, 100, 760, 580);
+    const sheetDims = { x: 1240, y: 960, z: 400 };
+    const e = 18;
+
+    // Caso A (Screenshot TEST): 3 verticales + 3 horizontales formando un mueble 2x2 dentro del papel
+    const vDivs = [
+      { id: 'v_left', position: 0.2, start: 0.2, end: 0.7 },
+      { id: 'v_mid', position: 0.4, start: 0.2, end: 0.7 },
+      { id: 'v_right', position: 0.6, start: 0.2, end: 0.7 },
+    ];
+    const hShs = [
+      { id: 'h_bot', position: 0.2, start: 0.2, end: 0.6 },
+      { id: 'h_mid', position: 0.45, start: 0.2, end: 0.6 },
+      { id: 'h_top', position: 0.7, start: 0.2, end: 0.6 },
+    ];
+
+    // 1) Sin rectRgba de foto real, las celdas nuevas jamás producen leg_void ni void_outside
+    const rawCells = partitionCellsFromVectors(vDivs, hShs);
+    const blankZones = classifyPartitionedZonesFromPhoto(
+      rawCells,
+      null,
+      0,
+      0,
+      sheetDims,
+      'roble',
+      [245, 245, 245],
+      [],
+      e,
+    );
+    expect(blankZones.some((z) => z.kind === 'leg_void' || z.kind === 'void_outside')).toBe(false);
+
+    // 2) Auto-encuadre del rectángulo cerrado dibujado -> convierte muros exteriores en caja real y conserva interiores 2x2
+    const fitted = fitBlankSketchDrawnOuterBox(vDivs, hShs, [], sheetQuad, sheetDims, e);
+    expect(fitted).not.toBeNull();
+    expect(fitted!.vDividers).toHaveLength(1);
+    expect(fitted!.vDividers[0].position).toBeCloseTo(0.5, 2);
+    expect(fitted!.hShelves).toHaveLength(1);
+    expect(fitted!.hShelves[0].position).toBeCloseTo(0.5, 2);
+
+    const desp = calculateDespiece(
+      {
+        ...est.topology,
+        shelfMode: 'custom',
+        equalShelfCount: 0,
+        hasBackPanel: true,
+        baseSupportType: 'none',
+        lShape: undefined,
+        vDividers: fitted!.vDividers,
+        hShelves: fitted!.hShelves,
+        frontZones: partitionCellsFromVectors(fitted!.vDividers, fitted!.hShelves).map((c) => ({
+          id: c.id,
+          uStart: c.uStart,
+          uEnd: c.uEnd,
+          vStart: c.vStart,
+          vEnd: c.vEnd,
+          kind: 'open',
+          label: 'Cubo',
+        })),
+      },
+      { ...est.params, targetDimensions: fitted!.nextDims },
+    );
+
+    expect(desp.matrizDespiece.some((p) => p.tipo === 'base')).toBe(true);
+    expect(desp.matrizDespiece.some((p) => p.tipo === 'cubierta')).toBe(true);
+    expect(desp.matrizDespiece.some((p) => p.tipo === 'fondo')).toBe(true);
+    expect(desp.matrizDespiece.some((p) => p.tipo === 'faldon')).toBe(false);
+    expect(desp.matrizDespiece.filter((p) => p.tipo === 'division_vertical')).toHaveLength(1);
+    expect(desp.matrizDespiece.filter((p) => p.tipo === 'repisa')).toHaveLength(2);
   });
 });
 

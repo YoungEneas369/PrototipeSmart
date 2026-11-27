@@ -68,16 +68,78 @@ function closeParentDetails(e: React.MouseEvent<HTMLElement>): void {
   if (details) details.removeAttribute('open');
 }
 
+function PaperGridSizeControls({
+  paperGridSnap,
+  paperGridStepMm = 25,
+  onTogglePaperGridSnap,
+  onStepPaperGridSize,
+}: {
+  paperGridSnap: boolean;
+  paperGridStepMm?: number;
+  onTogglePaperGridSnap?: () => void;
+  onStepPaperGridSize?: (delta: -1 | 1) => void;
+}) {
+  if (!onTogglePaperGridSnap && !onStepPaperGridSize) return null;
+  return (
+    <>
+      {onTogglePaperGridSnap && (
+        <button
+          type="button"
+          className={paperGridSnap ? 'vc-chip active' : 'vc-chip'}
+          onClick={onTogglePaperGridSnap}
+          title={`Muestra cuadrícula milimetrada (${paperGridStepMm} mm) y adapta líneas a múltiplos exactos (Alt para soltar)`}
+        >
+          <Grid size={11} /> Milimetrado
+        </button>
+      )}
+      {onStepPaperGridSize && (
+        <div className="vc-btn-group" role="group" aria-label="Tamaño de cuadrícula">
+          <button
+            type="button"
+            className="vc-icon-text-btn"
+            onClick={() => onStepPaperGridSize(-1)}
+            disabled={paperGridSnap && paperGridStepMm <= 10}
+            title="Achicar cuadrados de la cuadrícula (más detalle)"
+            aria-label="Achicar cuadrícula"
+          >
+            −
+          </button>
+          <span
+            className="vc-zoom-readout"
+            title="Tamaño de cada cuadro de la cuadrícula milimetrada en mm"
+          >
+            {paperGridStepMm}mm
+          </span>
+          <button
+            type="button"
+            className="vc-icon-text-btn"
+            onClick={() => onStepPaperGridSize(1)}
+            disabled={paperGridSnap && paperGridStepMm >= 200}
+            title="Agrandar cuadrícula (cuadros más grandes)"
+            aria-label="Agrandar cuadrícula"
+          >
+            +
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
 function StrokeTypeToggleGroup({
   strokeMode,
   paperGridSnap,
+  paperGridStepMm = 25,
   onChangeStrokeMode,
   onTogglePaperGridSnap,
+  onStepPaperGridSize,
 }: {
   strokeMode: UserStrokeMode;
   paperGridSnap: boolean;
+  paperGridStepMm?: number;
   onChangeStrokeMode: (mode: UserStrokeMode) => void;
   onTogglePaperGridSnap?: () => void;
+  onStepPaperGridSize?: (delta: -1 | 1) => void;
 }) {
   return (
     <>
@@ -99,16 +161,12 @@ function StrokeTypeToggleGroup({
           <Spline size={11} /> Curva
         </button>
       </div>
-      {onTogglePaperGridSnap && (
-        <button
-          type="button"
-          className={paperGridSnap ? 'vc-chip active' : 'vc-chip'}
-          onClick={onTogglePaperGridSnap}
-          title="Muestra cuadrícula milimetrada y adapta líneas a múltiplos exactos de 10 mm (Alt para soltar)"
-        >
-          <Grid size={11} /> Milimetrado
-        </button>
-      )}
+      <PaperGridSizeControls
+        paperGridSnap={paperGridSnap}
+        paperGridStepMm={paperGridStepMm}
+        onTogglePaperGridSnap={onTogglePaperGridSnap}
+        onStepPaperGridSize={onStepPaperGridSize}
+      />
     </>
   );
 }
@@ -126,6 +184,7 @@ export interface CanvasTopBarsProps {
   subTool: SubTool;
   magneticSnap: boolean;
   paperGridSnap?: boolean;
+  paperGridStepMm?: number;
   calibRefMm: number;
   calibPtsCount: number;
   internalLineCount: number;
@@ -138,6 +197,7 @@ export interface CanvasTopBarsProps {
   canRedo: boolean;
   undoCount: number;
   redoCount: number;
+  redoCornersCount?: number;
   zoom: number;
   panToolActive: boolean;
   isSpacePan: boolean;
@@ -174,6 +234,7 @@ export interface CanvasTopBarsProps {
   onCancelPickCorners: () => void;
   onToggleMagneticSnap: () => void;
   onTogglePaperGridSnap?: () => void;
+  onStepPaperGridSize?: (delta: -1 | 1) => void;
   onAutoContour: () => void;
   onClearLines: () => void;
   onChangeLinesSubMode: (mode: LinesSubMode) => void;
@@ -199,6 +260,7 @@ export function CanvasTopBars({
   subTool,
   magneticSnap,
   paperGridSnap = true,
+  paperGridStepMm = 25,
   calibRefMm,
   calibPtsCount,
   internalLineCount,
@@ -211,6 +273,7 @@ export function CanvasTopBars({
   canRedo,
   undoCount,
   redoCount,
+  redoCornersCount = 0,
   zoom,
   panToolActive,
   isSpacePan,
@@ -247,6 +310,7 @@ export function CanvasTopBars({
   onCancelPickCorners,
   onToggleMagneticSnap,
   onTogglePaperGridSnap,
+  onStepPaperGridSize,
   onAutoContour,
   onClearLines,
   onChangeLinesSubMode,
@@ -267,6 +331,9 @@ export function CanvasTopBars({
   const effectiveUndoCount =
     pickingCorners && pickingCorners.length > 0 ? pickingCorners.length : undoCount;
   const canTriggerUndo = canUndo || Boolean(pickingCorners && pickingCorners.length > 0);
+  const effectiveRedoCount =
+    pickingCorners !== null && redoCornersCount > 0 ? redoCornersCount : redoCount;
+  const canTriggerRedo = canRedo || (pickingCorners !== null && redoCornersCount > 0);
   const panActive = panToolActive || isSpacePan;
 
   const hasNonDefaultLineOpt =
@@ -387,14 +454,14 @@ export function CanvasTopBars({
             </button>
             <button
               type="button"
-              className={`vc-history-btn vc-redo-btn${canRedo ? ' is-ready' : ''}`}
+              className={`vc-history-btn vc-redo-btn${canTriggerRedo ? ' is-ready' : ''}`}
               onClick={onRedo}
-              disabled={!canRedo}
-              title="Rehacer (Ctrl+Y / Ctrl+Shift+Z)"
-              aria-label="Rehacer"
+              disabled={!canTriggerRedo}
+              title="Revertir lo deshecho / Rehacer (Ctrl+Y / Ctrl+Shift+Z)"
+              aria-label="Revertir lo deshecho (Rehacer)"
             >
               <Redo2 size={13} />
-              <span>Rehacer{redoCount > 0 ? ` (${redoCount})` : ''}</span>
+              <span>Rehacer{effectiveRedoCount > 0 ? ` (${effectiveRedoCount})` : ''}</span>
             </button>
           </div>
 
@@ -403,7 +470,7 @@ export function CanvasTopBars({
               type="button"
               className="vc-icon-text-btn"
               onClick={onZoomOut}
-              disabled={zoom <= 0.76}
+              disabled={zoom <= 0.51}
               title="Alejar (Ctrl+Rueda)"
               aria-label="Alejar"
             >
@@ -421,7 +488,7 @@ export function CanvasTopBars({
               type="button"
               className="vc-icon-text-btn"
               onClick={onZoomIn}
-              disabled={zoom >= 3.99}
+              disabled={zoom >= 4.99}
               title="Acercar (Ctrl+Rueda)"
               aria-label="Acercar"
             >
@@ -553,12 +620,21 @@ export function CanvasTopBars({
                   </button>
                 </div>
               )}
-              {traceStep === 'lines' && (
+              {traceStep === 'lines' ? (
                 <StrokeTypeToggleGroup
                   strokeMode={strokeMode}
                   paperGridSnap={paperGridSnap}
+                  paperGridStepMm={paperGridStepMm}
                   onChangeStrokeMode={onChangeStrokeMode}
                   onTogglePaperGridSnap={onTogglePaperGridSnap}
+                  onStepPaperGridSize={onStepPaperGridSize}
+                />
+              ) : (
+                <PaperGridSizeControls
+                  paperGridSnap={paperGridSnap}
+                  paperGridStepMm={paperGridStepMm}
+                  onTogglePaperGridSnap={onTogglePaperGridSnap}
+                  onStepPaperGridSize={onStepPaperGridSize}
                 />
               )}
               {onRecognizeSketch && hasTopPhoto && (
@@ -623,12 +699,21 @@ export function CanvasTopBars({
                   </button>
                 </div>
               )}
-              {traceStep === 'lines' && (
+              {traceStep === 'lines' ? (
                 <StrokeTypeToggleGroup
                   strokeMode={strokeMode}
                   paperGridSnap={paperGridSnap}
+                  paperGridStepMm={paperGridStepMm}
                   onChangeStrokeMode={onChangeStrokeMode}
                   onTogglePaperGridSnap={onTogglePaperGridSnap}
+                  onStepPaperGridSize={onStepPaperGridSize}
+                />
+              ) : (
+                <PaperGridSizeControls
+                  paperGridSnap={paperGridSnap}
+                  paperGridStepMm={paperGridStepMm}
+                  onTogglePaperGridSnap={onTogglePaperGridSnap}
+                  onStepPaperGridSize={onStepPaperGridSize}
                 />
               )}
               <button type="button" className="vc-chip" onClick={onUploadSidePhoto}>
@@ -681,6 +766,12 @@ export function CanvasTopBars({
                 >
                   4 toques
                 </button>
+                <PaperGridSizeControls
+                  paperGridSnap={paperGridSnap}
+                  paperGridStepMm={paperGridStepMm}
+                  onTogglePaperGridSnap={onTogglePaperGridSnap}
+                  onStepPaperGridSize={onStepPaperGridSize}
+                />
                 {panToolActive && (
                   <button
                     type="button"
@@ -781,8 +872,10 @@ export function CanvasTopBars({
               <StrokeTypeToggleGroup
                 strokeMode={strokeMode}
                 paperGridSnap={paperGridSnap}
+                paperGridStepMm={paperGridStepMm}
                 onChangeStrokeMode={onChangeStrokeMode}
                 onTogglePaperGridSnap={onTogglePaperGridSnap}
+                onStepPaperGridSize={onStepPaperGridSize}
               />
               <button
                 type="button"

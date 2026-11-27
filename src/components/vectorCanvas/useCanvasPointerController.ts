@@ -165,6 +165,7 @@ export interface UseCanvasPointerControllerOptions {
   subTool: SubTool;
   magneticSnap: boolean;
   paperGridSnap?: boolean;
+  paperGridStepMm?: number;
   isSpacePan: boolean;
   frontBitmap: WorkingBitmap | null;
   topBitmap: WorkingBitmap | null;
@@ -228,6 +229,7 @@ export function useCanvasPointerController({
   subTool,
   magneticSnap,
   paperGridSnap = true,
+  paperGridStepMm,
   isSpacePan,
   frontBitmap,
   topBitmap,
@@ -329,7 +331,7 @@ export function useCanvasPointerController({
 
   const applyZoom = useCallback(
     (nextZoomRaw: number) => {
-      const nextZoom = Number(clampNum(nextZoomRaw, 0.75, 4).toFixed(2));
+      const nextZoom = Number(clampNum(nextZoomRaw, 0.5, 5).toFixed(2));
       setZoom(nextZoom);
       setPan((prev) => clampPanForZoom(prev, nextZoom));
     },
@@ -376,7 +378,7 @@ export function useCanvasPointerController({
       e.preventDefault();
       const factor = Math.exp(-e.deltaY * 0.0022);
       setZoom((prevZoom) => {
-        const nextZoom = Number(clampNum(prevZoom * factor, 0.75, 4).toFixed(2));
+        const nextZoom = Number(clampNum(prevZoom * factor, 0.5, 5).toFixed(2));
         setPan((prevPan) => clampPanForZoom(prevPan, nextZoom));
         return nextZoom;
       });
@@ -487,7 +489,7 @@ export function useCanvasPointerController({
           axisLock,
           diags,
           xyCurveEndpoints,
-          { enabled: paperGridSnap && !altKey },
+          { enabled: paperGridSnap && !altKey, stepMm: paperGridStepMm },
         );
         if (structSnap && structSnap.indicator) {
           return {
@@ -529,6 +531,7 @@ export function useCanvasPointerController({
       topology.diagonalDividers,
       xyCurveEndpoints,
       paperGridSnap,
+      paperGridStepMm,
     ],
   );
 
@@ -823,7 +826,7 @@ export function useCanvasPointerController({
               scaleX,
               scaleY,
               isTouch ? 16 : 12,
-              { wMm: planeW, hMm: planeH, enabled: paperGridSnap && !e.altKey },
+              { wMm: planeW, hMm: planeH, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
             )
           : null;
       const startPt = unitSnap?.snappedImg ?? rawPt;
@@ -1124,7 +1127,7 @@ export function useCanvasPointerController({
         const dist = Math.max(10, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y));
         const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
         const base = pinchBaseRef.current;
-        const nextZoom = Number(clampNum(base.zoom * (dist / base.dist), 0.75, 4).toFixed(2));
+        const nextZoom = Number(clampNum(base.zoom * (dist / base.dist), 0.5, 5).toFixed(2));
         setZoom(nextZoom);
         setPan(
           clampPanForZoom(
@@ -1221,7 +1224,7 @@ export function useCanvasPointerController({
                 scaleX,
                 scaleY,
                 isTouch ? 16 : 12,
-                { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey },
+                { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
               )
             : null;
         setHoverTarget({ kind: 'none' });
@@ -1519,7 +1522,7 @@ export function useCanvasPointerController({
                 scaleX,
                 scaleY,
                 isTouch ? 16 : 12,
-                { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey },
+                { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
               )
             : null;
         let endPt = unitSnap?.snappedImg ?? rawPt;
@@ -1570,8 +1573,9 @@ export function useCanvasPointerController({
         if (paperGridSnap && !e.altKey) {
           const xIntMm = Math.max(1, xf - 2 * eMm);
           const yIntMm = Math.max(1, yf - 2 * eMm);
-          nextU = snapNormToPaperGridMm(nextU, xIntMm, eMm, 0.5, 10);
-          nextV = snapNormToPaperGridMm(nextV, yIntMm, eMm, 0.5, 10);
+          const gridStep = paperGridStepMm ?? 10;
+          nextU = snapNormToPaperGridMm(nextU, xIntMm, eMm, 0.5, gridStep);
+          nextV = snapNormToPaperGridMm(nextV, yIntMm, eMm, 0.5, gridStep);
         }
         u = nextU;
         v = nextV;
@@ -1699,7 +1703,7 @@ export function useCanvasPointerController({
               scaleX,
               scaleY,
               isTouch ? 16 : 12,
-              { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey },
+              { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
             );
       const rawUnit = applyHomography(planeHom.toUnit, rawPt);
       if (!rawUnit && !unitSnap) return;
@@ -1975,7 +1979,7 @@ export function useCanvasPointerController({
               scaleX,
               scaleY,
               isTouch ? 16 : 12,
-              { wMm: planeW, hMm: planeH, enabled: paperGridSnap && !e.altKey },
+              { wMm: planeW, hMm: planeH, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
             )
           : null;
 

@@ -134,10 +134,11 @@ stateDiagram-v2
     LateralZY --> Step1Frame : Vuelve a Vista Frontal XY (estima profundidad Z)
 
     note right of Step2Lines
-        Pila Undo / Redo activa en las 3 vistas y los 3 pasos (Ctrl+Z / Ctrl+Y):
+        Pila Undo / Redo (Deshacer y Rehacer Ctrl+Z / Ctrl+Y) activa en las 3 vistas (XY, XZ, ZY), 4 toques y los 3 pasos:
         Restaura snapshot inmutable de
-        (quad, vDividers, hShelves, diagonalDividers, curvedCuts, lShape,
-        frontZones, cubiertaMaterialOverride, shelfMode, equalShelfCount y dims)
+        (quad, topQuad, sideQuad, vDividers, hShelves, diagonalDividers,
+        planeLinesXZ, planeLinesZY, curvedCuts, lShape, frontZones,
+        cubiertaMaterialOverride, shelfMode, equalShelfCount y dims)
     end note
 ```
 
@@ -145,5 +146,5 @@ stateDiagram-v2
 
 1. **Lienzo Limpio sin Barras Innecesarias + Barra Superior de 3 Vistas:** Sin vista cargada en `frontal`, solo se muestran las pestañas `1. Frente (XY)`, `2. Arriba (XZ)`, `3. Lado (ZY)`, `"Medidas razonables"` y el acceso directo `"Dibujar en lienzo libre"`.
 2. **Sincronización Automática 3-Vistas y Cálculo Diferencial:** Ajustar `quad` (XY), `topQuad` (XZ) o `sideQuad` (ZY) ejecuta `synthesize3DFromTriViews`, sincronizando proporción `Alto Y`, profundidad `Z`, topología en L y curvas Bézier (`s = ∫ds`, `κ = 1/R`) en tiempo real.
-3. **Revelación Progresiva y Cero Duplicación:** En Paso 2 (`lines`), la barra visible inicia en `Dibujar` (`draw_only`) junto al selector explícito `Línea recta | Curva` y el botón `Milimetrado` (cuadrícula proyectiva + ajuste a múltiplos de `10 mm`/`50 mm`), manteniendo `Mover / Editar` separado para que ninguna línea previa secuestre al trazar en una esquina; al tocar una línea cualquiera se selecciona (`selectedLine` / `selectedPlaneLineId`) y permite achicar o alargar arrastrando directamente sus puntas azules o usando `−10 largo` / `+10 largo` en `XY`, `XZ` y `ZY`.
-4. **Historial Unificado (`Undo/Redo`):** Toda mutación confirmada guarda un snapshot inmutable completo que incluye `dims`, `cubiertaMaterialOverride`, `curvedCuts` y `lShape`.
+3. **Revelación Progresiva, Cuadrícula Redimensionable y Cero Duplicación:** En Paso 2 (`lines`), la barra visible inicia en `Dibujar` (`draw_only`) junto al selector explícito `Línea recta | Curva`, el botón `Milimetrado` y los controles `- / +` para agrandar o achicar la cuadrícula (`10..200 mm`) en `XY`, `XZ` y `ZY` (con zoom `0.5×..5×`), manteniendo `Mover / Editar` separado para que ninguna línea previa secuestre al trazar en una esquina; al tocar una línea cualquiera se selecciona (`selectedLine` / `selectedPlaneLineId`) y permite achicar o alargar arrastrando directamente sus puntas azules o usando `−10 largo` / `+10 largo` en `XY`, `XZ` y `ZY`.
+4. **Historial Unificado (`Undo/Redo` en XY/XZ/ZY + 4 Toques):** Toda mutación confirmada (contorno, líneas en `Frente`/`Arriba`/`Lado`, curvas, zonas y toques de esquina) guarda estado reversible con `Deshacer` (`Ctrl+Z`) y `Rehacer` (`Ctrl+Y`) incluyendo `dims`, `topQuad`, `sideQuad`, `planeLinesXZ`, `planeLinesZY`, `cubiertaMaterialOverride`, `curvedCuts` y `lShape`.

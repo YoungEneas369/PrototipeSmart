@@ -22,9 +22,13 @@ import { cloneQuad, isEditableElement } from './geometryHelpers';
 
 export interface CanvasHistorySnapshot {
   quad: [Point2D, Point2D, Point2D, Point2D];
+  topQuad?: [Point2D, Point2D, Point2D, Point2D];
+  sideQuad?: [Point2D, Point2D, Point2D, Point2D];
   vDividers: NormalizedSegment[];
   hShelves: NormalizedSegment[];
   diagonalDividers: DiagonalSegment[];
+  planeLinesXZ?: DiagonalSegment[];
+  planeLinesZY?: DiagonalSegment[];
   curvedCuts?: CurvedCutSpec[];
   lShape?: LShapeWingConfig;
   frontZones: FrontZone[] | undefined;
@@ -40,9 +44,13 @@ function cloneHistorySnapshot(snap: CanvasHistorySnapshot): CanvasHistorySnapsho
   const ls = snap.lShape;
   return {
     quad: cloneQuad(snap.quad),
+    topQuad: snap.topQuad ? cloneQuad(snap.topQuad) : undefined,
+    sideQuad: snap.sideQuad ? cloneQuad(snap.sideQuad) : undefined,
     vDividers: snap.vDividers.map((d) => ({ ...d })),
     hShelves: snap.hShelves.map((s) => ({ ...s })),
     diagonalDividers: snap.diagonalDividers.map((dg) => ({ ...dg })),
+    planeLinesXZ: snap.planeLinesXZ ? snap.planeLinesXZ.map((p) => ({ ...p })) : undefined,
+    planeLinesZY: snap.planeLinesZY ? snap.planeLinesZY.map((p) => ({ ...p })) : undefined,
     curvedCuts: snap.curvedCuts
       ? snap.curvedCuts.map((c) => ({
           ...c,
@@ -77,12 +85,22 @@ export function buildSnapshotFromState(
   quad: readonly [Point2D, Point2D, Point2D, Point2D],
   topology: FurnitureTopology,
   dims?: { x: number; y: number; z: number },
+  extraPlanes?: {
+    topQuad?: readonly [Point2D, Point2D, Point2D, Point2D];
+    sideQuad?: readonly [Point2D, Point2D, Point2D, Point2D];
+    planeLinesXZ?: readonly DiagonalSegment[];
+    planeLinesZY?: readonly DiagonalSegment[];
+  },
 ): CanvasHistorySnapshot {
   return cloneHistorySnapshot({
     quad: cloneQuad(quad),
+    topQuad: extraPlanes?.topQuad ? cloneQuad(extraPlanes.topQuad) : undefined,
+    sideQuad: extraPlanes?.sideQuad ? cloneQuad(extraPlanes.sideQuad) : undefined,
     vDividers: topology.vDividers,
     hShelves: topology.hShelves,
     diagonalDividers: topology.diagonalDividers ?? [],
+    planeLinesXZ: extraPlanes?.planeLinesXZ ? [...extraPlanes.planeLinesXZ] : undefined,
+    planeLinesZY: extraPlanes?.planeLinesZY ? [...extraPlanes.planeLinesZY] : undefined,
     curvedCuts: topology.curvedCuts,
     lShape: topology.lShape,
     frontZones: topology.frontZones,
@@ -99,6 +117,8 @@ export interface UseCanvasHistoryOptions {
   onApplySnapshot: (snapshot: CanvasHistorySnapshot, direction: 'undo' | 'redo') => void;
   /** Permite interceptar Ctrl+Z (ej. deshacer toque 3/4 → 2/4 en modo 4 esquinas). */
   onUndoIntercept?: () => boolean;
+  /** Permite interceptar Ctrl+Y / Rehacer cuando hay toques deshechos. */
+  onRedoIntercept?: () => boolean;
 }
 
 export interface UseCanvasHistoryReturn {
@@ -117,6 +137,7 @@ export function useCanvasHistory({
   getCurrentSnapshot,
   onApplySnapshot,
   onUndoIntercept,
+  onRedoIntercept,
 }: UseCanvasHistoryOptions): UseCanvasHistoryReturn {
   const [counts, setCounts] = useState<{ past: number; future: number }>({ past: 0, future: 0 });
   const pastRef = useRef<CanvasHistorySnapshot[]>([]);
@@ -126,6 +147,7 @@ export function useCanvasHistory({
   const getCurrentRef = useRef(getCurrentSnapshot);
   const applyRef = useRef(onApplySnapshot);
   const interceptRef = useRef(onUndoIntercept);
+  const redoInterceptRef = useRef(onRedoIntercept);
 
   useEffect(() => {
     getCurrentRef.current = getCurrentSnapshot;
@@ -138,6 +160,10 @@ export function useCanvasHistory({
   useEffect(() => {
     interceptRef.current = onUndoIntercept;
   }, [onUndoIntercept]);
+
+  useEffect(() => {
+    redoInterceptRef.current = onRedoIntercept;
+  }, [onRedoIntercept]);
 
   const syncCounts = useCallback(() => {
     setCounts({ past: pastRef.current.length, future: futureRef.current.length });
@@ -172,6 +198,9 @@ export function useCanvasHistory({
   }, [syncCounts]);
 
   const triggerRedo = useCallback((): boolean => {
+    if (redoInterceptRef.current && redoInterceptRef.current()) {
+      return true;
+    }
     if (futureRef.current.length === 0) return false;
     const next = futureRef.current[0];
     const current = cloneHistorySnapshot(getCurrentRef.current());
@@ -202,9 +231,9 @@ export function useCanvasHistory({
           if (didHandle) e.preventDefault();
         }
       } else if (key === 'y' || (key === 'z' && e.shiftKey)) {
-        if (futureRef.current.length > 0) {
-          e.preventDefault();
-          triggerRedo();
+        if (futureRef.current.length > 0 || Boolean(redoInterceptRef.current)) {
+          const didHandle = triggerRedo();
+          if (didHandle) e.preventDefault();
         }
       }
     };

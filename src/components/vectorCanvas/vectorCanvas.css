@@ -100,7 +100,7 @@
 }
 
 .vc-history-btn:disabled {
-  opacity: 0.48;
+  opacity: 0.72;
   cursor: not-allowed;
 }
 
@@ -118,9 +118,10 @@
 }
 
 .vc-redo-btn.is-ready {
-  background: #e0f2fe;
-  border-color: #38bdf8;
+  background: #dbeafe;
+  border-color: #0284c7;
   color: #0369a1;
+  box-shadow: 0 1px 3px rgba(2, 132, 199, 0.25);
 }
 
 .vc-redo-btn.is-ready:hover:not(:disabled) {

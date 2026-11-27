@@ -93,6 +93,7 @@ export interface CanvasViewportProps {
   visualLayer: VisualLayerMode;
   strokeMode: UserStrokeMode;
   paperGridSnap?: boolean;
+  paperGridStepMm?: number;
   activeQuad: [Point2D, Point2D, Point2D, Point2D];
   homography: { toUnit: Matrix3x3; toCanvas: Matrix3x3 } | null;
   vDividers: NormalizedSegment[];
@@ -156,6 +157,7 @@ export function CanvasViewport({
   visualLayer,
   strokeMode,
   paperGridSnap = true,
+  paperGridStepMm = 25,
   activeQuad,
   homography,
   vDividers,
@@ -283,8 +285,16 @@ export function CanvasViewport({
       const botWpx = distScreenPx(activeQuad[3], activeQuad[2], screenScaleX, screenScaleY);
       const leftHpx = distScreenPx(activeQuad[0], activeQuad[3], screenScaleX, screenScaleY);
       const rightHpx = distScreenPx(activeQuad[1], activeQuad[2], screenScaleX, screenScaleY);
-      const spacingX = computePaperGridSpacing(spanW, Math.max(80, (topWpx + botWpx) / 2));
-      const spacingY = computePaperGridSpacing(spanH, Math.max(80, (leftHpx + rightHpx) / 2));
+      const spacingX = computePaperGridSpacing(
+        spanW,
+        Math.max(80, (topWpx + botWpx) / 2),
+        paperGridStepMm,
+      );
+      const spacingY = computePaperGridSpacing(
+        spanH,
+        Math.max(80, (leftHpx + rightHpx) / 2),
+        paperGridStepMm,
+      );
       const mapGridPt = (uVal: number, vVal: number) =>
         applyHomography(
           gridHom.toCanvas,
@@ -292,6 +302,80 @@ export function CanvasViewport({
             ? { x: interiorToExterior(uVal, e, xf), y: interiorToExterior(vVal, e, yf) }
             : { x: uVal, y: vVal },
         );
+
+      // Extensión de la cuadrícula por todo el lienzo exterior (para que agrandar/achicar afecte toda la hoja)
+      const pOrigin = mapGridPt(0, 0);
+      const pRight = mapGridPt(spacingX.minorMm / Math.max(1, spanW), 0);
+      const pDown = mapGridPt(0, spacingY.minorMm / Math.max(1, spanH));
+      if (pOrigin && pRight && pDown) {
+        const vxX = pRight.x - pOrigin.x;
+        const vxY = pRight.y - pOrigin.y;
+        const vyX = pDown.x - pOrigin.x;
+        const vyY = pDown.y - pOrigin.y;
+        const stepLenX = Math.hypot(vxX, vxY);
+        const stepLenY = Math.hypot(vyX, vyY);
+        const areaDet = Math.abs(vxX * vyY - vxY * vyX);
+        if (stepLenX >= 4 && stepLenY >= 4 && areaDet > 4) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(0, 0, cw, ch);
+          ctx.moveTo(activeQuad[0].x, activeQuad[0].y);
+          ctx.lineTo(activeQuad[1].x, activeQuad[1].y);
+          ctx.lineTo(activeQuad[2].x, activeQuad[2].y);
+          ctx.lineTo(activeQuad[3].x, activeQuad[3].y);
+          ctx.closePath();
+          ctx.clip('evenodd');
+
+          const invDet = vxX * vyY - vxY * vyX;
+          const cornersCanvas = [
+            { x: 0, y: 0 },
+            { x: cw, y: 0 },
+            { x: cw, y: ch },
+            { x: 0, y: ch },
+          ];
+          let minK = 0;
+          let maxK = 0;
+          let minM = 0;
+          let maxM = 0;
+          for (const cc of cornersCanvas) {
+            const dx = cc.x - pOrigin.x;
+            const dy = cc.y - pOrigin.y;
+            const k = (dx * vyY - dy * vyX) / invDet;
+            const m = (vxX * dy - vxY * dx) / invDet;
+            minK = Math.min(minK, Math.floor(k) - 1);
+            maxK = Math.max(maxK, Math.ceil(k) + 1);
+            minM = Math.min(minM, Math.floor(m) - 1);
+            maxM = Math.max(maxM, Math.ceil(m) + 1);
+          }
+          minK = Math.max(-80, minK);
+          maxK = Math.min(120, maxK);
+          minM = Math.max(-80, minM);
+          maxM = Math.min(120, maxM);
+
+          const majorRatioX = Math.max(1, Math.round(spacingX.majorMm / Math.max(1, spacingX.minorMm)));
+          const majorRatioY = Math.max(1, Math.round(spacingY.majorMm / Math.max(1, spacingY.minorMm)));
+
+          for (let k = minK; k <= maxK; k++) {
+            const isMajor = ((k % majorRatioX) + majorRatioX) % majorRatioX === 0;
+            ctx.strokeStyle = isMajor ? 'rgba(13, 148, 136, 0.20)' : 'rgba(20, 184, 166, 0.09)';
+            ctx.lineWidth = isMajor ? 1.1 : 0.75;
+            ctx.beginPath();
+            ctx.moveTo(pOrigin.x + k * vxX + minM * vyX, pOrigin.y + k * vxY + minM * vyY);
+            ctx.lineTo(pOrigin.x + k * vxX + maxM * vyX, pOrigin.y + k * vxY + maxM * vyY);
+            ctx.stroke();
+          }
+          for (let m = minM; m <= maxM; m++) {
+            const isMajor = ((m % majorRatioY) + majorRatioY) % majorRatioY === 0;
+            ctx.strokeStyle = isMajor ? 'rgba(13, 148, 136, 0.20)' : 'rgba(20, 184, 166, 0.09)';
+            ctx.lineWidth = isMajor ? 1.1 : 0.75;
+            ctx.beginPath();
+            ctx.moveTo(pOrigin.x + minK * vxX + m * vyX, pOrigin.y + minK * vxY + m * vyY);
+            ctx.lineTo(pOrigin.x + maxK * vxX + m * vyX, pOrigin.y + maxK * vxY + m * vyY);
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
 
       ctx.save();
       for (let xMm = spacingX.minorMm; xMm < spanW; xMm += spacingX.minorMm) {
@@ -1286,6 +1370,7 @@ export function CanvasViewport({
     visualLayer,
     strokeMode,
     paperGridSnap,
+    paperGridStepMm,
     activeQuad,
     homography,
     vDividers,

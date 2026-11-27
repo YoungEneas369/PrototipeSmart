@@ -702,13 +702,21 @@ export function computeAdaptiveAutoExtend(
   return clampNum(16 / minSidePx, 0.06, 0.18);
 }
 
+export const PAPER_GRID_STEP_PRESETS = [10, 20, 25, 50, 100, 200] as const;
+
 /**
- * Calcula pasos legibles de papel milimetrado según el tamaño físico en mm y en píxeles de pantalla.
+ * Calcula pasos legibles de papel milimetrado según tamaño físico, pantalla y paso elegido por el usuario.
  */
 export function computePaperGridSpacing(
   spanMm: number,
   spanPx: number,
+  customStepMm?: number,
 ): { minorMm: number; majorMm: number; snapMm: number } {
+  if (customStepMm && customStepMm >= 10) {
+    const minorMm = customStepMm;
+    const majorMm = customStepMm <= 25 ? customStepMm * 4 : customStepMm * 2;
+    return { minorMm, majorMm, snapMm: customStepMm };
+  }
   const pxPerMm = spanPx / Math.max(1, spanMm);
   const candidates = [10, 20, 25, 50, 100];
   let minorMm = 100;
@@ -724,8 +732,8 @@ export function computePaperGridSpacing(
 }
 
 /**
- * Adapta una coordenada normalizada `[0, 1]` al papel milimetrado en múltiplos exactos de 10 mm
- * (con imán suave a líneas principales cada 50 mm dentro de `5.5 px`), preservando paredes `0` y `1`.
+ * Adapta una coordenada normalizada `[0, 1]` al papel milimetrado según el tamaño de cuadrícula activo
+ * (múltiplos exactos de `stepMm`, con imán suave a líneas principales), preservando paredes `0` y `1`.
  */
 export function snapNormToPaperGridMm(
   normVal: number,
@@ -738,13 +746,14 @@ export function snapNormToPaperGridMm(
   if (c <= 0.008) return 0;
   if (c >= 0.992) return 1;
   const posMm = offsetMm + c * spanMm;
-  const majorMm = 50;
+  const effectiveStep = Math.max(5, stepMm);
+  const majorMm = effectiveStep <= 25 ? effectiveStep * 4 : effectiveStep * 2;
   const nearestMajor = Math.round(posMm / majorMm) * majorMm;
   const distMajorPx = Math.abs(posMm - nearestMajor) * Math.max(0.05, pxPerMm);
   const targetMm =
     distMajorPx <= 5.5
       ? nearestMajor
-      : Math.round(posMm / Math.max(5, stepMm)) * Math.max(5, stepMm);
+      : Math.round(posMm / effectiveStep) * effectiveStep;
   return round4(clampNum((targetMm - offsetMm) / Math.max(1, spanMm), 0.005, 0.995));
 }
 
@@ -1995,33 +2004,19 @@ export function createBlankSketchBitmap(
   canvas.height = h;
   const ctx = canvas.getContext('2d');
   if (ctx) {
+    // Fondo limpio papel milimetrado suave: la rejilla dinámica escalable se proyecta encima desde CanvasViewport
     ctx.fillStyle = '#f3fbf8';
     ctx.fillRect(0, 0, w, h);
 
-    ctx.strokeStyle = 'rgba(20, 184, 166, 0.16)';
+    ctx.strokeStyle = 'rgba(20, 184, 166, 0.09)';
     ctx.lineWidth = 1;
-    for (let x = 10; x < w; x += 10) {
+    for (let x = 20; x < w; x += 20) {
       ctx.beginPath();
       ctx.moveTo(x, 0);
       ctx.lineTo(x, h);
       ctx.stroke();
     }
-    for (let y = 10; y < h; y += 10) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(w, y);
-      ctx.stroke();
-    }
-
-    ctx.strokeStyle = 'rgba(13, 148, 136, 0.28)';
-    ctx.lineWidth = 1.25;
-    for (let x = 50; x < w; x += 50) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-      ctx.stroke();
-    }
-    for (let y = 50; y < h; y += 50) {
+    for (let y = 20; y < h; y += 20) {
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(w, y);
@@ -2042,4 +2037,198 @@ export function createBlankSketchBitmap(
     ? new Uint8ClampedArray(ctx.getImageData(0, 0, w, h).data)
     : new Uint8ClampedArray(w * h * 4);
   return { canvas, rgba, w, h };
+}
+
+export interface BlankSketchAutoBoxResult {
+  nextQuad: [Point2D, Point2D, Point2D, Point2D];
+  nextDims: { x: number; y: number; z: number };
+  vDividers: NormalizedSegment[];
+  hShelves: NormalizedSegment[];
+}
+
+function mergedCoverageFraction(
+  rawSpans: Array<[number, number]>,
+  targetMin: number,
+  targetMax: number,
+): number {
+  const total = targetMax - targetMin;
+  if (total <= 1e-4) return 0;
+  const intervals: Array<[number, number]> = [];
+  for (const [a, b] of rawSpans) {
+    const s = Math.max(targetMin, Math.min(a, b) - 0.02);
+    const e = Math.min(targetMax, Math.max(a, b) + 0.02);
+    if (e > s + 1e-4) intervals.push([s, e]);
+  }
+  if (intervals.length === 0) return 0;
+  intervals.sort((x, y) => x[0] - y[0]);
+  let covered = 0;
+  let curS = intervals[0][0];
+  let curE = intervals[0][1];
+  for (let i = 1; i < intervals.length; i++) {
+    if (intervals[i][0] <= curE + 0.015) {
+      curE = Math.max(curE, intervals[i][1]);
+    } else {
+      covered += curE - curS;
+      curS = intervals[i][0];
+      curE = intervals[i][1];
+    }
+  }
+  covered += curE - curS;
+  return covered / total;
+}
+
+/**
+ * Cuando el usuario dibuja un mueble completo con contorno cerrado en el lienzo en blanco
+ * (`2+` verticales y `2+` horizontales formando los 4 muros exteriores dentro de la hoja),
+ * ajusta el marco `quad` y las dimensiones `nextDims` exactamente a ese dibujo para evitar
+ * generar un mueble gigante alrededor de la hoja con compartimentos flotando adentro.
+ */
+export function fitBlankSketchDrawnOuterBox(
+  vDividers: readonly NormalizedSegment[],
+  hShelves: readonly NormalizedSegment[],
+  diagonalDividers: readonly DiagonalSegment[],
+  currentQuad: readonly [Point2D, Point2D, Point2D, Point2D],
+  currentDims: { x: number; y: number; z: number },
+  boardThickness: number,
+): BlankSketchAutoBoxResult | null {
+  if (diagonalDividers.length > 0) return null;
+  if (vDividers.length < 2 || hShelves.length < 2) return null;
+
+  const hom = computeQuadToUnitHomography(currentQuad);
+  if (!hom) return null;
+
+  const uMin = Math.min(...vDividers.map((d) => d.position));
+  const uMax = Math.max(...vDividers.map((d) => d.position));
+  const vMin = Math.min(...hShelves.map((s) => s.position));
+  const vMax = Math.max(...hShelves.map((s) => s.position));
+
+  const wSpan = uMax - uMin;
+  const hSpan = vMax - vMin;
+  if (wSpan < 0.12 || hSpan < 0.12) return null;
+
+  // Solo activar si la caja dibujada está contenida dentro de la hoja (no si ya coincide con los bordes)
+  const insetMargins = uMin >= 0.035 || uMax <= 0.965 || vMin >= 0.035 || vMax <= 0.965;
+  if (!insetMargins || wSpan * hSpan > 0.8) return null;
+
+  const boundTol = 0.035;
+  for (const d of vDividers) {
+    const s0 = Math.min(d.start, d.end);
+    const s1 = Math.max(d.start, d.end);
+    if (s0 < vMin - boundTol || s1 > vMax + boundTol) return null;
+  }
+  for (const s of hShelves) {
+    const s0 = Math.min(s.start, s.end);
+    const s1 = Math.max(s.start, s.end);
+    if (s0 < uMin - boundTol || s1 > uMax + boundTol) return null;
+  }
+
+  const edgeTol = 0.025;
+  const leftCov = mergedCoverageFraction(
+    vDividers
+      .filter((d) => Math.abs(d.position - uMin) <= edgeTol)
+      .map((d): [number, number] => [d.start, d.end]),
+    vMin,
+    vMax,
+  );
+  const rightCov = mergedCoverageFraction(
+    vDividers
+      .filter((d) => Math.abs(d.position - uMax) <= edgeTol)
+      .map((d): [number, number] => [d.start, d.end]),
+    vMin,
+    vMax,
+  );
+  const botCov = mergedCoverageFraction(
+    hShelves
+      .filter((s) => Math.abs(s.position - vMin) <= edgeTol)
+      .map((s): [number, number] => [s.start, s.end]),
+    uMin,
+    uMax,
+  );
+  const topCov = mergedCoverageFraction(
+    hShelves
+      .filter((s) => Math.abs(s.position - vMax) <= edgeTol)
+      .map((s): [number, number] => [s.start, s.end]),
+    uMin,
+    uMax,
+  );
+
+  if (leftCov < 0.82 || rightCov < 0.82 || botCov < 0.82 || topCov < 0.82) {
+    return null;
+  }
+
+  const xf = currentDims.x;
+  const yf = currentDims.y;
+  const xInt = Math.max(40, xf - 2 * boardThickness);
+  const yInt = Math.max(40, yf - 2 * boardThickness);
+
+  const tl = applyHomography(hom.toCanvas, {
+    x: interiorToExterior(uMin, boardThickness, xf),
+    y: interiorToExterior(vMax, boardThickness, yf),
+  });
+  const tr = applyHomography(hom.toCanvas, {
+    x: interiorToExterior(uMax, boardThickness, xf),
+    y: interiorToExterior(vMax, boardThickness, yf),
+  });
+  const br = applyHomography(hom.toCanvas, {
+    x: interiorToExterior(uMax, boardThickness, xf),
+    y: interiorToExterior(vMin, boardThickness, yf),
+  });
+  const bl = applyHomography(hom.toCanvas, {
+    x: interiorToExterior(uMin, boardThickness, xf),
+    y: interiorToExterior(vMin, boardThickness, yf),
+  });
+  if (!tl || !tr || !br || !bl) return null;
+  const nextQuad: [Point2D, Point2D, Point2D, Point2D] = [tl, tr, br, bl];
+  if (!isConvexQuad(nextQuad)) return null;
+
+  let dimX = Math.max(40, Math.round((wSpan * xInt) / 10) * 10);
+  let dimY = Math.max(40, Math.round((hSpan * yInt) / 10) * 10);
+  const minDim = Math.min(dimX, dimY);
+  if (minDim > 0 && minDim < 300) {
+    const lift = 300 / minDim;
+    dimX = Math.round((dimX * lift) / 10) * 10;
+    dimY = Math.round((dimY * lift) / 10) * 10;
+  }
+  const nextDims = {
+    x: clampNum(dimX, 300, 2400),
+    y: clampNum(dimY, 300, 2400),
+    z: clampNum(Math.round(currentDims.z), 200, 900),
+  };
+
+  const snapEdge01 = (val: number): number => (val <= 0.03 ? 0 : val >= 0.97 ? 1 : round4(val));
+
+  const nextVDividers: NormalizedSegment[] = [];
+  for (const d of vDividers) {
+    if (Math.abs(d.position - uMin) <= edgeTol || Math.abs(d.position - uMax) <= edgeTol) {
+      continue;
+    }
+    const pos = round4((d.position - uMin) / wSpan);
+    if (pos <= 0.025 || pos >= 0.975) continue;
+    const s0 = snapEdge01(clampNum((Math.min(d.start, d.end) - vMin) / hSpan, 0, 1));
+    const s1 = snapEdge01(clampNum((Math.max(d.start, d.end) - vMin) / hSpan, 0, 1));
+    if (s1 - s0 >= 0.04) {
+      nextVDividers.push({ ...d, position: pos, start: s0, end: s1 });
+    }
+  }
+
+  const nextHShelves: NormalizedSegment[] = [];
+  for (const s of hShelves) {
+    if (Math.abs(s.position - vMin) <= edgeTol || Math.abs(s.position - vMax) <= edgeTol) {
+      continue;
+    }
+    const pos = round4((s.position - vMin) / hSpan);
+    if (pos <= 0.025 || pos >= 0.975) continue;
+    const s0 = snapEdge01(clampNum((Math.min(s.start, s.end) - uMin) / wSpan, 0, 1));
+    const s1 = snapEdge01(clampNum((Math.max(s.start, s.end) - uMin) / wSpan, 0, 1));
+    if (s1 - s0 >= 0.04) {
+      nextHShelves.push({ ...s, position: pos, start: s0, end: s1 });
+    }
+  }
+
+  return {
+    nextQuad,
+    nextDims,
+    vDividers: nextVDividers,
+    hShelves: nextHShelves,
+  };
 }

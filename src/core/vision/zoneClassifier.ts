@@ -924,31 +924,7 @@ export function classifyZonesUnified(
   const refLab = rgbToLab(refRgb[0], refRgb[1], refRgb[2]);
   const bgDistFromCarcass = exteriorBgRgb ? rgbDeltaE(refRgb, exteriorBgRgb) : 999;
 
-  if (!rectRgba || rectW < 20 || rectH < 20) {
-    return cells.map((cell, idx) => ({
-      id: cell.id ?? `${idPrefix}_${idx + 1}`,
-      uStart: Number(cell.uStart.toFixed(4)),
-      uEnd: Number(cell.uEnd.toFixed(4)),
-      vStart: Number(cell.vStart.toFixed(4)),
-      vEnd: Number(cell.vEnd.toFixed(4)),
-      kind: 'open',
-      label: `Zona ${idx + 1}`,
-    }));
-  }
-
-  const lum = ctx.lum ?? extractLuminanceBuffer(rectRgba, rectW, rectH, true);
-
-  interface ClassifiedCell {
-    cell: CellRect;
-    stats: CellPixelStats;
-    kind: FrontModuleKind;
-    drawerCount?: number;
-    basketCount?: number;
-    matOverride?: MelamineMaterial;
-    preserved?: FrontZone;
-  }
-
-  // 1. Emparejamiento 1:1 con `previousZones` (borde ±0.04 o IoU >= 0.72 para conservar ajustes de 5–8%)
+  // 1. Emparejamiento 1:1 con `previousZones` (borde ±0.04 o IoU >= 0.72 para conservar ajustes de 5–8% incluso sin foto)
   const cellRectIoU = (
     a: { uStart: number; uEnd: number; vStart: number; vEnd: number },
     b: { uStart: number; uEnd: number; vStart: number; vEnd: number },
@@ -965,7 +941,6 @@ export function classifyZonesUnified(
   const prevMatches: Array<FrontZone | undefined> = new Array(cells.length).fill(undefined);
   if (previousZones.length > 0) {
     const usedPrev = new Set<number>();
-    // Paso 1a: coincidencia estrecha de los 4 bordes (±0.04)
     for (let ci = 0; ci < cells.length; ci++) {
       const cell = cells[ci];
       const pIdx = previousZones.findIndex(
@@ -981,7 +956,6 @@ export function classifyZonesUnified(
         prevMatches[ci] = previousZones[pIdx];
       }
     }
-    // Paso 1b: coincidencia global por IoU >= 0.72 (ordenada de mayor a menor IoU, 1:1 sin ambigüedad)
     const pairs: Array<{ ci: number; pi: number; iou: number }> = [];
     for (let ci = 0; ci < cells.length; ci++) {
       if (prevMatches[ci]) continue;
@@ -999,6 +973,43 @@ export function classifyZonesUnified(
       usedPrev.add(pair.pi);
       prevMatches[pair.ci] = previousZones[pair.pi];
     }
+  }
+
+  if (!rectRgba || rectW < 20 || rectH < 20) {
+    return cells.map((cell, idx) => {
+      const preserved = prevMatches[idx];
+      if (preserved) {
+        return {
+          ...preserved,
+          id: cell.id ?? `${idPrefix}_${idx + 1}`,
+          uStart: Number(cell.uStart.toFixed(4)),
+          uEnd: Number(cell.uEnd.toFixed(4)),
+          vStart: Number(cell.vStart.toFixed(4)),
+          vEnd: Number(cell.vEnd.toFixed(4)),
+        };
+      }
+      return {
+        id: cell.id ?? `${idPrefix}_${idx + 1}`,
+        uStart: Number(cell.uStart.toFixed(4)),
+        uEnd: Number(cell.uEnd.toFixed(4)),
+        vStart: Number(cell.vStart.toFixed(4)),
+        vEnd: Number(cell.vEnd.toFixed(4)),
+        kind: 'open',
+        label: `Zona ${idx + 1}`,
+      };
+    });
+  }
+
+  const lum = ctx.lum ?? extractLuminanceBuffer(rectRgba, rectW, rectH, true);
+
+  interface ClassifiedCell {
+    cell: CellRect;
+    stats: CellPixelStats;
+    kind: FrontModuleKind;
+    drawerCount?: number;
+    basketCount?: number;
+    matOverride?: MelamineMaterial;
+    preserved?: FrontZone;
   }
 
   // Medir estadísticas exactas en espacio exterior rectificado para cada celda

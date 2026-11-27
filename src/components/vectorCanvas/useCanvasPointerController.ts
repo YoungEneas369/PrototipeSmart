@@ -116,6 +116,8 @@ type ActiveDrag =
       startV: number;
       startAnchored: boolean;
       guidedEndImg: Point2D;
+      guidedSnappedAnchor?: boolean;
+      lastMoveRawImg?: Point2D;
       points: Point2D[];
       plane: CurvePlane;
       startClient: Point2D;
@@ -307,12 +309,17 @@ export function useCanvasPointerController({
   } | null>(null);
   const draftRegionRef = useRef<DraftSubRegion | null>(null);
   const activeTouchMapRef = useRef<Map<number, Point2D>>(new Map());
+  const pinchWasActiveRef = useRef<boolean>(false);
   const pinchBaseRef = useRef<{
     dist: number;
     mid: Point2D;
     zoom: number;
     pan: Point2D;
   } | null>(null);
+  const zoomRef = useRef<number>(zoom);
+  zoomRef.current = zoom;
+  const panRef = useRef<Point2D>(pan);
+  panRef.current = pan;
 
   const clampPanForZoom = useCallback(
     (nextPan: Point2D, nextZoom: number): Point2D => {
@@ -344,7 +351,17 @@ export function useCanvasPointerController({
     setPanToolActive(false);
   }, []);
 
-  const clearDrafts = useCallback(() => {
+  const cancelActiveDragOnly = useCallback(() => {
+    const active = dragRef.current;
+    if (active && canvasRef.current) {
+      try {
+        if (canvasRef.current.hasPointerCapture(active.pointerId)) {
+          canvasRef.current.releasePointerCapture(active.pointerId);
+        }
+      } catch {
+        // Ignorar si ya fue liberado
+      }
+    }
     dragRef.current = null;
     draftQuadRef.current = null;
     draftTopQuadRef.current = null;
@@ -352,8 +369,6 @@ export function useCanvasPointerController({
     draftLinesRef.current = null;
     draftPlaneLinesRef.current = null;
     draftRegionRef.current = null;
-    pinchBaseRef.current = null;
-    activeTouchMapRef.current.clear();
     setDraftQuad(null);
     setDraftTopQuad(null);
     setDraftSideQuad(null);
@@ -367,9 +382,17 @@ export function useCanvasPointerController({
     setHoverTarget({ kind: 'none' });
     setIsDraggingState(false);
     setIsPanningState(false);
-  }, []);
+  }, [canvasRef]);
+
+  const clearDrafts = useCallback(() => {
+    pinchBaseRef.current = null;
+    pinchWasActiveRef.current = false;
+    activeTouchMapRef.current.clear();
+    cancelActiveDragOnly();
+  }, [cancelActiveDragOnly]);
 
   // Zoom continuo con Ctrl+Rueda (jamás bloquea el scroll vertical normal cuando zoom = 1×)
+  // + seguimiento táctil multi-dedo en fase capture sobre todo el viewport (pinch-to-zoom confiable)
   useEffect(() => {
     const el = stageRef.current;
     if (!el) return;
@@ -383,9 +406,67 @@ export function useCanvasPointerController({
         return nextZoom;
       });
     };
+
+    const onTouchPointerDown = (e: PointerEvent) => {
+      if (e.pointerType !== 'touch') return;
+      activeTouchMapRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activeTouchMapRef.current.size >= 2) {
+        pinchWasActiveRef.current = true;
+        cancelActiveDragOnly();
+        const pts = Array.from(activeTouchMapRef.current.values());
+        pinchBaseRef.current = {
+          dist: Math.max(10, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y)),
+          mid: { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 },
+          zoom: zoomRef.current,
+          pan: { ...panRef.current },
+        };
+      }
+    };
+
+    const onTouchPointerMove = (e: PointerEvent) => {
+      if (e.pointerType !== 'touch' || !activeTouchMapRef.current.has(e.pointerId)) return;
+      activeTouchMapRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activeTouchMapRef.current.size >= 2 && pinchBaseRef.current) {
+        e.preventDefault();
+        const pts = Array.from(activeTouchMapRef.current.values());
+        const dist = Math.max(10, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y));
+        const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+        const base = pinchBaseRef.current;
+        const nextZoom = Number(clampNum(base.zoom * (dist / base.dist), 0.5, 5).toFixed(2));
+        setZoom(nextZoom);
+        setPan(
+          clampPanForZoom(
+            { x: base.pan.x + (mid.x - base.mid.x), y: base.pan.y + (mid.y - base.mid.y) },
+            nextZoom,
+          ),
+        );
+      }
+    };
+
+    const onTouchPointerEnd = (e: PointerEvent) => {
+      if (e.pointerType !== 'touch') return;
+      activeTouchMapRef.current.delete(e.pointerId);
+      if (activeTouchMapRef.current.size < 2) {
+        pinchBaseRef.current = null;
+      }
+      if (activeTouchMapRef.current.size === 0) {
+        pinchWasActiveRef.current = false;
+      }
+    };
+
     el.addEventListener('wheel', onWheel, { passive: false });
-    return () => el.removeEventListener('wheel', onWheel);
-  }, [stageRef, clampPanForZoom]);
+    el.addEventListener('pointerdown', onTouchPointerDown, { capture: true });
+    el.addEventListener('pointermove', onTouchPointerMove, { capture: true, passive: false });
+    el.addEventListener('pointerup', onTouchPointerEnd, { capture: true });
+    el.addEventListener('pointercancel', onTouchPointerEnd, { capture: true });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('pointerdown', onTouchPointerDown, { capture: true });
+      el.removeEventListener('pointermove', onTouchPointerMove, { capture: true });
+      el.removeEventListener('pointerup', onTouchPointerEnd, { capture: true });
+      el.removeEventListener('pointercancel', onTouchPointerEnd, { capture: true });
+    };
+  }, [stageRef, clampPanForZoom, cancelActiveDragOnly]);
 
   const getCanvasMetrics = useCallback(
     (clientX: number, clientY: number) => {
@@ -580,7 +661,7 @@ export function useCanvasPointerController({
         strokeMode,
       );
 
-      // Ancla SOLO el eje perpendicular al trazo para no jalar nunca hacia bordes paralelos
+      // Ancla SOLO el eje perpendicular al trazo usando exactamente startV/startU (cero pérdida de uniones T por temblor lateral)
       const axisLock: 'both' | 'uOnly' | 'vOnly' =
         guide.axis === 'horizontal' || guide.axis === 'near_horizontal'
           ? 'uOnly'
@@ -588,8 +669,21 @@ export function useCanvasPointerController({
             ? 'vOnly'
             : 'both';
 
+      const probePt =
+        guide.axis === 'horizontal'
+          ? (applyHomography(hom.toCanvas, {
+              x: interiorToExterior(guide.u, eMm, xf),
+              y: interiorToExterior(startV, eMm, yf),
+            }) ?? rawEndPt)
+          : guide.axis === 'vertical'
+            ? (applyHomography(hom.toCanvas, {
+                x: interiorToExterior(startU, eMm, xf),
+                y: interiorToExterior(guide.v, eMm, yf),
+              }) ?? rawEndPt)
+            : rawEndPt;
+
       const snapped = snapForLineOperation(
-        rawEndPt,
+        probePt,
         scaleX,
         scaleY,
         altKey,
@@ -597,7 +691,7 @@ export function useCanvasPointerController({
         materializedBase.hShelves,
         undefined,
         axisLock,
-        isTouch ? 16 : 12,
+        isTouch ? 24 : 12,
         topology.diagonalDividers ?? [],
       );
 
@@ -636,18 +730,8 @@ export function useCanvasPointerController({
   );
 
   const handlePointerCancel = useCallback(() => {
-    const active = dragRef.current;
-    if (active && canvasRef.current) {
-      try {
-        if (canvasRef.current.hasPointerCapture(active.pointerId)) {
-          canvasRef.current.releasePointerCapture(active.pointerId);
-        }
-      } catch {
-        // Ignorar si ya fue liberado
-      }
-    }
-    clearDrafts();
-  }, [canvasRef, clearDrafts]);
+    cancelActiveDragOnly();
+  }, [cancelActiveDragOnly]);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -656,15 +740,9 @@ export function useCanvasPointerController({
 
     if (isTouch) {
       activeTouchMapRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (activeTouchMapRef.current.size === 2) {
-        handlePointerCancel();
-        const pts = Array.from(activeTouchMapRef.current.values());
-        pinchBaseRef.current = {
-          dist: Math.max(10, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y)),
-          mid: { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 },
-          zoom,
-          pan,
-        };
+      if (activeTouchMapRef.current.size >= 2 || pinchWasActiveRef.current) {
+        pinchWasActiveRef.current = true;
+        cancelActiveDragOnly();
         return;
       }
     }
@@ -757,6 +835,7 @@ export function useCanvasPointerController({
       const planeH = nonFrontPlane === 'xz' ? params.targetDimensions.z : params.targetDimensions.y;
       const plines = nonFrontPlane === 'xz' ? planeLinesXZ : planeLinesZY;
       const planeHom = computeQuadToUnitHomography(targetQuad);
+      const allowUnselectedEnds = linesSubMode === 'smart';
       const pHit = planeHom
         ? hitTestPlaneLinesScreenPx(
             rawPt,
@@ -766,7 +845,7 @@ export function useCanvasPointerController({
             scaleY,
             selectedPlaneLineId,
             isTouch,
-            false,
+            allowUnselectedEnds,
           )
         : null;
       const pTapHit =
@@ -825,7 +904,7 @@ export function useCanvasPointerController({
               getNonFrontUnitVertices(nonFrontPlane),
               scaleX,
               scaleY,
-              isTouch ? 16 : 12,
+              isTouch ? 24 : 12,
               { wMm: planeW, hMm: planeH, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
             )
           : null;
@@ -989,6 +1068,7 @@ export function useCanvasPointerController({
         return;
       }
 
+      const allowUnselectedEnds = linesSubMode === 'smart';
       const hit = hitTestLinesScreenPx(
         rawPt,
         vDivs,
@@ -1002,7 +1082,7 @@ export function useCanvasPointerController({
         scaleY,
         selectedLine,
         isTouch,
-        false,
+        allowUnselectedEnds,
       );
       const tapHit =
         hit ??
@@ -1071,7 +1151,7 @@ export function useCanvasPointerController({
         hShs,
         undefined,
         'both',
-        isTouch ? 16 : 12,
+        isTouch ? 24 : 12,
         diags,
       );
       const startPt = snappedStart?.pt ?? rawPt;
@@ -1120,21 +1200,9 @@ export function useCanvasPointerController({
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const isTouch = e.pointerType === 'touch';
 
-    if (isTouch && activeTouchMapRef.current.has(e.pointerId)) {
+    if (isTouch) {
       activeTouchMapRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (activeTouchMapRef.current.size === 2 && pinchBaseRef.current) {
-        const pts = Array.from(activeTouchMapRef.current.values());
-        const dist = Math.max(10, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y));
-        const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
-        const base = pinchBaseRef.current;
-        const nextZoom = Number(clampNum(base.zoom * (dist / base.dist), 0.5, 5).toFixed(2));
-        setZoom(nextZoom);
-        setPan(
-          clampPanForZoom(
-            { x: base.pan.x + (mid.x - base.mid.x), y: base.pan.y + (mid.y - base.mid.y) },
-            nextZoom,
-          ),
-        );
+      if (activeTouchMapRef.current.size >= 2 || pinchWasActiveRef.current) {
         return;
       }
     }
@@ -1197,7 +1265,7 @@ export function useCanvasPointerController({
             scaleY,
             selectedPlaneLineId,
             isTouch,
-            false,
+            linesSubMode === 'smart',
           );
           const showPlaneHover =
             pHit !== null &&
@@ -1223,7 +1291,7 @@ export function useCanvasPointerController({
                 getNonFrontUnitVertices(nonFrontPlane),
                 scaleX,
                 scaleY,
-                isTouch ? 16 : 12,
+                isTouch ? 24 : 12,
                 { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
               )
             : null;
@@ -1264,7 +1332,7 @@ export function useCanvasPointerController({
             scaleY,
             selectedLine,
             isTouch,
-            false,
+            linesSubMode === 'smart',
           );
           const showLineHover =
             hit !== null &&
@@ -1295,7 +1363,7 @@ export function useCanvasPointerController({
           materializedBase.hShelves,
           undefined,
           'both',
-          isTouch ? 16 : 12,
+          isTouch ? 24 : 12,
           topology.diagonalDividers ?? [],
         );
         setSnapIndicator(snapped?.indicator ?? null);
@@ -1499,6 +1567,10 @@ export function useCanvasPointerController({
           isTouch,
         );
         active.guidedEndImg = resolved.endPt;
+        active.lastMoveRawImg = { ...rawPt };
+        active.guidedSnappedAnchor = Boolean(
+          resolved.indicator && resolved.indicator.kind !== 'edge',
+        );
         setSnapIndicator(resolved.indicator);
         setLoupeFocusPt(resolved.endPt);
         setLiveStroke({
@@ -1521,7 +1593,7 @@ export function useCanvasPointerController({
                 getNonFrontUnitVertices(active.plane),
                 scaleX,
                 scaleY,
-                isTouch ? 16 : 12,
+                isTouch ? 24 : 12,
                 { wMm: pWMm, hMm: pHMm, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
               )
             : null;
@@ -1540,6 +1612,10 @@ export function useCanvasPointerController({
           }
         }
         active.guidedEndImg = endPt;
+        active.lastMoveRawImg = { ...rawPt };
+        active.guidedSnappedAnchor = Boolean(
+          unitSnap?.indicator && unitSnap.indicator.kind !== 'edge',
+        );
         setSnapIndicator(unitSnap?.indicator ?? null);
         setLoupeFocusPt(endPt);
         setLiveStroke({
@@ -1593,7 +1669,7 @@ export function useCanvasPointerController({
           baseLines.hShelves,
           hit.id,
           endAxisLock,
-          isTouch ? 16 : 11,
+          isTouch ? 24 : 12,
         );
         if (!snapped) return;
         u = snapped.u;
@@ -1751,9 +1827,14 @@ export function useCanvasPointerController({
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (e.pointerType === 'touch') {
+    const isTouch = e.pointerType === 'touch';
+    if (isTouch) {
       activeTouchMapRef.current.delete(e.pointerId);
       if (activeTouchMapRef.current.size < 2) pinchBaseRef.current = null;
+      if (pinchWasActiveRef.current) {
+        if (activeTouchMapRef.current.size === 0) pinchWasActiveRef.current = false;
+        return;
+      }
     }
 
     const finished = dragRef.current;
@@ -1770,7 +1851,6 @@ export function useCanvasPointerController({
     }
 
     const { pt: endRaw, scaleX, scaleY } = getCanvasMetrics(e.clientX, e.clientY);
-    const isTouch = e.pointerType === 'touch';
     dragRef.current = null;
     setIsDraggingState(false);
     setIsPanningState(false);
@@ -1912,7 +1992,7 @@ export function useCanvasPointerController({
         e.clientX - finished.startClient.x,
         e.clientY - finished.startClient.y,
       );
-      if (distScreen < 5) {
+      if (distScreen < (isTouch ? 12 : 5)) {
         if (finished.plane !== 'xy') {
           if (finished.clickFallbackPlaneLineId) {
             onSetSelectedPlaneLineId?.(finished.clickFallbackPlaneLineId);
@@ -1954,23 +2034,39 @@ export function useCanvasPointerController({
             ? params.targetDimensions.z
             : params.targetDimensions.y;
 
+      // Evitar salto táctil al despegar el dedo (`pointerup` peel-off): conservar el extremo ya anclado en el último `pointermove`
+      const liftDriftPx =
+        isTouch && finished.lastMoveRawImg
+          ? Math.hypot(
+              (endRaw.x - finished.lastMoveRawImg.x) * scaleX,
+              (endRaw.y - finished.lastMoveRawImg.y) * scaleY,
+            )
+          : Infinity;
+      const keepGuidedTouchEnd =
+        isTouch &&
+        (liftDriftPx <= 32 ||
+          (Boolean(finished.guidedSnappedAnchor) &&
+            distScreenPx(endRaw, finished.guidedEndImg, scaleX, scaleY) <= 44));
+
       const resolvedXY =
         finished.plane === 'xy' && committedHomography
-          ? resolveGuidedStrokeEnd(
-              finished.startU,
-              finished.startV,
-              endRaw,
-              committedHomography,
-              scaleX,
-              scaleY,
-              e.altKey,
-              isTouch,
-              finished.guidedEndImg,
-            )
+          ? keepGuidedTouchEnd
+            ? { endPt: finished.guidedEndImg, axis: 'free' as OrthoGuideAxis, indicator: null }
+            : resolveGuidedStrokeEnd(
+                finished.startU,
+                finished.startV,
+                endRaw,
+                committedHomography,
+                scaleX,
+                scaleY,
+                e.altKey,
+                isTouch,
+                finished.guidedEndImg,
+              )
           : null;
 
       const unitSnapNonFront =
-        finished.plane !== 'xy' && !e.altKey
+        finished.plane !== 'xy' && !e.altKey && !keepGuidedTouchEnd
           ? snapPointInUnitQuad(
               endRaw,
               planeHom.toUnit,
@@ -1978,7 +2074,7 @@ export function useCanvasPointerController({
               getNonFrontUnitVertices(finished.plane),
               scaleX,
               scaleY,
-              isTouch ? 16 : 12,
+              isTouch ? 24 : 12,
               { wMm: planeW, hMm: planeH, enabled: paperGridSnap && !e.altKey, stepMm: paperGridStepMm },
             )
           : null;

@@ -197,7 +197,8 @@ export function vectorizeUserStroke(
       : autoExtend
         ? 0.06
         : 0;
-  const anchorSnapTol = extendTol > 0 ? Math.min(0.06, extendTol) : 0;
+  const anchorSnapTol =
+    extendTol > 0 ? Math.min(0.06, extendTol) : interactiveOpts?.exactStartPos ? 0.015 : 0;
 
   // En muebles bajos y anchos (ej. rack TV 1800×480), un pequeño temblor horizontal al trazar
   // una vertical limpia (`|du| <= 0.035` con `|dv| >= 0.35`) no debe convertirse en diagonal

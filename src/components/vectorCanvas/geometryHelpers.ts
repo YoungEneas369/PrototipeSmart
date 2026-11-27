@@ -556,10 +556,10 @@ export function hitTestLinesScreenPx(
   isTouch = false,
   includeUnselectedEndsForTap = false,
 ): LineHitResult | null {
-  const endTol = isTouch ? 18 : 13;
-  const selEndTol = isTouch ? 22 : 16;
-  const cornerReserveTol = isTouch ? 18 : 14;
-  const bodyTol = isTouch ? 14 : 9;
+  const endTol = isTouch ? 26 : 13;
+  const selEndTol = isTouch ? 36 : 18;
+  const cornerReserveTol = isTouch ? 20 : 14;
+  const bodyTol = isTouch ? 18 : 9;
 
   let bestEnd: LineHitResult | null = null;
   let bestBody: LineHitResult | null = null;
@@ -633,10 +633,10 @@ export function hitTestPlaneLinesScreenPx(
   isTouch = false,
   includeUnselectedEndsForTap = false,
 ): { id: string; part: 'start' | 'end' | 'body'; distPx: number } | null {
-  const endTol = isTouch ? 18 : 13;
-  const selEndTol = isTouch ? 22 : 16;
-  const cornerReserveTol = isTouch ? 18 : 14;
-  const bodyTol = isTouch ? 14 : 9;
+  const endTol = isTouch ? 26 : 13;
+  const selEndTol = isTouch ? 36 : 18;
+  const cornerReserveTol = isTouch ? 20 : 14;
+  const bodyTol = isTouch ? 18 : 9;
 
   let bestEnd: { id: string; part: 'start' | 'end' | 'body'; distPx: number } | null = null;
   let bestBody: { id: string; part: 'start' | 'end' | 'body'; distPx: number } | null = null;
@@ -747,13 +747,23 @@ export function snapNormToPaperGridMm(
   if (c >= 0.992) return 1;
   const posMm = offsetMm + c * spanMm;
   const effectiveStep = Math.max(5, stepMm);
+  const scalePx = Math.max(0.05, pxPerMm);
   const majorMm = effectiveStep <= 25 ? effectiveStep * 4 : effectiveStep * 2;
   const nearestMajor = Math.round(posMm / majorMm) * majorMm;
-  const distMajorPx = Math.abs(posMm - nearestMajor) * Math.max(0.05, pxPerMm);
-  const targetMm =
-    distMajorPx <= 5.5
-      ? nearestMajor
-      : Math.round(posMm / effectiveStep) * effectiveStep;
+  const distMajorPx = Math.abs(posMm - nearestMajor) * scalePx;
+
+  let targetMm: number;
+  if (distMajorPx <= 6) {
+    targetMm = nearestMajor;
+  } else if (effectiveStep > 25) {
+    // Cuando la cuadrícula visual es grande (50/100/200 mm), imantar solo cerca de sus líneas
+    // y conservar precisión fina de 10 mm entre medio para evitar saltos bruscos lejos de otras líneas.
+    const nearestStep = Math.round(posMm / effectiveStep) * effectiveStep;
+    const distStepPx = Math.abs(posMm - nearestStep) * scalePx;
+    targetMm = distStepPx <= 6.5 ? nearestStep : Math.round(posMm / 10) * 10;
+  } else {
+    targetMm = Math.round(posMm / effectiveStep) * effectiveStep;
+  }
   return round4(clampNum((targetMm - offsetMm) / Math.max(1, spanMm), 0.005, 0.995));
 }
 

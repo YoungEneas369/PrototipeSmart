@@ -609,19 +609,19 @@ export function CanvasViewport({
       }
 
       // 4B. Vectores estructurales (Divisores V, Repisas H y Diagonales)
-      const endRBase = Math.max(4.5, cw / 185);
+      const endRBase = Math.max(5.0, cw / 170);
       const drawEndpointHandle = (
         pt: Point2D,
         isSelected: boolean,
         isHovered: boolean,
         accent: string,
       ) => {
-        const r = isSelected ? endRBase * 1.45 : isHovered ? endRBase * 1.3 : endRBase;
+        const r = isSelected ? endRBase * 1.75 : isHovered ? endRBase * 1.35 : endRBase;
         ctx.save();
         if (isSelected || isHovered) {
           ctx.beginPath();
-          ctx.arc(pt.x, pt.y, r + 3.5, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(56, 189, 248, 0.35)';
+          ctx.arc(pt.x, pt.y, r + (isSelected ? 5.5 : 3.5), 0, Math.PI * 2);
+          ctx.fillStyle = isSelected ? 'rgba(2, 132, 199, 0.28)' : 'rgba(56, 189, 248, 0.35)';
           ctx.fill();
         }
         ctx.beginPath();
@@ -629,7 +629,7 @@ export function CanvasViewport({
         ctx.fillStyle = isSelected ? '#ffffff' : '#f8fafc';
         ctx.fill();
         ctx.strokeStyle = isSelected ? '#0284c7' : accent;
-        ctx.lineWidth = Math.max(2, cw / 420);
+        ctx.lineWidth = Math.max(isSelected ? 2.8 : 2, cw / 380);
         ctx.stroke();
         ctx.restore();
       };
@@ -1536,13 +1536,14 @@ export function CanvasViewport({
     !isSpacePan &&
     zoom <= 1.02 &&
     subTool === 'none'
-      ? 'pan-y'
+      ? 'pan-y pinch-zoom'
       : 'none';
 
   return (
     <div
       ref={stageRef}
       className={`vc-viewport-stage${isDragOver ? ' drag-over' : ''}`}
+      style={activeBmp ? { touchAction: effectiveTouchAction } : undefined}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}

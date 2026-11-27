@@ -57,6 +57,7 @@ import {
   matchZoneIdByCentroid,
   mergeZoneWithNeighbor,
   resizeZoneDimensionMm,
+  snapNormToPaperGridMm,
   snapPointInUnitQuad,
   snapPointToStructuralAnchors,
   splitZoneTopology,
@@ -1296,6 +1297,30 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
     expect(xzTap?.id).toBe('pln_xz_1');
     const xzResizeSel = hitTestPlaneLinesScreenPx(xzEndImg, [xzLine], hom.toCanvas, 1, 1, 'pln_xz_1', false, false);
     expect(xzResizeSel?.part).toBe('end');
+
+    // En modo táctil, el extremo de una línea seleccionada tolera dedos hasta 34 px para acortar/alargar sin dibujar encima
+    const selectedTouchHit = hitTestLinesScreenPx(
+      { x: cornerPx.x + 28, y: cornerPx.y - 10 },
+      [],
+      [shelf1],
+      [],
+      hom.toCanvas,
+      e,
+      xf,
+      yf,
+      1,
+      1,
+      { kind: 'hShelf', id: 'rep_1' },
+      true,
+      false,
+    );
+    expect(selectedTouchHit?.part).toBe('end');
+
+    // Con cuadrícula grande (stepMm = 100), puntos alejados de líneas mayores mantienen precisión fina de 10 mm sin saltos de ±50 mm
+    const midGridVal = snapNormToPaperGridMm(0.432, 1000, 18, 0.5, 100);
+    const midGridMm = Math.round(18 + midGridVal * 1000);
+    expect(midGridMm % 10).toBe(0);
+    expect(Math.abs(midGridMm - (18 + 432))).toBeLessThanOrEqual(8);
 
     const barWithResizeHtml = renderToStaticMarkup(
       <LineSelectionBar

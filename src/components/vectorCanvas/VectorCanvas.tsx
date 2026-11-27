@@ -654,58 +654,6 @@ export function VectorCanvas({
     ) => {
       if (opts.recordUndo) pushSnapshot();
       const prevZones = topology.frontZones ?? [];
-
-      // En lienzo libre blanco, si el usuario dibuja un rectángulo cerrado exterior con líneas,
-      // auto-ajustar contorno 3D y cotas exactamente a su dibujo (cero marco gigante fantasma).
-      if (frontIsBlankSketch && opts.preserveZones !== false) {
-        const autoBox = fitBlankSketchDrawnOuterBox(
-          nextVDivs,
-          nextHShelves,
-          nextDiags,
-          quad,
-          params.targetDimensions,
-          params.boardThickness,
-        );
-        if (autoBox) {
-          const fittedHom = computeQuadToUnitHomography(autoBox.nextQuad);
-          const fittedZones = classifyPartitionedZonesFromPhoto(
-            partitionCellsFromVectors(autoBox.vDividers, autoBox.hShelves),
-            null,
-            0,
-            0,
-            autoBox.nextDims,
-            params.material,
-            exteriorBgRgb,
-            [],
-            params.boardThickness,
-          );
-          setQuad(autoBox.nextQuad);
-          setSelectedZone(fittedZones[0]?.id ?? null);
-          onApplyCalibratedDims(autoBox.nextDims);
-          onUpdateTopology({
-            ...topology,
-            aspectRatioXY: autoBox.nextDims.x / Math.max(1, autoBox.nextDims.y),
-            quadCorners: autoBox.nextQuad,
-            homographyMatrix: fittedHom
-              ? fittedHom.toUnit.map((r) => [...r])
-              : topology.homographyMatrix,
-            shelfMode: 'custom',
-            equalShelfCount: 0,
-            vDividers: autoBox.vDividers,
-            hShelves: autoBox.hShelves,
-            diagonalDividers: nextDiags,
-            frontZones: fittedZones,
-            hasBackPanel: true,
-            detectionSource: 'manual',
-            detectionConfidence: 0.98,
-          });
-          setStatusMsg(
-            `¡Dibujo cerrado detectado! Contorno ajustado a ${autoBox.nextDims.x} × ${autoBox.nextDims.y} mm para reflejar tu mueble exacto (Ctrl+Z para deshacer).`,
-          );
-          return;
-        }
-      }
-
       const cells = partitionCellsFromVectors(nextVDivs, nextHShelves);
       const zones = classifyPartitionedZonesFromPhoto(
         cells,
@@ -758,7 +706,6 @@ export function VectorCanvas({
       exteriorBgRgb,
       effectiveSelectedZoneId,
       setSelectedZone,
-      onApplyCalibratedDims,
       onUpdateTopology,
       estimatedAspectXY,
       quad,
@@ -1699,15 +1646,72 @@ export function VectorCanvas({
 
   const handleRunReasonableMeasures = useCallback(() => {
     pushSnapshot();
-    const res = makeDrawingMeasurementsReasonable(topology, params);
+    let baseTopo = topology;
+    let baseParams = params;
+    let adjustedMsg = '';
+
+    if (frontIsBlankSketch) {
+      const autoBox = fitBlankSketchDrawnOuterBox(
+        materializedBase.vDividers,
+        materializedBase.hShelves,
+        topology.diagonalDividers ?? [],
+        quad,
+        params.targetDimensions,
+        params.boardThickness,
+      );
+      if (autoBox) {
+        const fittedHom = computeQuadToUnitHomography(autoBox.nextQuad);
+        const fittedZones = classifyPartitionedZonesFromPhoto(
+          partitionCellsFromVectors(autoBox.vDividers, autoBox.hShelves),
+          null,
+          0,
+          0,
+          autoBox.nextDims,
+          params.material,
+          exteriorBgRgb,
+          [],
+          params.boardThickness,
+        );
+        setQuad(autoBox.nextQuad);
+        baseTopo = {
+          ...topology,
+          aspectRatioXY: autoBox.nextDims.x / Math.max(1, autoBox.nextDims.y),
+          quadCorners: autoBox.nextQuad,
+          homographyMatrix: fittedHom
+            ? fittedHom.toUnit.map((r) => [...r])
+            : topology.homographyMatrix,
+          shelfMode: 'custom',
+          equalShelfCount: 0,
+          vDividers: autoBox.vDividers,
+          hShelves: autoBox.hShelves,
+          frontZones: fittedZones,
+          hasBackPanel: true,
+        };
+        baseParams = { ...params, targetDimensions: autoBox.nextDims };
+        adjustedMsg = `Contorno ajustado a caja (${autoBox.nextDims.x} × ${autoBox.nextDims.y} mm) · `;
+      }
+    }
+
+    const res = makeDrawingMeasurementsReasonable(baseTopo, baseParams);
     onUpdateTopology(res.topology);
     onApplyCalibratedDims?.(res.params.targetDimensions);
     setStatusMsg(
-      res.changesSummary.length > 0
-        ? `Medidas razonables aplicadas: ${res.changesSummary.slice(0, 3).join(' · ')}.`
+      adjustedMsg || res.changesSummary.length > 0
+        ? `${adjustedMsg}Medidas razonables aplicadas: ${res.changesSummary.slice(0, 3).join(' · ')}.`
         : 'Las medidas, simetrías y alas L ya están normalizadas a múltiplos de 10 mm.',
     );
-  }, [topology, params, pushSnapshot, onUpdateTopology, onApplyCalibratedDims]);
+  }, [
+    topology,
+    params,
+    frontIsBlankSketch,
+    materializedBase.vDividers,
+    materializedBase.hShelves,
+    quad,
+    exteriorBgRgb,
+    pushSnapshot,
+    onUpdateTopology,
+    onApplyCalibratedDims,
+  ]);
 
   const handleToggleLInnerCurve = useCallback(() => {
     pushSnapshot();

@@ -9,7 +9,7 @@ flowchart TD
     subgraph UI["Capa UI — React 18 + R3F (src/App.tsx y src/components/)"]
         APP["App.tsx (Orquestador activeView studio/blueprint/workshop y sidebar progresivo)"]
         VC["VectorCanvas modular (src/components/vectorCanvas/)"]
-        V3D["Viewer3D (src/components/viewer3d/Viewer3D.tsx)"]
+        V3D["Viewer3D + viewer3dEditHelpers (src/components/viewer3d/)"]
         MP["MathPanel (src/components/mathPanel/MathPanel.tsx)"]
         VBP["VectorBlueprintPanel (src/components/vectorBlueprint/VectorBlueprintPanel.tsx)"]
         NI["NumericInput (src/components/NumericInput.tsx)"]
@@ -43,6 +43,7 @@ flowchart TD
     MP --> NI
     VBP --> NI
     VBP --> VC
+    V3D --> VC
 
     APP --> ME
     APP --> CS
@@ -106,6 +107,7 @@ flowchart TD
 - **`src/core/cuttingStock/`**: `index.ts`, `optimizer.ts` (separación estricta por `(espesor, material)`, Guillotina 2 etapas / MaxRects con kerf virtual-pad, `trimMm` y `isBackPanelSheet`), `svgGenerator.ts` (plano de corte SVG XML-safe), `costEstimator.ts` (BOM + presupuesto editable CLP con desglose bicolor) y `exporters.ts` (`.xls` SpreadsheetML 3 hojas / `.csv` Excel Chile).
 - **`src/core/vectorBlueprint/`**: `index.ts` (motor SVG de alzado frontal, perfil lateral ZY, Planta L XZ y rutas Bézier diferenciales `.svg-diff-curve` / `.plan-curve-piece`) y `catalog14.ts` (catálogo QA de 14 muebles reales con `detectionSource: 'preset'`).
 - **`src/components/vectorCanvas/`**: Editor interactivo modular compuesto por `VectorCanvas.tsx` (orquestador de 3 vistas `frontal | superior | lateral`, 3 pasos `frame` -> `lines` -> `zones`, dibujo en lienzo libre y `"Medidas razonables"`), `CanvasToolbars.tsx` (pestañas de 3 vistas, modos `Editar/Trazar`/`Curva Bézier`, botón `"Medidas razonables"` y menú `Opciones`), `CanvasViewport.tsx` (zoom/pan/lupa 4x y render 60 fps incl. curvas Bézier en tiempo real), `useCanvasPointerController.ts` (trazo libre poli-línea `curve`, handles ampliados y snap T-junctions), `useCanvasHistory.ts` (Undo/Redo inmutable incluyendo `dims`, `cubiertaMaterialOverride`, `curvedCuts` y `lShape`), `CalibrationBar.tsx`, `LineSelectionBar.tsx`, `ZoneInspector.tsx` y `geometryHelpers.ts` (`createBlankSketchBitmap`).
+- **`src/components/viewer3d/`**: Visor R3F 100 % offline compuesto por `Viewer3D.tsx` (`CameraRig` estable, extrusión curva, canastos, patas/zócalos/ruedas, gizmos 3D interactivos y barra contextual HUD de edición directa) y `viewer3dEditHelpers.ts` (mutación pura e inmutable de repisas, divisores en ala principal/L, zonas frontales `FrontZone` y acabados sin parsear `piece.id`).
 
 ## Matriz de Fronteras Permitidas y Prohibidas (Regla DAG)
 

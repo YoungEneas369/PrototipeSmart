@@ -100,6 +100,7 @@ export interface CanvasTopBarsProps {
   isLShape?: boolean;
   hasLInnerCurve?: boolean;
   onSelectStep: (step: TraceStep) => void;
+  onSetPlaneTraceStep?: (step: 'frame' | 'lines') => void;
   onSwitchViewTab?: (tab: CanvasViewTab) => void;
   onUndo: () => void;
   onRedo: () => void;
@@ -170,6 +171,7 @@ export function CanvasTopBars({
   isLShape = false,
   hasLInnerCurve = false,
   onSelectStep,
+  onSetPlaneTraceStep,
   onSwitchViewTab,
   onUndo,
   onRedo,
@@ -216,7 +218,7 @@ export function CanvasTopBars({
   const panActive = panToolActive || isSpacePan;
 
   const hasNonDefaultLineOpt =
-    linesSubMode !== 'smart' || strokeMode !== 'auto' || magneticSnap || panToolActive;
+    linesSubMode === 'regions' || strokeMode !== 'auto' || magneticSnap || panToolActive;
   const hasNonDefaultFrameOpt = frameMode !== 'quad' || magneticSnap || panToolActive;
 
   return (
@@ -471,11 +473,31 @@ export function CanvasTopBars({
           <>
             <span className="vc-context-banner-text">
               <span className="vc-pill">ARRIBA XZ</span>
-              {hasTopPhoto
-                ? 'Ajusta contorno, dibuja curvas o reconoce planta (Recto / L / Curva).'
-                : 'Sube foto/boceto superior o dibuja en cuadrícula libre.'}
+              {traceStep === 'frame'
+                ? 'Ajusta las 4 esquinas del marco exterior.'
+                : 'Dibuja rectas o curvas conectando desde cualquier esquina.'}
             </span>
             <div className="vc-context-actions">
+              {onSetPlaneTraceStep && (
+                <div className="vc-segmented" role="group" aria-label="Modo vista superior">
+                  <button
+                    type="button"
+                    className={traceStep === 'lines' ? 'active' : ''}
+                    onClick={() => onSetPlaneTraceStep('lines')}
+                    title="Dibuja líneas y curvas desde cualquier esquina sin mover el marco"
+                  >
+                    <PenTool size={11} /> Dibujar
+                  </button>
+                  <button
+                    type="button"
+                    className={traceStep === 'frame' ? 'active' : ''}
+                    onClick={() => onSetPlaneTraceStep('frame')}
+                    title="Ajustar las 4 esquinas exteriores del contorno"
+                  >
+                    <Crop size={11} /> Marco
+                  </button>
+                </div>
+              )}
               {onRecognizeSketch && hasTopPhoto && (
                 <button type="button" className="vc-chip" onClick={onRecognizeSketch}>
                   <Wand2 size={12} /> Reconocer boceto XZ
@@ -513,11 +535,31 @@ export function CanvasTopBars({
           <>
             <span className="vc-context-banner-text">
               <span className="vc-pill">LADO ZY</span>
-              {hasSidePhoto
-                ? 'Ajusta el costado para recalcular profundidad Z o dibuja curva lateral.'
-                : 'Sube foto lateral o dibuja en lienzo libre.'}
+              {traceStep === 'frame'
+                ? 'Ajusta el perfil lateral para calibrar profundidad Z.'
+                : 'Dibuja líneas o curvas conectando desde cualquier esquina.'}
             </span>
             <div className="vc-context-actions">
+              {onSetPlaneTraceStep && (
+                <div className="vc-segmented" role="group" aria-label="Modo vista lateral">
+                  <button
+                    type="button"
+                    className={traceStep === 'lines' ? 'active' : ''}
+                    onClick={() => onSetPlaneTraceStep('lines')}
+                    title="Dibuja líneas y curvas sin mover el marco lateral"
+                  >
+                    <PenTool size={11} /> Dibujar
+                  </button>
+                  <button
+                    type="button"
+                    className={traceStep === 'frame' ? 'active' : ''}
+                    onClick={() => onSetPlaneTraceStep('frame')}
+                    title="Ajustar las 4 esquinas del perfil lateral ZY"
+                  >
+                    <Crop size={11} /> Marco
+                  </button>
+                </div>
+              )}
               <button type="button" className="vc-chip" onClick={onUploadSidePhoto}>
                 <Camera size={12} /> {hasSidePhoto ? 'Foto Lateral' : 'Subir Lateral'}
               </button>
@@ -647,6 +689,24 @@ export function CanvasTopBars({
         ) : traceStep === 'lines' ? (
           <>
             <div className="vc-context-actions">
+              <div className="vc-segmented" role="group" aria-label="Acción al arrastrar líneas">
+                <button
+                  type="button"
+                  className={linesSubMode === 'draw_only' ? 'active' : ''}
+                  onClick={() => onChangeLinesSubMode('draw_only')}
+                  title="Dibuja líneas nuevas conectando libremente a cualquier esquina o punta"
+                >
+                  <PenTool size={11} /> Dibujar
+                </button>
+                <button
+                  type="button"
+                  className={linesSubMode === 'smart' ? 'active' : ''}
+                  onClick={() => onChangeLinesSubMode('smart')}
+                  title="Haz clic sobre una línea para moverla o editarla; arrastra en esquinas o libre para dibujar"
+                >
+                  <MousePointer2 size={11} /> Mover / Editar
+                </button>
+              </div>
               <button
                 type="button"
                 className="vc-chip"
@@ -665,14 +725,14 @@ export function CanvasTopBars({
                 <Trash2 size={11} /> Limpiar
               </button>
 
-              {linesSubMode !== 'smart' && (
+              {linesSubMode === 'regions' && (
                 <button
                   type="button"
                   className="vc-chip active"
                   onClick={() => onChangeLinesSubMode('smart')}
-                  title="Volver al modo normal Editar / Trazar"
+                  title="Volver al modo normal"
                 >
-                  {linesSubMode === 'draw_only' ? 'Solo trazar' : 'Secciones auto'} <X size={10} />
+                  Secciones auto <X size={10} />
                 </button>
               )}
               {strokeMode !== 'auto' && linesSubMode !== 'regions' && (
@@ -706,39 +766,17 @@ export function CanvasTopBars({
                 </summary>
                 <div className="vc-more-popover">
                   <div className="vc-more-section">
-                    <span className="vc-more-label">Modo puntero</span>
-                    <div className="vc-segmented" role="group" aria-label="Modo de edición y trazado">
-                      <button
-                        type="button"
-                        className={linesSubMode === 'smart' ? 'active' : ''}
-                        onClick={(e) => {
-                          onChangeLinesSubMode('smart');
-                          closeParentDetails(e);
-                        }}
-                      >
-                        <MousePointer2 size={11} /> Editar / Trazar
-                      </button>
-                      <button
-                        type="button"
-                        className={linesSubMode === 'draw_only' ? 'active' : ''}
-                        onClick={(e) => {
-                          onChangeLinesSubMode('draw_only');
-                          closeParentDetails(e);
-                        }}
-                      >
-                        <PenTool size={11} /> Solo trazar
-                      </button>
-                      <button
-                        type="button"
-                        className={linesSubMode === 'regions' ? 'active vc-tab-regions' : ''}
-                        onClick={(e) => {
-                          onChangeLinesSubMode('regions');
-                          closeParentDetails(e);
-                        }}
-                      >
-                        <BoxSelect size={11} /> Secciones auto
-                      </button>
-                    </div>
+                    <span className="vc-more-label">Detección</span>
+                    <button
+                      type="button"
+                      className={linesSubMode === 'regions' ? 'vc-chip active vc-tab-regions' : 'vc-chip'}
+                      onClick={(e) => {
+                        onChangeLinesSubMode(linesSubMode === 'regions' ? 'smart' : 'regions');
+                        closeParentDetails(e);
+                      }}
+                    >
+                      <BoxSelect size={11} /> Secciones auto
+                    </button>
                   </div>
 
                   <div className="vc-more-section">

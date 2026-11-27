@@ -18,7 +18,7 @@ stateDiagram-v2
         ThreeDMode --> PhotoMode : Cambia a studioMode = photo
 
         SplitMode --> SplitMode : Selector Presets U3, Presets L o Catálogo 14, Forma Recto/L Der/L Izq o VectorCanvas
-        ThreeDMode --> ThreeDMode : Control Explotar integrado en Viewer3D (explodeFactor) y hover 2D-3D ambas alas
+        ThreeDMode --> ThreeDMode : Control Explotar en Viewer3D, hover 2D-3D ambas alas y edición directa 3D (flechas ±20 mm, HUD módulos/acabados/curva L)
     }
 
     state "Vista Blueprint (activeView = blueprint · Plano 2D V0 vs Vf)" as Blueprint {
@@ -87,17 +87,17 @@ stateDiagram-v2
     }
 
     state "Paso 2 — lines (Trazado en Vivo + Curvas Diferenciales Bézier)" as Step2Lines {
-        [*] --> SmartEditDraw : linesSubMode = smart y strokeMode = auto (Editar / Trazar)
-        SmartEditDraw --> DrawStroke : Arrastra en vacío (recta, diagonal o polilínea curve en tiempo real)
-        SmartEditDraw --> DragSegment : Arrastra cuerpo o extremo de segmento existente
-        DrawStroke --> SmartEditDraw : PointerUp (vectorizeUserStroke o fitDifferentialCurveFromStroke + UndoStack)
-        DragSegment --> SmartEditDraw : PointerUp (actualiza segmento, commit UndoStack)
-        SmartEditDraw --> AutoSuggesting : Pulsa Sugerir líneas o Reconocer boceto (sketchRecognizer + photoPipeline)
-        AutoSuggesting --> SmartEditDraw : Aplica candidatos, curvas e inferencia L + commit UndoStack
-        SmartEditDraw --> ReasonableNorm : Pulsa Medidas razonables (simetría, colinealidad, alas L iguales, 10 mm)
-        ReasonableNorm --> SmartEditDraw : Commit UndoStack con cotas y topología normalizadas
-        SmartEditDraw --> AdvancedModes : Abre menú plegado Opciones (Solo trazar, Secciones auto, Auto/Recta/Diagonal/Curva, Imán OFF)
-        AdvancedModes --> SmartEditDraw : Vuelve a modo inteligente Editar / Trazar
+        [*] --> DrawConnect : linesSubMode = draw_only (Dibujar · libre desde cualquier esquina) o smart (Mover / Editar)
+        DrawConnect --> DrawStroke : Arrastra desde esquina, punta existente o vacío (snap 12 px sin salto de soltar)
+        DrawConnect --> DragSegment : En Mover/Editar arrastra cuerpo (o extremo de línea ya seleccionada)
+        DrawStroke --> DrawConnect : PointerUp (vectorizeUserStroke exactStartPos / fitDifferentialCurveFromStroke + UndoStack)
+        DragSegment --> DrawConnect : PointerUp (actualiza segmento, commit UndoStack)
+        DrawConnect --> AutoSuggesting : Pulsa Sugerir líneas o Reconocer boceto (sketchRecognizer + photoPipeline)
+        AutoSuggesting --> DrawConnect : Aplica candidatos, curvas e inferencia L + commit UndoStack
+        DrawConnect --> ReasonableNorm : Pulsa Medidas razonables (simetría, colinealidad, alas L iguales, 10 mm)
+        ReasonableNorm --> DrawConnect : Commit UndoStack con cotas y topología normalizadas
+        DrawConnect --> AdvancedModes : Abre menú plegado Opciones (Secciones auto, Auto/Recta/Diagonal/Curva, Imán OFF)
+        AdvancedModes --> DrawConnect : Vuelve a modo Dibujar o Mover / Editar
     }
 
     state "Paso 3 — zones (ZoneInspector Simplificado con Revelación Progresiva)" as Step3Zones {
@@ -145,5 +145,5 @@ stateDiagram-v2
 
 1. **Lienzo Limpio sin Barras Innecesarias + Barra Superior de 3 Vistas:** Sin vista cargada en `frontal`, solo se muestran las pestañas `1. Frente (XY)`, `2. Arriba (XZ)`, `3. Lado (ZY)`, `"Medidas razonables"` y el acceso directo `"Dibujar en lienzo libre"`.
 2. **Sincronización Automática 3-Vistas y Cálculo Diferencial:** Ajustar `quad` (XY), `topQuad` (XZ) o `sideQuad` (ZY) ejecuta `synthesize3DFromTriViews`, sincronizando proporción `Alto Y`, profundidad `Z`, topología en L y curvas Bézier (`s = ∫ds`, `κ = 1/R`) en tiempo real.
-3. **Revelación Progresiva y Cero Duplicación:** En Paso 2 (`lines`), el modo `Editar / Trazar` convive con el botón rápido `"Curva"` / `"Curva interior L"` y el botón `"Medidas razonables"`; las opciones secundarias viven bajo `Opciones`.
+3. **Revelación Progresiva y Cero Duplicación:** En Paso 2 (`lines`), la barra visible separa limpiamente `Dibujar` (`draw_only`) de `Mover / Editar` (`smart`), y en líneas no seleccionadas las puntas quedan libres como vértices conectables para evitar secuestrar la línea previa al trazar en una esquina; en `Arriba XZ` / `Lado ZY` la barra separa `Dibujar` de `Marco`.
 4. **Historial Unificado (`Undo/Redo`):** Toda mutación confirmada guarda un snapshot inmutable completo que incluye `dims`, `cubiertaMaterialOverride`, `curvedCuts` y `lShape`.

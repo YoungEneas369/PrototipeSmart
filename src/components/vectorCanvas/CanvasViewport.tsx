@@ -36,7 +36,6 @@ import {
   VECTOR_ROLE_COLORS,
   ZONE_COLORS,
   ZONE_SHORT_LABELS,
-  computeAdaptiveAutoExtend,
   projectDiagonal,
   projectHShelf,
   projectVDivider,
@@ -97,6 +96,8 @@ export interface CanvasViewportProps {
   hShelves: NormalizedSegment[];
   diagonalDividers: DiagonalSegment[];
   curvedCuts?: CurvedCutSpec[];
+  planeLinesXZ?: readonly DiagonalSegment[];
+  planeLinesZY?: readonly DiagonalSegment[];
   frontZones: FrontZone[];
   subRegions: SelectedSubRegion[];
   draftRegion: { uStart: number; uEnd: number; vStart: number; vEnd: number } | null;
@@ -156,6 +157,8 @@ export function CanvasViewport({
   hShelves,
   diagonalDividers,
   curvedCuts = [],
+  planeLinesXZ = [],
+  planeLinesZY = [],
   frontZones,
   subRegions,
   draftRegion,
@@ -666,8 +669,9 @@ export function CanvasViewport({
           hShelves,
           e,
           params.targetDimensions,
-          computeAdaptiveAutoExtend(activeQuad, screenScaleX, screenScaleY),
+          false,
           strokeMode,
+          { exactStartPos: true },
         );
         ctx.save();
         if (previewVec) {
@@ -861,10 +865,37 @@ export function CanvasViewport({
       }
     }
 
-    // 4F. Renderizar curvas diferenciales comprometidas + trazo libre en curso en Arriba / Lado / Frente
+    // 4F. Renderizar líneas de vista superior/lateral y curvas diferenciales + trazo en curso
     const activePlane = viewTab === 'frontal' ? 'xy' : viewTab === 'superior' ? 'xz' : 'zy';
     const planeHom = viewTab === 'frontal' ? homography : computeQuadToUnitHomography(activeQuad);
     if (planeHom) {
+      if (viewTab !== 'frontal') {
+        const plines = viewTab === 'superior' ? planeLinesXZ : planeLinesZY;
+        for (const ln of plines) {
+          const pA = applyHomography(planeHom.toCanvas, { x: ln.u1, y: ln.v1 });
+          const pB = applyHomography(planeHom.toCanvas, { x: ln.u2, y: ln.v2 });
+          if (!pA || !pB) continue;
+          ctx.save();
+          ctx.strokeStyle = '#0284c7';
+          ctx.lineWidth = Math.max(3.2, cw / 260);
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(pA.x, pA.y);
+          ctx.lineTo(pB.x, pB.y);
+          ctx.stroke();
+          for (const ep of [pA, pB]) {
+            ctx.beginPath();
+            ctx.arc(ep.x, ep.y, Math.max(4, cw / 195), 0, Math.PI * 2);
+            ctx.fillStyle = '#f8fafc';
+            ctx.fill();
+            ctx.strokeStyle = '#0284c7';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
+
       const planeCurves = curvedCuts.filter((c) => c.plane === activePlane);
       for (const c of planeCurves) {
         const mapped = c.controlPoints.map((pt) =>
@@ -898,37 +929,57 @@ export function CanvasViewport({
           ctx.strokeStyle = '#d946ef';
           ctx.lineWidth = Math.max(3.2, cw / 270);
           ctx.stroke();
+          if (traceStep === 'lines') {
+            for (const ep of [mapped[0], mapped[3]]) {
+              ctx.beginPath();
+              ctx.arc(ep.x, ep.y, Math.max(4, cw / 195), 0, Math.PI * 2);
+              ctx.fillStyle = '#fdf4ff';
+              ctx.fill();
+              ctx.strokeStyle = '#a21caf';
+              ctx.lineWidth = 2;
+              ctx.stroke();
+            }
+          }
           ctx.restore();
         }
       }
     }
-    if (viewTab !== 'frontal' && liveStroke?.points && liveStroke.points.length >= 2) {
+    if (viewTab !== 'frontal' && liveStroke) {
       ctx.save();
-      ctx.strokeStyle = '#d946ef';
-      ctx.lineWidth = Math.max(3.6, cw / 230);
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.beginPath();
-      liveStroke.points.forEach((pt, idx) =>
-        idx === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y),
-      );
-      ctx.stroke();
+      if (strokeMode === 'curve' && liveStroke.points && liveStroke.points.length >= 3) {
+        ctx.strokeStyle = '#d946ef';
+        ctx.lineWidth = Math.max(3.6, cw / 230);
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        liveStroke.points.forEach((pt, idx) =>
+          idx === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y),
+        );
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = '#0ea5e9';
+        ctx.lineWidth = Math.max(3.4, cw / 240);
+        ctx.setLineDash([8, 5]);
+        ctx.beginPath();
+        ctx.moveTo(liveStroke.startImg.x, liveStroke.startImg.y);
+        ctx.lineTo(liveStroke.currentImg.x, liveStroke.currentImg.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
       ctx.restore();
     }
 
-    // 5. Contorno exterior (siempre nítido; manijas interactivas en Paso 1 o Arriba/Lado)
+    // 5. Contorno exterior (siempre nítido; manijas interactivas solo en 'frame')
     ctx.save();
-    ctx.strokeStyle = traceStep === 'frame' || viewTab !== 'frontal' ? '#38bdf8' : '#00e5ff';
+    ctx.strokeStyle = traceStep === 'frame' ? '#38bdf8' : '#00e5ff';
     ctx.lineWidth = Math.max(traceStep === 'frame' ? 3.2 : 2.2, cw / 300);
     ctx.beginPath();
     activeQuad.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
     ctx.closePath();
     ctx.stroke();
 
-    // Resaltar arista hovered en Paso 1 y mostrar manijas en los 4 bordes
-    const showFrameHandles =
-      (viewTab === 'frontal' && traceStep === 'frame' && subTool === 'none') ||
-      viewTab !== 'frontal';
+    // Resaltar arista hovered y mostrar manijas en los 4 bordes solo en Contorno ('frame')
+    const showFrameHandles = traceStep === 'frame' && subTool === 'none';
 
     if (showFrameHandles && pickingCorners === null) {
       // Guías sutiles de perspectiva al arrastrar el marco en Paso 1
@@ -1141,6 +1192,8 @@ export function CanvasViewport({
     hShelves,
     diagonalDividers,
     curvedCuts,
+    planeLinesXZ,
+    planeLinesZY,
     frontZones,
     subRegions,
     draftRegion,

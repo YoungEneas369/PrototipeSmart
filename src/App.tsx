@@ -1865,6 +1865,10 @@ export default function App() {
                 onHoverZone={setHoveredZoneId}
                 onExplodeChange={setExplodeFactor}
                 onAddCenterDivider={handleEnsureCenterDivider}
+                onUpdateTopology={handleUpdateTopology}
+                onUpdateMaterialOnly={handleUpdateMaterialOnly}
+                onChangeBaseSupport={(nextSupport) => handleSetBaseSupport(nextSupport)}
+                onToggleLInnerCurve={(enabled) => handleToggleLInnerCurve(enabled)}
               />
             )}
           </div>
@@ -1924,6 +1928,10 @@ export default function App() {
                   onHoverZone={setHoveredZoneId}
                   onExplodeChange={setExplodeFactor}
                   onAddCenterDivider={handleEnsureCenterDivider}
+                  onUpdateTopology={handleUpdateTopology}
+                  onUpdateMaterialOnly={handleUpdateMaterialOnly}
+                  onChangeBaseSupport={(nextSupport) => handleSetBaseSupport(nextSupport)}
+                  onToggleLInnerCurve={(enabled) => handleToggleLInnerCurve(enabled)}
                 />
               )}
 

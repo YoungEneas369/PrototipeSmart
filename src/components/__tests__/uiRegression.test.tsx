@@ -12,9 +12,12 @@ import {
   buildCornerFilletCutSpec,
   calculateDespiece,
   clonePreset,
+  computeQuadToUnitHomography,
+  interiorToExterior,
   scaleBaseMatrix,
   type PresetKey,
 } from '../../core/mathEngine';
+import { vectorizeUserStroke } from '../../core/vision';
 import {
   estimateProjectBomAndCost,
   formatClp,
@@ -27,14 +30,30 @@ import { LineSelectionBar } from '../vectorCanvas/LineSelectionBar';
 import { CanvasTopBars } from '../vectorCanvas/CanvasToolbars';
 import { MathPanel } from '../mathPanel/MathPanel';
 import { VectorBlueprintPanel } from '../vectorBlueprint/VectorBlueprintPanel';
+import type { Viewer3DProps } from '../viewer3d/Viewer3D';
+import {
+  canEditPiecePositionIn3D,
+  changeZoneKindFrom3D,
+  compute3DEditHandlePositions,
+  nudgeDividerMmIn3D,
+  nudgeShelfMmIn3D,
+  removeDividerIn3D,
+  removeShelfIn3D,
+  splitZoneIn3D,
+  updateCubiertaMaterialIn3D,
+  updateZoneFrom3D,
+} from '../viewer3d/viewer3dEditHelpers';
 import {
   findMergeableNeighbors,
   getZoneInteriorDimsMm,
   hitTestFrameScreenPx,
+  hitTestLinesScreenPx,
   makeAxisAlignedQuad,
   matchZoneIdByCentroid,
   mergeZoneWithNeighbor,
   resizeZoneDimensionMm,
+  snapPointInUnitQuad,
+  snapPointToStructuralAnchors,
   splitZoneTopology,
 } from '../vectorCanvas/geometryHelpers';
 
@@ -820,6 +839,7 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
         isLShape
         hasLInnerCurve
         onSelectStep={noop}
+        onSetPlaneTraceStep={noop}
         onSwitchViewTab={noop}
         onUndo={noop}
         onRedo={noop}
@@ -897,6 +917,7 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
         isLShape
         hasLInnerCurve
         onSelectStep={noop}
+        onSetPlaneTraceStep={noop}
         onSwitchViewTab={noop}
         onUndo={noop}
         onRedo={noop}
@@ -950,6 +971,262 @@ describe('SmartFurniture v8.0 — 3. Integridad 6 Presets (Rectos y en L) + Etap
     );
     expect(mathHtml).toContain('5. Geometría Diferencial en Cortes Curvos');
     expect(mathHtml).toContain('Cortes Curvos Bézier');
+    expect(barHtml).toContain('Dibujar');
+    expect(barHtml).toContain('Mover / Editar');
+    expect(topBarHtml).toContain('Marco');
+  });
+
+  it('Trazado consecutivo en esquinas: punta no seleccionada queda libre como esquina y segunda línea conecta sin saltar', () => {
+    const quad = makeAxisAlignedQuad(140, 100, 760, 580);
+    const hom = computeQuadToUnitHomography(quad)!;
+    const e = 18;
+    const xf = 1200;
+    const yf = 900;
+
+    // Línea 1: repisa parcial horizontal desde esquina izquierda (u=0) hasta centro-derecha (u=0.55) en v=0.55
+    const shelf1 = { id: 'rep_1', position: 0.55, start: 0, end: 0.55 };
+    const rightTipCanvas = {
+      x:
+        hom.toCanvas[0][0] * interiorToExterior(shelf1.end, e, xf) +
+        hom.toCanvas[0][1] * interiorToExterior(shelf1.position, e, yf) +
+        hom.toCanvas[0][2],
+      y:
+        hom.toCanvas[1][0] * interiorToExterior(shelf1.end, e, xf) +
+        hom.toCanvas[1][1] * interiorToExterior(shelf1.position, e, yf) +
+        hom.toCanvas[1][2],
+    };
+    const w = hom.toCanvas[2][0] * interiorToExterior(shelf1.end, e, xf) +
+      hom.toCanvas[2][1] * interiorToExterior(shelf1.position, e, yf) +
+      hom.toCanvas[2][2];
+    const cornerPx = { x: rightTipCanvas.x / w, y: rightTipCanvas.y / w };
+
+    // 1. Con selectedLine=null, tocar la esquina/punta derecha de rep_1 NO secuestra rep_1
+    const hitCorner = hitTestLinesScreenPx(
+      cornerPx,
+      [],
+      [shelf1],
+      [],
+      hom.toCanvas,
+      e,
+      xf,
+      yf,
+      1,
+      1,
+      null,
+      false,
+    );
+    expect(hitCorner).toBeNull();
+
+    // 2. El imán estructural a 5 px de esa esquina la captura exactamente como 'Esquina' (u=0.55, v=0.55)
+    const snapCorner = snapPointToStructuralAnchors(
+      { x: cornerPx.x + 5, y: cornerPx.y - 4 },
+      hom.toUnit,
+      hom.toCanvas,
+      [],
+      [shelf1],
+      e,
+      xf,
+      yf,
+      1,
+      1,
+      12,
+      undefined,
+      'both',
+    );
+    expect(snapCorner).not.toBeNull();
+    expect(snapCorner!.u).toBeCloseTo(0.55, 3);
+    expect(snapCorner!.v).toBeCloseTo(0.55, 3);
+    expect(snapCorner!.indicator?.label).toBe('Esquina');
+
+    // 3. Trazar Línea 2 vertical hacia abajo desde esa esquina hasta v=0.20 (sin saltar ni al 0 ni al borde)
+    const targetEnd = {
+      x: cornerPx.x,
+      y: cornerPx.y + 150,
+    };
+    const line2 = vectorizeUserStroke(
+      snapCorner!.snappedImg,
+      targetEnd,
+      hom.toUnit,
+      [],
+      [shelf1],
+      e,
+      { x: xf, y: yf },
+      false,
+      'auto',
+      { exactStartPos: true },
+    );
+    expect(line2?.kind).toBe('vDivider');
+    if (line2?.kind === 'vDivider') {
+      expect(line2.segment.position).toBeCloseTo(0.55, 2);
+      expect(line2.segment.end).toBeCloseTo(0.55, 2);
+      expect(line2.segment.start).toBeGreaterThan(0.05);
+      expect(line2.segment.start).toBeLessThan(0.45);
+    }
+
+    // 4. Trazar línea pegada al borde superior (v=0.99) conserva v cerca de 0.99 (no empuja a 0.96)
+    const topLeftSnap = snapPointToStructuralAnchors(
+      { x: quad[0].x + 12, y: quad[0].y + 10 },
+      hom.toUnit,
+      hom.toCanvas,
+      [],
+      [],
+      e,
+      xf,
+      yf,
+      1,
+      1,
+      12,
+    );
+    const topRightSnap = snapPointToStructuralAnchors(
+      { x: quad[1].x - 10, y: quad[1].y + 10 },
+      hom.toUnit,
+      hom.toCanvas,
+      [],
+      [],
+      e,
+      xf,
+      yf,
+      1,
+      1,
+      12,
+    );
+    const borderLine = vectorizeUserStroke(
+      topLeftSnap!.snappedImg,
+      topRightSnap!.snappedImg,
+      hom.toUnit,
+      [],
+      [],
+      e,
+      { x: xf, y: yf },
+      false,
+      'auto',
+      { exactStartPos: true },
+    );
+    expect(borderLine?.kind).toBe('hShelf');
+    if (borderLine?.kind === 'hShelf') {
+      expect(borderLine.segment.position).toBeGreaterThanOrEqual(0.985);
+    }
+
+    // 5. Vista Arriba (XZ) también imanta limpiamente esquinas del marco y vértices dibujados (quad[2] = BR -> (1, 0))
+    const xzSnap = snapPointInUnitQuad(
+      { x: quad[2].x - 5, y: quad[2].y - 5 },
+      hom.toUnit,
+      hom.toCanvas,
+      [{ x: 0.4, y: 0.5 }],
+      1,
+      1,
+      12,
+    );
+    expect(xzSnap?.unitPt).toEqual({ x: 1, y: 0 });
+    expect(xzSnap?.indicator?.label).toBe('Esquina');
+  });
+
+  it('edición directa en 3D mueve/quita repisas y divisores, divide zonas y soporta ala L retorno', () => {
+    // 1. Repisa equidistante en estantería: mover +20 mm en 3D convierte a custom sin perder las otras repisas
+    const est = clonePreset('estanteria');
+    const despEst = calculateDespiece(est.topology, est.params);
+    const shelfPiece = despOrFail(despEst).find((p) => p.tipo === 'repisa');
+    expect(shelfPiece).toBeDefined();
+    expect(canEditPiecePositionIn3D(est.topology, est.params, shelfPiece!)).toBe(true);
+
+    const handles = compute3DEditHandlePositions(
+      shelfPiece!,
+      [shelfPiece!.posicion3D[0] / 1000, shelfPiece!.posicion3D[1] / 1000, shelfPiece!.posicion3D[2] / 1000],
+      est.topology,
+      est.params,
+    );
+    expect(handles.map((h) => h.deltaMm)).toEqual([20, -20]);
+
+    const afterShelfNudge = nudgeShelfMmIn3D(est.topology, est.params, shelfPiece!, 20);
+    expect(afterShelfNudge).not.toBeNull();
+    expect(afterShelfNudge?.shelfMode).toBe('custom');
+    expect(afterShelfNudge?.hShelves.length).toBe(est.topology.equalShelfCount);
+    const despAfterNudge = calculateDespiece(afterShelfNudge!, est.params);
+    expect(despAfterNudge.matrizDespiece.some((p) => p.tipo === 'repisa')).toBe(true);
+    expect(
+      despAfterNudge.alerts.filter((a) => a.tipo === 'dimension_invalida'),
+    ).toHaveLength(0);
+
+    // Quitar una repisa reduce el conteo en 1
+    const movedShelfPiece = despAfterNudge.matrizDespiece.find((p) => p.tipo === 'repisa')!;
+    const afterRemoveShelf = removeShelfIn3D(afterShelfNudge!, est.params, movedShelfPiece);
+    expect(afterRemoveShelf).not.toBeNull();
+    expect(afterRemoveShelf?.hShelves.length).toBe(est.topology.equalShelfCount - 1);
+
+    // 2. Zonas en Mueble de Catálogo (#03 Rack Bicolor): cambiar tipo a cajones, ajustar cantidad, dividir zona y cubierta bicolor
+    const rack = cloneCatalogFurniture(CATALOG_14_MUEBLES[2].id)!;
+    expect(rack).toBeDefined();
+    const firstZone = rack.topology.frontZones![0];
+    expect(firstZone).toBeDefined();
+    const withDrawers = changeZoneKindFrom3D(rack.topology, 'main', firstZone.id, 'drawers');
+    const zDrawers = withDrawers.frontZones!.find((z) => z.id === firstZone.id)!;
+    expect(zDrawers.kind).toBe('drawers');
+    expect(zDrawers.drawerCount).toBe(3);
+
+    const withFiveDrawers = updateZoneFrom3D(withDrawers, 'main', firstZone.id, {
+      drawerCount: 5,
+      materialOverride: 'grafito',
+    });
+    const despFive = calculateDespiece(withFiveDrawers, rack.params);
+    expect(despFive.matrizDespiece.filter((p) => p.zoneId === firstZone.id && p.tipo === 'frente_cajon')).toHaveLength(5);
+
+    const splitRes = splitZoneIn3D(withFiveDrawers, rack.params, 'main', firstZone.id, 'cols');
+    expect(splitRes).not.toBeNull();
+    expect(splitRes!.topology.vDividers.length).toBe(rack.topology.vDividers.length + 1);
+
+    const withCubGrafito = updateCubiertaMaterialIn3D(splitRes!.topology, 'main', 'grafito');
+    expect(withCubGrafito.cubiertaMaterialOverride).toBe('grafito');
+
+    // 3. Ala de retorno L (wing === 'return', probada en lado derecho e izquierdo): mover y quitar divisor 3D
+    for (const side of ['right', 'left'] as const) {
+      const lDesk = clonePreset('escritorio_l');
+      const lTopo: FurnitureTopology = {
+        ...lDesk.topology,
+        lShape: {
+          ...lDesk.topology.lShape!,
+          side,
+          vDividers: [{ id: 'ret_d1', position: 0.5, start: 0, end: 1 }],
+        },
+      };
+      const despL = calculateDespiece(lTopo, lDesk.params);
+      const retDiv = despOrFail(despL).find(
+        (p) => p.tipo === 'division_vertical' && p.wing === 'return',
+      );
+      expect(retDiv).toBeDefined();
+      expect(canEditPiecePositionIn3D(lTopo, lDesk.params, retDiv!, despL.matrizDespiece)).toBe(true);
+
+      const retHandles = compute3DEditHandlePositions(
+        retDiv!,
+        [retDiv!.posicion3D[0] / 1000, retDiv!.posicion3D[1] / 1000, retDiv!.posicion3D[2] / 1000],
+        lTopo,
+        lDesk.params,
+        despL.matrizDespiece,
+      );
+      expect(retHandles.map((h) => h.deltaMm)).toEqual([20, -20]);
+
+      const afterRetMove = nudgeDividerMmIn3D(lTopo, lDesk.params, retDiv!, 25, despL.matrizDespiece);
+      expect(afterRetMove).not.toBeNull();
+      expect(afterRetMove!.lShape!.vDividers[0].position).toBeGreaterThan(0.5);
+
+      const despRetMoved = calculateDespiece(afterRetMove!, lDesk.params);
+      const retDivMoved = despRetMoved.matrizDespiece.find(
+        (p) => p.tipo === 'division_vertical' && p.wing === 'return',
+      )!;
+      const afterRetDel = removeDividerIn3D(afterRetMove!, lDesk.params, retDivMoved, despRetMoved.matrizDespiece);
+      expect(afterRetDel?.lShape?.vDividers).toHaveLength(0);
+    }
+
+    // 4. Verificación estática de props de Viewer3D con callbacks de edición 3D
+    const propsCheck: Pick<
+      Viewer3DProps,
+      'onUpdateTopology' | 'onUpdateMaterialOnly' | 'onChangeBaseSupport' | 'onToggleLInnerCurve'
+    > = {
+      onUpdateTopology: () => undefined,
+      onUpdateMaterialOnly: () => undefined,
+      onChangeBaseSupport: () => undefined,
+      onToggleLInnerCurve: () => undefined,
+    };
+    expect(typeof propsCheck.onUpdateTopology).toBe('function');
   });
 });
 

@@ -40,7 +40,7 @@ flowchart TD
 
     subgraph CONVERGENCIA["Fase Común — Parametrización Progresiva (Recto / L + Curvas Diferenciales), Validación y Taller"]
         CONV["Ajustar medidas Vf (mm/cm), planta Recto / L Der / L Izq (L2, Z2, Alto B, esquina abierta, esquina interior curva R) y material"]
-        REV["Revisar en vivo: Visor 3D interactivo (alas L + ExtrudeGeometry curva, Explotar) y Plano Vectorial 2D (Planta XZ + Alzados A/B + rutas Bézier)"]
+        REV["Revisar y editar directo en 3D: Viewer3D interactivo (alas L, ExtrudeGeometry curva, flechas ±20 mm sobre repisas/divisores, HUD de módulos/acabados, Explotar) y Plano Vectorial 2D"]
         ALERT{"Alerta estructural DIN 68874-1, pandeo > 850 mm o radio curvo R < 28 mm?"}
         FIX["Agregar divisor vertical o ampliar radio curvo en vivo hasta 0 alertas"]
         BLUEPRINT_OPT["Opcional: revisar Plano 2D V0 vs Vf y marcar Aprobar Modelo (modelApproved = true)"]

@@ -939,6 +939,87 @@ input[type='range'] {
   color: #cbd5e1;
 }
 
+.piece-hud-edit-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(148, 163, 184, 0.28);
+}
+
+.hud-edit-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 7px;
+  padding: 3px 6px;
+}
+
+.hud-edit-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #93c5fd;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.hud-edit-select {
+  background: #1e293b;
+  color: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 5px;
+  padding: 2px 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.hud-edit-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 5px;
+  padding: 3px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.hud-edit-btn:hover {
+  background: rgba(56, 189, 248, 0.26);
+  border-color: rgba(56, 189, 248, 0.6);
+}
+
+.hud-edit-btn.active {
+  background: #0284c7;
+  border-color: #38bdf8;
+  color: #ffffff;
+}
+
+.hud-edit-btn.danger {
+  background: rgba(239, 68, 68, 0.22);
+  border-color: rgba(248, 113, 113, 0.55);
+  color: #fecaca;
+}
+
+.hud-edit-btn.danger:hover {
+  background: rgba(220, 38, 38, 0.45);
+}
+
+.hud-edit-count {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #f8fafc;
+  min-width: 16px;
+  text-align: center;
+}
+
 .hud-close-btn {
   background: rgba(255, 255, 255, 0.12);
   color: #f8fafc;

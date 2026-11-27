@@ -11,15 +11,19 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentRef } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
 import { Edges, Html, Line, OrbitControls } from '@react-three/drei';
-import { AlertTriangle, Eye, EyeOff, Layers, RotateCcw, X } from 'lucide-react';
+import { AlertTriangle, Eye, EyeOff, Layers, RotateCcw, Trash2, X } from 'lucide-react';
 import * as THREE from 'three';
 import type {
+  BaseSupportType,
   BoardCurveProfile,
   BoardPiece,
   DespieceResult,
+  FrontModuleKind,
+  FrontZone,
   FurnitureTopology,
   MelamineMaterial,
   ScaleAndBoardParams,
+  WingRole,
 } from '../../types/contracts';
 import {
   calculateShelfDeflectionDIN,
@@ -28,6 +32,20 @@ import {
   resolveBaseSupport,
   resolveLShapePlan,
 } from '../../core/mathEngine';
+import { MELAMINE_LABELS, ZONE_LABELS } from '../vectorCanvas/geometryHelpers';
+import {
+  canEditPiecePositionIn3D,
+  changeZoneKindFrom3D,
+  compute3DEditHandlePositions,
+  nudgeDividerMmIn3D,
+  nudgeShelfMmIn3D,
+  removeDividerIn3D,
+  removeShelfIn3D,
+  resolveEffectiveLShapePlan,
+  splitZoneIn3D,
+  updateCubiertaMaterialIn3D,
+  updateZoneFrom3D,
+} from './viewer3dEditHelpers';
 
 export interface Viewer3DProps {
   despiece: DespieceResult;
@@ -43,6 +61,10 @@ export interface Viewer3DProps {
   onHoverZone?: (zoneId: string | null) => void;
   onExplodeChange?: (value: number) => void;
   onAddCenterDivider?: () => void;
+  onUpdateTopology?: (next: FurnitureTopology) => void;
+  onUpdateMaterialOnly?: (material: MelamineMaterial) => void;
+  onChangeBaseSupport?: (type: BaseSupportType) => void;
+  onToggleLInnerCurve?: (enabled: boolean) => void;
 }
 
 type CameraPreset = 'iso' | 'front' | 'side';
@@ -291,6 +313,7 @@ interface MeshGroupProps {
   onSelectPiece: (id: string | null) => void;
   onSelectZone?: (zoneId: string | null) => void;
   onHoverZone?: (zoneId: string | null) => void;
+  onNudgePiece3D?: (piece: BoardPiece, deltaMm: number) => void;
 }
 
 function FurnitureMeshGroup({
@@ -308,6 +331,7 @@ function FurnitureMeshGroup({
   onSelectPiece,
   onSelectZone,
   onHoverZone,
+  onNudgePiece3D,
 }: MeshGroupProps) {
   useEffect(() => {
     return () => {
@@ -356,31 +380,10 @@ function FurnitureMeshGroup({
     };
   }, [textureBank]);
 
-  const lPlanBase = useMemo(() => resolveLShapePlan(topology, params), [topology, params]);
-
-  const effectiveLPlan = useMemo(() => {
-    if (!lPlanBase?.enabled) return null;
-    let minZ = Infinity;
-    let maxZ = -Infinity;
-    for (const p of despiece.matrizDespiece) {
-      if (p.wing !== 'return' || p.tipo === 'puerta' || p.tipo === 'frente_cajon') continue;
-      const rotY = p.rotacion3D[1] ?? 0;
-      const cosY = Math.abs(Math.cos(rotY));
-      const sinY = Math.abs(Math.sin(rotY));
-      const worldDz = p.dimensiones3D[0] * sinY + p.dimensiones3D[2] * cosY;
-      minZ = Math.min(minZ, p.posicion3D[2] - worldDz / 2);
-      maxZ = Math.max(maxZ, p.posicion3D[2] + worldDz / 2);
-    }
-    if (Number.isFinite(minZ) && Number.isFinite(maxZ) && maxZ > minZ) {
-      return {
-        ...lPlanBase,
-        zStartB: minZ,
-        netLengthMm: maxZ - minZ,
-        totalLengthMm: maxZ,
-      };
-    }
-    return lPlanBase;
-  }, [lPlanBase, despiece.matrizDespiece]);
+  const effectiveLPlan = useMemo(
+    () => resolveEffectiveLShapePlan(topology, params, despiece.matrizDespiece),
+    [topology, params, despiece.matrizDespiece],
+  );
 
   const zoneMap = useMemo(() => {
     const map = new Map<
@@ -631,6 +634,20 @@ function FurnitureMeshGroup({
   }, [hoveredZoneId, selectedZoneId, zoneMap, effectiveLPlan, e, xInt, yInt, xf, zf]);
 
   const renderDims = showDimensions && explodeFactor <= 0.1;
+  const activeEditPiece = useMemo(
+    () => (selectedPieceId ? despiece.matrizDespiece.find((p) => p.id === selectedPieceId) ?? null : null),
+    [despiece.matrizDespiece, selectedPieceId],
+  );
+  const editHandles = useMemo(() => {
+    if (!onNudgePiece3D || !activeEditPiece) return [];
+    return compute3DEditHandlePositions(
+      activeEditPiece,
+      piecePosition(activeEditPiece),
+      topology,
+      params,
+      despiece.matrizDespiece,
+    );
+  }, [onNudgePiece3D, activeEditPiece, topology, params, despiece.matrizDespiece, explodeDist, cx0, cy0, cz0]);
 
   return (
     <group position={[-xm / 2, 0, -totalZm / 2]}>
@@ -1002,6 +1019,7 @@ function FurnitureMeshGroup({
               rotation={[0, bk.rotY, 0]}
               onClick={(e) => {
                 e.stopPropagation();
+                onSelectPiece(null);
                 onSelectZone?.(bk.zoneId);
               }}
               onPointerOver={(e) => {
@@ -1071,6 +1089,36 @@ function FurnitureMeshGroup({
             </group>
           );
         })}
+
+        {/* Manijas interactivas 3D sobre la repisa o divisor vertical seleccionado */}
+        {onNudgePiece3D &&
+          activeEditPiece &&
+          editHandles.map((h) => (
+            <mesh
+              key={h.key}
+              position={h.positionM}
+              rotation={h.rotationRad}
+              onClick={(e) => {
+                e.stopPropagation();
+                onNudgePiece3D(activeEditPiece, h.deltaMm);
+              }}
+              onPointerOver={(e) => {
+                e.stopPropagation();
+                document.body.style.cursor = 'pointer';
+              }}
+              onPointerOut={() => {
+                document.body.style.cursor = 'auto';
+              }}
+            >
+              <coneGeometry args={[0.022, 0.044, 16]} />
+              <meshStandardMaterial
+                color={h.color}
+                emissive="#0ea5e9"
+                emissiveIntensity={0.35}
+                roughness={0.3}
+              />
+            </mesh>
+          ))}
 
         {/* Cotas 3D dinámicas (pointer-events: none para nunca bloquear clics u órbita) */}
         {renderDims && (
@@ -1208,16 +1256,51 @@ export function Viewer3D({
   onHoverZone,
   onExplodeChange,
   onAddCenterDivider,
+  onUpdateTopology,
+  onUpdateMaterialOnly,
+  onChangeBaseSupport,
+  onToggleLInnerCurve,
 }: Viewer3DProps) {
   const [camPreset, setCamPreset] = useState<CameraPreset>('iso');
   const [camTrigger, setCamTrigger] = useState<number>(0);
   const [showDimensions, setShowDimensions] = useState<boolean>(true);
   const [selectedPieceId, setSelectedPieceId] = useState<string | null>(null);
   const [explodeOpen, setExplodeOpen] = useState<boolean>(false);
+  const pendingReselectRef = useRef<{
+    tipo: BoardPiece['tipo'];
+    wing: WingRole;
+    targetPos: [number, number, number];
+  } | null>(null);
 
-  // Limpia automáticamente la pieza seleccionada si ya no existe al cambiar preset/catálogo
+  // Limpia o re-vincula la pieza seleccionada cuando la topología cambia (p.ej. equidistant -> custom)
   useEffect(() => {
-    if (selectedPieceId && !despiece.matrizDespiece.some((p) => p.id === selectedPieceId)) {
+    if (selectedPieceId && despiece.matrizDespiece.some((p) => p.id === selectedPieceId)) {
+      pendingReselectRef.current = null;
+      return;
+    }
+    const hint = pendingReselectRef.current;
+    pendingReselectRef.current = null;
+    if (hint) {
+      let bestPiece: BoardPiece | null = null;
+      let bestDist = 80;
+      for (const p of despiece.matrizDespiece) {
+        if (p.tipo !== hint.tipo || (p.wing ?? 'main') !== hint.wing) continue;
+        const dist = Math.hypot(
+          p.posicion3D[0] - hint.targetPos[0],
+          p.posicion3D[1] - hint.targetPos[1],
+          p.posicion3D[2] - hint.targetPos[2],
+        );
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestPiece = p;
+        }
+      }
+      if (bestPiece) {
+        setSelectedPieceId(bestPiece.id);
+        return;
+      }
+    }
+    if (selectedPieceId) {
       setSelectedPieceId(null);
     }
   }, [despiece.matrizDespiece, selectedPieceId]);
@@ -1231,15 +1314,20 @@ export function Viewer3D({
     [despiece.matrizDespiece, selectedPieceId],
   );
 
-  const selectedPieceZoneLabel = useMemo(() => {
-    if (!selectedPiece?.zoneId) return null;
-    const allZones = [
-      ...(topology.frontZones ?? []),
-      ...(topology.lShape?.enabled ? topology.lShape.frontZones ?? [] : []),
-    ];
-    const z = allZones.find((item) => item.id === selectedPiece.zoneId);
-    return z?.label ?? selectedPiece.zoneId;
-  }, [selectedPiece, topology.frontZones, topology.lShape]);
+  const activeZoneEntry = useMemo<{ zone: FrontZone; wing: WingRole } | null>(() => {
+    const zId = selectedPiece?.zoneId ?? selectedZoneId ?? null;
+    if (!zId) return null;
+    const mainMatch = (topology.frontZones ?? []).find((z) => z.id === zId);
+    if (mainMatch) return { zone: mainMatch, wing: 'main' };
+    if (topology.lShape?.enabled) {
+      const retMatch = (topology.lShape.frontZones ?? []).find((z) => z.id === zId);
+      if (retMatch) return { zone: retMatch, wing: 'return' };
+    }
+    return null;
+  }, [selectedPiece?.zoneId, selectedZoneId, topology.frontZones, topology.lShape]);
+
+  const selectedPieceZoneLabel =
+    activeZoneEntry?.zone.label ?? activeZoneEntry?.zone.id ?? null;
 
   const selectedPieceDin = useMemo(() => {
     if (!selectedPiece || selectedPiece.tipo !== 'repisa') return null;
@@ -1289,6 +1377,69 @@ export function Viewer3D({
 
   const pandeoAlerts = despiece.alerts.filter((a) => a.tipo === 'pandeo');
   const maxSpan = pandeoAlerts.reduce((m, a) => Math.max(m, a.luzLibreMm ?? 0), 0);
+
+  const canEditSelectedPos = Boolean(
+    selectedPiece &&
+      onUpdateTopology &&
+      canEditPiecePositionIn3D(topology, params, selectedPiece, despiece.matrizDespiece),
+  );
+
+  const handleNudgePiece = (piece: BoardPiece, deltaMm: number) => {
+    if (!onUpdateTopology) return;
+    const next =
+      piece.tipo === 'repisa'
+        ? nudgeShelfMmIn3D(topology, params, piece, deltaMm, despiece.matrizDespiece)
+        : piece.tipo === 'division_vertical'
+          ? nudgeDividerMmIn3D(topology, params, piece, deltaMm, despiece.matrizDespiece)
+          : null;
+    if (!next) return;
+    const [px, py, pz] = piece.posicion3D;
+    let targetPos: [number, number, number] = [px, py, pz];
+    if (piece.tipo === 'repisa') {
+      targetPos = [px, py + deltaMm, pz];
+    } else if (piece.wing === 'return') {
+      const sideSign = topology.lShape?.side === 'left' ? -1 : 1;
+      targetPos = [px, py, pz + sideSign * deltaMm];
+    } else {
+      targetPos = [px + deltaMm, py, pz];
+    }
+    pendingReselectRef.current = {
+      tipo: piece.tipo,
+      wing: piece.wing ?? 'main',
+      targetPos,
+    };
+    onUpdateTopology(next);
+  };
+
+  const handleRemoveSelectedPiece = (piece: BoardPiece) => {
+    if (!onUpdateTopology) return;
+    const next =
+      piece.tipo === 'repisa'
+        ? removeShelfIn3D(topology, params, piece, despiece.matrizDespiece)
+        : piece.tipo === 'division_vertical'
+          ? removeDividerIn3D(topology, params, piece, despiece.matrizDespiece)
+          : null;
+    if (!next) return;
+    pendingReselectRef.current = null;
+    setSelectedPieceId(null);
+    onUpdateTopology(next);
+  };
+
+  const lInnerCurveEnabled = Boolean(
+    topology.curvedCuts?.some((c) => c.cornerTarget === 'l_inner'),
+  );
+  const melamineList: readonly MelamineMaterial[] = ['blanco', 'roble', 'grafito'];
+  const moduleKindList: readonly FrontModuleKind[] = [
+    'open',
+    'door_left',
+    'door_right',
+    'door_double',
+    'door_glass',
+    'drawers',
+    'baskets',
+    'leg_void',
+    'void_outside',
+  ];
 
   const selectView = (next: CameraPreset) => {
     setCamPreset(next);
@@ -1417,53 +1568,363 @@ export function Viewer3D({
         </div>
       </div>
 
-      {(selectedPiece || pandeoAlerts.length > 0) && (
+      {(selectedPiece || activeZoneEntry || pandeoAlerts.length > 0) && (
         <div className="viewer3d-bottom-stack">
-          {selectedPiece && (
+          {(selectedPiece || activeZoneEntry) && (
             <div className="viewer3d-piece-hud">
               <div className="piece-hud-content">
-                <div className="piece-hud-title">
-                  <strong>{selectedPiece.nombre}</strong>
-                  <span className="piece-hud-tag">{selectedPiece.tipo}</span>
-                  {selectedPiece.wing && (
-                    <span className="piece-hud-tag">
-                      {selectedPiece.wing === 'return' ? 'Ala Retorno B' : 'Ala Principal A'}
-                    </span>
-                  )}
-                  {selectedPieceZoneLabel && (
-                    <span className="piece-hud-tag zone-tag">Zona: {selectedPieceZoneLabel}</span>
-                  )}
-                  <span className="mono">
-                    Corte:{' '}
-                    <strong>
-                      {selectedPiece.ancho.toFixed(1)} × {selectedPiece.alto.toFixed(1)} ×{' '}
-                      {selectedPiece.espesor} mm
-                    </strong>
-                  </span>
-                </div>
-                <div className="piece-hud-meta mono">
-                  <span>
-                    Centro ℝ³: ({selectedPiece.posicion3D.map((v) => Math.round(v)).join(', ')}) mm
-                  </span>
-                  <span>Acabado: {selectedPiece.material}</span>
-                  <span>Veta: {selectedPiece.respectGrain ? 'Eje ancho' : 'Libre'}</span>
-                  {selectedPiece.miterAngleDeg !== undefined && (
-                    <span>Inglete: {selectedPiece.miterAngleDeg.toFixed(1)}°</span>
-                  )}
-                  {selectedPiece.curveProfile && (
-                    <span>
-                      Curva: arco={selectedPiece.curveProfile.arcLengthMm.toFixed(1)} mm (R_mín=
-                      {selectedPiece.curveProfile.minRadiusMm.toFixed(0)} mm)
-                    </span>
-                  )}
-                  {selectedPieceDin && (
-                    <span className={selectedPieceDin.passesDIN ? 'din-pill ok' : 'din-pill bad'}>
-                      DIN 68874-1: δ={selectedPieceDin.deflectionMm.toFixed(2)} mm /{' '}
-                      {selectedPieceDin.allowableMm.toFixed(2)} mm (máx.{' '}
-                      {selectedPieceDin.maxLoadKg.toFixed(1)} kg)
-                    </span>
-                  )}
-                </div>
+                {selectedPiece ? (
+                  <>
+                    <div className="piece-hud-title">
+                      <strong>{selectedPiece.nombre}</strong>
+                      <span className="piece-hud-tag">{selectedPiece.tipo}</span>
+                      {selectedPiece.wing && (
+                        <span className="piece-hud-tag">
+                          {selectedPiece.wing === 'return' ? 'Ala Retorno B' : 'Ala Principal A'}
+                        </span>
+                      )}
+                      {selectedPieceZoneLabel && (
+                        <span className="piece-hud-tag zone-tag">
+                          Zona: {selectedPieceZoneLabel}
+                        </span>
+                      )}
+                      <span className="mono">
+                        Corte:{' '}
+                        <strong>
+                          {selectedPiece.ancho.toFixed(1)} × {selectedPiece.alto.toFixed(1)} ×{' '}
+                          {selectedPiece.espesor} mm
+                        </strong>
+                      </span>
+                    </div>
+                    <div className="piece-hud-meta mono">
+                      <span>
+                        Centro ℝ³: ({selectedPiece.posicion3D.map((v) => Math.round(v)).join(', ')})
+                        mm
+                      </span>
+                      <span>Acabado: {selectedPiece.material}</span>
+                      <span>Veta: {selectedPiece.respectGrain ? 'Eje ancho' : 'Libre'}</span>
+                      {selectedPiece.miterAngleDeg !== undefined && (
+                        <span>Inglete: {selectedPiece.miterAngleDeg.toFixed(1)}°</span>
+                      )}
+                      {selectedPiece.curveProfile && (
+                        <span>
+                          Curva: arco={selectedPiece.curveProfile.arcLengthMm.toFixed(1)} mm (R_mín=
+                          {selectedPiece.curveProfile.minRadiusMm.toFixed(0)} mm)
+                        </span>
+                      )}
+                      {selectedPieceDin && (
+                        <span className={selectedPieceDin.passesDIN ? 'din-pill ok' : 'din-pill bad'}>
+                          DIN 68874-1: δ={selectedPieceDin.deflectionMm.toFixed(2)} mm /{' '}
+                          {selectedPieceDin.allowableMm.toFixed(2)} mm (máx.{' '}
+                          {selectedPieceDin.maxLoadKg.toFixed(1)} kg)
+                        </span>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  activeZoneEntry && (
+                    <div className="piece-hud-title">
+                      <strong>Zona {activeZoneEntry.zone.label ?? activeZoneEntry.zone.id}</strong>
+                      <span className="piece-hud-tag zone-tag">
+                        {ZONE_LABELS[activeZoneEntry.zone.kind]}
+                      </span>
+                      <span className="piece-hud-tag">
+                        {activeZoneEntry.wing === 'return' ? 'Ala Retorno B' : 'Ala Principal A'}
+                      </span>
+                    </div>
+                  )
+                )}
+
+                {(onUpdateTopology ||
+                  onUpdateMaterialOnly ||
+                  onChangeBaseSupport ||
+                  onToggleLInnerCurve) && (
+                  <div className="piece-hud-edit-bar" role="group" aria-label="Edición directa en 3D">
+                    {canEditSelectedPos && selectedPiece && (
+                      <div className="hud-edit-group">
+                        <span className="hud-edit-label">
+                          {selectedPiece.tipo === 'repisa' ? 'Altura:' : 'Posición:'}
+                        </span>
+                        <button
+                          type="button"
+                          className="hud-edit-btn"
+                          onClick={() => handleNudgePiece(selectedPiece, -10)}
+                          title="Desplazar -10 mm"
+                        >
+                          {selectedPiece.tipo === 'repisa' ? '▼ -10 mm' : '◀ -10 mm'}
+                        </button>
+                        <button
+                          type="button"
+                          className="hud-edit-btn"
+                          onClick={() => handleNudgePiece(selectedPiece, 10)}
+                          title="Desplazar +10 mm"
+                        >
+                          {selectedPiece.tipo === 'repisa' ? '▲ +10 mm' : '▶ +10 mm'}
+                        </button>
+                        <button
+                          type="button"
+                          className="hud-edit-btn danger"
+                          onClick={() => handleRemoveSelectedPiece(selectedPiece)}
+                          title="Eliminar esta placa del mueble"
+                        >
+                          <Trash2 size={11} /> Quitar
+                        </button>
+                      </div>
+                    )}
+
+                    {activeZoneEntry && onUpdateTopology && (() => {
+                      const { zone, wing } = activeZoneEntry;
+                      const supportsColor =
+                        zone.kind === 'door_left' ||
+                        zone.kind === 'door_right' ||
+                        zone.kind === 'door_double' ||
+                        zone.kind === 'door_glass' ||
+                        zone.kind === 'drawers';
+                      const activeCubiertaWingMat =
+                        wing === 'return'
+                          ? topology.lShape?.cubiertaMaterialOverride
+                          : topology.cubiertaMaterialOverride;
+                      return (
+                        <>
+                          <div className="hud-edit-group">
+                            <span className="hud-edit-label">Módulo:</span>
+                            <select
+                              className="hud-edit-select"
+                              aria-label="Tipo de módulo 3D"
+                              value={zone.kind}
+                              onChange={(ev) =>
+                                onUpdateTopology(
+                                  changeZoneKindFrom3D(
+                                    topology,
+                                    wing,
+                                    zone.id,
+                                    ev.target.value as FrontModuleKind,
+                                  ),
+                                )
+                              }
+                            >
+                              {moduleKindList.map((mk) => (
+                                <option key={mk} value={mk}>
+                                  {ZONE_LABELS[mk]}
+                                </option>
+                              ))}
+                            </select>
+                            {(zone.kind === 'drawers' || zone.kind === 'baskets') && (() => {
+                              const isDrawers = zone.kind === 'drawers';
+                              const count = isDrawers
+                                ? (zone.drawerCount ?? 3)
+                                : (zone.basketCount ?? 3);
+                              const setCount = (nextN: number) => {
+                                const clamped = Math.max(1, Math.min(6, nextN));
+                                onUpdateTopology(
+                                  updateZoneFrom3D(
+                                    topology,
+                                    wing,
+                                    zone.id,
+                                    isDrawers ? { drawerCount: clamped } : { basketCount: clamped },
+                                  ),
+                                );
+                              };
+                              return (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="hud-edit-btn"
+                                    onClick={() => setCount(count - 1)}
+                                    aria-label="Menos cajones o canastos"
+                                  >
+                                    −
+                                  </button>
+                                  <span className="hud-edit-count mono">{count}</span>
+                                  <button
+                                    type="button"
+                                    className="hud-edit-btn"
+                                    onClick={() => setCount(count + 1)}
+                                    aria-label="Más cajones o canastos"
+                                  >
+                                    +
+                                  </button>
+                                </>
+                              );
+                            })()}
+                            <button
+                              type="button"
+                              className="hud-edit-btn"
+                              onClick={() => {
+                                const res = splitZoneIn3D(topology, params, wing, zone.id, 'cols');
+                                if (res) {
+                                  setSelectedPieceId(null);
+                                  onUpdateTopology(res.topology);
+                                  onSelectZone?.(res.newSelectedZoneId);
+                                }
+                              }}
+                              title="Dividir esta zona verticalmente"
+                            >
+                              + Divisor
+                            </button>
+                            <button
+                              type="button"
+                              className="hud-edit-btn"
+                              onClick={() => {
+                                const res = splitZoneIn3D(topology, params, wing, zone.id, 'rows');
+                                if (res) {
+                                  setSelectedPieceId(null);
+                                  onUpdateTopology(res.topology);
+                                  onSelectZone?.(res.newSelectedZoneId);
+                                }
+                              }}
+                              title="Dividir esta zona con una repisa horizontal"
+                            >
+                              + Repisa
+                            </button>
+                          </div>
+
+                          {supportsColor && (
+                            <div className="hud-edit-group">
+                              <span className="hud-edit-label">Frente:</span>
+                              <button
+                                type="button"
+                                className={
+                                  !zone.materialOverride ? 'hud-edit-btn active' : 'hud-edit-btn'
+                                }
+                                onClick={() =>
+                                  onUpdateTopology(
+                                    updateZoneFrom3D(topology, wing, zone.id, {
+                                      materialOverride: activeCubiertaWingMat,
+                                    }),
+                                  )
+                                }
+                              >
+                                Cuerpo
+                              </button>
+                              {melamineList.map((mat) => (
+                                <button
+                                  key={`z_mat_${mat}`}
+                                  type="button"
+                                  className={
+                                    zone.materialOverride === mat
+                                      ? 'hud-edit-btn active'
+                                      : 'hud-edit-btn'
+                                  }
+                                  onClick={() =>
+                                    onUpdateTopology(
+                                      updateZoneFrom3D(topology, wing, zone.id, {
+                                        materialOverride: mat,
+                                      }),
+                                    )
+                                  }
+                                >
+                                  {MELAMINE_LABELS[mat]}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
+
+                    {selectedPiece?.tipo === 'cubierta' && onUpdateTopology && (() => {
+                      const wing: WingRole = selectedPiece.wing === 'return' ? 'return' : 'main';
+                      const curCubMat =
+                        wing === 'return'
+                          ? topology.lShape?.cubiertaMaterialOverride
+                          : topology.cubiertaMaterialOverride;
+                      return (
+                        <div className="hud-edit-group">
+                          <span className="hud-edit-label">Cubierta:</span>
+                          <button
+                            type="button"
+                            className={!curCubMat ? 'hud-edit-btn active' : 'hud-edit-btn'}
+                            onClick={() =>
+                              onUpdateTopology(updateCubiertaMaterialIn3D(topology, wing, undefined))
+                            }
+                          >
+                            Cuerpo
+                          </button>
+                          {melamineList.map((mat) => (
+                            <button
+                              key={`cub_mat_${mat}`}
+                              type="button"
+                              className={curCubMat === mat ? 'hud-edit-btn active' : 'hud-edit-btn'}
+                              onClick={() =>
+                                onUpdateTopology(updateCubiertaMaterialIn3D(topology, wing, mat))
+                              }
+                            >
+                              {MELAMINE_LABELS[mat]}
+                            </button>
+                          ))}
+                          {topology.lShape?.enabled && onToggleLInnerCurve && (
+                            <button
+                              type="button"
+                              className={
+                                lInnerCurveEnabled ? 'hud-edit-btn active' : 'hud-edit-btn'
+                              }
+                              onClick={() => onToggleLInnerCurve(!lInnerCurveEnabled)}
+                            >
+                              Curva interior L
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })()}
+
+                    {selectedPiece &&
+                      (selectedPiece.tipo === 'lateral' ||
+                        selectedPiece.tipo === 'base' ||
+                        selectedPiece.tipo === 'fondo' ||
+                        selectedPiece.tipo === 'zocalo') && (
+                        <>
+                          {onUpdateMaterialOnly && (
+                            <div className="hud-edit-group">
+                              <span className="hud-edit-label">Melamina:</span>
+                              {melamineList.map((mat) => (
+                                <button
+                                  key={`body_mat_${mat}`}
+                                  type="button"
+                                  className={
+                                    params.material === mat ? 'hud-edit-btn active' : 'hud-edit-btn'
+                                  }
+                                  onClick={() => onUpdateMaterialOnly(mat)}
+                                >
+                                  {MELAMINE_LABELS[mat]}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          {(selectedPiece.tipo === 'base' || selectedPiece.tipo === 'zocalo') &&
+                            onChangeBaseSupport && (
+                              <div className="hud-edit-group">
+                                <span className="hud-edit-label">Apoyo:</span>
+                                <select
+                                  className="hud-edit-select"
+                                  aria-label="Tipo de apoyo del mueble"
+                                  value={supportSummary.type}
+                                  onChange={(ev) =>
+                                    onChangeBaseSupport(ev.target.value as BaseSupportType)
+                                  }
+                                >
+                                  <option value="none">Al piso</option>
+                                  <option value="legs">Patas</option>
+                                  <option value="wheels">Ruedas</option>
+                                  <option value="toe_kick">Zócalo</option>
+                                </select>
+                              </div>
+                            )}
+                          {selectedPiece.tipo === 'fondo' &&
+                            !activeZoneEntry &&
+                            onAddCenterDivider && (
+                              <button
+                                type="button"
+                                className="hud-edit-btn"
+                                onClick={onAddCenterDivider}
+                              >
+                                + Divisor central
+                              </button>
+                            )}
+                        </>
+                      )}
+                  </div>
+                )}
               </div>
               <button
                 type="button"
@@ -1528,6 +1989,7 @@ export function Viewer3D({
           onSelectPiece={setSelectedPieceId}
           onSelectZone={onSelectZone}
           onHoverZone={onHoverZone}
+          onNudgePiece3D={onUpdateTopology ? handleNudgePiece : undefined}
         />
         <CameraRig
           preset={camPreset}

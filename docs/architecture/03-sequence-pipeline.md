@@ -66,10 +66,13 @@ sequenceDiagram
     App->>Cost: estimateProjectBomAndCost(despiece, cuttingPlan, params)
     Cost-->>App: ProjectCostEstimate (fijaciones BOM + herrajes + planchas + tapacanto con tarifas costConfig CLP)
 
-    opt Hover Interactivo 2D <-> 3D
+    opt Hover y Edición Directa 3D <-> 2D (Estudio y Taller)
         User->>VC: Hover sobre FrontZone (zoneId)
         VC->>App: setHoveredZoneId(zoneId)
         App->>V3D: Resalta piezas con piece.zoneId === hoveredZoneId
+        User->>V3D: Clic en tablero/canasto o flechas 3D (±20 mm) y barra HUD
+        V3D->>App: onUpdateTopology / onUpdateMaterialOnly / onChangeBaseSupport / onToggleLInnerCurve
+        Note over V3D: CameraRig mantiene la órbita 3D estable sin reseteo al mutar topología
     end
 
     opt Exportación Offline de Entregables

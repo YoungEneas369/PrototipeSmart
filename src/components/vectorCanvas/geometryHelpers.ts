@@ -556,6 +556,7 @@ export function hitTestLinesScreenPx(
   isTouch = false,
 ): LineHitResult | null {
   const endTol = isTouch ? 17 : 12;
+  const cornerReserveTol = isTouch ? 14 : 10;
   const bodyTol = isTouch ? 14 : 9;
 
   let bestEnd: LineHitResult | null = null;
@@ -571,19 +572,29 @@ export function hitTestLinesScreenPx(
     const selBonus = isSel ? 2.5 : 0;
 
     const d0 = distScreenPx(ptImg, proj.p0, scaleX, scaleY);
-    if (d0 <= endTol + selBonus) {
-      const score = d0 - (isSel ? 3 : 0);
-      if (!bestEnd || score < bestEnd.distPx) {
-        bestEnd = { kind, id, part: 'start', distPx: score };
-      }
-    }
     const d1 = distScreenPx(ptImg, proj.p1, scaleX, scaleY);
-    if (d1 <= endTol + selBonus) {
-      const score = d1 - (isSel ? 3 : 0);
-      if (!bestEnd || score < bestEnd.distPx) {
-        bestEnd = { kind, id, part: 'end', distPx: score };
+
+    // Solo arrastrar puntas cuando la línea ya está seleccionada expresamente;
+    // en líneas no seleccionadas, las puntas quedan libres como esquinas para conectar la línea siguiente.
+    if (isSel) {
+      if (d0 <= endTol + selBonus) {
+        const score = d0 - 3;
+        if (!bestEnd || score < bestEnd.distPx) {
+          bestEnd = { kind, id, part: 'start', distPx: score };
+        }
+      }
+      if (d1 <= endTol + selBonus) {
+        const score = d1 - 3;
+        if (!bestEnd || score < bestEnd.distPx) {
+          bestEnd = { kind, id, part: 'end', distPx: score };
+        }
       }
     }
+
+    const segPx = distScreenPx(proj.p0, proj.p1, scaleX, scaleY);
+    const effectiveReserve = Math.min(cornerReserveTol, segPx * 0.34);
+    const nearUnselectedEndpoint = !isSel && (d0 <= effectiveReserve || d1 <= effectiveReserve);
+    if (nearUnselectedEndpoint) return;
 
     const db = pointToSegmentDistScreenPx(ptImg, proj.p0, proj.p1, scaleX, scaleY);
     if (db <= bodyTol + selBonus * 0.5) {
@@ -645,18 +656,95 @@ export function snapPointToStructuralAnchors(
   snapTolPx = 11,
   excludeId?: string,
   axisLock: 'both' | 'uOnly' | 'vOnly' = 'both',
+  diagonalDividers: readonly DiagonalSegment[] = [],
+  extraVertexNorms: readonly Point2D[] = [],
 ): { snappedImg: Point2D; u: number; v: number; indicator: SnapIndicator | null } | null {
   const unit = applyHomography(toUnit, rawPtImg);
   if (!unit) return null;
   let u = exteriorToInterior(unit.x, e, xf);
   let v = exteriorToInterior(unit.y, e, yf);
 
+  // 1. Prioridad máxima en captura 2D libre: esquinas, extremos de líneas existentes, diagonales e intersecciones
+  if (axisLock === 'both') {
+    const vertexAnchors: Array<{ u: number; v: number; label: string; kind: 'wall' | 'tjunction' }> = [
+      { u: 0, v: 0, label: 'Esquina', kind: 'wall' },
+      { u: 1, v: 0, label: 'Esquina', kind: 'wall' },
+      { u: 1, v: 1, label: 'Esquina', kind: 'wall' },
+      { u: 0, v: 1, label: 'Esquina', kind: 'wall' },
+    ];
+    for (const d of vDividers) {
+      if (d.id === excludeId) continue;
+      vertexAnchors.push({ u: d.position, v: d.start, label: 'Esquina', kind: 'tjunction' });
+      vertexAnchors.push({ u: d.position, v: d.end, label: 'Esquina', kind: 'tjunction' });
+    }
+    for (const s of hShelves) {
+      if (s.id === excludeId) continue;
+      vertexAnchors.push({ u: s.start, v: s.position, label: 'Esquina', kind: 'tjunction' });
+      vertexAnchors.push({ u: s.end, v: s.position, label: 'Esquina', kind: 'tjunction' });
+    }
+    for (const dg of diagonalDividers) {
+      if (dg.id === excludeId) continue;
+      vertexAnchors.push({ u: dg.u1, v: dg.v1, label: 'Esquina', kind: 'tjunction' });
+      vertexAnchors.push({ u: dg.u2, v: dg.v2, label: 'Esquina', kind: 'tjunction' });
+    }
+    for (const d of vDividers) {
+      if (d.id === excludeId) continue;
+      for (const s of hShelves) {
+        if (s.id === excludeId) continue;
+        if (
+          d.position >= Math.min(s.start, s.end) - 0.02 &&
+          d.position <= Math.max(s.start, s.end) + 0.02 &&
+          s.position >= Math.min(d.start, d.end) - 0.02 &&
+          s.position <= Math.max(d.start, d.end) + 0.02
+        ) {
+          vertexAnchors.push({ u: d.position, v: s.position, label: 'Unión T', kind: 'tjunction' });
+        }
+      }
+    }
+    for (const ev of extraVertexNorms) {
+      vertexAnchors.push({
+        u: clampNum(ev.x, 0, 1),
+        v: clampNum(ev.y, 0, 1),
+        label: 'Esquina',
+        kind: 'tjunction',
+      });
+    }
+
+    let bestVtxDist = snapTolPx;
+    let bestVtx: { u: number; v: number; img: Point2D; label: string; kind: 'wall' | 'tjunction' } | null =
+      null;
+    for (const va of vertexAnchors) {
+      const testImg = applyHomography(toCanvas, {
+        x: interiorToExterior(va.u, e, xf),
+        y: interiorToExterior(va.v, e, yf),
+      });
+      if (!testImg) continue;
+      const dist = distScreenPx(rawPtImg, testImg, scaleX, scaleY);
+      if (dist <= bestVtxDist) {
+        bestVtxDist = dist;
+        bestVtx = { u: va.u, v: va.v, img: testImg, label: va.label, kind: va.kind };
+      }
+    }
+    if (bestVtx) {
+      return {
+        snappedImg: bestVtx.img,
+        u: bestVtx.u,
+        v: bestVtx.v,
+        indicator: {
+          pt: bestVtx.img,
+          kind: bestVtx.kind,
+          label: bestVtx.label,
+        },
+      };
+    }
+  }
+
   let snappedU = false;
   let snappedV = false;
   let uKind: 'wall' | 'tjunction' = 'wall';
   let vKind: 'wall' | 'tjunction' = 'wall';
 
-  // Candidatos U (paredes izquierda/derecha + divisores verticales activos en v)
+  // Candidatos U (paredes izquierda/derecha + divisores verticales activos en v + extremos de repisas/diagonales)
   if (axisLock !== 'vOnly') {
     const uAnchors: Array<{ val: number; kind: 'wall' | 'tjunction' }> = [
       { val: 0, kind: 'wall' },
@@ -664,9 +752,21 @@ export function snapPointToStructuralAnchors(
     ];
     for (const d of vDividers) {
       if (d.id === excludeId) continue;
-      if (v >= d.start - 0.04 && v <= d.end + 0.04) {
+      if (v >= d.start - 0.06 && v <= d.end + 0.06) {
         uAnchors.push({ val: d.position, kind: 'tjunction' });
       }
+    }
+    for (const s of hShelves) {
+      if (s.id === excludeId) continue;
+      if (Math.abs(v - s.position) <= 0.14) {
+        uAnchors.push({ val: s.start, kind: 'tjunction' });
+        uAnchors.push({ val: s.end, kind: 'tjunction' });
+      }
+    }
+    for (const dg of diagonalDividers) {
+      if (dg.id === excludeId) continue;
+      if (Math.abs(v - dg.v1) <= 0.12) uAnchors.push({ val: dg.u1, kind: 'tjunction' });
+      if (Math.abs(v - dg.v2) <= 0.12) uAnchors.push({ val: dg.u2, kind: 'tjunction' });
     }
 
     let bestUDist = snapTolPx;
@@ -686,7 +786,7 @@ export function snapPointToStructuralAnchors(
     }
   }
 
-  // Candidatos V (base/cubierta + repisas horizontales activas en u)
+  // Candidatos V (base/cubierta + repisas horizontales activas en u + extremos de divisores/diagonales)
   if (axisLock !== 'uOnly') {
     const vAnchors: Array<{ val: number; kind: 'wall' | 'tjunction' }> = [
       { val: 0, kind: 'wall' },
@@ -694,9 +794,21 @@ export function snapPointToStructuralAnchors(
     ];
     for (const s of hShelves) {
       if (s.id === excludeId) continue;
-      if (u >= s.start - 0.04 && u <= s.end + 0.04) {
+      if (u >= s.start - 0.06 && u <= s.end + 0.06) {
         vAnchors.push({ val: s.position, kind: 'tjunction' });
       }
+    }
+    for (const d of vDividers) {
+      if (d.id === excludeId) continue;
+      if (Math.abs(u - d.position) <= 0.14) {
+        vAnchors.push({ val: d.start, kind: 'tjunction' });
+        vAnchors.push({ val: d.end, kind: 'tjunction' });
+      }
+    }
+    for (const dg of diagonalDividers) {
+      if (dg.id === excludeId) continue;
+      if (Math.abs(u - dg.u1) <= 0.12) vAnchors.push({ val: dg.v1, kind: 'tjunction' });
+      if (Math.abs(u - dg.u2) <= 0.12) vAnchors.push({ val: dg.v2, kind: 'tjunction' });
     }
 
     let bestVDist = snapTolPx;
@@ -745,6 +857,86 @@ export function snapPointToStructuralAnchors(
       kind: isTJunction ? 'tjunction' : 'wall',
       label,
     },
+  };
+}
+
+/**
+ * Snap suave de esquinas, bordes y vértices existentes en espacio unitario [0, 1]^2
+ * para las vistas Arriba (XZ) y Lado (ZY), evitando saltos inesperados.
+ */
+export function snapPointInUnitQuad(
+  rawPtImg: Point2D,
+  toUnit: Matrix3x3,
+  toCanvas: Matrix3x3,
+  extraUnitVertices: readonly Point2D[],
+  scaleX: number,
+  scaleY: number,
+  snapTolPx = 12,
+): { snappedImg: Point2D; unitPt: Point2D; indicator: SnapIndicator | null } | null {
+  const unit = applyHomography(toUnit, rawPtImg);
+  if (!unit) return null;
+
+  const corners: Array<{ x: number; y: number; label: string; kind: 'wall' | 'tjunction' }> = [
+    { x: 0, y: 0, label: 'Esquina', kind: 'wall' },
+    { x: 1, y: 0, label: 'Esquina', kind: 'wall' },
+    { x: 1, y: 1, label: 'Esquina', kind: 'wall' },
+    { x: 0, y: 1, label: 'Esquina', kind: 'wall' },
+    ...extraUnitVertices.map((pt) => ({
+      x: clampNum(pt.x, 0, 1),
+      y: clampNum(pt.y, 0, 1),
+      label: 'Esquina',
+      kind: 'tjunction' as const,
+    })),
+  ];
+
+  let bestDist = snapTolPx;
+  let bestCorner: (typeof corners)[number] & { img: Point2D } | null = null;
+  for (const c of corners) {
+    const img = applyHomography(toCanvas, { x: c.x, y: c.y });
+    if (!img) continue;
+    const d = distScreenPx(rawPtImg, img, scaleX, scaleY);
+    if (d <= bestDist) {
+      bestDist = d;
+      bestCorner = { ...c, img };
+    }
+  }
+  if (bestCorner) {
+    return {
+      snappedImg: bestCorner.img,
+      unitPt: { x: bestCorner.x, y: bestCorner.y },
+      indicator: { pt: bestCorner.img, kind: bestCorner.kind, label: bestCorner.label },
+    };
+  }
+
+  let u = unit.x;
+  let v = unit.y;
+  let snapped = false;
+
+  for (const edgeU of [0, 1]) {
+    const img = applyHomography(toCanvas, { x: edgeU, y: clampNum(v, 0, 1) });
+    if (img && distScreenPx(rawPtImg, img, scaleX, scaleY) <= snapTolPx) {
+      u = edgeU;
+      snapped = true;
+      break;
+    }
+  }
+  for (const edgeV of [0, 1]) {
+    const img = applyHomography(toCanvas, { x: clampNum(u, 0, 1), y: edgeV });
+    if (img && distScreenPx(rawPtImg, img, scaleX, scaleY) <= snapTolPx) {
+      v = edgeV;
+      snapped = true;
+      break;
+    }
+  }
+
+  if (!snapped) {
+    return { snappedImg: rawPtImg, unitPt: unit, indicator: null };
+  }
+  const snappedImg = applyHomography(toCanvas, { x: u, y: v }) ?? rawPtImg;
+  return {
+    snappedImg,
+    unitPt: { x: u, y: v },
+    indicator: { pt: snappedImg, kind: 'wall', label: 'Borde' },
   };
 }
 

@@ -161,6 +161,7 @@ export function vectorizeUserStroke(
   dimsMm: { x: number; y: number },
   autoExtend: boolean | number = true,
   strokeMode: UserStrokeMode = 'auto',
+  interactiveOpts?: { exactStartPos?: boolean },
 ): TracedStrokeResult | null {
   const uA = applyHomography(toUnitHomography, p1);
   const uB = applyHomography(toUnitHomography, p2);
@@ -262,7 +263,11 @@ export function vectorizeUserStroke(
   const isHorizontal = !isCleanLowFurnitureVertical && dxMm >= dyMm;
 
   if (isHorizontal) {
-    const vPos = clamp((y1 + y2) / 2, 0.04, 0.96);
+    const posMin = interactiveOpts?.exactStartPos ? 0.005 : 0.04;
+    const posMax = interactiveOpts?.exactStartPos ? 0.995 : 0.96;
+    const rawV =
+      interactiveOpts?.exactStartPos && Math.abs(y2 - y1) <= 0.03 ? y1 : (y1 + y2) / 2;
+    const vPos = clamp(rawV, posMin, posMax);
     const activeVAnchors = [
       0,
       ...existingVDividers
@@ -274,8 +279,10 @@ export function vectorizeUserStroke(
     let uStart = clamp(Math.min(x1, x2), 0, 1);
     let uEnd = clamp(Math.max(x1, x2), 0, 1);
 
-    uStart = snapToAnchors(uStart, activeVAnchors, anchorSnapTol);
-    uEnd = snapToAnchors(uEnd, activeVAnchors, anchorSnapTol);
+    if (anchorSnapTol > 0) {
+      uStart = snapToAnchors(uStart, activeVAnchors, anchorSnapTol);
+      uEnd = snapToAnchors(uEnd, activeVAnchors, anchorSnapTol);
+    }
 
     if (extendTol > 0) {
       const leftWall = [...activeVAnchors].reverse().find((a) => a <= uStart + 0.015) ?? 0;
@@ -284,7 +291,7 @@ export function vectorizeUserStroke(
       if (rightWall - uEnd <= extendTol) uEnd = rightWall;
     }
 
-    if (uEnd - uStart < 0.05) return null;
+    if (uEnd - uStart < (interactiveOpts?.exactStartPos ? 0.025 : 0.05)) return null;
 
     const baseId = `usr_rep_${Math.round(vPos * 1000)}_${Math.round(uStart * 1000)}_${Math.round(uEnd * 1000)}`;
     return {
@@ -303,7 +310,11 @@ export function vectorizeUserStroke(
   }
 
   // Vector Vertical -> Divisor
-  const uPos = clamp((x1 + x2) / 2, 0.04, 0.96);
+  const posMinV = interactiveOpts?.exactStartPos ? 0.005 : 0.04;
+  const posMaxV = interactiveOpts?.exactStartPos ? 0.995 : 0.96;
+  const rawU =
+    interactiveOpts?.exactStartPos && Math.abs(x2 - x1) <= 0.03 ? x1 : (x1 + x2) / 2;
+  const uPos = clamp(rawU, posMinV, posMaxV);
   const activeHAnchors = [
     0,
     ...existingHShelves
@@ -315,8 +326,10 @@ export function vectorizeUserStroke(
   let vStart = clamp(Math.min(y1, y2), 0, 1);
   let vEnd = clamp(Math.max(y1, y2), 0, 1);
 
-  vStart = snapToAnchors(vStart, activeHAnchors, anchorSnapTol);
-  vEnd = snapToAnchors(vEnd, activeHAnchors, anchorSnapTol);
+  if (anchorSnapTol > 0) {
+    vStart = snapToAnchors(vStart, activeHAnchors, anchorSnapTol);
+    vEnd = snapToAnchors(vEnd, activeHAnchors, anchorSnapTol);
+  }
 
   if (extendTol > 0) {
     const botWall = [...activeHAnchors].reverse().find((a) => a <= vStart + 0.015) ?? 0;
@@ -325,7 +338,7 @@ export function vectorizeUserStroke(
     if (topWall - vEnd <= extendTol) vEnd = topWall;
   }
 
-  if (vEnd - vStart < 0.05) return null;
+  if (vEnd - vStart < (interactiveOpts?.exactStartPos ? 0.025 : 0.05)) return null;
 
   const baseId = `usr_div_${Math.round(uPos * 1000)}_${Math.round(vStart * 1000)}_${Math.round(vEnd * 1000)}`;
   return {

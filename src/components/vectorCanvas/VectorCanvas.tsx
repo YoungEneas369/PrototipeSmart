@@ -198,10 +198,12 @@ export function VectorCanvas({
   const [topQuad, setTopQuad] = useState<[Point2D, Point2D, Point2D, Point2D]>(
     makeAxisAlignedQuad(165, 110, 735, 510),
   );
+  const [planeLinesXZ, setPlaneLinesXZ] = useState<DiagonalSegment[]>([]);
   const [sideBitmap, setSideBitmap] = useState<WorkingBitmap | null>(null);
   const [sideQuad, setSideQuad] = useState<[Point2D, Point2D, Point2D, Point2D]>(
     makeAxisAlignedQuad(180, 100, 460, 520),
   );
+  const [planeLinesZY, setPlaneLinesZY] = useState<DiagonalSegment[]>([]);
   const [quad, setQuad] = useState<[Point2D, Point2D, Point2D, Point2D]>(
     topology.quadCorners ?? makeAxisAlignedQuad(165, 120, 735, 540),
   );
@@ -833,6 +835,12 @@ export function VectorCanvas({
     onCommitTopQuad: handleCommitTopQuad,
     onCommitSideQuad: handleCommitSideQuad,
     onCommitTracedVectors: commitTracedVectors,
+    planeLinesXZ,
+    planeLinesZY,
+    onCommitPlaneLine: (plane, seg) => {
+      if (plane === 'xz') setPlaneLinesXZ((prev) => [...prev, seg]);
+      else setPlaneLinesZY((prev) => [...prev, seg]);
+    },
     onCommitCurvedCut: handleCommitCurvedCut,
     onSetStatusMsg: setStatusMsg,
   });
@@ -849,6 +857,8 @@ export function VectorCanvas({
     setCalibFeedback(null);
     setSubTool('none');
     setLegHintDetected(false);
+    setPlaneLinesXZ([]);
+    setPlaneLinesZY([]);
   }, [clearDrafts, resetViewport]);
 
   // Carga de fotos reales del Catálogo QA (y limpieza al volver a Preset sin foto)
@@ -979,12 +989,16 @@ export function VectorCanvas({
       materializedBase.vDividers.length === 0 &&
       materializedBase.hShelves.length === 0 &&
       (topology.diagonalDividers?.length ?? 0) === 0 &&
-      (topology.curvedCuts?.length ?? 0) === 0
+      (topology.curvedCuts?.length ?? 0) === 0 &&
+      planeLinesXZ.length === 0 &&
+      planeLinesZY.length === 0
     ) {
       return;
     }
     pushSnapshot();
     setSelectedLine(null);
+    setPlaneLinesXZ([]);
+    setPlaneLinesZY([]);
     const singleZone: FrontZone = {
       id: 'traced_zone_1',
       uStart: 0,
@@ -1007,7 +1021,15 @@ export function VectorCanvas({
     });
     setSelectedZone(singleZone.id);
     setStatusMsg('Líneas y curvas limpiadas (Ctrl+Z para restaurar).');
-  }, [materializedBase, topology, pushSnapshot, onUpdateTopology, setSelectedZone]);
+  }, [
+    materializedBase,
+    topology,
+    planeLinesXZ.length,
+    planeLinesZY.length,
+    pushSnapshot,
+    onUpdateTopology,
+    setSelectedZone,
+  ]);
 
   // REGLA ESTRICTA: tanto "Sugerir líneas en contorno" como "Ejecutar visión real" SIEMPRE
   // respetan `overrideQuad: quad` (jamás tiran el contorno marcado por el usuario!) y mantienen
@@ -1221,6 +1243,7 @@ export function VectorCanvas({
         if (topBlobUrlRef.current) URL.revokeObjectURL(topBlobUrlRef.current);
         topBlobUrlRef.current = url;
         setTopBitmap(bmp);
+        setPlaneLinesXZ([]);
         setViewTab('superior');
         const sk = recognizeHandDrawnSketch(
           bmp.rgba,
@@ -1265,6 +1288,7 @@ export function VectorCanvas({
         if (sideBlobUrlRef.current) URL.revokeObjectURL(sideBlobUrlRef.current);
         sideBlobUrlRef.current = url;
         setSideBitmap(bmp);
+        setPlaneLinesZY([]);
         setViewTab('lateral');
         const sk = recognizeHandDrawnSketch(
           bmp.rgba,
@@ -1312,8 +1336,8 @@ export function VectorCanvas({
       setQuad(blankQuad);
       setFrameMode('quad');
       setTraceStep('lines');
-      setLinesSubMode('smart');
-      setStrokeMode('ortho');
+      setLinesSubMode('draw_only');
+      setStrokeMode('auto');
       resetAllTransient();
       clearHistory();
       triViewRef.current = { ...triViewRef.current, front: undefined };
@@ -1353,14 +1377,16 @@ export function VectorCanvas({
       }
       setTopBitmap(bmp);
       setTopQuad(makeAxisAlignedQuad(160, 110, 740, 520));
+      setPlaneLinesXZ([]);
       setTraceStep('lines');
-      setStrokeMode('curve');
+      setLinesSubMode('draw_only');
+      setStrokeMode('auto');
       onUpdateTopology({
         ...topology,
         viewsMode: sideBitmap ? 3 : 2,
       });
       setStatusMsg(
-        'Lienzo de Planta Arriba (XZ) listo. Traza curvas de empalme con "Curva (Bézier)" o ajusta el marco.',
+        'Lienzo de Planta Arriba (XZ) listo. Dibuja rectas desde cualquier esquina o cambia a "Curva" en Opciones.',
       );
       return;
     }
@@ -1370,12 +1396,15 @@ export function VectorCanvas({
     }
     setSideBitmap(bmp);
     setSideQuad(makeAxisAlignedQuad(220, 100, 680, 580));
-    setTraceStep('frame');
+    setPlaneLinesZY([]);
+    setTraceStep('lines');
+    setLinesSubMode('draw_only');
+    setStrokeMode('auto');
     onUpdateTopology({
       ...topology,
       viewsMode: topBitmap ? 3 : 2,
     });
-    setStatusMsg('Lienzo lateral (ZY) listo. Ajusta el perfil para calibrar la profundidad Z.');
+    setStatusMsg('Lienzo lateral (ZY) listo. Dibuja líneas desde cualquier esquina o cambia a "Marco" para ajustar profundidad Z.');
   }, [
     viewTab,
     topology,
@@ -1851,7 +1880,13 @@ export function VectorCanvas({
         magneticSnap={magneticSnap}
         calibRefMm={calibRefMm}
         calibPtsCount={calibPts.length}
-        internalLineCount={activeVDividers.length + activeHShelves.length + activeDiagonals.length}
+        internalLineCount={
+          viewTab === 'frontal'
+            ? activeVDividers.length + activeHShelves.length + activeDiagonals.length
+            : viewTab === 'superior'
+              ? planeLinesXZ.length
+              : planeLinesZY.length
+        }
         curvedCount={topology.curvedCuts?.length ?? 0}
         zonesCount={zones.length}
         subRegions={subRegions}
@@ -1877,6 +1912,7 @@ export function VectorCanvas({
           setSelectedLine(null);
           setViewTab(tab);
         }}
+        onSetPlaneTraceStep={(step) => setTraceStep(step)}
         onSelectStep={(step) => {
           setViewTab('frontal');
           setSubTool('none');
@@ -1979,6 +2015,8 @@ export function VectorCanvas({
         hShelves={activeHShelves}
         diagonalDividers={activeDiagonals}
         curvedCuts={topology.curvedCuts}
+        planeLinesXZ={planeLinesXZ}
+        planeLinesZY={planeLinesZY}
         frontZones={zones}
         subRegions={subRegions}
         draftRegion={pointer.draftRegion}
